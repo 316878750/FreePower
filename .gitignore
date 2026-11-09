@@ -12,3 +12,4 @@ data/
 profiles/
 user-data/
 .tmp/
+.npm-cache/

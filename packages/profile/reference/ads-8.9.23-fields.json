@@ -1,0 +1,237 @@
+{
+  "_meta": {
+    "product": "AdsPower Global",
+    "version": "8.9.23",
+    "generated": "2026-11-09",
+    "evidence": "%APPDATA%/adspower_global/cwd_global/lib/main.min.js (node agent, webpack minified only, 8.85MB) + internal/adspower-browser/skills/references/fingerprint-config.md (official doc shipped by AdsPower, adspower-browser@2.1.1)",
+    "notes": "profile 记录是平铺表 + fingerprint_config 一个 JSON 列；values 中的数组为该字段允许取值，\"default\" 表示真实本机值。默认值以官方 skill 文档为准（见 md 的 0.0.1）。",
+    "fields_verified": true,
+    "fields_inferred": ["server_side_only_keys"],
+    "official_doc": "8.9.23/official-skills/references/fingerprint-config.md"
+  },
+  "profile": {
+    "identity": {
+      "name": { "type": "string", "max": 100 },
+      "group_id": { "type": "string", "required": true, "api_v2_alias": "batch_id" },
+      "category_id": { "type": "string", "api_v2_alias": "sys_app_cate_id" },
+      "profile_tag_ids": { "type": "array<string>", "api_v2_alias": "fbcc_user_tag_ids", "stored_as": "csv" },
+      "remark": { "type": "string" },
+      "domain_name": { "type": "string", "api_v2_alias_from": "platform" },
+      "open_urls": { "type": "array<string>", "api_v2_alias": "openfb_urls" },
+      "tabs": { "type": "array<string>" },
+      "repeat_config": { "type": "array<string>", "stored_as": "csv" },
+      "platform_account": { "type": "array<object>", "stored_as": "json" },
+      "cookie": { "type": "string", "format": "json-string" },
+      "username": { "type": "string" },
+      "password": { "type": "string" },
+      "fakey": { "type": "string" },
+      "login_user": { "type": "string" },
+      "login_user_comment": { "type": "string" },
+      "random_fingerprint": { "type": "enum", "values": ["0", "1"], "api_v2_alias": "switch_random_finger" },
+      "app_ids": { "type": "array<string>" },
+      "sys_user_id": { "type": "string", "server_side": true },
+      "company_id": { "type": "string", "server_side": true },
+      "invite_code": { "type": "string", "server_side": true },
+      "ext_obj": { "type": "string", "format": "json-string" }
+    },
+
+    "browser": {
+      "browser": { "type": "enum", "values": ["chrome"] },
+      "browser_kernel_config": {
+        "type": "object",
+        "shape": { "version": "string (ua_auto | 118..156)", "type": "string" }
+      },
+      "browser_head": { "type": "string" },
+      "platform": { "type": "enum", "values": ["Win32", "MacIntel", "Linux x86_64", "Linux i686", "Linux armv8l", "Android", "iPhone"] },
+      "new_mobile_mode": { "type": "enum", "values": ["0", "1"], "requires_kernel": ">=143" },
+      "kernelSandboxMode": { "type": "string" },
+      "browser_compatibility_mode": { "type": "enum", "values": ["0", "1"] },
+      "gpu": { "type": "string" },
+      "gpu_switch": { "type": "string" },
+      "cdp_mask": { "type": "string", "default": "0" },
+      "ban_dev_tools": { "type": "enum", "values": ["0", "1"] },
+      "renderer_accessibility": { "type": "string" },
+      "device_scale": { "type": "number", "range": "0 < x < 2.1" },
+      "virtual_camera": { "type": "enum", "values": ["0", "1"] }
+    },
+
+    "ua_and_language": {
+      "ua": { "type": "string" },
+      "client_hints": {
+        "type": "object",
+        "shape": {
+          "platform": "string",
+          "platform_version": "string",
+          "architecture": "string",
+          "model": "string",
+          "mobile": "0|1",
+          "wow64": "0|1",
+          "ua_full_version": "string",
+          "bitness": "string"
+        }
+      },
+      "language": { "type": "array<string>" },
+      "language_switch": { "type": "enum", "values": ["0", "1"] },
+      "lang": { "type": "string" },
+      "page_language": { "type": "string", "values": ["<lang-code>", "native"] },
+      "page_language_switch": { "type": "enum", "values": ["0", "1"] },
+      "timezone": { "type": "string", "format": "IANA, spaces->underscore" },
+      "automatic_timezone": { "type": "enum", "values": ["0", "1"] }
+    },
+
+    "noise_quad": {
+      "canvas": { "type": "enum", "values": ["0", "1"] },
+      "canvas_id": { "type": "number" },
+      "webgl_image": { "type": "enum", "values": ["0", "1"] },
+      "webgl_image_id": { "type": "number" },
+      "webgl": { "type": "enum", "values": ["0", "2"] },
+      "webgl_config": {
+        "type": "object",
+        "shape": {
+          "unmasked_vendor": "string",
+          "unmasked_renderer": "string",
+          "webgpu": { "webgpu_switch": "1" }
+        }
+      },
+      "audio": { "type": "enum", "values": ["0", "1"] },
+      "audio_id": { "type": "number" },
+      "client_rects": { "type": "enum", "values": ["0", "1"] },
+      "client_rects_id": { "type": "number" },
+      "dis_canvas_url": { "type": "string" }
+    },
+
+    "fonts": {
+      "fonts": { "type": "array<string>", "special": ["all"] },
+      "disabled_fonts": { "type": "array<string>" }
+    },
+
+    "screen_hardware": {
+      "screen_resolution": { "type": "string", "format": "<W>_<H> | none" },
+      "hardware_concurrency": { "type": "enum", "values": ["default", 2, 3, 4, 6, 8, 10, 12, 16, 20, 24] },
+      "device_memory": { "type": "enum", "values": ["default", 2, 4, 6, 8] },
+      "device_name": { "type": "string" },
+      "device_name_switch": { "type": "enum", "values": ["0", "1", "2"] },
+      "mac_address_config": {
+        "type": "object",
+        "shape": { "model": "0|2", "address": "string (mac)" }
+      },
+      "gyroscope": { "type": "enum", "values": ["0"] },
+      "network_information_type": { "type": "string", "requires_kernel": ">=148" }
+    },
+
+    "media_devices": {
+      "media_devices": { "type": "enum", "values": ["0", "1", "2"] },
+      "media_devices_num": {
+        "type": "object",
+        "shape": { "audioinput_num": "1..9", "videoinput_num": "1..9", "audiooutput_num": "1..9" }
+      },
+      "media_devices_config": { "type": "array<object>" },
+      "media_devices_config_v2": { "type": "array<object>" },
+      "speech_switch": { "type": "enum", "values": ["0", "1"] },
+      "speech_voices": { "type": "array<string>" }
+    },
+
+    "network": {
+      "webrtc": { "type": "enum", "values": ["disabled", "local", "proxy", "forward", "disable_udp"] },
+      "user_proxy_config": { "type": "object", "stored_as": "json" },
+      "ip": { "type": "string" },
+      "ip_country": { "type": "string" },
+      "ip_city": { "type": "string" },
+      "ip_region": { "type": "string" },
+      "ipchecker": { "type": "string" },
+      "is_multi_level_proxy": { "type": "enum", "values": ["0", "1"] },
+      "mutli_level_proxy": { "type": "enum", "values": ["0", "1"] },
+      "bypass_proxy_check": { "type": "enum", "values": ["0", "1"] },
+      "full_pac_url": { "type": "string" },
+      "scan_port_type": { "type": "enum", "values": ["0", "1"] },
+      "allow_scan_ports": { "type": "string", "format": "csv ports" }
+    },
+
+    "geolocation": {
+      "location": { "type": "enum", "values": ["block", "allow", "ask"] },
+      "location_switch": { "type": "enum", "values": ["0", "1"] },
+      "longitude": { "type": "number", "precision": 6 },
+      "latitude": { "type": "number", "precision": 6 },
+      "accuracy": { "type": "number", "default": 1000 }
+    },
+
+    "privacy_switches": {
+      "do_not_track": { "type": "enum", "values": ["true", "false"] },
+      "tls": { "type": "string" },
+      "tls_switch": { "type": "enum", "values": ["0", "1"] },
+      "flash": { "type": "enum", "values": ["allow", "block"] },
+      "automation_controlled": { "type": "enum", "values": ["0", "1"] },
+      "disable_image": { "type": "enum", "values": ["0", "1"] },
+      "disable_video": { "type": "enum", "values": ["0", "1"] },
+      "image_size": { "type": "number", "unit": "KB" },
+      "disable_console": { "type": "enum", "values": ["0", "1"] },
+      "disable_save_password": { "type": "enum", "values": ["0", "1"] },
+      "disable_password_filling": { "type": "enum", "values": ["0", "1"] },
+      "sync_password": { "type": "string" },
+      "fb_cloud_password_manager": { "type": "string" },
+      "open_google_api": { "type": "enum", "values": ["0", "1"] },
+      "translate_webpages": { "type": "enum", "values": ["0", "1"] },
+      "blacklist": { "type": "array<string>" },
+      "whitelist": { "type": "array<string>" },
+      "whitelist_open": { "type": "string" },
+      "domain_https": { "type": "enum", "values": ["0", "1"] },
+      "tabAssistantExt": { "type": "enum", "values": ["0", "1"] },
+      "tabAssistantFeatures": {
+        "type": "array<enum>",
+        "values": ["tabAssistant", "chromeValidationHeaders", "chromeWebstoreValidationHeaders", "extensionManagement"]
+      },
+      "hidden_notification": { "type": "enum", "values": ["0", "1"] },
+      "virtual_camera": { "type": "enum", "values": ["0", "1"] }
+    },
+
+    "launch_and_cache": {
+      "launch_args": { "type": "string" },
+      "browser_run_args": { "type": "array<string>" },
+      "no_args": { "type": "enum", "values": ["0", "1"] },
+      "cover_args": { "type": "enum", "values": ["0", "1"] },
+      "headless": { "type": "enum", "values": ["0", "1", "2"] },
+      "optimize_launch": { "type": "enum", "values": ["0", "1"] },
+      "use_launch_optimize": { "type": "enum", "values": ["0", "1"] },
+      "open_tabs": { "type": "enum", "values": ["1", "2"] },
+      "new_startup_page": { "type": "string" },
+      "window_position": { "type": "string" },
+      "win_x": { "type": "number" },
+      "win_y": { "type": "number" },
+      "clear_cache_after_closing": { "type": "enum", "values": ["0", "1"] },
+      "cache_backup": { "type": "enum", "values": ["0", "1"] },
+      "storage_strategy": { "type": "string" },
+      "storage_cloud_option": { "type": "object", "stored_as": "json" },
+      "sync_localstorage_cache": { "type": "enum", "values": ["0", "1"] },
+      "sync_indexeddb_cache": { "type": "enum", "values": ["0", "1"] },
+      "sync_extension_cache": { "type": "enum", "values": ["0", "1"] },
+      "sync_history": { "type": "enum", "values": ["0", "1"] },
+      "not_sync_cache_not_open": { "type": "enum", "values": ["0", "1"] },
+      "browser_security_lock": { "type": "enum", "values": ["0", "1"] },
+      "browser_security_lock_ignore_ids": { "type": "array<string>" },
+      "api_merged": { "type": "enum", "values": ["0", "1"] },
+      "is_fb_network_acceleration": { "type": "enum", "values": ["0", "1"] },
+      "ignore_agent_config": { "type": "enum", "values": ["0", "1"] }
+    }
+  },
+
+  "injection_channels": {
+    "sunBrowserParams": {
+      "transport": "--extended-parameters=<base64(JSON)>",
+      "gated_by": "process.env.IS_SUNFLOWER_BROWSER_BASE64 === 'true'",
+      "keys": ["AudioFp", "CanvasMark", "WebGLMark", "StartTime", "AllowScanPorts", "GeolocationSetting", "Platform", "Langs", "AcceptLang", "DisableBackgroundMode", "ProxyUser", "ProxyPassword", "DisableWebRTC", "WebRTCAddress", "WebRTCLocalAddress", "EnableDoNotTrack", "HardwareConcurrency", "DeviceMemory", "FlashPluginSetting", "FlashPluginPath", "TimeZone", "Geoposition", "StaticConfig", "DynamicConfig", "MobileModeFixedResolution", "DisableWebRTCRaw"]
+    },
+    "staticConfig": {
+      "transport": "file <profileCacheDir>/md5(fbccId + '_static'), base64(JSON); path passed as sunBrowserParams.StaticConfig",
+      "keys": ["CanvasMarkEx", "WebGLMarkEx", "Fakefonts", "DisabledFonts", "MediaDevices", "MediaDevicesMask", "MaxTouchPoints", "TTSEngines", "MacAddress", "DeviceName", "ProductType", "UserAgentMetadata", "NetFilters", "DevtoolsPreferences", "DisCanvasUrl", "WebRTCSocks5UdpProxy", "WebRTCStun", "WebRTCTurn", "WebRTCAllowScanPorts", "command_line", "gyroscope", "deviceorientationdata", "DeviceMotion", "NewMobileMode", "EnableFakeVideoCaptureDevice"],
+      "excluded_keys": ["WebGLFP", "StaticConfig", "CookiesFile", "DynamicConfig", "Geoposition", "TimeZone"]
+    },
+    "dynamicConfig": {
+      "transport": "file <profileCacheDir>/md5(fbccId + '_webrtc'), base64(JSON); path passed as sunBrowserParams.DynamicConfig",
+      "purpose": "运行时可改：TimeZone / Geoposition / WebRTCAddress"
+    },
+    "cookiesFile": {
+      "transport": "file <profileCacheDir>/md5(fbccId + '_cookies'), JSON",
+      "purpose": "启动前注入 cookie"
+    }
+  }
+}

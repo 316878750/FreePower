@@ -1,0 +1,15 @@
+{
+  "name": "freepower",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "FreePower — 独立实现的指纹浏览器（多环境隔离 + 代理 + 指纹一致 + 本地 API）",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "start": "node --no-warnings src/main.js",
+    "dev": "node --no-warnings --watch src/main.js",
+    "smoke": "node --no-warnings test/smoke.mjs"
+  }
+}
