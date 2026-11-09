@@ -13,3 +13,4 @@ profiles/
 user-data/
 .tmp/
 .npm-cache/
+.npm-cache/
