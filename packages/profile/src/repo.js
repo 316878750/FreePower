@@ -11,6 +11,8 @@ import { validateProfile } from './validate.js';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const DDL = fs.readFileSync(path.join(here, 'schema.sql'), 'utf8');
 
+export { DDL };
+
 const FLAT = FIELDS.filter((f) => f.storage !== 'fp');
 const FP = FIELDS.filter((f) => f.storage === 'fp');
 const EXT_COLS = ['id', 'profile_no', 'fp_seed', 'kernel_version', 'proxy_id', 'status', 'created_at', 'updated_at', 'last_launch_at'];
@@ -94,6 +96,17 @@ export function createProfile(db, input) {
   db.prepare(sql).run(...cols.map((c) => row[c]));
 
   return { ok: true, warnings: res.warnings, profile: getProfile(db, rec.id) };
+}
+
+/**
+ * 按记录直插（迁移/导入用）：不做默认值填充以外的改写，保留原 id / profile_no。
+ */
+export function insertRecord(db, rec) {
+  const row = toRow({ ...rec, created_at: rec.created_at ?? now(), updated_at: rec.updated_at ?? now() });
+  const cols = Object.keys(row).filter((c) => row[c] !== undefined);
+  const sql = `INSERT INTO profiles (${cols.map((c) => `"${c}"`).join(',')}) VALUES (${cols.map(() => '?').join(',')})`;
+  db.prepare(sql).run(...cols.map((c) => row[c]));
+  return getProfile(db, rec.id);
 }
 
 export function updateProfile(db, id, input) {

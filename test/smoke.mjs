@@ -108,6 +108,20 @@ async function main() {
     const noauth = await fetch(base + '/api/v1/user/list');
     check('无 key 被拒', noauth.status === 401, `HTTP ${noauth.status}`);
 
+    // CORS：非本机 Origin 必须是 403 纯文本
+    const corsBad = await fetch(base + '/api/v1/user/list', {
+      headers: { api_key: apiKey, origin: 'https://evil.example.com' },
+    });
+    const corsText = await corsBad.text();
+    check('跨站 Origin 被拒（403 纯文本 CORS ERROR）', corsBad.status === 403 && corsText === 'CORS ERROR', `${corsBad.status} ${corsText}`);
+
+    // 限流：不带 mcp 头连打两次，第二次必须是那句固定报文
+    const r1 = await fetch(base + '/api/v1/user/list', { headers: { api_key: apiKey } });
+    await r1.json();
+    const r2 = await fetch(base + '/api/v1/user/list', { headers: { api_key: apiKey } });
+    const r2j = await r2.json();
+    check('限流报文对齐', r2j.code === -1 && r2j.msg === 'Too many request per second, please check', JSON.stringify(r2j));
+
     // 建环境
     const c1 = await api('POST', '/api/v1/user/create', { name: 'smoke-a', country: 'US' });
     const p1 = c1.json.data;
@@ -123,7 +137,13 @@ async function main() {
     if (s1.json.code !== 0) throw new Error('启动失败，后续跳过');
     const ws1 = s1.json.data.ws.puppeteer;
     check('返回 ws.puppeteer', typeof ws1 === 'string' && ws1.startsWith('ws://'), ws1);
-    check('返回 debug_port', s1.json.data.debug_port > 0, String(s1.json.data.debug_port));
+    check('debug_port 是字符串（对手契约）', typeof s1.json.data.debug_port === 'string' && Number(s1.json.data.debug_port) > 0, s1.json.data.debug_port);
+    check('ws.selenium 只放 host:port', /^127\.0\.0\.1:\d+$/.test(s1.json.data.ws.selenium), s1.json.data.ws.selenium);
+
+    // 幂等：重复 start 必须是同一个 pid，不能起第二个浏览器
+    const s1b = await api('GET', `/api/v1/browser/start?user_id=${p1.profile_id}`);
+    check('重复 start 幂等', s1b.json.code === 0 && s1b.json.data.pid === s1.json.data.pid && s1b.json.data.already_running === true,
+      `pid ${s1.json.data.pid} / ${s1b.json.data.pid}`);
 
     // 探针
     const probes = await evalInInjectedPages(ws1, PROBE_EXPR);

@@ -12,8 +12,8 @@ export function listRunning() {
   return [...running.values()].map((i) => ({
     profile_id: i.profile_id,
     pid: i.pid,
-    debug_port: i.port,
-    ws: { puppeteer: i.wsUrl, selenium: i.wsUrl },
+    debug_port: String(i.port),                                   // 对手契约：字符串
+    ws: { puppeteer: i.wsUrl, selenium: `127.0.0.1:${i.port}` },   // selenium 只放 host:port
     status: i.status,
     started_at: i.started_at,
   }));
@@ -47,8 +47,8 @@ export async function startProfile(profile) {
     return {
       profile_id: id,
       pid: inst.pid,
-      debug_port: inst.port,
-      ws: { puppeteer: inst.wsUrl, selenium: inst.wsUrl },
+      debug_port: String(inst.port),
+      ws: { puppeteer: inst.wsUrl, selenium: `127.0.0.1:${inst.port}` },
       status: inst.status,
       already_running: true,
     };
@@ -110,8 +110,8 @@ export async function startProfile(profile) {
     return {
       profile_id: id,
       pid,
-      debug_port: port,
-      ws: { puppeteer: reportedWs, selenium: reportedWs },
+      debug_port: String(port),
+      ws: { puppeteer: reportedWs, selenium: `127.0.0.1:${port}` },
       status: 'running',
       real_version: realVersion,
       already_running: false,

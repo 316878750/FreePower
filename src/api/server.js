@@ -195,7 +195,10 @@ export function createApiServer() {
       'access-control-allow-methods': 'GET,POST,OPTIONS',
     } : {};
     if (origin && allowed === false) {
-      return send(res, 403, { code: -1, msg: 'origin not allowed' });
+      // 对齐对手：CORS 拒绝是 403 + 纯文本，不是 JSON
+      const body = 'CORS ERROR';
+      res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8', 'content-length': Buffer.byteLength(body) });
+      return res.end(body);
     }
     if (req.method === 'OPTIONS') {
       res.writeHead(204, corsHeaders);
@@ -210,7 +213,8 @@ export function createApiServer() {
       if (!key || key !== apiKey) return send(res, 401, { code: -2, msg: 'invalid api_key' }, corsHeaders);
       const limit = req.headers['x-freepower-client'] === 'mcp' ? RATE_LIMIT_MCP : RATE_LIMIT_DEFAULT;
       if (!rateLimit(key + '|' + (req.headers['x-freepower-client'] || ''), limit)) {
-        return send(res, 429, { code: -3, msg: `rate limit: ${limit}/s` }, corsHeaders);
+        // 超限报文与对手逐字对齐（HTTP 200 + code:-1）
+        return send(res, 200, { code: -1, msg: 'Too many request per second, please check' }, corsHeaders);
       }
     }
 
