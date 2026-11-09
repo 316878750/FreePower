@@ -1,0 +1,14 @@
+node_modules/
+dist/
+out/
+build/
+release/
+*.log
+.env
+.env.*
+.DS_Store
+Thumbs.db
+data/
+profiles/
+user-data/
+.tmp/
