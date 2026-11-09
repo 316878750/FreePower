@@ -92,7 +92,8 @@ export function generateFingerprint(opts = {}) {
   const screen = pick(rng, SCREENS);
   const gl = pick(rng, WEBGL_WINDOWS);
   const cores = pick(rng, [8, 12, 16, 4, 6]);
-  const memory = cores <= 6 ? 8 : pick(rng, [8, 16, 32]);
+  // deviceMemory 的真实值域只有 2|4|6|8（Chromium 上限 8G），别造 16/32 这种不存在的机器
+  const memory = cores <= 6 ? 8 : pick(rng, [8, 8, 4]);
   const audioIn = pick(rng, [1, 2, 3]);
   const videoIn = pick(rng, [1, 2]);
 

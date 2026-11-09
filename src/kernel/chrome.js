@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { CHROME_BIN, KERNELS_DIR, START_TIMEOUT_MS } from '../config.js';
+import { fingerprintView } from '../fingerprint/view.js';
 
 const CANDIDATE_DIRS = [
   'C:\\Program Files\\Google\\Chrome\\Application',
@@ -78,13 +79,15 @@ export function compareVersion(a, b) {
   return 0;
 }
 
-/**
- * 启动参数：只放「参数级真实行为」的东西（UA/时区等走 CDP Emulation，不在这伪造）。
- * 注意：不加 --enable-automation，并从 Blink 特性里摘掉 AutomationControlled。
- */
+/** 启动参数：只放「参数级真实行为」的东西（UA/时区等走 CDP Emulation，不在这伪造）。 */
 export function buildArgs(profile, { userDataDir, proxy }) {
   const fp = profile.fingerprint_config || {};
-  const screen = fp.screen || { width: 1920, height: 1080 };
+  const view = fingerprintView(profile);
+  const screen = view.screen || { width: 1920, height: 1080 };
+
+  const disableFeatures = ['Translate', 'OptimizationHints', 'MediaRouter', 'CalculateNativeWinOcclusion'];
+  if (fp.webgl_config?.webgpu?.webgpu_switch === '0') disableFeatures.push('WebGPU', 'WebGPUService');
+
   const args = [
     `--user-data-dir=${userDataDir}`,
     '--remote-debugging-port=0',
@@ -92,16 +95,28 @@ export function buildArgs(profile, { userDataDir, proxy }) {
     '--no-first-run',
     '--no-default-browser-check',
     '--no-service-autorun',
+    // 不加 --enable-automation，并从 Blink 特性里摘掉 AutomationControlled（navigator.webdriver 的来源）
     '--disable-blink-features=AutomationControlled',
-    '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
-    '--webrtc-ip-handling-policy=disable_non_proxied_udp',
-    `--lang=${fp.locale || 'en-US'}`,
-    `--accept-lang=${(fp.language || ['en-US']).join(',')}`,
-    `--window-size=${screen.width},${screen.height}`,
-    '--disable-features=Translate,OptimizationHints,MediaRouter,CalculateNativeWinOcclusion',
+    `--lang=${view.locale || 'en-US'}`,
+    `--accept-lang=${(view.language || ['en-US']).join(',')}`,
+    `--window-size=${profile.window_size || `${screen.width},${screen.height}`}`,
+    `--disable-features=${[...new Set(disableFeatures)].join(',')}`,
     '--disable-search-engine-choice-screen',
     '--hide-crash-restore-bubble',
   ];
+
+  // WebRTC：只放浏览器真实支持的策略位
+  if (view.webrtc === 'disabled') {
+    args.push('--force-webrtc-ip-handling-policy=disable_non_proxied_udp', '--webrtc-ip-handling-policy=disable_non_proxied_udp');
+  } else if (view.webrtc === 'disable_udp' || view.webrtc === 'proxy' || view.webrtc === 'forward') {
+    args.push('--force-webrtc-ip-handling-policy=disable_non_proxied_udp', '--webrtc-ip-handling-policy=disable_non_proxied_udp');
+  }
+
+  if (profile.headless === '1' || profile.headless === '2') {
+    args.push(profile.headless === '2' ? '--headless=new' : '--headless');
+  }
+  if (profile.window_position === 'maximize') args.push('--start-maximized');
+
   if (proxy && proxy.host && proxy.port) {
     const scheme = proxy.proxy_type === 'https' ? 'https' : proxy.proxy_type === 'socks5' ? 'socks5' : 'http';
     args.push(`--proxy-server=${scheme}://${proxy.host}:${proxy.port}`);

@@ -52,6 +52,11 @@ export function validateField(name, value) {
     if (!DOMAINS.webgl.includes(String(value))) return [err(name, 'must be "0" | "2" | "3"（"2" 手动掩码 / "3" 随机）')];
     return [];
   }
+  // 拆解表只列 true|false，官方另有 "default"（见 reference/overrides.mjs）→ 取并集
+  if (name === 'do_not_track') {
+    if (!DOMAINS.do_not_track.includes(String(value))) return [err(name, `must be one of ${DOMAINS.do_not_track.join('|')}`)];
+    return [];
+  }
   // 拆解里是 csv 字符串，官方 API 是数组 → 两种都收
   if (name === 'allow_scan_ports') {
     if (Array.isArray(value)) {
