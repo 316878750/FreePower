@@ -1,16 +1,25 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { PROFILES_DIR, LOG_DIR, START_TIMEOUT_MS } from '../config.js';
-import { findChrome, buildArgs, launchChrome, waitForDevToolsPort, killProcessTree } from '../kernel/chrome.js';
+import {
+  PROFILES_DIR, LOG_DIR, START_TIMEOUT_MS,
+  EGRESS_PROBE_URL, PROXY_PROBE_TIMEOUT_MS, EGRESS_TIMEOUT_MS, UA_AUTOALIGN,
+} from '../config.js';
+import { findChrome, buildArgs, launchChrome, waitForDevToolsPort, killProcessTree, rememberVersion } from '../kernel/chrome.js';
 import { CdpClient, fetchJson } from '../kernel/cdp.js';
 import { buildInjectionSource } from '../kernel/inject.js';
+import { alignProfileToKernel } from '../kernel/version.js';
 import { fingerprintView } from '../fingerprint/view.js';
-import { checkProfile, markStatus } from '../store/profiles.js';
+import { checkProfile, markStatus, applyProfileFields, persistEgress } from '../store/profiles.js';
+import { checkProxy, hasProxy } from '../proxy/probe.js';
+import { probeEgressInBrowser } from '../proxy/egress.js';
+import { checkEgress } from '../../packages/profile/src/validate.js';
 
 /** profile_id -> instance */
 const running = new Map();
 /** profile_id -> 启动中的 Promise（防并发重复启动） */
 const starting = new Map();
+
+const soft = (field, message) => ({ field, message, severity: 'soft' });
 
 /** 运行中实例 → 对外契约形状（ws.selenium 只放 host:port；debug_port 是字符串） */
 function toStartData(i, { alreadyRunning = false } = {}) {
@@ -24,6 +33,12 @@ function toStartData(i, { alreadyRunning = false } = {}) {
     real_version: i.real_version,
     started_at: i.started_at,
     already_running: alreadyRunning,
+    // P3 前置新增（超集，不影响只读旧字段的调用方）
+    proxy: i.proxy || null,
+    egress: i.egress || null,
+    ua_aligned: i.ua_aligned || null,
+    launch_args: i.launch_args || { applied: [], rejected: [] },
+    warnings: i.warnings || [],
   };
 }
 
@@ -62,10 +77,14 @@ function log(profileId, ...parts) {
 /**
  * 启动环境。幂等：已启动直接返回现成的 ws，不开第二个。
  *
- * 关键顺序：页面在「暂停态」被接住 → 装 addScriptToEvaluateOnNewDocument + Emulation 覆盖 → 放行，
- * 保证页面第一条脚本执行前指纹就位，不给检测留「首帧原始值」的窗口。
+ * 关键顺序（任何一步不满足都不许起进程）：
+ *   一致性校验 → 内核解析 → UA 跟版 → **代理预检（fail-closed）** → 起内核 →
+ *   页面在暂停态接住并装配 → 浏览器内出口探测 → 地理/时区一致性告警
+ *
+ * @param {object} profile
+ * @param {{force?:boolean}} opts force=1 时允许越过硬冲突（软冲突本来就只告警）
  */
-export async function startProfile(profile) {
+export async function startProfile(profile, { force = false } = {}) {
   const id = profile.id || profile.profile_id;
 
   const inst = running.get(id);
@@ -77,13 +96,18 @@ export async function startProfile(profile) {
   }
 
   const p = (async () => {
-    // 1) 启动前一致性校验：一条对不上就不让起，避免「带着已知冲突的指纹出门」
-    const check = checkProfile(profile);
+    // 1) 启动前校验：硬冲突 + 值域错误阻断，软冲突只告警
+    const check = checkProfile(profile, { force });
     if (!check.ok) {
       const err = new Error(check.errors.map((e) => `${e.field}: ${e.message}`).join('; '));
       err.code = 800005;
+      err.reason = 'consistency';
       err.errors = check.errors;
       throw err;
+    }
+    const warnings = [...check.soft];
+    if (check.forced) {
+      warnings.unshift(soft('$', `已强制启动：${check.hard.length} 条硬冲突被 force=1 越过（${check.hard.map((e) => e.field).join(',')}）`));
     }
 
     const chrome = findChrome();
@@ -93,15 +117,51 @@ export async function startProfile(profile) {
       throw err;
     }
 
-    const view = fingerprintView(profile);
-    const udd = userDataDirFor(profile);
+    // 2) 代理 fail-closed：先证明代理活着、能出网，再决定要不要起内核
+    const proxy = profile.user_proxy_config || profile.proxy_config || null;
+    const proxyBound = hasProxy(proxy);
+    let proxyCheck = null;
+    if (proxyBound) {
+      if (String(profile.bypass_proxy_check) === '1') {
+        warnings.push(soft('bypass_proxy_check', '已跳过代理预检（bypass_proxy_check=1）：代理若失效就不会有兜底，请自行确认'));
+        log(id, 'WARN 跳过代理预检（bypass_proxy_check=1）');
+      } else {
+        proxyCheck = await checkProxy(proxy, { url: EGRESS_PROBE_URL, timeoutMs: PROXY_PROBE_TIMEOUT_MS });
+        if (!proxyCheck.ok) {
+          log(id, '代理预检失败，拒绝启动', proxyCheck.error);
+          const err = new Error(`代理不可用，已阻止启动（fail-closed）：${proxyCheck.error}`);
+          err.code = 800003;
+          err.reason = 'proxy_unreachable';
+          err.proxy_check = proxyCheck;
+          throw err;
+        }
+        log(id, '代理预检通过', `${proxyCheck.ip} ${proxyCheck.countryCode || ''} ${proxyCheck.latency_ms}ms`);
+      }
+    } else {
+      warnings.push(soft('proxy', '未绑定代理：出口即本机 IP，跑真实账号请务必绑代理'));
+    }
+
+    // 3) 起内核：用户 launch_args 走白名单合并进真实 argv
+    //    UA 跟版放在拿到 Browser.getVersion 之后做 —— 目录名不是版本真值（Application 里可能同时躺着两个版本）
+    let effective = profile;
+    let view = fingerprintView(effective);
+    let uaAligned = null;
+    const udd = userDataDirFor(effective);
     fs.mkdirSync(udd, { recursive: true });
 
-    const proxy = profile.user_proxy_config || profile.proxy_config || null;
-    const args = buildArgs(profile, { userDataDir: udd, proxy });
-    log(id, 'launch', chrome.path, chrome.version, args.join(' '));
+    const built = buildArgs(effective, {
+      userDataDir: udd,
+      proxy,
+      proxyBound,
+      userArgs: effective.launch_args,
+    });
+    warnings.push(...built.warnings);
+    for (const r of built.rejected) {
+      warnings.push(soft('launch_args', `参数被拒绝：${r.arg} —— ${r.reason}`));
+    }
+    log(id, 'launch', chrome.path, chrome.version, built.args.join(' '));
 
-    const child = launchChrome(chrome.path, args);
+    const child = launchChrome(chrome.path, built.args);
     const pid = child.pid;
     let client = null;
 
@@ -114,11 +174,24 @@ export async function startProfile(profile) {
       client = await CdpClient.connect(reportedWs);
       const bv = await client.send('Browser.getVersion');
       const realVersion = String(bv.product || '').replace(/^.*\//, '');
+      rememberVersion(chrome.path, realVersion);
 
-      // 内核版本漂移检查：UA 声明的版本必须等于真实内核版本
-      const declared = profile.client_hints?.ua_full_version;
+      // 4) UA / 内核版本跟版：以真实内核版本为准，系统 Chrome 自动升级后不用人手改
+      if (UA_AUTOALIGN && realVersion) {
+        const aligned = alignProfileToKernel(profile, realVersion);
+        if (aligned.changed) {
+          effective = aligned.profile;
+          view = fingerprintView(effective);
+          uaAligned = { from: aligned.from, to: aligned.to, patch: aligned.patch, reasons: aligned.reasons };
+          log(id, 'UA 跟版', aligned.reasons.join('; '));
+          try { applyProfileFields(id, aligned.patch); } catch (e) { log(id, 'UA 跟版落库失败', e.message); }
+        }
+      }
+
+      // 内核版本漂移检查：UA 声明的版本必须等于真实内核版本（跟版之后这里应当已经一致）
+      const declared = effective.client_hints?.ua_full_version;
       if (declared && realVersion && declared !== realVersion) {
-        log(id, `WARN 内核/UA 版本漂移：声明 ${declared}，实际 ${realVersion}`);
+        warnings.push(soft('client_hints.ua_full_version', `UA 声明 ${declared}，真实内核 ${realVersion}（未开自动跟版？）`));
       }
 
       const instance = {
@@ -132,6 +205,11 @@ export async function startProfile(profile) {
         started_at: Math.floor(Date.now() / 1000),
         real_version: realVersion,
         user_data_dir: udd,
+        proxy: proxyCheck,
+        egress: null,
+        ua_aligned: uaAligned,
+        launch_args: { applied: built.applied, rejected: built.rejected },
+        warnings,
       };
       running.set(id, instance);
       markStatus(id, 'starting');
@@ -146,7 +224,25 @@ export async function startProfile(profile) {
         try { if (client) client.close(); } catch { /* ignore */ }
       });
 
-      await injectAndOpen(instance, profile, view);
+      await injectAndOpen(instance, effective, view);
+
+      // 5) 浏览器内出口探测：验证「流量真的走了代理」，而不是只证明代理活着
+      const egress = await probeEgressInBrowser(client, {
+        url: EGRESS_PROBE_URL,
+        timeoutMs: EGRESS_TIMEOUT_MS,
+      });
+      instance.egress = egress;
+      if (egress.ok) {
+        log(id, '出口', `${egress.ip} ${egress.countryCode || ''} ${egress.timezone || ''}`);
+        if (proxyBound && proxyCheck?.ok && proxyCheck.ip && egress.ip !== proxyCheck.ip) {
+          warnings.push(soft('ip', `出口 IP 与代理预检不一致：预检 ${proxyCheck.ip}，浏览器 ${egress.ip}（轮换代理属正常；固定代理则说明流量没走代理）`));
+        }
+        warnings.push(...checkEgress(effective, egress));
+        persistEgress(id, egress);
+      } else {
+        log(id, 'WARN 出口探测失败', egress.error || '');
+        warnings.push(soft('ip', `浏览器出口探测失败：${egress.error || '未知原因'}`));
+      }
 
       instance.status = 'running';
       markStatus(id, 'running');

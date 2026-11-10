@@ -264,10 +264,13 @@ export function markStatus(profileId, status) {
 }
 
 /**
- * 启动前一致性校验：返回 {ok, errors, warnings}。
- * 一致性告警在启动前一律升级为错误 —— 「一条对不上整组作废」，不能带着已知冲突的指纹出门。
+ * 启动前一致性校验。分两级（见 packages/profile/src/validate.js）：
+ *   - 字段级错误（值域非法）+ 硬冲突 → 阻断
+ *   - 软冲突（语言↔时区、核数↔内存、没绑代理…）→ 只告警
+ * `force` 是显式覆盖开关：知道自己在做什么时可以越过硬冲突，但会记录到启动响应与日志。
+ * @returns {{ok:boolean, errors:object[], hard:object[], soft:object[], warnings:object[], forced:boolean}}
  */
-export function checkProfile(profile) {
+export function checkProfile(profile, { force = false } = {}) {
   const input = {};
   for (const f of BY_NAME.keys()) {
     if (profile[f] !== undefined && profile[f] !== null) input[f] = profile[f];
@@ -275,9 +278,38 @@ export function checkProfile(profile) {
   // 契约层是数组，字段表里是字符串列 —— 校验前先还原成存储形态
   if (Array.isArray(input.launch_args)) input.launch_args = JSON.stringify(input.launch_args);
   const res = validateProfile(input, { mode: 'update', fillDefaults: false });
+  const hard = res.warnings.filter((w) => w.severity === 'hard');
+  const soft = res.warnings.filter((w) => w.severity !== 'hard');
+  const errors = [...res.errors, ...hard];
   return {
-    ok: res.errors.length === 0 && res.warnings.length === 0,
-    errors: [...res.errors, ...res.warnings],
+    ok: res.errors.length === 0 && (force || hard.length === 0),
+    errors,
+    hard,
+    soft,
     warnings: res.warnings,
+    forced: Boolean(force) && hard.length > 0,
   };
+}
+
+/** 直接按字段落库（UA 跟版、出口信息回写用），不走 API 的「运行中不许改」限制 */
+export function applyProfileFields(profileId, patch = {}) {
+  const res = dbUpdate(getDb(), profileId, patch);
+  if (!res.ok) {
+    throw new Error(res.errors.map((e) => `${e.field}: ${e.message}`).join('; ') || 'update failed');
+  }
+  return toApi(res.profile);
+}
+
+/** 把出口探测结果写回 ip / ip_country / ip_city / ip_region（字段表里本来就有这四个） */
+export function persistEgress(profileId, egress = {}) {
+  if (!egress || !egress.ok || !egress.ip) return null;
+  const patch = { ip: String(egress.ip), ipchecker: 'freepower' };
+  if (egress.countryCode) patch.ip_country = String(egress.countryCode).toUpperCase();
+  if (egress.city) patch.ip_city = String(egress.city);
+  if (egress.region) patch.ip_region = String(egress.region);
+  try {
+    return applyProfileFields(profileId, patch);
+  } catch {
+    return null;
+  }
 }

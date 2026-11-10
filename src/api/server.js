@@ -6,6 +6,7 @@ import {
   newFingerprintFor, listGroups, createGroup,
 } from '../store/profiles.js';
 import { startProfile, stopProfile, listRunning, getRunning, stopAll } from '../runtime/manager.js';
+import { checkProxy, hasProxy } from '../proxy/probe.js';
 import { toCanonical, toV2 } from '../../packages/profile/src/aliases.js';
 import {
   ApiError, ERR, ok, normalizeLaunchArgs, serializeLaunchArgs, normalizePasswordFilling, serializePasswordFilling,
@@ -154,6 +155,14 @@ function buildRoutes() {
     return ok(createGroup(ctx.body.group_name));
   });
 
+  /* ---- 代理工具（UI / 脚本先验一下再绑） ---- */
+  add(['POST'], ['/api/v1/proxy/check', '/api/v2/proxy/check'], async (ctx) => {
+    const p = ctx.body.proxy_config || ctx.body;
+    if (!hasProxy(p)) throw new ApiError(ERR.INVALID, 'host / port is required');
+    const r = await checkProxy(p);
+    return ok(r);
+  });
+
   /* ---- 浏览器生命周期 ---- */
   add(['GET'], both('browser/start', 'browser-profile/start'), async (ctx) => {
     const v = versionOf(ctx.path);
@@ -162,10 +171,13 @@ function buildRoutes() {
     if (!p) throw new ApiError(ERR.NOT_FOUND, 'profile not found');
     const live = getRunning(id);
     if (live) return ok({ ...live, already_running: true });
+    const force = ['1', 'true', 'yes'].includes(String(ctx.query.force ?? '').toLowerCase());
     try {
-      return ok(await startProfile({ ...p, id }));
+      return ok(await startProfile({ ...p, id }, { force }));
     } catch (e) {
-      throw new ApiError(e.code === 800005 ? ERR.CONSISTENCY : ERR.START_FAILED, `start failed: ${e.message}`, 200, { errors: e.errors });
+      const extra = { errors: e.errors, reason: e.reason, proxy_check: e.proxy_check };
+      for (const k of Object.keys(extra)) if (extra[k] === undefined) delete extra[k];
+      throw new ApiError(e.code === 800005 ? ERR.CONSISTENCY : ERR.START_FAILED, `start failed: ${e.message}`, 200, extra);
     }
   });
 

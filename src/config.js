@@ -26,3 +26,19 @@ export const CHROME_BIN = process.env.FREEPOWER_CHROME || '';
 
 /** 环境启动后保持的调试端口随机分配；外部脚本通过返回的 ws 地址接入 */
 export const START_TIMEOUT_MS = Number(process.env.FREEPOWER_START_TIMEOUT || 20000);
+
+/**
+ * 出口探测：默认走明文 HTTP 的 ip-api（不用 TLS 也能过 CONNECT 受限的代理），
+ * 备用 https://ipinfo.io/json。两个都失败才算代理不可用。
+ */
+export const EGRESS_PROBE_URL = process.env.FREEPOWER_EGRESS_PROBE
+  || 'http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,timezone,isp,query';
+
+/** 代理预检超时：连接 + 首包。坏代理要「快速失败」，不能拖住整个启动 */
+export const PROXY_PROBE_TIMEOUT_MS = Number(process.env.FREEPOWER_PROXY_TIMEOUT || 6000);
+
+/** 浏览器内出口探测超时（页面加载 + 读完 JSON） */
+export const EGRESS_TIMEOUT_MS = Number(process.env.FREEPOWER_EGRESS_TIMEOUT || 8000);
+
+/** UA 跟版：内核升级后自动把 UA/UA-CH/内核版本号对齐真实内核（1=开，0=只告警） */
+export const UA_AUTOALIGN = process.env.FREEPOWER_UA_AUTOALIGN !== '0';

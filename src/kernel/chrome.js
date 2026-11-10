@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
-import { CHROME_BIN, KERNELS_DIR, START_TIMEOUT_MS } from '../config.js';
+import { CHROME_BIN, DATA_DIR, KERNELS_DIR, START_TIMEOUT_MS } from '../config.js';
 import { fingerprintView } from '../fingerprint/view.js';
+import { mergeLaunchArgs } from './launch-args.js';
 
 const CANDIDATE_DIRS = [
   'C:\\Program Files\\Google\\Chrome\\Application',
@@ -39,9 +40,22 @@ function versionFromPath(exe) {
 
 /**
  * 内核解析顺序：FREEPOWER_CHROME 指定 → 内核矩阵（data/kernels/<version>/） → 系统 Chrome。
- * P0 用系统 Chrome 跑通链路，P1 换成 CfT 矩阵（按 major 下载 118→最新）。
+ *
+ * 注意：`Application\chrome.exe` 这个启动器实际跑哪个版本由注册表决定，**和目录名不一定一致**
+ * （实测目录里有 156/157 两个，启动器跑的是 156）。所以这里解析出的 version 只是「猜」，
+ * 真值以启动后 Browser.getVersion 为准，并写进 data/kernel-version.json 供下次直接复用。
  */
 export function findChrome() {
+  const resolved = resolveChrome();
+  if (!resolved) return null;
+  const known = readKnownVersion();
+  if (known && known.path === resolved.path) {
+    return { ...resolved, version: known.version, guessed_version: resolved.version, source: `${resolved.source}+probe` };
+  }
+  return resolved;
+}
+
+function resolveChrome() {
   if (CHROME_BIN && fs.existsSync(CHROME_BIN)) {
     return { path: CHROME_BIN, version: versionFromPath(CHROME_BIN), source: 'env' };
   }
@@ -69,6 +83,25 @@ export function findChrome() {
   return null;
 }
 
+const KNOWN_FILE = () => path.join(DATA_DIR, 'kernel-version.json');
+
+/** 上一次实测到的内核真实版本（启动成功后写入） */
+export function readKnownVersion() {
+  try {
+    const j = JSON.parse(fs.readFileSync(KNOWN_FILE(), 'utf8'));
+    if (j && typeof j.path === 'string' && /^\d+\.\d+\.\d+\.\d+$/.test(String(j.version))) return j;
+  } catch { /* 没缓存过 */ }
+  return null;
+}
+
+export function rememberVersion(exePath, version) {
+  if (!exePath || !/^\d+\.\d+\.\d+\.\d+$/.test(String(version || ''))) return;
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(KNOWN_FILE(), JSON.stringify({ path: exePath, version, at: new Date().toISOString() }, null, 2));
+  } catch { /* 写不进缓存不影响启动 */ }
+}
+
 export function compareVersion(a, b) {
   const pa = String(a).split('.').map(Number);
   const pb = String(b).split('.').map(Number);
@@ -79,8 +112,11 @@ export function compareVersion(a, b) {
   return 0;
 }
 
-/** 启动参数：只放「参数级真实行为」的东西（UA/时区等走 CDP Emulation，不在这伪造）。 */
-export function buildArgs(profile, { userDataDir, proxy }) {
+/**
+ * 启动参数：只放「参数级真实行为」的东西（UA/时区等走 CDP Emulation，不在这伪造）。
+ * 返回 {args, applied, rejected, warnings}：argv 是系统基线与用户白名单参数合并后的结果。
+ */
+export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, userArgs = [] } = {}) {
   const fp = profile.fingerprint_config || {};
   const view = fingerprintView(profile);
   const screen = view.screen || { width: 1920, height: 1080 };
@@ -117,11 +153,42 @@ export function buildArgs(profile, { userDataDir, proxy }) {
   }
   if (profile.window_position === 'maximize') args.push('--start-maximized');
 
+  const warnings = [];
+
+  if (proxyBound) {
+    // fail-closed 的浏览器侧：只认这一个代理，且把「本机/内网直连」的隐含 bypass 也去掉。
+    // `<-loopback>` 是 Chromium 的「减掉 loopback 隐含绕过」写法；不加它就还能直连 localhost。
+    args.push('--proxy-bypass-list=<-loopback>');
+    if (profile.full_pac_url) {
+      warnings.push({
+        field: 'full_pac_url',
+        message: 'PAC 脚本可能含 DIRECT 回退，fail-closed 无法保证；建议改用固定代理',
+        severity: 'soft',
+      });
+    }
+  } else if (profile.full_pac_url) {
+    args.push(`--proxy-pac-url=${profile.full_pac_url}`);
+  }
+
   if (proxy && proxy.host && proxy.port) {
     const scheme = proxy.proxy_type === 'https' ? 'https' : proxy.proxy_type === 'socks5' ? 'socks5' : 'http';
     args.push(`--proxy-server=${scheme}://${proxy.host}:${proxy.port}`);
   }
-  return args;
+
+  if (String(profile.is_multi_level_proxy) === '1' || String(profile.mutli_level_proxy) === '1') {
+    warnings.push({
+      field: 'is_multi_level_proxy',
+      message: '多级代理（链式）暂未实现：只对第一跳做预检与注入，链路中间跳不可见',
+      severity: 'soft',
+    });
+  }
+
+  const merged = mergeLaunchArgs(args, userArgs, {
+    proxyBound,
+    fileExists: (p) => fs.existsSync(p),
+  });
+  merged.warnings.push(...warnings);
+  return merged;
 }
 
 /** 等 Chrome 把 DevToolsActivePort 写出来 */

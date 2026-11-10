@@ -9,8 +9,8 @@ release/
 .DS_Store
 Thumbs.db
 data/
+data-smoke*/
 profiles/
 user-data/
 .tmp/
-.npm-cache/
 .npm-cache/

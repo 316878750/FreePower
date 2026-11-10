@@ -4,8 +4,8 @@
 
 内核用官方 Chrome for Testing（独立进程），指纹通过 CDP 注入与启动参数实现，不搬运 AdsPower 的私有代码、二进制、资源与商标。
 
-> 当前阶段：**P0（骨架 + 端到端链路）**。能建环境、起真 Chrome、注入指纹、回收进程、跑本地 API。
-> 阶段细节见 [P0 交付说明](docs/01-P0-交付.md)，技术路线见 [技术方案](docs/00-技术方案.md)。
+> 当前阶段：**P1 完成 + P3 前置**（存储/校验/启停 + 代理 fail-closed、出口探测、launch_args 白名单、UA 跟版）。
+> 阶段细节见 [P1 交付说明](docs/02-P1-交付.md)、[P3 前置](docs/03-P3前置-代理与启动参数.md)，技术路线见 [技术方案](docs/00-技术方案.md)。
 
 ## 一、范围（先看这个，避免后面被要求补）
 
@@ -88,6 +88,7 @@ CORS：只放行 `127.0.0.1` / `localhost` 的 Origin，其他返回 `403` + 纯
 | GET | `/api/v1/browser/stop` | 关环境 |
 | GET | `/api/v1/browser/active` | 运行中列表 |
 | GET | `/api/v1/browser/local-active` | 同上（对齐对手命名） |
+| POST | `/api/v1/proxy/check` | 代理预检：先验一下代理再绑环境（`data.ok` 是检查结果，失败也 `code:0`） |
 
 `browser/start` 返回（形状按拆解手 05 号契约）：
 
@@ -96,10 +97,18 @@ CORS：只放行 `127.0.0.1` / `localhost` 的 Origin，其他返回 `403` + 纯
   "profile_id":"kjkvcd","pid":1234,
   "ws":{"puppeteer":"ws://127.0.0.1:60328/devtools/browser/b742df5a-...",
         "selenium":"127.0.0.1:60328"},
-  "debug_port":"60328","status":"running","already_running":false}}
+  "debug_port":"60328","status":"running","already_running":false,
+  "proxy":{"ok":true,"ip":"203.0.113.9","countryCode":"JP","timezone":"Asia/Tokyo"},
+  "egress":{"ok":true,"ip":"203.0.113.9","countryCode":"JP"},
+  "ua_aligned":null,
+  "launch_args":{"applied":[],"rejected":[]},
+  "warnings":[{"field":"proxy","message":"未绑定代理：出口即本机 IP…","severity":"soft"}]}}
 ```
 
 三条硬规则：`ws.selenium` 只放 `host:port`；`debug_port` 是字符串；重复调用 `start` 幂等（返回同一 `pid`，`already_running:true`）。
+新增字段都是超集（`proxy` / `egress` / `ua_aligned` / `launch_args` / `warnings`），旧字段一个没动。
+
+代理不可用时 `start` 返回 `code:800003` + `data.reason:"proxy_unreachable"` + `data.proxy_check` 诊断，**内核进程根本不会启动**（fail-closed，详见 [P3 前置](docs/03-P3前置-代理与启动参数.md)）。
 
 ### 例子
 
@@ -123,25 +132,35 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 2. **字体不伪装。** 只如实声明系统真实字体列表（`fingerprint_config.fonts.spoofed = false`）。
    伪造字体列表必须同时伪造几十种字体的宽度度量表，做不好比不做更危险。
 3. **内核配置类 42 条 + `--extended-parameters` 10 条不实现**，列入「不兼容项」。
-4. **SOCKS5 认证不支持**（Chrome 本身不支持命令行传 SOCKS5 账号密码）；HTTP/HTTPS 代理认证走 CDP `Fetch`，只对带账号密码的代理挂载，会给请求加一跳。
+4. **SOCKS5 的账号密码只有预检支持**（Chrome 的 `--proxy-server` 不接受 SOCKS5 凭据，内核限制）；HTTP/HTTPS 代理认证走 CDP `Fetch`，只对带账号密码的代理挂载，会给请求加一跳。
 5. **WebRTC 只做参数级**（`disable_non_proxied_udp`），不做 JS 层伪造 `RTCPeerConnection`。
 6. **Worker / AudioWorklet realm 覆盖不到**：`addScriptToEvaluateOnNewDocument` 覆盖主帧与子帧，worker 里再取一次原生函数会看到两套实现。
 7. **沙箱内起不了 Chrome**：Windows 沙箱禁止命名管道，Chrome 的 Mojo IPC 会以 `platform_channel.cc:112 Check failed: 0x5` 自终止。这不是产品缺陷，但**跑冒烟必须用普通终端（非沙箱）**。
-8. 主程序 UI（Electron）还没做，P0 只有 API 与内核链路。
+8. **`https` 代理 + `https` 目标**（TLS in TLS）预检不支持，会明确报错，不静默降级。
+9. **PAC 无法 fail-closed**：`full_pac_url` 里可能有 `DIRECT` 回退，绑代理时忽略并告警；多级代理（`is_multi_level_proxy`）未实现，只对第一跳做预检。
+10. **轮换代理会把「出口 IP 与预检不一致」判为告警**（正常业务形态，只提示不阻断）；运行中没有代理健康检查，掉线时请求失败但不会回退直连。
+11. 主程序 UI（Electron）还没做，目前只有 API 与内核链路。
 
 ## 六、验证
 
 ```powershell
-# 必须用普通终端（不要在受限沙箱里跑）
+# 不需要 Chrome：profile schema + 代理预检/白名单/跟版/校验分级
+npm run test
+
+# 需要真实 Chrome + 完整权限（沙箱挡命名管道和进程查询）
 npm run smoke
 ```
 
-冒烟覆盖：
+冒烟覆盖（95 项）：
 
 - `/status` 形状、鉴权、跨站 Origin 403 纯文本、限流报文
 - 建环境 → 起真 Chrome → 探针读回 UA / UA-CH / 时区 / 语言 / platform / hardwareConcurrency / WebGL / `navigator.webdriver`
 - Canvas 同页连读两次一致、重启后不变、换环境后必变
 - 停环境后进程树回收干净、重复 start 幂等
+- **代理 fail-closed**：死代理 `start` 失败且一个内核进程都不起；活代理下浏览器出口 IP = 预检 IP；连 `127.0.0.1` 也走代理（没有 loopback bypass）
+- **出口地理一致性**：声明时区/语言与出口不一致时会出现在 `warnings` 里
+- **launch_args 白名单**：从真实 `CommandLine` 验证白名单参数生效、保护参数不在 argv 里
+- **UA 跟版**：旧版本 UA 启动时对齐到真实内核版本并落库
 
 ## 七、目录
 
@@ -154,9 +173,15 @@ src/
   store/profiles.js    环境 CRUD（内部 schema）
   fingerprint/         指纹生成（种子化，保证自洽）
   kernel/chrome.js     内核定位、启动参数、DevToolsActivePort、进程树回收
+  kernel/launch-args.js launch_args 白名单合并（保护名单/feature 并集）
+  kernel/version.js    UA / UA-CH / kernel_version 跟版
   kernel/cdp.js        CDP over WebSocket 客户端
   kernel/inject.js     页面注入脚本（canvas/audio/webgl/navigator）
-  runtime/manager.js   启停、自动 attach 新标签页、代理认证
-test/smoke.mjs         端到端冒烟
+  proxy/probe.js       代理预检（HTTP/HTTPS/SOCKS5）、出口信息归一
+  proxy/egress.js      浏览器内出口探测（验证流量真的走了代理）
+  runtime/manager.js   启停、校验/预检/跟版、自动 attach 新标签页、代理认证
+test/smoke.mjs         端到端冒烟（95 项）
+test/unit.test.mjs     零 Chrome 单元测试（20 项）
+test/fake-proxy.mjs    假代理 / 假出口端点（冒烟不依赖公网）
 docs/                  技术方案、阶段交付
 ```
