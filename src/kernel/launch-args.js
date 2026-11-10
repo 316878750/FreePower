@@ -38,6 +38,7 @@ const PROTECTED = new Map([
   ['--allow-running-insecure-content', '会破坏安全模型'],
   ['--ignore-certificate-errors', '会破坏安全模型，且是强指纹特征'],
   ['--disable-gpu', '会让 WebGL 退回软件渲染，和 webgl_config 声明的 vendor/renderer 冲突'],
+  ['--disable-accelerated-2d-canvas', '2D canvas 由 FreePower 固定为软件光栅化，保证 canvas 哈希跨重启一致'],
   ['--disable-software-rasterizer', '会让 WebGL 直接不可用，和目标指纹冲突'],
   ['--headless', '无头模式由环境的 headless 字段决定'],
   ['--window-size', '窗口尺寸由屏幕指纹决定'],

@@ -42,3 +42,13 @@ export const EGRESS_TIMEOUT_MS = Number(process.env.FREEPOWER_EGRESS_TIMEOUT || 
 
 /** UA 跟版：内核升级后自动把 UA/UA-CH/内核版本号对齐真实内核（1=开，0=只告警） */
 export const UA_AUTOALIGN = process.env.FREEPOWER_UA_AUTOALIGN !== '0';
+
+/**
+ * 自检：环境启动后自动跑一次（0=关闭，用 API 手动触发）。
+ * 探针在页面里跑（含 1.2s WebRTC 候选收集），失败只告警，不影响启动。
+ */
+export const SELFCHECK_ON_START = process.env.FREEPOWER_SELFCHECK !== '0';
+export const SELFCHECK_TIMEOUT_MS = Number(process.env.FREEPOWER_SELFCHECK_TIMEOUT || 25000);
+
+/** 指纹调试：把注入前的原生函数暴露到 window.__fpOrig（排查「哈希为什么变了」用，默认关） */
+export const FP_DEBUG = process.env.FREEPOWER_FP_DEBUG === '1';

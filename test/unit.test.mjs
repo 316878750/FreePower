@@ -10,6 +10,13 @@ import { mergeLaunchArgs, parseLaunchArgs } from '../src/kernel/launch-args.js';
 import { alignProfileToKernel } from '../src/kernel/version.js';
 import { checkProfile } from '../src/store/profiles.js';
 import { checkEgress } from '../packages/profile/src/validate.js';
+import { deriveNoiseSeeds, ensureNoiseSeeds, seedOf } from '../src/fingerprint/seeds.js';
+import { generateFingerprint } from '../src/fingerprint/generate.js';
+import { fingerprintView } from '../src/fingerprint/view.js';
+import { buildReport } from '../src/selfcheck/report.js';
+import { renderHtml } from '../src/selfcheck/html.js';
+import { pacInUse, pacMessage } from '../src/proxy/pac.js';
+import { buildArgs } from '../src/kernel/chrome.js';
 import { startFakeProxy } from './fake-proxy.mjs';
 
 /** 找一个当前没人监听的端口（起一个 server 再关掉） */
@@ -265,4 +272,171 @@ test('出口一致性：一致的出口不报', () => {
     ok: true, ip: '203.0.113.9', countryCode: 'JP', country: 'Japan', timezone: 'Asia/Tokyo',
   });
   assert.deepEqual(w, []);
+});
+
+/* ------------------------- P2：噪点种子 ------------------------- */
+
+test('噪点种子：四个维度独立、同种子稳定、同种子同 id', () => {
+  const a = deriveNoiseSeeds('abc');
+  const b = deriveNoiseSeeds('abc');
+  assert.deepEqual(a, b);
+  assert.equal(new Set(Object.values(a).map(String)).size, 4, '四个维度不能共用一个种子');
+  assert.equal(seedOf('abc', 1), a.canvas_id);
+  assert.notEqual(deriveNoiseSeeds('abd').canvas_id, a.canvas_id, '换种子必须整组换');
+});
+
+test('噪点种子：老环境缺哪个补哪个，已有值不动', () => {
+  const patch = ensureNoiseSeeds({ fp_seed: 'legacy' });
+  assert.deepEqual(Object.keys(patch).sort(), ['audio_id', 'canvas_id', 'client_rects_id', 'webgl_image_id']);
+  const kept = ensureNoiseSeeds({ fp_seed: 'legacy', canvas_id: 7, audio_id: null });
+  assert.equal(kept.canvas_id, undefined, '已有 canvas_id 不能被覆盖');
+  assert.equal(typeof kept.audio_id, 'number');
+});
+
+test('指纹生成：四个种子入库、同种子跨调用不变、媒体设备默认随机模式', () => {
+  const p1 = generateFingerprint({ seed: 'stable-seed', kernel: '156.0.8078.80', country: 'US' });
+  const p2 = generateFingerprint({ seed: 'stable-seed', kernel: '156.0.8078.80', country: 'US' });
+  for (const k of ['canvas_id', 'webgl_image_id', 'audio_id', 'client_rects_id']) {
+    assert.equal(typeof p1[k], 'number', k);
+    assert.equal(p1[k], p2[k], `${k} 必须确定性`);
+  }
+  assert.equal(p1.media_devices, '1', '0=真实 1=随机 2=手动');
+  assert.notEqual(generateFingerprint({ seed: 'other', kernel: '156.0.8078.80' }).canvas_id, p1.canvas_id);
+});
+
+test('媒体设备视图：0=真实不注入、1=按数量、2=用手动 label', () => {
+  assert.equal(fingerprintView({ media_devices: '0' }).media, null);
+  const random = fingerprintView({ media_devices: '1', media_devices_num: { audioinput_num: '2', videoinput_num: '1', audiooutput_num: '3' } });
+  assert.deepEqual(random.media.counts, { audioinput_num: 2, videoinput_num: 1, audiooutput_num: 3 });
+  const manual = fingerprintView({
+    media_devices: '2',
+    media_devices_num: { audioinput_num: 1, videoinput_num: 1, audiooutput_num: 1 },
+    media_devices_config: [{ kind: 'audioinput', label: 'My Mic' }],
+  });
+  assert.equal(manual.media.devices[0].label, 'My Mic');
+});
+
+/* ------------------------- P2：PAC 明确拒绝 ------------------------- */
+
+test('PAC：full_pac_url 与 proxy_type=pac 都要识别，空值不算', () => {
+  assert.match(pacInUse({ full_pac_url: 'http://x/proxy.pac' }), /full_pac_url/);
+  assert.match(pacInUse({ proxy_config: { proxy_type: 'pac' } }), /proxy_type=pac/);
+  assert.equal(pacInUse({ full_pac_url: '' }), null);
+  assert.equal(pacInUse({ full_pac_url: '   ' }), null);
+  assert.match(pacMessage('x'), /不支持 PAC/);
+});
+
+test('PAC：buildArgs 纵深防御，绝不生成 --proxy-pac-url', () => {
+  assert.throws(() => buildArgs({
+    full_pac_url: 'http://x/proxy.pac',
+    webgl_config: {},
+  }, { userDataDir: 'C:\\fp\\udd' }), /不支持 PAC/);
+});
+
+/* ------------------------- P2：自检报告 ------------------------- */
+
+function selfProfile(over = {}) {
+  const base = generateFingerprint({ seed: 'selfcheck-seed', kernel: '156.0.8078.80', country: 'US' });
+  return { id: 'unit-profile', profile_no: 10001, name: 'unit', kernel_version: '156.0.8078.80', ...base, ...over };
+}
+
+function fakeRaw(p) {
+  const v = fingerprintView(p);
+  const mc = v.media
+    ? { audioinput: v.media.counts.audioinput_num, videoinput: v.media.counts.videoinput_num, audiooutput: v.media.counts.audiooutput_num }
+    : { audioinput: 1, videoinput: 1, audiooutput: 1 };
+  return {
+    ua: v.ua,
+    platform: v.platform,
+    languages: v.language.slice(),
+    language: v.language[0],
+    timezone: v.timezone,
+    locale: v.locale,
+    cores: v.hardware_concurrency,
+    memory: v.device_memory,
+    screen: { width: v.screen.width, height: v.screen.height, dpr: v.device_scale_factor },
+    applied: ['canvas', 'webgl_image', 'audio', 'client_rects', 'webgl', 'media_devices'],
+    installed: true,
+    uaData: { brands: v.ua_metadata.brands, mobile: false, platform: v.ua_metadata.platform },
+    uaDataHigh: {
+      fullVersionList: v.ua_metadata.fullVersionList,
+      platform: v.ua_metadata.platform,
+      platformVersion: v.ua_metadata.platformVersion,
+    },
+    canvas: { hash: 'aaaa0001', stable: true },
+    webgl: {
+      supported: true, vendor: v.webgl.vendor, renderer: v.webgl.renderer, stable: true,
+      image_hash: 'bbbb0002', image_hash2: 'bbbb0002',
+    },
+    audio: { hash: 'cccc0003', stable: true },
+    client_rects: { hash: 'dddd0004', stable: true },
+    fonts: { detected: ['Arial', 'Calibri'], declared: v.fonts },
+    media_devices: { supported: true, counts: mc, list: [] },
+    webrtc: { supported: true, count: 0, types: [], addresses: [] },
+  };
+}
+
+test('自检报告：声明一致时 full=pass、partial=warn、字体=none 标黄', () => {
+  const p = selfProfile();
+  const report = buildReport(p, fakeRaw(p), { kernelVersion: '156.0.8078.80' });
+  const byId = Object.fromEntries(report.items.map((i) => [i.id, i]));
+  assert.equal(report.items.length, 15);
+  assert.equal(byId.ua.status, 'pass');
+  assert.equal(byId.ua.coverage, 'full');
+  assert.equal(byId.webgl.status, 'warn');
+  assert.equal(byId.webgl.coverage, 'partial');
+  assert.equal(byId.canvas.status, 'warn');
+  assert.equal(byId.fonts.coverage, 'none');
+  assert.equal(byId.fonts.status, 'warn');
+  assert.equal(byId.webrtc.status, 'pass');
+  assert.equal(report.summary.full, 7, JSON.stringify(report.summary));
+  assert.equal(report.summary.partial, 7);
+  assert.equal(report.summary.none, 1);
+  assert.equal(report.summary.fail, 0);
+  assert.equal(report.determinism.cross_restart, null);
+  assert.ok(report.summary.score > 70 && report.summary.score < 100);
+});
+
+test('自检报告：声明没生效要报 fail（UA / WebGL / WebRTC 泄漏）', () => {
+  const p = selfProfile({ webrtc: 'disabled' });
+  const raw = fakeRaw(p);
+  raw.ua = 'Mozilla/5.0 (X11; Linux x86_64) Chrome/120.0.0.0 Safari/537.36';
+  raw.webgl.vendor = 'Google Inc. (Intel)';
+  raw.webrtc.addresses = ['203.0.113.9'];
+  const report = buildReport(p, raw, { kernelVersion: '156.0.8078.80' });
+  const byId = Object.fromEntries(report.items.map((i) => [i.id, i]));
+  assert.equal(byId.ua.status, 'fail');
+  assert.equal(byId.webgl.status, 'fail');
+  assert.equal(byId.webrtc.status, 'fail');
+  assert.equal(report.summary.fail, 3);
+  assert.match(byId.webrtc.note, /203\.0\.113\.9/);
+});
+
+test('自检报告：同内核历史哈希一致 → 跨重启一致；不一致 → 对应项 fail', () => {
+  const p = selfProfile();
+  const raw = fakeRaw(p);
+  const first = buildReport(p, raw, { kernelVersion: '156.0.8078.80' });
+  const prev = { kernel_version: '156.0.8078.80', generated_at: '2026-11-10T00:00:00.000Z', hashes: first.hashes };
+  const again = buildReport(p, raw, { kernelVersion: '156.0.8078.80', previous: prev });
+  assert.equal(again.determinism.cross_restart, true);
+
+  const drift = buildReport(p, { ...raw, canvas: { ...raw.canvas, hash: 'ffff0000' } }, {
+    kernelVersion: '156.0.8078.80', previous: prev,
+  });
+  assert.equal(drift.determinism.cross_restart, false);
+  assert.equal(drift.items.find((i) => i.id === 'canvas').status, 'fail');
+
+  // 换内核版本时不拿旧哈希下结论（渲染会随内核变）
+  const newKernel = buildReport(p, raw, { kernelVersion: '157.0.8103.40', previous: prev });
+  assert.equal(newKernel.determinism.cross_restart, null);
+});
+
+test('自检 HTML：本地渲染、内容转义、不引外链', () => {
+  const p = selfProfile({ name: '<script>alert(1)</script>' });
+  const report = buildReport(p, fakeRaw(p), { kernelVersion: '156.0.8078.80' });
+  const html = renderHtml(report);
+  assert.match(html, /<!doctype html>/);
+  assert.ok(!html.includes('<script>alert(1)</script>'), '必须转义');
+  assert.match(html, /自检符合度/);
+  assert.ok(!/https?:\/\//.test(html), '不引外部资源');
 });

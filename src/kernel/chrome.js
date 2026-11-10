@@ -139,6 +139,10 @@ export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, use
     `--disable-features=${[...new Set(disableFeatures)].join(',')}`,
     '--disable-search-engine-choice-screen',
     '--hide-crash-restore-bubble',
+    // 2D canvas 固定走软件光栅化：GPU 2D canvas 在「全新 profile 首次启动」和之后的启动之间
+    // 会给出不同的抗锯齿/渐变像素（实测 raw PNG 都不同），跨会话就是「你换了设备」。
+    // 代价：chrome://gpu 里 Canvas 显示 Software only，重 canvas 场景略慢。见 README 已知限制。
+    '--disable-accelerated-2d-canvas',
   ];
 
   // WebRTC：只放浏览器真实支持的策略位
@@ -155,19 +159,15 @@ export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, use
 
   const warnings = [];
 
+  // PAC 明确拒绝（调用方已先拦，这里是纵深防御）：PAC 的 DIRECT 回退无法 fail-closed
+  if (profile.full_pac_url) {
+    throw Object.assign(new Error('不支持 PAC：请改用固定 HTTP / SOCKS5 代理'), { code: 800003, reason: 'pac_unsupported' });
+  }
+
   if (proxyBound) {
     // fail-closed 的浏览器侧：只认这一个代理，且把「本机/内网直连」的隐含 bypass 也去掉。
     // `<-loopback>` 是 Chromium 的「减掉 loopback 隐含绕过」写法；不加它就还能直连 localhost。
     args.push('--proxy-bypass-list=<-loopback>');
-    if (profile.full_pac_url) {
-      warnings.push({
-        field: 'full_pac_url',
-        message: 'PAC 脚本可能含 DIRECT 回退，fail-closed 无法保证；建议改用固定代理',
-        severity: 'soft',
-      });
-    }
-  } else if (profile.full_pac_url) {
-    args.push(`--proxy-pac-url=${profile.full_pac_url}`);
   }
 
   if (proxy && proxy.host && proxy.port) {

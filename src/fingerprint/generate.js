@@ -6,6 +6,7 @@
  * 注入层需要的嵌套视图由 src/fingerprint/view.js 从平铺字段派生。
  */
 import { seededRng, pick, newSeed } from './rng.js';
+import { deriveNoiseSeeds } from './seeds.js';
 
 /** 内核真实版本兜底（找不到系统 Chrome 时用） */
 export const FALLBACK_KERNEL = '156.0.8078.80';
@@ -92,10 +93,13 @@ export function generateFingerprint(opts = {}) {
   const screen = pick(rng, SCREENS);
   const gl = pick(rng, WEBGL_WINDOWS);
   const cores = pick(rng, [8, 12, 16, 4, 6]);
-  // deviceMemory 的真实值域只有 2|4|6|8（Chromium 上限 8G），别造 16/32 这种不存在的机器
-  const memory = cores <= 6 ? 8 : pick(rng, [8, 8, 4]);
+  // deviceMemory 的真实值域只有 2|4|6|8（Chromium 上限 8G），别造 16/32 这种不存在的机器；
+  // 高核数配 4G 会触发「不像真实机器」的软冲突，所以 8 核以上统一 8G。
+  const memory = cores <= 4 ? pick(rng, [4, 8]) : 8;
   const audioIn = pick(rng, [1, 2, 3]);
   const videoIn = pick(rng, [1, 2]);
+  // 四个噪点维度各自一个种子，落库后跨重启不变（换种子 = 换指纹，必须整组换）
+  const noise = deriveNoiseSeeds(seed);
 
   return {
     // 身份自洽：UA 的版本段必须等于内核版本
@@ -129,15 +133,15 @@ export function generateFingerprint(opts = {}) {
     hardware_concurrency: cores,
     device_memory: memory,
     device_name_switch: '1',
-    // 噪点四件套：全部开，种子确定性
+    // 噪点四件套：全部开，四个独立种子
     canvas: '1',
-    canvas_id: seedOf(seed, 1),
+    canvas_id: noise.canvas_id,
     webgl_image: '1',
-    webgl_image_id: seedOf(seed, 2),
+    webgl_image_id: noise.webgl_image_id,
     audio: '1',
-    audio_id: seedOf(seed, 3),
+    audio_id: noise.audio_id,
     client_rects: '1',
-    client_rects_id: seedOf(seed, 4),
+    client_rects_id: noise.client_rects_id,
     webgl: '2',
     webgl_config: {
       unmasked_vendor: gl.vendor,
@@ -146,8 +150,8 @@ export function generateFingerprint(opts = {}) {
     },
     // 字体：MVP 不伪装系统字体（CDP 路线硬伤，标黄）
     fonts: ['all'],
-    // 媒体设备
-    media_devices: '2',
+    // 媒体设备：0=真实 1=随机 2=手动（字段表语义），默认随机数量；手动模式没配 config 时由数量派生
+    media_devices: '1',
     media_devices_num: { audioinput_num: audioIn, videoinput_num: videoIn, audiooutput_num: 2 },
     // 网络：默认禁非代理 UDP；端口扫描白名单空 = 一个都不许
     webrtc: 'disable_udp',
@@ -163,17 +167,6 @@ export function generateFingerprint(opts = {}) {
     headless: '0',
     window_position: 'default',
   };
-}
-
-/** 有符号 32 位整数种子（对齐拆解实测：AudioFp / ClientRectFp 用有符号整数） */
-function seedOf(seedStr, salt) {
-  let h = (2166136261 ^ salt) >>> 0;
-  const s = `${seedStr}:${salt}`;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619) >>> 0;
-  }
-  return h | 0;
 }
 
 /** 新指纹：只换种子重算，保证「整组换」，不是零散改一个字段 */

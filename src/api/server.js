@@ -5,8 +5,12 @@ import {
   createProfile, getProfile, listProfiles, updateProfile, deleteProfiles, regroupProfiles,
   newFingerprintFor, listGroups, createGroup,
 } from '../store/profiles.js';
-import { startProfile, stopProfile, listRunning, getRunning, stopAll } from '../runtime/manager.js';
+import { startProfile, stopProfile, listRunning, getRunning, getInstance, stopAll } from '../runtime/manager.js';
 import { checkProxy, hasProxy } from '../proxy/probe.js';
+import { pacInUse, pacMessage } from '../proxy/pac.js';
+import { runSelfCheck } from '../selfcheck/index.js';
+import { readReportFile, summarize } from '../selfcheck/store.js';
+import { renderHtml } from '../selfcheck/html.js';
 import { toCanonical, toV2 } from '../../packages/profile/src/aliases.js';
 import {
   ApiError, ERR, ok, normalizeLaunchArgs, serializeLaunchArgs, normalizePasswordFilling, serializePasswordFilling,
@@ -69,6 +73,9 @@ function input(body = {}, version) {
   if (pf !== undefined) canonical.disable_password_filling = pf ? '1' : '0';
   // v1 的 platform 是域名（toCanonical 已映到 domain_name），别覆盖 navigator.platform
   if (version === 'v1') delete canonical.platform;
+  // PAC 明确拒绝：不静默忽略、不退化成直连（报错发生在落库之前）
+  const pac = pacInUse({ ...canonical, proxy_config: body.proxy_config || body.user_proxy_config || canonical.user_proxy_config });
+  if (pac) throw new ApiError(ERR.INVALID, pacMessage(pac));
   return canonical;
 }
 
@@ -197,6 +204,33 @@ function buildRoutes() {
 
   add(['GET'], ['/api/v1/browser/local-active', '/api/v2/browser-profile/local-active'], () => ok({ list: listRunning() }));
 
+  /* ---- 自检报告：启动后自动跑一次，这里读缓存；rerun=1 重跑 ---- */
+  add(['GET'], ['/api/v1/browser/selfcheck', '/api/v2/browser-profile/selfcheck'], async (ctx) => {
+    const v = versionOf(ctx.path);
+    const id = requireId(ctx, v);
+    const p = getProfile(id);
+    if (!p) throw new ApiError(ERR.NOT_FOUND, 'profile not found');
+
+    const inst = getInstance(id);
+    let report = null;
+    let fresh = false;
+    if (inst && inst.selfcheckReport) { report = inst.selfcheckReport; fresh = true; }
+    if (!report) report = readReportFile(id).latest;
+
+    const rerun = ['1', 'true', 'yes'].includes(String(ctx.query.rerun ?? '').toLowerCase());
+    if (rerun) {
+      if (!inst) throw new ApiError(ERR.NOT_RUNNING, 'profile is not running');
+      report = await runSelfCheck(inst, p);
+      inst.selfcheck = summarize(report);
+      fresh = true;
+    }
+    if (!report) throw new ApiError(ERR.NOT_RUNNING, 'profile is not running and no selfcheck report yet');
+
+    const out = { ...report, running: !!inst, stale: !fresh };
+    if (String(ctx.query.format).toLowerCase() === 'html') return { __html: renderHtml(out) };
+    return ok(out);
+  });
+
   return routes;
 }
 
@@ -228,6 +262,15 @@ function send(res, status, obj, extraHeaders = {}) {
     ...extraHeaders,
   });
   res.end(body);
+}
+
+function sendHtml(res, html, extraHeaders = {}) {
+  res.writeHead(200, {
+    'content-type': 'text/html; charset=utf-8',
+    'content-length': Buffer.byteLength(html),
+    ...extraHeaders,
+  });
+  res.end(html);
 }
 
 export function createApiServer({ port } = {}) {
@@ -271,7 +314,8 @@ export function createApiServer({ port } = {}) {
         body,
       };
       const out = await route.handler(ctx);
-      send(res, 200, out, corsHeaders);
+      if (out && typeof out.__html === 'string') sendHtml(res, out.__html, corsHeaders);
+      else send(res, 200, out, corsHeaders);
     } catch (e) {
       if (e instanceof ApiError) {
         const extra = Object.keys(e.extra || {}).length ? { data: e.extra } : {};

@@ -246,6 +246,54 @@ async function main() {
     }
     check('3 个环境指纹两两不同', new Set(probes.map((v) => `${v?.ua}|${v?.timezone}|${JSON.stringify(v?.gl)}`)).size === 3);
 
+    /* ================= P2：启动后自动自检 ================= */
+    for (const [i, s] of started.entries()) {
+      const sc = s.data.selfcheck || {};
+      check(`${countries[i]} 启动后自动自检`, sc.total === 15 && sc.fail === 0, JSON.stringify(sc));
+      check(`${countries[i]} 自检覆盖度对齐字段表 (7/7/1)`, sc.full === 7 && sc.partial === 7 && sc.none === 1, `${sc.full}/${sc.partial}/${sc.none}`);
+      check(`${countries[i]} 四个噪点哈希都有`, !!sc.hashes?.canvas && !!sc.hashes?.webgl_image && !!sc.hashes?.audio && !!sc.hashes?.client_rects, JSON.stringify(sc.hashes));
+      check(`${countries[i]} 同页两次读取一致`, sc.determinism?.canvas === true && sc.determinism?.webgl_image === true && sc.determinism?.audio === true && sc.determinism?.client_rects === true, JSON.stringify(sc.determinism));
+    }
+
+    {
+      const first = started[0].profile.profile_id;
+      const scj = await api('GET', `/api/v1/browser/selfcheck?user_id=${first}`);
+      const report = scj.json.data || {};
+      const byId = Object.fromEntries((report.items || []).map((x) => [x.id, x]));
+      check('自检 API 返回 15 项报告', scj.json.code === 0 && report.items?.length === 15, scj.json.msg);
+      check('字体项覆盖度 none 且标黄', byId.fonts?.coverage === 'none' && byId.fonts?.status === 'warn', JSON.stringify(byId.fonts));
+      check('自检注明 CDP 结构性上限', /结构性/.test(String(report.caveat)), String(report.caveat).slice(0, 60));
+      check('自检在安全上下文里跑（UA-CH 可验证）', report.context?.secure === true, JSON.stringify(report.context));
+      check('媒体设备数量与声明一致', byId.media_devices?.status === 'warn' && byId.media_devices?.actual?.counts?.audioinput === report.declared?.media_counts?.audioinput_num, JSON.stringify(byId.media_devices?.actual));
+
+      const rerun = await api('GET', `/api/v2/browser-profile/selfcheck?profile_id=${first}&rerun=1`);
+      check('rerun=1 重新跑并返回新报告', rerun.json.code === 0 && rerun.json.data?.generated_at !== report.generated_at, `${report.generated_at} -> ${rerun.json.data?.generated_at}`);
+
+      const htmlRes = await fetch(base + `/api/v2/browser-profile/selfcheck?profile_id=${first}&format=html`, {
+        headers: { api_key: apiKey, 'x-freepower-client': 'mcp' },
+      });
+      const html = await htmlRes.text();
+      check('自检 HTML 可读（本地渲染，无外链）', /text\/html/.test(htmlRes.headers.get('content-type') || '')
+        && html.includes('自检报告') && html.includes('覆盖度') && !/https?:\/\//.test(html), String(htmlRes.status));
+    }
+
+  /* ---------- 本地探测端点（不连公网） ---------- */
+    if (started[0]) {
+      const c = await CdpClient.connect(started[0].data.ws.puppeteer);
+      try {
+        const { targetId } = await c.send('Target.createTarget', { url: 'about:blank' });
+        await sleep(1200);
+        const { sessionId } = await c.send('Target.attachToTarget', { targetId, flatten: true });
+        const r = await c.send('Runtime.evaluate', { expression: 'window.__fpApplied || null', returnByValue: true }, sessionId);
+        check('新开标签完成注入（首帧不漏）', Array.isArray(r.result.value) && r.result.value.includes('canvas'), JSON.stringify(r.result.value));
+        const cores = await c.send('Runtime.evaluate', { expression: 'navigator.hardwareConcurrency', returnByValue: true }, sessionId);
+        check('新开标签硬件参数已覆写', typeof cores.result.value === 'number', String(cores.result.value));
+        await c.send('Target.closeTarget', { targetId });
+      } finally {
+        c.close();
+      }
+    }
+
     /* ---------- cookie 隔离（浏览器级 CDP 读写，不依赖页面状态） ---------- */
     const cookieOrigin = `${base}/`;
     async function setCookie(wsUrl, name, value) {
@@ -287,6 +335,31 @@ async function main() {
     if (forced.json.data?.ws?.puppeteer) {
       extraPids.push(Number(forced.json.data.pid));
       await api('GET', `/api/v1/browser/stop?user_id=${badId}`);
+    }
+
+    /* ================= PAC：明确拒绝，绝不静默降级 ================= */
+    {
+      const pacCreate = await api('POST', '/api/v2/browser-profile/create', {
+        name: 'p2-pac', country: 'US', full_pac_url: 'http://example.com/proxy.pac',
+      });
+      check('PAC：创建直接报错', pacCreate.json.code === 100002 && /不支持 PAC/.test(String(pacCreate.json.msg)), `${pacCreate.json.code} ${pacCreate.json.msg}`);
+
+      const pacCreate2 = await api('POST', '/api/v2/browser-profile/create', {
+        name: 'p2-pac2', proxy_config: { proxy_type: 'pac', host: '127.0.0.1', port: 1 },
+      });
+      check('PAC：proxy_type=pac 也直接报错', pacCreate2.json.code === 100002 && /不支持 PAC/.test(String(pacCreate2.json.msg)), `${pacCreate2.json.code} ${pacCreate2.json.msg}`);
+
+      // 老数据（迁移/手改库）里的 PAC：启动前拦，且不许拉起内核
+      const pacP = await api('POST', '/api/v1/user/create', { name: 'p2-pac-db', country: 'US' });
+      const pacId = pacP.json.data.profile_id;
+      created.push(pacId);
+      getDb().prepare('UPDATE profiles SET full_pac_url = ? WHERE id = ?').run('http://example.com/proxy.pac', pacId);
+      const uddPac = `profiles\\${pacP.json.data?.profile_no}_${String(pacId).slice(0, 8)}`;
+      const beforePac = chromePidsMatching(uddPac);
+      const pacStart = await api('GET', `/api/v1/browser/start?user_id=${pacId}`);
+      check('PAC：旧数据启动返回 800003', pacStart.json.code === 800003, `${pacStart.json.code} ${pacStart.json.msg}`);
+      check('PAC：reason=pac_unsupported', pacStart.json.data?.reason === 'pac_unsupported', String(pacStart.json.data?.reason));
+      check('PAC：零内核进程', chromePidsMatching(uddPac).length === 0 && beforePac.length === 0, String(chromePidsMatching(uddPac).length));
     }
 
     /* ================= 代理环境：流量必须真的走代理 ================= */
@@ -369,7 +442,36 @@ async function main() {
       await api('GET', `/api/v1/browser/stop?user_id=${uaId}`);
     }
 
-    /* ================= 停止与回收 ================= */
+    /* ================= P2：跨重启噪点确定性 ================= */
+    {
+      const rp = await api('POST', '/api/v1/user/create', { name: 'p2-restart', country: 'DE' });
+      const rid = rp.json.data.profile_id;
+      created.push(rid);
+      const keys = ['canvas_id', 'webgl_image_id', 'audio_id', 'client_rects_id'];
+      const seedsBefore = keys.map((k) => rp.json.data?.[k]);
+      check('噪点种子在建环境时入库', seedsBefore.every((v) => typeof v === 'number'), JSON.stringify(seedsBefore));
+
+      const r1 = await api('GET', `/api/v1/browser/start?user_id=${rid}`);
+      const h1 = r1.json.data?.selfcheck?.hashes || {};
+      check('第一次启动自检通过', r1.json.code === 0 && r1.json.data?.selfcheck?.fail === 0, JSON.stringify(r1.json.data?.selfcheck));
+      await api('GET', `/api/v1/browser/stop?user_id=${rid}`);
+      await sleep(900);
+
+      const r2 = await api('GET', `/api/v1/browser/start?user_id=${rid}`);
+      const h2 = r2.json.data?.selfcheck?.hashes || {};
+      for (const k of ['canvas', 'webgl_image', 'audio', 'client_rects']) {
+        check(`跨重启 ${k} 哈希一致`, !!h1[k] && h1[k] === h2[k], `${h1[k]} vs ${h2[k]}`);
+      }
+      check('自检报告确认跨重启一致', r2.json.data?.selfcheck?.determinism?.cross_restart === true, JSON.stringify(r2.json.data?.selfcheck?.determinism));
+
+      const after = await api('GET', `/api/v1/user/detail?user_id=${rid}`);
+      const seedsAfter = keys.map((k) => after.json.data?.[k]);
+      check('重启后种子没漂移', JSON.stringify(seedsAfter) === JSON.stringify(seedsBefore), `${JSON.stringify(seedsBefore)} vs ${JSON.stringify(seedsAfter)}`);
+      await api('GET', `/api/v1/browser/stop?user_id=${rid}`);
+      await sleep(500);
+    }
+
+    /* ================= 契约基础 ================= */
     const pids = started.map((s) => Number(s.data.pid));
     const stops = await Promise.all(started.map((s) => api('GET', `/api/v1/browser/stop?user_id=${s.profile.profile_id}`)));
     check('3 个环境都停掉', stops.every((r) => r.json.code === 0 && r.json.data?.stopped === true));

@@ -2,16 +2,20 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   PROFILES_DIR, LOG_DIR, START_TIMEOUT_MS,
-  EGRESS_PROBE_URL, PROXY_PROBE_TIMEOUT_MS, EGRESS_TIMEOUT_MS, UA_AUTOALIGN,
+  EGRESS_PROBE_URL, PROXY_PROBE_TIMEOUT_MS, EGRESS_TIMEOUT_MS, UA_AUTOALIGN, SELFCHECK_ON_START, FP_DEBUG,
 } from '../config.js';
 import { findChrome, buildArgs, launchChrome, waitForDevToolsPort, killProcessTree, rememberVersion } from '../kernel/chrome.js';
 import { CdpClient, fetchJson } from '../kernel/cdp.js';
 import { buildInjectionSource } from '../kernel/inject.js';
 import { alignProfileToKernel } from '../kernel/version.js';
 import { fingerprintView } from '../fingerprint/view.js';
+import { ensureNoiseSeeds } from '../fingerprint/seeds.js';
 import { checkProfile, markStatus, applyProfileFields, persistEgress } from '../store/profiles.js';
 import { checkProxy, hasProxy } from '../proxy/probe.js';
+import { pacInUse, pacMessage } from '../proxy/pac.js';
 import { probeEgressInBrowser } from '../proxy/egress.js';
+import { runSelfCheck } from '../selfcheck/index.js';
+import { summarize } from '../selfcheck/store.js';
 import { checkEgress } from '../../packages/profile/src/validate.js';
 
 /** profile_id -> instance */
@@ -39,6 +43,8 @@ function toStartData(i, { alreadyRunning = false } = {}) {
     ua_aligned: i.ua_aligned || null,
     launch_args: i.launch_args || { applied: [], rejected: [] },
     warnings: i.warnings || [],
+    // P2 新增：启动后自动跑一次自检的摘要（完整报告走 selfcheck 接口）
+    selfcheck: i.selfcheck || null,
   };
 }
 
@@ -110,6 +116,23 @@ export async function startProfile(profile, { force = false } = {}) {
       warnings.unshift(soft('$', `已强制启动：${check.hard.length} 条硬冲突被 force=1 越过（${check.hard.map((e) => e.field).join(',')}）`));
     }
 
+    // 1.5) PAC 明确拒绝：不能为了「支持」而留一个 DIRECT 回退的后门
+    const pac = pacInUse(profile);
+    if (pac) {
+      const err = new Error(pacMessage(pac));
+      err.code = 800003;
+      err.reason = 'pac_unsupported';
+      throw err;
+    }
+
+    // 1.6) 噪点种子补齐：老环境可能没有 *_id，按 fp_seed 派生并落库，保证跨重启一致
+    const seedPatch = ensureNoiseSeeds(profile);
+    if (Object.keys(seedPatch).length) {
+      profile = { ...profile, ...seedPatch };
+      try { applyProfileFields(id, seedPatch); log(id, '补齐噪点种子', Object.keys(seedPatch).join(',')); }
+      catch (e) { log(id, '噪点种子落库失败', e.message); }
+    }
+
     const chrome = findChrome();
     if (!chrome) {
       const err = new Error('找不到内核：设置 FREEPOWER_CHROME，或把内核放到 data/kernels/<version>/ 下');
@@ -148,6 +171,9 @@ export async function startProfile(profile, { force = false } = {}) {
     let uaAligned = null;
     const udd = userDataDirFor(effective);
     fs.mkdirSync(udd, { recursive: true });
+    // 上一次运行留下的 DevToolsActivePort 会让本轮读到旧端口 → 连到一个已经死掉的端口。
+    // 必须在新内核写文件之前删掉（重启同一环境的常见坑）。
+    try { fs.rmSync(path.join(udd, 'DevToolsActivePort'), { force: true }); } catch { /* ignore */ }
 
     const built = buildArgs(effective, {
       userDataDir: udd,
@@ -210,6 +236,8 @@ export async function startProfile(profile, { force = false } = {}) {
         ua_aligned: uaAligned,
         launch_args: { applied: built.applied, rejected: built.rejected },
         warnings,
+        selfcheck: null,
+        selfcheckReport: null,
       };
       running.set(id, instance);
       markStatus(id, 'starting');
@@ -242,6 +270,23 @@ export async function startProfile(profile, { force = false } = {}) {
       } else {
         log(id, 'WARN 出口探测失败', egress.error || '');
         warnings.push(soft('ip', `浏览器出口探测失败：${egress.error || '未知原因'}`));
+      }
+
+      // 6) 自检：在环境自己的页面里读回真实指纹，逐项对照声明值。
+      //    自检失败只告警，不影响启动（它是证据，不是启动的前置条件）。
+      if (SELFCHECK_ON_START) {
+        try {
+          const report = await runSelfCheck(instance, effective);
+          instance.selfcheck = summarize(report);
+          if (report.summary.fail > 0) {
+            const bad = report.items.filter((i) => i.status === 'fail').map((i) => i.id);
+            warnings.push(soft('selfcheck', `自检有 ${bad.length} 项未生效：${bad.join(', ')}（详见 selfcheck 报告）`));
+          }
+          log(id, '自检', `score=${report.summary.score} pass=${report.summary.pass} warn=${report.summary.warn} fail=${report.summary.fail}`);
+        } catch (e) {
+          log(id, 'WARN 自检失败', e.message);
+          warnings.push(soft('selfcheck', `自检失败：${e.message}`));
+        }
       }
 
       instance.status = 'running';
@@ -277,6 +322,9 @@ async function injectAndOpen(instance, profile, view) {
       if (waitingForDebugger) client.send('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => {});
       return;
     }
+    // 新建标签（我们建的 / 用户 Ctrl+T / window.open）的**首个文档**在 attach 之前就存在，
+    // 注册脚本只对下一个文档生效 —— 空白页必须重载一次，否则这张页面上是首帧原始指纹。
+    const blank = !targetInfo.url || targetInfo.url === 'about:blank' || targetInfo.url.startsWith('chrome://newtab');
     const prep = (async () => {
       try {
         await applyToSession(client, sessionId, profile, view);
@@ -287,11 +335,13 @@ async function injectAndOpen(instance, profile, view) {
           await client.send('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => {});
         }
       }
+      if (blank) scheduleBlankReload(client, sessionId);
     })();
     pageReady.set(targetInfo.targetId, { prep, sessionId });
   });
 
   await client.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
+  client.on('Target.detachedFromTarget', (params) => { pageReady.delete(params.targetId); });
 
   /**
    * 启动时 Chrome 自带的那张空白页在 setAutoAttach 之前就存在，脚本已经跑过一轮。
@@ -322,8 +372,80 @@ async function injectAndOpen(instance, profile, view) {
         await client.send('Page.navigate', { url }, sessionId)
           .catch((e) => log(profileId, 'navigate 失败', url, e.message));
       }
+    } else if (entry) {
+      // 空白页不会再有新文档，补一次重载让注入脚本跑上
+      await ensureInjected(client, entry.sessionId);
     }
   }
+
+  /** 内部工具（自检等）：开一张已经装配好指纹的页面 */
+  instance.openPage = async (url = 'about:blank', { timeoutMs = 8000 } = {}) => {
+    const { targetId } = await client.send('Target.createTarget', { url: 'about:blank' });
+    const entry = pageReady.get(targetId) || await waitFor(() => pageReady.get(targetId), timeoutMs);
+    if (!entry) throw new Error('新页面没有被 auto-attach 接住');
+    await entry.prep.catch(() => {});
+    // 首个 about:blank 文档早于脚本注册，先确认注入真的生效，再决定要不要导航
+    await ensureInjected(client, entry.sessionId);
+    if (url && url !== 'about:blank') {
+      await client.send('Page.navigate', { url }, entry.sessionId)
+        .catch((e) => log(profileId, 'navigate 失败', url, e.message));
+    }
+    return { targetId, sessionId: entry.sessionId };
+  };
+  instance.closePage = async (targetId) => {
+    try { await client.send('Target.closeTarget', { targetId }); } catch { /* 已关闭 */ }
+  };
+}
+
+/**
+ * 确认这张页面的「当前文档」真跑过注入；没有就重载一次等新文档。
+ * 注意重载会丢掉页面里的状态，只对空白页/我们自己的内部页用。
+ */
+async function ensureInjected(client, sessionId) {
+  const r = await client.send('Runtime.evaluate', {
+    expression: 'window.__fpInstalled === true',
+    returnByValue: true,
+  }, sessionId).catch(() => null);
+  if (r?.result?.value === true) return true;
+  await reloadSession(client, sessionId).catch(() => {});
+  return false;
+}
+
+/**
+ * 空白页补一次重载：addScriptToEvaluateOnNewDocument 只对「下一个文档」生效，
+ * 而新建标签的首个文档在 attach 之前就存在。
+ * 但不能无脑 reload —— 出口探测 / open_urls 可能正在这张页上导航，抢过去会把它们的导航顶掉。
+ * 所以延迟一拍，确认它还停在空白页才重载。
+ */
+function scheduleBlankReload(client, sessionId, delayMs = 400) {
+  const timer = setTimeout(async () => {
+    try {
+      const r = await client.send('Runtime.evaluate', {
+        expression: 'location.href',
+        returnByValue: true,
+      }, sessionId);
+      const href = String(r?.result?.value ?? '');
+      if (href === '' || href === 'about:blank' || href === 'chrome://newtab/') {
+        await reloadSession(client, sessionId).catch(() => {});
+      }
+    } catch { /* 页面已关或会话已断 */ }
+  }, delayMs);
+  timer.unref?.();
+}
+
+/**
+ * 重载一张页面并等 load：让 addScriptToEvaluateOnNewDocument 真正跑一遍。
+ * about:blank 的初始文档早于脚本注册，只有新文档才会执行注入。
+ */
+async function reloadSession(client, sessionId, timeoutMs = 6000) {
+  const loaded = new Promise((resolve) => {
+    const off = client.on('Page.loadEventFired', (params, sid) => { if (sid === sessionId) { off(); resolve(); } });
+    setTimeout(() => { off(); resolve(); }, timeoutMs);
+  });
+  await client.send('Page.reload', {}, sessionId).catch(() => {});
+  await loaded;
+  // load 之后脚本可能还在跑最后几行（注入是同步的，但给一帧余量）
+  await new Promise((r) => setTimeout(r, 30));
 }
 
 async function waitFor(fn, timeoutMs = 5000, step = 60) {
@@ -349,7 +471,7 @@ async function sessionForTarget(client, targetId) {
 async function applyToSession(client, sessionId, profile, view) {
   const s = sessionId;
   await client.send('Page.enable', {}, s);
-  await client.send('Page.addScriptToEvaluateOnNewDocument', { source: buildInjectionSource(view) }, s);
+  await client.send('Page.addScriptToEvaluateOnNewDocument', { source: buildInjectionSource(view, { debug: FP_DEBUG }) }, s);
 
   if (view.ua) {
     await client.send('Emulation.setUserAgentOverride', {
