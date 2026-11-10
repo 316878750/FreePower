@@ -210,6 +210,20 @@ export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, use
 
   const warnings = [];
 
+  /**
+   * 环境兜底：在受限环境里（CI、远程会话、被别的宿主进程代起时）内核自己的 Chromium 沙箱
+   * 可能起不来，症状是 Chrome 秒退（STATUS_BREAKPOINT）且从不写 DevToolsActivePort。
+   * 默认**不加** —— 沙箱该开着；只有用户显式 FREEPOWER_KERNEL_NO_SANDBOX=1 才退化，并且如实标注。
+   */
+  if (process.env.FREEPOWER_KERNEL_NO_SANDBOX === '1') {
+    args.push('--no-sandbox');
+    warnings.push({
+      field: 'kernel_sandbox',
+      message: '内核以 --no-sandbox 启动（FREEPOWER_KERNEL_NO_SANDBOX=1）：只在沙箱起不来的受限环境用',
+      severity: 'soft',
+    });
+  }
+
   // PAC 明确拒绝（调用方已先拦，这里是纵深防御）：PAC 的 DIRECT 回退无法 fail-closed
   if (profile.full_pac_url) {
     throw Object.assign(new Error('不支持 PAC：请改用固定 HTTP / SOCKS5 代理'), { code: 800003, reason: 'pac_unsupported' });

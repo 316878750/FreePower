@@ -42,7 +42,11 @@ export default async function renderSelfcheck({ head, page, params }) {
       disabled: !report.running,
       onClick: rerun,
     }, '重跑自检'),
-    h('a', { class: 'btn', href: api.selfcheckHtmlUrl(id), target: '_blank', rel: 'noreferrer' }, 'HTML 报告'),
+    h('button', {
+      class: 'btn',
+      title: '在新标签打开可打印的 HTML 报告（地址带一次性票据，不含 api_key）',
+      onClick: openHtml,
+    }, 'HTML 报告'),
     h('button', { class: 'btn', onClick: () => { location.hash = '#/profiles'; } }, '返回列表'));
 
   const content = h('div', { class: 'stack' });
@@ -105,6 +109,15 @@ export default async function renderSelfcheck({ head, page, params }) {
       await renderSelfcheck({ head, page, params });
     } catch (e) {
       toast(`重跑失败：${e.message}`, 'bad');
+    }
+  }
+
+  async function openHtml() {
+    try {
+      const url = await api.selfcheckHtmlUrl(id);
+      window.open(url, '_blank', 'noreferrer');
+    } catch (e) {
+      toast(`打不开报告：${e.message}`, 'bad');
     }
   }
 }

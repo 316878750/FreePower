@@ -4,8 +4,8 @@
 
 内核用官方 Chrome for Testing（独立进程），指纹通过 CDP 注入与启动参数实现，不搬运 AdsPower 的私有代码、二进制、资源与商标。
 
-> 当前阶段：**P5 完成**（Web 管理控制台：环境列表/编辑/代理/自检报告）。之前：P1 存储/校验/启停、P3 前置代理 fail-closed、P2 自检与四维确定性噪声、P4 本地 API 完整化 + 批量启停。
-> 阶段细节见 [P1](docs/02-P1-交付.md)、[P3 前置](docs/03-P3前置-代理与启动参数.md)、[P2](docs/04-P2-自检与注入补全.md)、[P4](docs/05-P4-本地API完整化.md)（附 [curl 实测记录](docs/05-P4-curl实测.md)）、[P5](docs/06-P5-Web控制台.md)，技术路线见 [技术方案](docs/00-技术方案.md)。
+> 当前阶段：**P6 完成**（Electron 桌面壳 + NSIS 安装包，有托盘/单实例/关机前清残留）。之前：P1 存储/校验/启停、P3 前置代理 fail-closed、P2 自检与四维确定性噪声、P4 本地 API 完整化 + 批量启停、P5 Web 管理控制台。
+> 阶段细节见 [P1](docs/02-P1-交付.md)、[P3 前置](docs/03-P3前置-代理与启动参数.md)、[P2](docs/04-P2-自检与注入补全.md)、[P4](docs/05-P4-本地API完整化.md)（附 [curl 实测记录](docs/05-P4-curl实测.md)）、[P5](docs/06-P5-Web控制台.md)、[P6](docs/07-P6-桌面壳.md)，技术路线见 [技术方案](docs/00-技术方案.md)。
 
 ## 一、范围（先看这个，避免后面被要求补）
 
@@ -19,6 +19,7 @@
 - 本地 API：`/status`、环境 CRUD、分组、标签、代理列表、浏览器启停、**批量启停（并发上限 + 失败清单 + 可中断）**、自检报告；返回值形状对齐 AdsPower（`ws.puppeteer` / `ws.selenium` / `debug_port` / `status: Active|Inactive` / `cookies` / `kernels`）
 - **Web 管理控制台**（`node:http` 直接托管，浏览器打开 `127.0.0.1:<端口>/` 即用）：环境列表（启动/停止/自检状态/批量操作）、环境编辑（11 组分栏表单，值域与必填来自后端注册表）、代理管理、自检报告。四个页面全部只调自己的 Local API，没有私有通道
 - 未实现的 46 条云端透传接口（回收站、分享、成员、内核下载…）**明确报「不支持」**（`code:-1` + `data.supported:false`），不假成功、不留未知码
+- **桌面版**：Electron 壳（单实例 / 托盘 / 关窗不退出 / 开机自启开关 / 退出前必清残留内核）+ NSIS 安装包，不需要 VS 编译链
 
 ### 不做（已和 CEO 确认，写进范围外）
 
@@ -36,7 +37,8 @@
 | 本地 API | `node:http` + 自写路由/限流/鉴权 | 零第三方依赖 |
 | CDP 客户端 | 自写 WebSocket（`src/kernel/cdp.js`） | 只实现需要的帧类型，无 `ws` 依赖 |
 | 内核 | 官方 Chrome for Testing | P0 用系统 Chrome 验链路，P1 接 CfT 版本矩阵 |
-| 主程序 UI | 原生 JS + 自写极简视图层，`node:http` 托管静态页 | 不引前端框架、不建构建链；Electron 壳后续再包（见已知限制 16） |
+| 主程序 UI | 原生 JS + 自写极简视图层，`node:http` 托管静态页 | 不引前端框架、不建构建链 |
+| 桌面壳 | Electron（主进程内起同一个服务，窗口 loadURL 到它） + electron-builder | 只做窗口/托盘/单实例/自启，**不重写服务**；无 native 模块，不需要 VS 编译链 |
 
 刻意保持 **零运行时依赖**：一开始就装一堆包，后面每次改内核启动参数都要跟着升级，收益不抵成本。
 
@@ -59,6 +61,14 @@ npm start
 
 ```powershell
 $env:FREEPOWER_CHROME='C:\path\to\chrome.exe'; npm start
+```
+
+桌面版（Electron 壳，见第六节）：
+
+```powershell
+npm install            # 首次：装 electron / electron-builder（约 150MB，可用 ELECTRON_MIRROR 加速）
+npm run desktop        # 开发态起桌面壳
+npm run dist:win       # 打 Windows 安装包 → release\FreePower-<ver>-setup.exe
 ```
 
 ## 四、本地 API
@@ -194,7 +204,32 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 
 更多：[编辑页](docs/shots/02-edit.png)、[后端校验原文回填](docs/shots/03-edit-invalid.png)、[噪声四维分栏](docs/shots/04-edit-noise.png)、[代理管理](docs/shots/05-proxies.png)、[自检报告](docs/shots/08-selfcheck.png)。完整操作清单见 [P5 文档](docs/06-P5-Web控制台.md)。
 
-## 六、已知限制（必须如实告知用户，不藏着）
+## 六、桌面壳与安装包（P6）
+
+同一个服务，套了一层 Electron：主进程内起的就是上面那个 `node:http`，窗口 `loadURL` 到 `127.0.0.1:<port>/`。
+**四页界面一个字节没改**，`web/` 仍然是零构建链。
+
+![桌面壳](docs/shots/10-desktop-window.png)
+
+桌面能力（都是壳的事，不碰服务）：
+
+| 能力 | 行为 |
+|---|---|
+| 单实例 | 已经有实例在跑时，再点图标不会起第二个进程/第二个端口，而是把已有窗口拉到前台 |
+| 托盘 | 常驻；菜单 = 打开控制台 / 运行中 N 个 / 停止全部环境 / 开机自启 / 退出 |
+| 关窗不退出 | 点 × 只收进托盘，服务和内核都继续跑 |
+| 托盘退出 | 先 `stopAll()`，再用命令行里的数据目录核对残留 chrome（`ensureNoChrome`：查 → taskkill → 再查），确认干净才退出；杀不掉就弹框默认留在托盘 |
+| 开机自启 | `setLoginItemSettings`，默认关；开机进托盘不弹窗 |
+| 安全 | `contextIsolation`/`sandbox` 开、`nodeIntegration` 关、**不挂 preload**；`window.open` 一律 deny，外链丢系统浏览器，导航出本地地址也拦 |
+
+装完：`%LOCALAPPDATA%\Programs\FreePower`，**357.4MB / 77 文件**，安装包 109.9MB；数据在 `%APPDATA%\FreePower\data`。
+
+顺带收掉一个 P5 尾巴：HTML 自检报告不再把 master `api_key` 拼进 URL，改成 **120 秒、绑定 profile 的一次性票据**
+（`POST /api/v2/browser-profile/selfcheck-ticket`）；`api_key` 走 query 的老用法保留，老脚本不受影响。
+
+完整设计、打包踩的坑、验收记录与操作清单：[P6 文档](docs/07-P6-桌面壳.md)。
+
+## 七、已知限制（必须如实告知用户，不藏着）
 
 1. **Canvas / Audio / WebGL 标识 / 字体是 JS 注入，不是内核级。**
    拆解手 08 号报告实测：AdsPower 139 个指纹字段里走 CDP 注入的是 0 个，全在内核配置和启动命令行。
@@ -216,21 +251,26 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 13. **云端依赖的接口一律不支持**：`cloud-active`、回收站、分享、成员体系、内核下载、`fb/*`、应用/分类等 17 条（对手 54 条路由里剩下的云端透传）返回 `-1` + `data.supported:false`，**不假成功**。`cloud-active` 尤其明确：脚本若以为"环境已开"会直接下错单。
 14. **批量启停的并发默认 3**（`FREEPOWER_BATCH_CONCURRENCY` 可调，请求里 `concurrency` 覆盖，夹在 1..10）。批量启动**中途失败即中断**：已经起来的保留，剩下的不硬起，返回 `failed` + `skipped`。
 15. **`kernels` 的版本号区分「实测」与「猜」**：系统 Chrome 的 `Application\` 下可能同时有几个版本目录（本机实测有 156/157），而启动器实际跑哪个由注册表决定。启动过就报 `Browser.getVersion` 的真值（`probed:true`），没启动过则按目录名猜。**不要拿目录名当真实版本用。**
-16. **控制台是本地网页，没有 Electron 桌面壳**（P5 决定后置：包壳要先解决几十兆体积和它自己的 IPC 沙箱问题，现在不该成为阻塞项）。所以目前没有系统托盘、开机自启、单实例锁、窗口快捷键这些桌面能力。
+16. **桌面壳没有代码签名、没有自动更新**：安装包和 exe 都未签名，SmartScreen 会提示「未知发布者」；要对外发版必须补证书。壳只做窗口/托盘/单实例/自启，不做增量更新与崩溃上报。
 17. **控制台的信任边界就是本机**：首页由本地服务渲染，会把 `api_key` 注入页面（等价于「本机用户能看到自己的 key」）。外站 Origin 一律 403，但这挡不住本机上的其它程序 —— 本机多用户/共享机器上，要按「同一台机器互不设防」来理解。
 18. **表单里 138 个字段的中文名只覆盖常用项**：其余（尤其启动与缓存、隐私开关里的脚本旋钮）直接显示 API 字段名，配注册表里的 `note` 说明。硬翻一遍反而会让「字段名 ↔ 文档」对不上。
+19. **自检 HTML 报告用一次性票据**（120 秒、绑定 profile、只在内存）替掉 URL 里的 master `api_key`。票据泄露影响面只有一个环境的报告；`api_key` 老用法仍可用。
+20. **托盘图标在受限会话里注册不上**：Agent 令牌下 Electron 的 Tray 对象/菜单/消息窗口都建好了，但 Win11 通知区域里看不到图标（裸 Electron 同样如此，而直接调 `Shell_NotifyIcon` 的探针成功）—— 判定为环境限制。**正常桌面双击安装后要确认一次托盘**；兜底是再点一次图标，单实例锁会把窗口拉回来，不会把用户锁在后台。
+21. **在受限终端里验桌面版要加参数**：`--no-sandbox`（Chromium 沙箱起不来会秒退）且数据目录必须落在工作区内（`%APPDATA%` 之外的写入被拦）。**用户正常桌面双击不需要任何参数。**
+22. **受限环境还可能挡住内核的沙箱**：`FREEPOWER_KERNEL_NO_SANDBOX=1` 会给内核加 `--no-sandbox`，并在启动结果 `warnings` 里标 `kernel_sandbox`。默认不开 —— 沙箱该开着。
+23. **卸载没能在本机验完**：静默 `/S` 会拉起 `old-uninstaller.exe` 后停住（文件一个没删），是受限会话里的行为；安装包构造本身正常，卸载要在普通桌面点「设置 → 应用 → FreePower → 卸载」验一次。
 
-## 七、验证
+## 八、验证
 
 ```powershell
-# 不需要 Chrome：schema + 单元测试 + 本地 API 契约 + 控制台契约（29 项）
+# 不需要 Chrome：schema + 单元 + 本地 API 契约 + 控制台契约 + 桌面壳契约
 npm run test
 
 # 需要真实 Chrome + 完整权限（沙箱挡命名管道和进程查询）
 npm run smoke
 ```
 
-当前实测：`npm run test` = schema **10** + unit **35** + api **61** + ui **29**；`npm run smoke` = **152/152**（真 Chrome 156.0.8078.80）。
+当前实测：`npm run test` = schema **10** + unit **35** + api **61** + ui **29** + desktop **44**；`npm run smoke` = **152/152**（真 Chrome 156.0.8078.80）。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 
 冒烟覆盖（152 项）：
 
@@ -250,17 +290,19 @@ npm run smoke
 - **UA 跟版**：旧版本 UA 启动时对齐到真实内核版本并落库
 - **控制台**：首页带 api_key、`/ui/app.js` 可加载、schema 11 组 131 字段、表单校验接口放行 UTC 与空 cookie
 
-## 八、目录
+## 九、目录
 
 ```
 src/
-  main.js              入口：起 API、写发现文件、回收环境
+  main.js              CLI 入口：起 API、打印摘要、SIGINT 回收环境
+  boot.js              启动引导（CLI 与 Electron 壳共用）：找端口、写发现文件、交句柄、停机收尾
   config.js            端口/路径/限流/批量并发配置
   api/server.js        传输层：鉴权、限流、CORS、静态托管、错误整形
   api/routes.js        路由表：A 类本地组装 / B 类自己实现 / 占位明确不支持
   api/contract.js      错误码、响应外壳、launch_args 与 password_filling 边界转换
   api/schema.js        编辑表单 schema（字段分组/值域/必填，来自 packages/profile 注册表）
   api/static.js        控制台静态托管（只放 web/，路径穿越一律 404）
+  api/tickets.js       自检报告的一次性票据（120 秒、绑 profile、只在内存）
   store/db.js          node:sqlite 建表、迁移补列、API Key
   store/profiles.js    环境 CRUD、分组、cookie 规范化、一致性校验
   store/tags.js        标签 CRUD（本地实现）
@@ -277,6 +319,11 @@ src/
   selfcheck/           自检：页面探针 / 报告 / 落盘 / 本地安全上下文服务 / HTML 渲染
   runtime/manager.js   启停、校验/预检/跟版、自动 attach 新标签页、自检、代理认证
   runtime/batch.js     批量启停：并发池、失败清单、中断
+desktop/
+  main.js              Electron 主进程：起服务、开窗、托盘、单实例、自启、退出收尾
+  residue.js           退出前的残留 chrome 检查（WMI 查命令行 → taskkill → 再查）
+  assets/tray.png      托盘图标（自绘）+ tray@2x / icon.png
+  build/icon.ico       安装包与 exe 图标（自绘）
 web/
   index.html           控制台外壳（api_key 由服务端注入）
   style.css            全部样式（无预处理器、无主题）
@@ -291,6 +338,10 @@ test/smoke.mjs         端到端冒烟（152 项，需真实 Chrome）
 test/unit.test.mjs     零 Chrome 单元测试（35 项）
 test/api.test.mjs      本地 API 契约测试（61 项，不需要 Chrome）
 test/ui.test.mjs       控制台契约测试（29 项：静态托管、schema、校验、删除清目录、限流额度）
+test/desktop.test.mjs  桌面壳契约测试（44 项：启动引导、票据、残留检查、安全姿势、打包配置）
 test/fake-proxy.mjs    假代理 / 假出口端点（冒烟不依赖公网）
-docs/                  技术方案、阶段交付、curl 实测、控制台截图（docs/shots/）
+tools/make-icons.py    自绘图标生成（Pillow，不引用第三方素材）
+tools/run-desktop.mjs  开发态起桌面壳（会剥掉 ELECTRON_RUN_AS_NODE 再起）
+electron-builder.yml   打包配置（win-unpacked + NSIS）
+docs/                  技术方案、阶段交付、curl 实测、截图（docs/shots/）
 ```

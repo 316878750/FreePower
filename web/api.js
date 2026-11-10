@@ -98,7 +98,10 @@ export const api = {
   /* ---- 自检 ---- */
   selfcheck: (id, { rerun = false } = {}) => call('/api/v2/browser-profile/selfcheck', { query: { profile_id: id, rerun: rerun ? 1 : '' } }),
   selfcheckSummary: (ids) => call('/api/v2/browser-profile/selfcheck-summary', { method: 'POST', body: { profile_ids: ids } }),
-  selfcheckHtmlUrl: (id) => `/api/v2/browser-profile/selfcheck?profile_id=${encodeURIComponent(id)}&format=html&api_key=${encodeURIComponent(key())}`,
+  selfcheckHtmlUrl: async (id) => {
+    const t = await call('/api/v2/browser-profile/selfcheck-ticket', { method: 'POST', body: { profile_id: id } });
+    return t.url;
+  },
 
   /* ---- 内核 ---- */
   kernels: () => call('/api/v2/browser-profile/kernels', { query: { kernel_type: 'chrome' } }),

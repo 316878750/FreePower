@@ -5,9 +5,10 @@ import { stopAll } from '../runtime/manager.js';
 import { ApiError, ERR, TOO_MANY_MSG } from './contract.js';
 import { isStaticPath, renderIndex, resolveStatic, sendStatic } from './static.js';
 import { buildRoutes } from './routes.js';
+import { redeemTicket } from './tickets.js';
 
 const MAX_BODY = 2 * 1024 * 1024;
-const VERSION = '0.2.0-p5';
+const VERSION = '0.3.0-p6';
 
 /* ------------------------------- 限流 ------------------------------- */
 const buckets = new Map();
@@ -136,17 +137,23 @@ export function createApiServer({ port } = {}) {
     if (!route) return send(res, 404, { code: ERR.GENERIC, msg: `no route ${req.method} ${url.pathname}`, data: { supported: false, path: url.pathname } }, corsHeaders);
 
     if (route.auth !== false) {
-      const key = extractKey(req, url);
-      if (!key || key !== apiKey) return send(res, 401, { code: ERR.GENERIC, msg: 'invalid api_key' }, corsHeaders);
-      const client = String(req.headers['x-freepower-client'] || '').toLowerCase();
-      const isMcp = ['mcp', '1'].includes(client)
-        || String(req.headers['x-adspower-client'] || '').toLowerCase() === 'mcp';
-      const isUi = client === 'ui';
-      const limit = isMcp ? RATE_LIMIT_MCP : isUi ? RATE_LIMIT_UI : RATE_LIMIT_DEFAULT;
-      const bucket = `${key}|${isMcp ? 'mcp' : isUi ? 'ui' : 'std'}`;
-      if (!rateLimit(bucket, limit)) {
-        // 超限报文逐字对齐对手（脚本按这句判断要不要重试）
-        return send(res, 200, { code: ERR.GENERIC, msg: TOO_MANY_MSG }, corsHeaders);
+      // 自检报告页在浏览器里直接打开，不能带 master key：允许 route.ticket 声明的路由
+      // 用短期票据代替 key（票据绑定 profile_id，泄露影响面只有一个环境的报告）
+      const usesTicket = !!route.ticket
+        && redeemTicket(url.searchParams.get('ticket'), url.searchParams.get('profile_id'));
+      if (!usesTicket) {
+        const key = extractKey(req, url);
+        if (!key || key !== apiKey) return send(res, 401, { code: ERR.GENERIC, msg: 'invalid api_key' }, corsHeaders);
+        const client = String(req.headers['x-freepower-client'] || '').toLowerCase();
+        const isMcp = ['mcp', '1'].includes(client)
+          || String(req.headers['x-adspower-client'] || '').toLowerCase() === 'mcp';
+        const isUi = client === 'ui';
+        const limit = isMcp ? RATE_LIMIT_MCP : isUi ? RATE_LIMIT_UI : RATE_LIMIT_DEFAULT;
+        const bucket = `${key}|${isMcp ? 'mcp' : isUi ? 'ui' : 'std'}`;
+        if (!rateLimit(bucket, limit)) {
+          // 超限报文逐字对齐对手（脚本按这句判断要不要重试）
+          return send(res, 200, { code: ERR.GENERIC, msg: TOO_MANY_MSG }, corsHeaders);
+        }
       }
     }
 

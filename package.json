@@ -1,21 +1,33 @@
 {
   "name": "freepower",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
-  "description": "FreePower — 独立实现的指纹浏览器（多环境隔离 + 代理 + 指纹一致 + 本地 API）",
+  "description": "FreePower — 独立实现的指纹浏览器（多环境隔离 + 代理 + 指纹一致 + 本地 API + 桌面壳）",
+  "author": {
+    "name": "FreePower"
+  },
+  "main": "desktop/main.js",
   "engines": {
     "node": ">=22.5"
   },
   "scripts": {
     "start": "node --no-warnings src/main.js",
     "dev": "node --no-warnings --watch src/main.js",
+    "desktop": "node tools/run-desktop.mjs",
+    "desktop:selftest": "node tools/run-desktop.mjs --selftest",
+    "dist:win": "electron-builder --win --x64",
     "smoke": "node --no-warnings test/smoke.mjs",
     "test:unit": "node --no-warnings test/unit.test.mjs",
     "test:api": "node --no-warnings test/api.test.mjs",
     "test:ui": "node --no-warnings test/ui.test.mjs",
+    "test:desktop": "node --no-warnings test/desktop.test.mjs",
     "test:profile": "node --no-warnings packages/profile/test/schema.test.mjs",
-    "test": "node --no-warnings packages/profile/test/schema.test.mjs && node --no-warnings test/unit.test.mjs && node --no-warnings test/api.test.mjs && node --no-warnings test/ui.test.mjs",
+    "test": "node --no-warnings packages/profile/test/schema.test.mjs && node --no-warnings test/unit.test.mjs && node --no-warnings test/api.test.mjs && node --no-warnings test/ui.test.mjs && node --no-warnings test/desktop.test.mjs",
     "gen": "node tools/gen-schema.mjs"
+  },
+  "devDependencies": {
+    "electron": "^45.2.3",
+    "electron-builder": "^26.0.12"
   }
 }

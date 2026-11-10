@@ -30,6 +30,7 @@ import { pacInUse, pacMessage } from '../proxy/pac.js';
 import { runSelfCheck } from '../selfcheck/index.js';
 import { readReportFile, summarize } from '../selfcheck/store.js';
 import { renderHtml } from '../selfcheck/html.js';
+import { issueTicket } from './tickets.js';
 import { listKernels } from '../kernel/chrome.js';
 import { toCanonical, toV2 } from '../../packages/profile/src/aliases.js';
 import {
@@ -454,6 +455,20 @@ export function buildRoutes() {
     const out = { ...report, running: !!inst, stale: !fresh };
     if (String(ctx.query.format).toLowerCase() === 'html') return { __html: renderHtml(out) };
     return ok(out);
+  }, { ticket: true });
+
+  /**
+   * 自检 HTML 报告的一次性票据。
+   * 报告是给浏览器直接打开的页面，不能把 master api_key 拼进 URL（会进浏览器历史/日志）。
+   * 票据 120 秒、绑 profile_id、只在内存里；主 key 的路径照旧可用，老脚本不受影响。
+   */
+  add(['POST'], ['/api/v2/browser-profile/selfcheck-ticket'], (ctx) => {
+    const p = resolveProfile(ctx, 'v2');
+    const t = issueTicket(p.id);
+    return ok({
+      ...t,
+      url: `/api/v2/browser-profile/selfcheck?profile_id=${encodeURIComponent(p.id)}&format=html&ticket=${encodeURIComponent(t.ticket)}`,
+    });
   });
 
   /**

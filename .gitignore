@@ -17,3 +17,7 @@ profiles/
 user-data/
 .tmp/
 .npm-cache/
+
+data-desktop*/
+data-packaged*/
+

@@ -1,0 +1,49 @@
+# electron-builder 配置：只打 Windows x64（当前唯一验证过的平台）。
+# 不要求本机有 VS 编译链：Electron 与 NSIS 全是预编译二进制，这里没有需要 native 编译的模块。
+appId: com.freepower.desktop
+productName: FreePower
+copyright: FreePower
+
+directories:
+  output: release
+  buildResources: desktop/build
+
+# 进包的只有跑得起来的那几样。test/ docs/ data/ 一律不进（否则安装包会带上调试产物）。
+files:
+  - package.json
+  - src/**/*
+  - web/**/*
+  - packages/**/*
+  - desktop/**/*
+  - '!**/*.test.mjs'
+  - '!**/test/**'
+  - '!**/*.md'
+  - '!test/**'
+  - '!docs/**'
+  - '!data*/**'
+  - '!release/**'
+  - '!tools/**'
+  - '!artifacts/**'
+
+# asar 开了省文件数；但图标要让原生层读得到，所以把 assets 解出来
+asar: true
+asarUnpack:
+  - desktop/assets/**
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  icon: desktop/build/icon.ico
+  artifactName: FreePower-${version}-setup.${ext}
+  requestedExecutionLevel: asInvoker
+
+nsis:
+  oneClick: true            # 双击装完就走，不弹下一步
+  perMachine: false         # 装到当前用户，不要管理员权限
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: FreePower
+  runAfterFinish: true      # 装完直接启动（验收项：双击安装后启动）
+  deleteAppDataOnUninstall: false
+  allowElevation: false
