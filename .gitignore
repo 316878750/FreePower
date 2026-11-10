@@ -10,6 +10,8 @@ release/
 Thumbs.db
 data/
 data-smoke*/
+data-curl*/
+artifacts/
 profiles/
 user-data/
 .tmp/

@@ -1,20 +1,9 @@
 import http from 'node:http';
 import { API_HOST, RATE_LIMIT_DEFAULT, RATE_LIMIT_MCP, API_PORT } from '../config.js';
 import { ensureApiKey } from '../store/db.js';
-import {
-  createProfile, getProfile, listProfiles, updateProfile, deleteProfiles, regroupProfiles,
-  newFingerprintFor, listGroups, createGroup,
-} from '../store/profiles.js';
-import { startProfile, stopProfile, listRunning, getRunning, getInstance, stopAll } from '../runtime/manager.js';
-import { checkProxy, hasProxy } from '../proxy/probe.js';
-import { pacInUse, pacMessage } from '../proxy/pac.js';
-import { runSelfCheck } from '../selfcheck/index.js';
-import { readReportFile, summarize } from '../selfcheck/store.js';
-import { renderHtml } from '../selfcheck/html.js';
-import { toCanonical, toV2 } from '../../packages/profile/src/aliases.js';
-import {
-  ApiError, ERR, ok, normalizeLaunchArgs, serializeLaunchArgs, normalizePasswordFilling, serializePasswordFilling,
-} from './contract.js';
+import { stopAll } from '../runtime/manager.js';
+import { ApiError, ERR, TOO_MANY_MSG } from './contract.js';
+import { buildRoutes } from './routes.js';
 
 const MAX_BODY = 2 * 1024 * 1024;
 
@@ -36,7 +25,8 @@ function rateLimit(key, limit) {
 function extractKey(req, url) {
   const q = url.searchParams.get('api_key');
   if (q) return q;
-  const h = req.headers['api_key'] || req.headers['x-api-key'];
+  // 对手的头是 api-key；另外两种是我们自己的风格，老的也说不要直接扔掉
+  const h = req.headers['api-key'] || req.headers['api_key'] || req.headers['x-api-key'];
   if (h) return String(h);
   const auth = req.headers.authorization || '';
   const m = /^Bearer\s+(.+)$/i.exec(auth);
@@ -52,189 +42,7 @@ function corsOrigin(origin) {
   return false;
 }
 
-/* --------------------------- 出站整形 --------------------------- */
-
-/** 内部记录 → 对外（v1 补 user_id/serial_number，v2 用 profile_id/profile_no） */
-function present(profile, version) {
-  if (!profile) return null;
-  const base = version === 'v2' ? toV2(profile) : { ...profile, user_id: profile.id, serial_number: profile.profile_no };
-  if (profile.launch_args !== undefined) base.launch_args = serializeLaunchArgs(profile.launch_args, version);
-  Object.assign(base, serializePasswordFilling(profile.disable_password_filling === '1'));
-  return base;
-}
-
-/** 入站：v1/v2 参数名 → 内部键，并处理边界类型 */
-function input(body = {}, version) {
-  const canonical = toCanonical(body, version);
-  if (body.launch_args !== undefined || body.browser_run_args !== undefined) {
-    canonical.launch_args = normalizeLaunchArgs(body.launch_args ?? body.browser_run_args);
-  }
-  const pf = normalizePasswordFilling(body);
-  if (pf !== undefined) canonical.disable_password_filling = pf ? '1' : '0';
-  // v1 的 platform 是域名（toCanonical 已映到 domain_name），别覆盖 navigator.platform
-  if (version === 'v1') delete canonical.platform;
-  // PAC 明确拒绝：不静默忽略、不退化成直连（报错发生在落库之前）
-  const pac = pacInUse({ ...canonical, proxy_config: body.proxy_config || body.user_proxy_config || canonical.user_proxy_config });
-  if (pac) throw new ApiError(ERR.INVALID, pacMessage(pac));
-  return canonical;
-}
-
-function requireId(ctx, version) {
-  const id = version === 'v1'
-    ? (ctx.query.user_id || ctx.body.user_id || ctx.query.profile_id)
-    : (ctx.query.profile_id || ctx.body.profile_id || ctx.query.user_id);
-  if (!id) throw new ApiError(ERR.INVALID, version === 'v2' ? 'profile_id is required' : 'user_id is required');
-  return String(id);
-}
-
-/* ------------------------------- 路由 ------------------------------- */
-function buildRoutes() {
-  const routes = [];
-  const add = (methods, paths, handler, opts = {}) => {
-    for (const path of paths) routes.push({ methods, path, handler, ...opts });
-  };
-  const both = (nameV1, nameV2) => [`/api/v1/${nameV1}`, `/api/v2/${nameV2}`];
-  const versionOf = (p) => (p.startsWith('/api/v2/') ? 'v2' : 'v1');
-
-  add(['GET'], ['/status'], () => ({ code: 0, msg: 'success' }), { auth: false });
-
-  /* ---- 列表 / 详情 ---- */
-  add(['GET'], both('user/list', 'browser-profile/list'), (ctx) => {
-    const r = listProfiles({
-      page: ctx.query.page,
-      page_size: ctx.query.page_size,
-      group_id: ctx.query.group_id ?? ctx.query.batch_id,
-      name: ctx.query.name,
-    });
-    const v = versionOf(ctx.path);
-    return ok({ list: r.list.map((p) => present(p, v)), page: r.page, page_size: r.page_size, total: r.total });
-  });
-
-  add(['GET'], ['/api/v1/user/detail', '/api/v2/browser-profile/detail'], (ctx) => {
-    const v = versionOf(ctx.path);
-    const p = getProfile(requireId(ctx, v));
-    if (!p) throw new ApiError(ERR.NOT_FOUND, 'profile not found');
-    return ok(present(p, v));
-  });
-
-  /* ---- 创建 / 更新 ---- */
-  add(['POST'], both('user/create', 'browser-profile/create'), (ctx) => {
-    const v = versionOf(ctx.path);
-    const p = createProfile(input(ctx.body, v));
-    return ok(present(p, v));
-  });
-
-  add(['POST'], both('user/update', 'browser-profile/update'), (ctx) => {
-    const v = versionOf(ctx.path);
-    const id = requireId(ctx, v);
-    if (getRunning(id)) throw new ApiError(ERR.GENERIC, 'profile is running, stop it before update');
-    const p = updateProfile(id, input(ctx.body, v));
-    if (!p) throw new ApiError(ERR.NOT_FOUND, 'profile not found');
-    return ok(present(p, v));
-  });
-
-  add(['POST'], both('user/delete', 'browser-profile/delete'), async (ctx) => {
-    const v = versionOf(ctx.path);
-    const raw = v === 'v1' ? (ctx.body.user_ids || []) : (ctx.body.profile_ids || []);
-    const ids = (Array.isArray(raw) ? raw : [raw]).filter(Boolean).map(String);
-    if (!ids.length) throw new ApiError(ERR.INVALID, v === 'v2' ? 'profile_ids is required' : 'user_ids is required');
-    for (const id of ids) if (getRunning(id)) await stopProfile(id);
-    return ok({ deleted: deleteProfiles(ids) });
-  });
-
-  add(['POST'], ['/api/v1/user/regroup', '/api/v2/browser-profile/regroup'], (ctx) => {
-    const ids = ctx.body.user_ids || ctx.body.profile_ids || [];
-    const group = ctx.body.group_id ?? ctx.body.batch_id ?? '0';
-    return ok({ changed: regroupProfiles(ids, group) });
-  });
-
-  add(['POST'], both('user/new-fingerprint', 'browser-profile/new-fingerprint'), (ctx) => {
-    const v = versionOf(ctx.path);
-    const p = newFingerprintFor(requireId(ctx, v));
-    if (!p) throw new ApiError(ERR.NOT_FOUND, 'profile not found');
-    return ok(present(p, v));
-  });
-
-  /* ---- 分组 ---- */
-  add(['GET'], ['/api/v1/group/list', '/api/v2/group/list'], () => ok({ list: listGroups() }));
-  add(['POST'], ['/api/v1/group/create', '/api/v2/group/create'], (ctx) => {
-    if (!ctx.body.group_name) throw new ApiError(ERR.INVALID, 'group_name required');
-    return ok(createGroup(ctx.body.group_name));
-  });
-
-  /* ---- 代理工具（UI / 脚本先验一下再绑） ---- */
-  add(['POST'], ['/api/v1/proxy/check', '/api/v2/proxy/check'], async (ctx) => {
-    const p = ctx.body.proxy_config || ctx.body;
-    if (!hasProxy(p)) throw new ApiError(ERR.INVALID, 'host / port is required');
-    const r = await checkProxy(p);
-    return ok(r);
-  });
-
-  /* ---- 浏览器生命周期 ---- */
-  add(['GET'], both('browser/start', 'browser-profile/start'), async (ctx) => {
-    const v = versionOf(ctx.path);
-    const id = requireId(ctx, v);
-    const p = getProfile(id);
-    if (!p) throw new ApiError(ERR.NOT_FOUND, 'profile not found');
-    const live = getRunning(id);
-    if (live) return ok({ ...live, already_running: true });
-    const force = ['1', 'true', 'yes'].includes(String(ctx.query.force ?? '').toLowerCase());
-    try {
-      return ok(await startProfile({ ...p, id }, { force }));
-    } catch (e) {
-      const extra = { errors: e.errors, reason: e.reason, proxy_check: e.proxy_check };
-      for (const k of Object.keys(extra)) if (extra[k] === undefined) delete extra[k];
-      throw new ApiError(e.code === 800005 ? ERR.CONSISTENCY : ERR.START_FAILED, `start failed: ${e.message}`, 200, extra);
-    }
-  });
-
-  add(['GET'], both('browser/stop', 'browser-profile/stop'), async (ctx) => {
-    const v = versionOf(ctx.path);
-    const r = await stopProfile(requireId(ctx, v));
-    if (!r.stopped) throw new ApiError(ERR.NOT_RUNNING, 'profile is not running');
-    return ok(r);
-  });
-
-  add(['GET'], both('browser/active', 'browser-profile/active'), (ctx) => {
-    const v = versionOf(ctx.path);
-    const id = ctx.query.user_id || ctx.query.profile_id;
-    const list = id ? listRunning().filter((x) => x.profile_id === String(id)) : listRunning();
-    return ok({ list: list.map((x) => present(x, v)) });
-  });
-
-  add(['GET'], ['/api/v1/browser/local-active', '/api/v2/browser-profile/local-active'], () => ok({ list: listRunning() }));
-
-  /* ---- 自检报告：启动后自动跑一次，这里读缓存；rerun=1 重跑 ---- */
-  add(['GET'], ['/api/v1/browser/selfcheck', '/api/v2/browser-profile/selfcheck'], async (ctx) => {
-    const v = versionOf(ctx.path);
-    const id = requireId(ctx, v);
-    const p = getProfile(id);
-    if (!p) throw new ApiError(ERR.NOT_FOUND, 'profile not found');
-
-    const inst = getInstance(id);
-    let report = null;
-    let fresh = false;
-    if (inst && inst.selfcheckReport) { report = inst.selfcheckReport; fresh = true; }
-    if (!report) report = readReportFile(id).latest;
-
-    const rerun = ['1', 'true', 'yes'].includes(String(ctx.query.rerun ?? '').toLowerCase());
-    if (rerun) {
-      if (!inst) throw new ApiError(ERR.NOT_RUNNING, 'profile is not running');
-      report = await runSelfCheck(inst, p);
-      inst.selfcheck = summarize(report);
-      fresh = true;
-    }
-    if (!report) throw new ApiError(ERR.NOT_RUNNING, 'profile is not running and no selfcheck report yet');
-
-    const out = { ...report, running: !!inst, stale: !fresh };
-    if (String(ctx.query.format).toLowerCase() === 'html') return { __html: renderHtml(out) };
-    return ok(out);
-  });
-
-  return routes;
-}
-
-/* ------------------------------- 服务 ------------------------------- */
+/* ------------------------------- 传输 ------------------------------- */
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let size = 0;
@@ -248,7 +56,11 @@ function readBody(req) {
       if (!chunks.length) return resolve({});
       const text = Buffer.concat(chunks).toString('utf8').trim();
       if (!text) return resolve({});
-      try { resolve(JSON.parse(text)); } catch { reject(new ApiError(ERR.INVALID, 'invalid json body')); }
+      try {
+        const parsed = JSON.parse(text);
+        // proxy-list/create 的 body 是顶层数组：包一层，路由里再拆
+        resolve(parsed);
+      } catch { reject(new ApiError(ERR.INVALID, 'invalid json body')); }
     });
     req.on('error', reject);
   });
@@ -262,6 +74,15 @@ function send(res, status, obj, extraHeaders = {}) {
     ...extraHeaders,
   });
   res.end(body);
+}
+
+function sendText(res, status, text, extraHeaders = {}) {
+  res.writeHead(status, {
+    'content-type': 'text/plain; charset=utf-8',
+    'content-length': Buffer.byteLength(text),
+    ...extraHeaders,
+  });
+  res.end(text);
 }
 
 function sendHtml(res, html, extraHeaders = {}) {
@@ -284,29 +105,36 @@ export function createApiServer({ port } = {}) {
     const allowed = corsOrigin(origin);
     const corsHeaders = allowed ? {
       'access-control-allow-origin': allowed,
-      'access-control-allow-headers': 'content-type,api_key,authorization,x-api-key,x-freepower-client',
+      'access-control-allow-headers': 'content-type,api-key,api_key,authorization,x-api-key,x-freepower-client,x-adspower-client',
       'access-control-allow-methods': 'GET,POST,OPTIONS',
     } : {};
-    if (origin && allowed === false) return send(res, 403, { code: ERR.GENERIC, msg: 'origin not allowed' });
+    // 对手的行为：Origin 不在白名单 → 403 + 纯文本 `CORS ERROR`（不是 JSON）
+    if (origin && allowed === false) return sendText(res, 403, 'CORS ERROR');
     if (req.method === 'OPTIONS') {
       res.writeHead(204, corsHeaders);
       return res.end();
     }
 
     const route = routes.find((r) => r.methods.includes(req.method) && r.path === url.pathname);
-    if (!route) return send(res, 404, { code: ERR.GENERIC, msg: `no route ${req.method} ${url.pathname}` }, corsHeaders);
+    if (!route) return send(res, 404, { code: ERR.GENERIC, msg: `no route ${req.method} ${url.pathname}`, data: { supported: false, path: url.pathname } }, corsHeaders);
 
     if (route.auth !== false) {
       const key = extractKey(req, url);
       if (!key || key !== apiKey) return send(res, 401, { code: ERR.GENERIC, msg: 'invalid api_key' }, corsHeaders);
-      const limit = req.headers['x-freepower-client'] === 'mcp' ? RATE_LIMIT_MCP : RATE_LIMIT_DEFAULT;
-      if (!rateLimit(key + '|' + (req.headers['x-freepower-client'] || ''), limit)) {
-        return send(res, 429, { code: ERR.GENERIC, msg: `rate limit: ${limit}/s` }, corsHeaders);
+      const isMcp = ['mcp', '1'].includes(String(req.headers['x-freepower-client'] || '').toLowerCase())
+        || String(req.headers['x-adspower-client'] || '').toLowerCase() === 'mcp';
+      const limit = isMcp ? RATE_LIMIT_MCP : RATE_LIMIT_DEFAULT;
+      const bucket = `${key}|${isMcp ? 'mcp' : 'std'}`;
+      if (!rateLimit(bucket, limit)) {
+        // 超限报文逐字对齐对手（脚本按这句判断要不要重试）
+        return send(res, 200, { code: ERR.GENERIC, msg: TOO_MANY_MSG }, corsHeaders);
       }
     }
 
     try {
-      const body = req.method === 'POST' ? await readBody(req) : {};
+      // 对手的 v2 active 允许 GET 带 body，这里只要客户端发了 body 就读
+      const hasBody = req.method === 'POST' || Number(req.headers['content-length'] || 0) > 0;
+      const body = hasBody ? await readBody(req) : {};
       const ctx = {
         req,
         path: url.pathname,
@@ -320,6 +148,10 @@ export function createApiServer({ port } = {}) {
       if (e instanceof ApiError) {
         const extra = Object.keys(e.extra || {}).length ? { data: e.extra } : {};
         return send(res, e.httpStatus, { code: e.code, msg: e.message, ...extra }, corsHeaders);
+      }
+      if (e && e.fieldErrors) {
+        // profile schema 校验失败：100002 + 字段级明细
+        return send(res, 200, { code: ERR.INVALID, msg: e.message, data: { errors: e.fieldErrors, warnings: e.warnings || [] } }, corsHeaders);
       }
       send(res, 500, { code: ERR.GENERIC, msg: e.message }, corsHeaders);
     }

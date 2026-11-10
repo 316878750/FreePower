@@ -4,8 +4,8 @@
 
 内核用官方 Chrome for Testing（独立进程），指纹通过 CDP 注入与启动参数实现，不搬运 AdsPower 的私有代码、二进制、资源与商标。
 
-> 当前阶段：**P2 完成**（P1 存储/校验/启停 + P3 前置代理 fail-closed、出口探测、launch_args 白名单、UA 跟版 + P2 自检页与四维确定性噪声）。
-> 阶段细节见 [P1 交付说明](docs/02-P1-交付.md)、[P3 前置](docs/03-P3前置-代理与启动参数.md)、[P2 自检与注入补全](docs/04-P2-自检与注入补全.md)（附[真实报告样例](docs/04-P2-自检样例.md)），技术路线见 [技术方案](docs/00-技术方案.md)。
+> 当前阶段：**P4 完成**（本地 API 完整化 + 批量启停）。之前：P1 存储/校验/启停、P3 前置代理 fail-closed、P2 自检与四维确定性噪声。
+> 阶段细节见 [P1](docs/02-P1-交付.md)、[P3 前置](docs/03-P3前置-代理与启动参数.md)、[P2](docs/04-P2-自检与注入补全.md)、[P4](docs/05-P4-本地API完整化.md)（附 [curl 实测记录](docs/05-P4-curl实测.md)），技术路线见 [技术方案](docs/00-技术方案.md)。
 
 ## 一、范围（先看这个，避免后面被要求补）
 
@@ -16,6 +16,8 @@
 - 指纹：UA / UA-CH / 语言 / 时区 / 屏幕与 DPR / WebGL vendor+renderer / Canvas 种子化噪声 / Audio 噪声 / WebGL 图像噪声 / client rects 噪声 / hardwareConcurrency / deviceMemory / media devices / platform / 字体声明 / WebRTC 策略
 - 自检：每个环境启动后自动跑一次真实页面探针，输出 15 项可读报告（覆盖度对齐字段表 full/partial/none），支持 API 与本地 HTML 页
 - 代理：HTTP/HTTPS/SOCKS5 绑定、账号密码认证（HTTP 代理）、**fail-closed**；PAC 明确拒绝（不支持就报错，不静默降级）
+- 本地 API：`/status`、环境 CRUD、分组、标签、代理列表、浏览器启停、**批量启停（并发上限 + 失败清单 + 可中断）**、自检报告；返回值形状对齐 AdsPower（`ws.puppeteer` / `ws.selenium` / `debug_port` / `status: Active|Inactive` / `cookies` / `kernels`）
+- 未实现的 46 条云端透传接口（回收站、分享、成员、内核下载…）**明确报「不支持」**（`code:-1` + `data.supported:false`），不假成功、不留未知码
 - 本地 API：`/status`、环境 CRUD、浏览器启停、返回值形状对齐 AdsPower（`ws.puppeteer` / `ws.selenium` / `debug_port`）
 
 ### 不做（已和 CEO 确认，写进范围外）
@@ -61,9 +63,9 @@ $env:FREEPOWER_CHROME='C:\path\to\chrome.exe'; npm start
 
 ## 四、本地 API
 
-鉴权：`api_key` 查询参数 / `api_key` 头 / `Authorization: Bearer`。**本地校验，离线可用**（对手是远端校验，离线不可用，这是我们有意做的差异）。
+鉴权：`api-key` 头（对齐对手）、`api_key` 查询参数 / 头、`Authorization: Bearer`。**本地校验，离线可用**（对手是远端校验，离线不可用，这是我们有意做的差异）。
 
-限流：`/status` 不限流；其余路由默认 1 次/秒，带 `x-freepower-client: mcp` 头走 30 次/秒。超限报文与对手逐字一致：
+限流：`/status` 不限流；其余路由默认 1 次/秒，带 `x-freepower-client: mcp` 或 `x-adspower-client: mcp` 头走 30 次/秒。超限报文与对手逐字一致（HTTP 200，脚本按这句判断要不要重试）：
 
 ```json
 {"code":-1,"msg":"Too many request per second, please check"}
@@ -75,25 +77,56 @@ CORS：只放行 `127.0.0.1` / `localhost` 的 Origin，其他返回 `403` + 纯
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/status` | 探活，`{"code":0,"msg":"success"}`，形状对齐 AdsPower |
+| GET | `/status` | 探活，`{"code":0,"msg":"success"}`，免鉴权、**不限流** |
 | GET | `/api/v1/user/list` | 环境列表（`page` / `page_size` / `group_id` / `name`） |
+| POST | `/api/v2/browser-profile/list` | 环境列表（v2：`limit` **不传只回 1 条**，照抄对手） |
 | GET | `/api/v1/user/detail` | 单个环境 |
 | POST | `/api/v1/user/create` | 建环境 |
 | POST | `/api/v1/user/update` | 改环境 |
 | POST | `/api/v1/user/delete` | 删环境（运行中会先停） |
 | POST | `/api/v1/user/regroup` | 改分组 |
-| POST | `/api/v1/user/new-fingerprint` | 整组重生成指纹 |
+| POST | `/api/v1/user/new-fingerprint` | 整组重生成指纹（≤10 个） |
 | GET | `/api/v1/group/list` | 分组列表 |
 | POST | `/api/v1/group/create` | 建分组 |
-| GET | `/api/v1/browser/start` | 起环境 |
-| GET | `/api/v1/browser/stop` | 关环境 |
-| GET | `/api/v1/browser/active` | 运行中列表 |
-| GET | `/api/v1/browser/local-active` | 同上（对齐对手命名） |
+| POST | `/api/v1/group/update` / `delete` | 改 / 删分组（删组把环境挪回 Default，不连带删环境） |
+| GET | `/api/v1/browser/start` | 起环境（支持 `launch_args` 覆盖、`force=1`） |
+| GET | `/api/v1/browser/stop` | 关环境（没开 → `800002`；成功**没有 `data`**） |
+| GET | `/api/v1/browser/active` | `{status:"Active",...}` 或 `{status:"Inactive"}`（缺 id → `100002`） |
+| GET | `/api/v1/browser/local-active` | 本机已开环境 `{list:[...]}` |
+| POST | `/api/v1/browser/cloud-active` | **明确报不支持**（云端能力，本地没有），不会假成功 |
+| POST | `/api/v1/browser/batch-start` | 批量起（并发上限、失败清单、可中断）— FreePower 扩展 |
+| POST | `/api/v1/browser/batch-stop` | 批量停 — FreePower 扩展 |
+| POST | `/api/v2/browser-profile/stop-all` | 关掉本机全部 |
+| GET | `/api/v2/browser-profile/cookies` | `{cookies:"<login_cookie 原文>"}` |
+| GET | `/api/v2/browser-profile/kernels` | `{list:[{kernel_type,kernel,is_downloaded}]}`（`kernel_type` 非法 → `100002`） |
+| POST | `/api/v2/browser-tags/list` / `create` / `update` / `delete` | 标签 CRUD（本地实现） |
+| POST | `/api/v2/proxy-list/create` / `update` / `list` / `delete` | 代理列表 CRUD（本地实现；create 的 body 是**顶层数组**） |
 | POST | `/api/v1/proxy/check` | 代理预检：先验一下代理再绑环境（`data.ok` 是检查结果，失败也 `code:0`） |
 | GET | `/api/v1/browser/selfcheck` | 自检报告（`user_id`；`rerun=1` 重跑） |
 | POST | `/api/v2/browser-profile/create` | 建环境（v2 形状：`launch_args` 出站数组、`password_filling` 单布尔） |
 | POST | `/api/v2/proxy/check` | 代理预检 |
 | GET | `/api/v2/browser-profile/selfcheck` | 自检报告（`profile_id`；`rerun=1` 重跑；`format=html` 出自检页） |
+
+未实现的云端透传接口（回收站、分享、成员体系、内核下载、fb/*…）统一返回：
+
+```json
+{"code":-1,"msg":"FreePower 不支持该接口（AdsPower 依赖其云端，本地没有对应能力）：/api/v2/browser-profile/share","data":{"supported":false,"path":"..."}}
+```
+
+错误码只有 6 个，脚本不会拿到未知码：`-1` 通用 / `100001` 环境不存在 / `100002` 参数非法 / `800002` 未在运行 / `800003` 启动失败 / `800005` 启动前一致性校验不通过。
+
+批量启停（FreePower 扩展，响应形状）：
+
+```json
+{"code":0,"msg":"success","data":{
+  "requested":3,"concurrency":3,"interrupted":false,"elapsed_ms":8120,
+  "started":[{"profile_id":"a1","pid":123,"ws":{"puppeteer":"ws://..."},"debug_port":"60001","already_running":false}],
+  "already_running":[],
+  "failed":[{"profile_id":"a2","code":800003,"reason":"proxy_unreachable","message":"..."}],
+  "skipped":["a3"]}}
+```
+
+`interrupted:true` 表示中途失败后**没有继续起剩下的**，剩下的原样在 `skipped` 里；起成功的不会回滚，用户能明确知道哪些成了。
 
 `browser/start` 返回（形状按拆解手 05 号契约）：
 
@@ -150,26 +183,32 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 10. **2D canvas 固定软件光栅化**（`--disable-accelerated-2d-canvas`）。GPU 2D 路径跨进程会产生不同像素，导致 canvas 哈希跨重启漂移；固定软件光栅化后四轮实测一致。代价：`chrome://gpu` 显示 Software only，canvas 密集页面略慢。
 11. **远程代理下的自检有盲区**：自检页走 `http://127.0.0.1` 安全上下文；若代理强制 loopback 也走代理（非 `--proxy-bypass-list=<-loopback>` 的配置），会回落到 `about:blank`，此时报告里 UA-CH / 媒体设备明确标「本次未验证」，不标通过。
 12. **轮换代理会把「出口 IP 与预检不一致」判为告警**（正常业务形态，只提示不阻断）；运行中没有代理健康检查，掉线时请求失败但不会回退直连。
-13. 主程序 UI（Electron）还没做，目前只有 API 与内核链路。
+13. **云端依赖的接口一律不支持**：`cloud-active`、回收站、分享、成员体系、内核下载、`fb/*`、应用/分类等 17 条（对手 54 条路由里剩下的云端透传）返回 `-1` + `data.supported:false`，**不假成功**。`cloud-active` 尤其明确：脚本若以为"环境已开"会直接下错单。
+14. **批量启停的并发默认 3**（`FREEPOWER_BATCH_CONCURRENCY` 可调，请求里 `concurrency` 覆盖，夹在 1..10）。批量启动**中途失败即中断**：已经起来的保留，剩下的不硬起，返回 `failed` + `skipped`。
+15. **`kernels` 的版本号区分「实测」与「猜」**：系统 Chrome 的 `Application\` 下可能同时有几个版本目录（本机实测有 156/157），而启动器实际跑哪个由注册表决定。启动过就报 `Browser.getVersion` 的真值（`probed:true`），没启动过则按目录名猜。**不要拿目录名当真实版本用。**
+16. 主程序 UI（Electron）还没做，目前只有 API 与内核链路。
 
 ## 六、验证
 
 ```powershell
-# 不需要 Chrome：profile schema + 代理预检/白名单/跟版/校验分级
+# 不需要 Chrome：schema + 单元测试 + 本地 API 契约
 npm run test
 
 # 需要真实 Chrome + 完整权限（沙箱挡命名管道和进程查询）
 npm run smoke
 ```
 
-冒烟覆盖（129 项）：
+冒烟覆盖（148 项）：
 
 - `/status` 形状、鉴权、跨站 Origin 403 纯文本、限流报文
 - 建环境 → 起真 Chrome → 探针读回 UA / UA-CH / 时区 / 语言 / platform / hardwareConcurrency / WebGL / `navigator.webdriver`
 - Canvas 同页连读两次一致、重启后不变、换环境后必变
 - **四维噪声确定性**：canvas / webgl_image / audio / client_rects 各自种子入库，重启后哈希与种子都不漂移
 - **自检**：启动后自动跑 15 项、覆盖度 7/7/1、四个哈希齐全、`rerun=1` 重跑、HTML 页可读且无外链
-- 停环境后进程树回收干净、重复 start 幂等
+- **本地 API 完整化**：`active` 的 Active/Inactive 形状、`local-active`、`cookies`、`kernels`、标签/代理列表 CRUD、占位接口明确不支持
+- **批量启停**：一次起 3 个、批量停、失败清单带 code/message、中途失败即中断、并发上限生效
+- **cloud-active 明确报错**（`-1` + `supported:false`，不假成功）
+- 停环境后进程树回收干净、重复 start 幂等、重复 stop 800002
 - **代理 fail-closed**：死代理 `start` 失败且一个内核进程都不起；活代理下浏览器出口 IP = 预检 IP；连 `127.0.0.1` 也走代理（没有 loopback bypass）
 - **PAC 明确拒绝**：建环境 `100002`；老数据启动 `800003` + 零内核进程
 - **出口地理一致性**：声明时区/语言与出口不一致时会出现在 `warnings` 里
@@ -181,12 +220,16 @@ npm run smoke
 ```
 src/
   main.js              入口：起 API、写发现文件、回收环境
-  config.js            端口/路径/限流配置
-  api/server.js        路由、鉴权、限流、CORS
-  store/db.js          node:sqlite 建表与 API Key
-  store/profiles.js    环境 CRUD（内部 schema）
+  config.js            端口/路径/限流/批量并发配置
+  api/server.js        传输层：鉴权、限流、CORS、错误整形
+  api/routes.js        路由表：A 类本地组装 / B 类自己实现 / 占位明确不支持
+  api/contract.js      错误码、响应外壳、launch_args 与 password_filling 边界转换
+  store/db.js          node:sqlite 建表、迁移补列、API Key
+  store/profiles.js    环境 CRUD、分组、cookie 规范化、一致性校验
+  store/tags.js        标签 CRUD（本地实现）
+  store/proxies.js     代理列表 CRUD（本地实现）+ proxy_id → 启动配置
   fingerprint/         指纹生成（种子化，保证自洽）+ seeds.js（四维噪点种子入库）
-  kernel/chrome.js     内核定位、启动参数、DevToolsActivePort、进程树回收
+  kernel/chrome.js     内核定位/清单、启动参数、DevToolsActivePort、进程树回收
   kernel/launch-args.js launch_args 白名单合并（保护名单/feature 并集）
   kernel/version.js    UA / UA-CH / kernel_version 跟版
   kernel/cdp.js        CDP over WebSocket 客户端
@@ -196,8 +239,10 @@ src/
   proxy/pac.js         PAC 检测与拒绝文案（fail-closed）
   selfcheck/           自检：页面探针 / 报告 / 落盘 / 本地安全上下文服务 / HTML 渲染
   runtime/manager.js   启停、校验/预检/跟版、自动 attach 新标签页、自检、代理认证
-test/smoke.mjs         端到端冒烟（129 项）
-test/unit.test.mjs     零 Chrome 单元测试（30 项）
+  runtime/batch.js     批量启停：并发池、失败清单、中断
+test/smoke.mjs         端到端冒烟（148 项，需真实 Chrome）
+test/unit.test.mjs     零 Chrome 单元测试（34 项）
+test/api.test.mjs      本地 API 契约测试（50 项，不需要 Chrome）
 test/fake-proxy.mjs    假代理 / 假出口端点（冒烟不依赖公网）
-docs/                  技术方案、阶段交付（含 P2 自检样例）
+docs/                  技术方案、阶段交付（含 P2 自检样例、P4 curl 实测）
 ```

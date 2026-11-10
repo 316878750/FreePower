@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS proxies (
   port          INTEGER NOT NULL,
   username      TEXT,
   password      TEXT,
+  remark        TEXT,
+  ipchecker     TEXT,
   last_ip       TEXT,
   last_country  TEXT,
   last_region   TEXT,

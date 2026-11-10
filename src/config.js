@@ -52,3 +52,9 @@ export const SELFCHECK_TIMEOUT_MS = Number(process.env.FREEPOWER_SELFCHECK_TIMEO
 
 /** 指纹调试：把注入前的原生函数暴露到 window.__fpOrig（排查「哈希为什么变了」用，默认关） */
 export const FP_DEBUG = process.env.FREEPOWER_FP_DEBUG === '1';
+
+/**
+ * 批量启停的并发上限。默认 3：再高会同时抢 CPU/磁盘，内核反而起得更慢，
+ * 也容易把代理预检压出超时（10 个环境 × 每个 3 条连接）。
+ */
+export const BATCH_CONCURRENCY = Math.max(1, Number(process.env.FREEPOWER_BATCH_CONCURRENCY || 3));

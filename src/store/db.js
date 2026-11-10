@@ -44,6 +44,7 @@ function migrate(d) {
   // 2) 建新结构（幂等）
   d.exec(DDL);
   d.exec('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);');
+  ensureColumns(d, 'proxies', { remark: 'TEXT', ipchecker: 'TEXT' });
 
   // 3) 数据搬迁
   if (tableExists(d, 'profiles_legacy_v0')) migrateLegacyProfiles(d);
@@ -59,6 +60,15 @@ function migrate(d) {
 
 function tableExists(d, name) {
   return !!d.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name);
+}
+
+/** 老库补列（CREATE TABLE IF NOT EXISTS 不会给已有表加列） */
+function ensureColumns(d, table, cols) {
+  if (!tableExists(d, table)) return;
+  const have = new Set(tableColumns(d, table));
+  for (const [name, type] of Object.entries(cols)) {
+    if (!have.has(name)) d.exec(`ALTER TABLE "${table}" ADD COLUMN "${name}" ${type};`);
+  }
 }
 
 function migrateLegacyGroups(d) {

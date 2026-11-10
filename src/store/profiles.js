@@ -17,6 +17,7 @@ import { generateFingerprint, regenerateFingerprint, FALLBACK_KERNEL, geoFor } f
 import { fingerprintView, declaredSnapshot } from '../fingerprint/view.js';
 import { newSeed } from '../fingerprint/rng.js';
 import { findChrome } from '../kernel/chrome.js';
+import { getProxy, proxyConfigOf } from './proxies.js';
 
 /** 对外暴露的默认代理形状（user_proxy_config 镜像） */
 export const DEFAULT_PROXY = {
@@ -93,6 +94,35 @@ export function toApi(profile) {
   };
 }
 
+/**
+ * cookie 字段的存储形状：对手要求它是「JSON 数组字符串」（校验文案 `cookie must be list string`），
+ * 但脚本里经常直接传 `sid=xxx; uid=7` 这种原始串。两种都收：
+ *   - 已经是 JSON 数组串 → 规整成数组串
+ *   - 原始串 → 包成单元素数组（读出来还是原文）
+ */
+export function cookieToStorage(v) {
+  const s = String(v ?? '').trim();
+  if (!s) return '';
+  if (s.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(s);
+      if (Array.isArray(parsed)) return JSON.stringify(parsed.map(String));
+    } catch { /* 不是 JSON，按原始串处理 */ }
+  }
+  return JSON.stringify([s]);
+}
+
+/** 存储形状 → 对外「原文」（单元素直接返回，多元素按 ; 拼成可用的 cookie 串） */
+export function cookieText(v) {
+  const s = String(v ?? '');
+  if (!s.trim()) return '';
+  try {
+    const parsed = JSON.parse(s);
+    if (Array.isArray(parsed)) return parsed.map(String).join('; ');
+  } catch { /* 老数据就是原始串 */ }
+  return s;
+}
+
 export function createProfile(input = {}) {
   const seed = input.fingerprint_seed ?? newSeed();
   const kernel = input.kernel_version || kernelVersionForNewProfile();
@@ -116,6 +146,14 @@ export function createProfile(input = {}) {
     status: 'idle',
   };
   if (flat.user_proxy_config) flat.domain_name = flat.domain_name || '';
+  if (input.login_cookie !== undefined) flat.cookie = cookieToStorage(input.login_cookie);
+  else if (flat.cookie !== undefined && flat.cookie !== null) flat.cookie = cookieToStorage(flat.cookie);
+  if (Array.isArray(input.profile_tag_ids)) flat.profile_tag_ids = input.profile_tag_ids.map(String);
+  // 引用代理列表里的代理：proxy_id → 连接配置（显式 proxy_config 优先，不覆盖）
+  if (!flat.user_proxy_config && input.proxy_id) {
+    const preset = getProxy(input.proxy_id);
+    if (preset) flat.user_proxy_config = proxyConfigOf(preset);
+  }
 
   const res = dbCreate(getDb(), flat);
   if (!res.ok) {
@@ -143,7 +181,15 @@ export function getProfile(profileId) {
   return toApi(dbGet(getDb(), profileId));
 }
 
-export function listProfiles({ page = 1, page_size = 50, group_id = null, name = null } = {}) {
+/** serial_number / profile_no 是同一个数字编号，脚本里两种写法都有 */
+export function getProfileByNo(no) {
+  const n = Number(no);
+  if (!Number.isFinite(n)) return null;
+  const row = getDb().prepare('SELECT id FROM profiles WHERE profile_no = ?').get(n);
+  return row ? toApi(dbGet(getDb(), row.id)) : null;
+}
+
+export function listProfiles({ page = 1, page_size = 50, group_id = null, name = null, ids = null, profile_nos = null, tag_ids = null, sort_field = null, sort_order = null } = {}) {
   const db = getDb();
   const where = [];
   const args = [];
@@ -155,11 +201,31 @@ export function listProfiles({ page = 1, page_size = 50, group_id = null, name =
     where.push('name LIKE ?');
     args.push(`%${name}%`);
   }
+  if (Array.isArray(ids) && ids.length) {
+    where.push(`id IN (${ids.map(() => '?').join(',')})`);
+    args.push(...ids.map(String));
+  }
+  if (Array.isArray(profile_nos) && profile_nos.length) {
+    const nos = profile_nos.map(Number).filter(Number.isFinite);
+    if (nos.length) {
+      where.push(`profile_no IN (${nos.map(() => '?').join(',')})`);
+      args.push(...nos);
+    }
+  }
+  if (Array.isArray(tag_ids) && tag_ids.length) {
+    // profile_tag_ids 是 CSV 存储：用 ,id, 的边界匹配，避免 tag_ab 命中 tag_abc
+    const likes = tag_ids.map(() => `(',' || profile_tag_ids || ',') LIKE ?`);
+    where.push(`(${likes.join(' OR ')})`);
+    for (const t of tag_ids) args.push(`%,${String(t)},%`);
+  }
   const sqlWhere = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const total = db.prepare(`SELECT COUNT(*) AS n FROM profiles ${sqlWhere}`).get(...args).n;
   const size = Math.min(Math.max(Number(page_size) || 50, 1), 500);
   const offset = (Math.max(Number(page) || 1, 1) - 1) * size;
-  const rows = db.prepare(`SELECT id FROM profiles ${sqlWhere} ORDER BY profile_no ASC LIMIT ? OFFSET ?`).all(...args, size, offset);
+  const sortable = { name: 'name', profile_no: 'profile_no', created_at: 'created_at', updated_at: 'updated_at', last_launch_at: 'last_launch_at' };
+  const orderBy = sortable[String(sort_field || 'profile_no')] || 'profile_no';
+  const dir = String(sort_order || 'asc').toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+  const rows = db.prepare(`SELECT id FROM profiles ${sqlWhere} ORDER BY ${orderBy} ${dir} LIMIT ? OFFSET ?`).all(...args, size, offset);
   return {
     list: rows.map((r) => toApi(dbGet(db, r.id))),
     page: Number(page) || 1,
@@ -183,6 +249,19 @@ export function updateProfile(profileId, patch = {}) {
   }
   if (patch.proxy_config !== undefined || patch.proxy_host !== undefined || patch.host !== undefined) {
     flat.user_proxy_config = normalizeProxy({ ...(cur.user_proxy_config || {}), ...(patch.proxy_config || patch) });
+  }
+  if (patch.login_cookie !== undefined) flat.cookie = cookieToStorage(patch.login_cookie);
+  else if (flat.cookie !== undefined && flat.cookie !== null) flat.cookie = cookieToStorage(flat.cookie);
+  if (Array.isArray(patch.profile_tag_ids)) flat.profile_tag_ids = patch.profile_tag_ids.map(String);
+  // 换绑代理列表里的代理
+  if (patch.proxy_id !== undefined && patch.proxy_config === undefined) {
+    if (!patch.proxy_id) {
+      flat.user_proxy_config = null;
+      flat.proxy_id = null;
+    } else {
+      const preset = getProxy(patch.proxy_id);
+      if (preset) flat.user_proxy_config = proxyConfigOf(preset);
+    }
   }
 
   // 换国家 = 换时区/语言/地理，必须整组重算，不能只改一个字段
@@ -257,6 +336,40 @@ export function createGroup(groupNameStr) {
   db.prepare('INSERT INTO groups (id, name, sort, created_at) VALUES (?, ?, ?, ?)')
     .run(id, groupNameStr, maxSort + 1, new Date().toISOString());
   return { group_id: id, group_name: groupNameStr };
+}
+
+export function getGroup(groupId) {
+  return getDb().prepare('SELECT id AS group_id, name AS group_name, sort FROM groups WHERE id = ?').get(String(groupId)) || null;
+}
+
+export function updateGroup({ group_id: groupId, group_name: groupName, remark } = {}) {
+  const db = getDb();
+  const cur = getGroup(groupId);
+  if (!cur) return null;
+  const name = groupName !== undefined ? String(groupName) : cur.group_name;
+  // groups 表没有 remark 列：先放在 meta 里（对手这里 remark 可为 null）
+  db.prepare('UPDATE groups SET name = ? WHERE id = ?').run(name, String(groupId));
+  if (remark !== undefined) {
+    db.exec('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);');
+    db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+      .run(`group_remark:${groupId}`, remark === null ? '' : String(remark));
+  }
+  return { group_id: String(groupId), group_name: name, remark: remark ?? null };
+}
+
+/**
+ * 删分组：不允许删 Default(0)；组里的环境不删，统一挪回 Default。
+ * 对手（云端）是先拦「组里有环境」，我们本地更实用：挪回默认组并如实返回数量。
+ */
+export function deleteGroup(groupId) {
+  const db = getDb();
+  const id = String(groupId);
+  if (id === '0') return { ok: false, reason: 'default_group_protected' };
+  const cur = getGroup(id);
+  if (!cur) return { ok: false, reason: 'not_found' };
+  const moved = db.prepare('UPDATE profiles SET group_id = ? WHERE group_id = ?').run('0', id).changes;
+  db.prepare('DELETE FROM groups WHERE id = ?').run(id);
+  return { ok: true, moved };
 }
 
 export function markStatus(profileId, status) {

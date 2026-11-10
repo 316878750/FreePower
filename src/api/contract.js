@@ -27,9 +27,30 @@ export class ApiError extends Error {
   }
 }
 
-/** 成功响应：code 0 / msg success / data */
+/**
+ * 成功响应：code 0 / msg success（小写）/ data。
+ * 契约细节：`data` 为 null 时**整个 key 不出现**（对齐对手，别输出 `"data":null`）。
+ */
 export function ok(data = null) {
-  return { code: 0, msg: 'success', data };
+  const out = { code: 0, msg: 'success' };
+  if (data !== null && data !== undefined) out.data = data;
+  return out;
+}
+
+/** 限流超限报文（逐字对齐对手，脚本会按这句做重试判断） */
+export const TOO_MANY_MSG = 'Too many request per second, please check';
+
+/**
+ * 未实现接口的统一说法：**明确说「不支持」，不假装成功**。
+ * 脚本拿到的是已知错误码 -1，不是未知码，也不会误判成「已经开了」。
+ */
+export function unsupported(path) {
+  return new ApiError(
+    ERR.GENERIC,
+    `FreePower 不支持该接口（AdsPower 依赖其云端，本地没有对应能力）：${path}`,
+    200,
+    { supported: false, path },
+  );
 }
 
 /**

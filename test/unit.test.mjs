@@ -17,6 +17,9 @@ import { buildReport } from '../src/selfcheck/report.js';
 import { renderHtml } from '../src/selfcheck/html.js';
 import { pacInUse, pacMessage } from '../src/proxy/pac.js';
 import { buildArgs } from '../src/kernel/chrome.js';
+import { ok, unsupported } from '../src/api/contract.js';
+import { clampConcurrency } from '../src/runtime/batch.js';
+import { cookieToStorage, cookieText } from '../src/store/profiles.js';
 import { startFakeProxy } from './fake-proxy.mjs';
 
 /** 找一个当前没人监听的端口（起一个 server 再关掉） */
@@ -439,4 +442,48 @@ test('自检 HTML：本地渲染、内容转义、不引外链', () => {
   assert.ok(!html.includes('<script>alert(1)</script>'), '必须转义');
   assert.match(html, /自检符合度/);
   assert.ok(!/https?:\/\//.test(html), '不引外部资源');
+});
+
+/* --------------------------- P4：本地 API 契约 --------------------------- */
+
+test('响应外壳：data 为 null 时整个 key 不出现（照抄对手）', () => {
+  assert.deepEqual(ok(null), { code: 0, msg: 'success' });
+  assert.equal('data' in ok(undefined), false);
+  assert.deepEqual(ok({ a: 1 }).data, { a: 1 });
+});
+
+test('未实现接口：明确说不支持，错误码是已知的 -1', () => {
+  const e = unsupported('/api/v2/browser-profile/share');
+  assert.equal(e.code, -1);
+  assert.equal(e.httpStatus, 200);
+  assert.match(e.message, /不支持/);
+  assert.equal(e.extra.supported, false);
+  assert.equal(e.extra.path, '/api/v2/browser-profile/share');
+});
+
+test('批量启停的并发上限夹在 1..10', () => {
+  assert.equal(clampConcurrency(3), 3);
+  assert.equal(clampConcurrency(0), 1);
+  assert.equal(clampConcurrency(-5), 1);
+  assert.equal(clampConcurrency(99), 10);
+  assert.equal(clampConcurrency('4'), 4);
+  assert.equal(clampConcurrency(undefined, 2), 2);
+  assert.equal(clampConcurrency('abc', 7), 7);
+  assert.equal(clampConcurrency(2.9), 2);
+});
+
+test('cookie 存储形状：原始串与 JSON 数组串都能进，读出来是原文', () => {
+  // 原始 cookie 串 → 包成单元素数组（校验要求 JSON 数组）
+  const stored = cookieToStorage('sid=abc; uid=7');
+  assert.equal(stored, JSON.stringify(['sid=abc; uid=7']));
+  assert.equal(cookieText(stored), 'sid=abc; uid=7');
+  // 已经是数组串 → 规整后原样返回
+  const arr = cookieToStorage('["a=1","b=2"]');
+  assert.equal(arr, '["a=1","b=2"]');
+  assert.equal(cookieText(arr), 'a=1; b=2');
+  // 空值
+  assert.equal(cookieToStorage(''), '');
+  assert.equal(cookieText(null), '');
+  // 坏 JSON 不抛异常，按原文处理
+  assert.equal(cookieText('[not json'), '[not json');
 });

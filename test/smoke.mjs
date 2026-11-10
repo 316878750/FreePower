@@ -471,22 +471,86 @@ async function main() {
       await sleep(500);
     }
 
+    /* ================= P4-A：不依赖内核的本地 API ================= */
+    {
+      const ids3 = started.map((s) => s.profile.profile_id);
+
+      // 批量启动的「中断」：第一个必然失败（死代理），后面的不许硬起
+      const b1 = await api('POST', '/api/v1/browser/batch-start', { user_ids: [badProxyId, 'ghost-a', 'ghost-b'], concurrency: 2 });
+      const d1 = b1.json.data || {};
+      check('批量启动：失败清单带 code/message', b1.json.code === 0 && d1.failed?.length >= 1 && typeof d1.failed[0].code === 'number', JSON.stringify(d1.failed));
+      check('批量启动：中途失败即中断，剩下的进 skipped', d1.interrupted === true && d1.started?.length === 0 && d1.skipped?.length >= 1, `started=${d1.started?.length} skipped=${d1.skipped?.length}`);
+      check('批量启动：回显并发上限', d1.concurrency === 2, String(d1.concurrency));
+
+      // cloud-active 必须明确报错
+      const cloud = await api('POST', '/api/v1/browser/cloud-active', { user_ids: ids3.join(',') });
+      check('cloud-active：明确报不支持，不假成功', cloud.json.code === -1 && cloud.json.data?.supported === false && /不支持 cloud-active/.test(cloud.json.msg), cloud.json.msg);
+
+      // 其余本地组装路由
+      const ck = await api('GET', `/api/v2/browser-profile/cookies?profile_id=${ids3[0]}`);
+      check('cookies：{cookies:"..."}', ck.json.code === 0 && typeof ck.json.data?.cookies === 'string');
+      const kn = await api('GET', '/api/v2/browser-profile/kernels?kernel_type=chrome');
+      check('kernels：本机内核列表', kn.json.code === 0 && (kn.json.data?.list || []).length > 0, JSON.stringify(kn.json.data?.list?.map((x) => x.kernel)));
+      const knBad = await api('GET', '/api/v2/browser-profile/kernels?kernel_type=opera');
+      check('kernels：非法类型 100002', knBad.json.code === 100002, knBad.json.msg);
+
+      // 标签 / 代理列表：本地 CRUD
+      const tag = await api('POST', '/api/v2/browser-tags/create', { tags: { name: 'smoke-tag', color: 'green' } });
+      check('标签：建', tag.json.code === 0 && tag.json.data?.list?.[0]?.color === 'green');
+      const tagId = tag.json.data?.list?.[0]?.id;
+      const px = await api('POST', '/api/v2/proxy-list/create', [{ type: 'socks5', host: '127.0.0.1', port: dead, remark: 'smoke' }]);
+      check('代理列表：建（顶层数组）', px.json.code === 0 && px.json.data?.[0]?.type === 'socks5');
+      const pxId = px.json.data?.[0]?.proxy_id;
+      const pxList = await api('POST', '/api/v2/proxy-list/list', { limit: 10 });
+      check('代理列表：列表', pxList.json.code === 0 && pxList.json.data?.list?.some((x) => x.proxy_id === pxId));
+      await api('POST', '/api/v2/proxy-list/delete', { proxy_id: [pxId] });
+      if (tagId) await api('POST', '/api/v2/browser-tags/delete', { ids: [tagId] });
+
+      // 占位：明确不支持
+      const ph = await api('POST', '/api/v2/browser-profile/recycle-bin/list', { page: 1 });
+      check('占位路由：明确不支持', ph.json.code === -1 && ph.json.data?.supported === false);
+    }
+
     /* ================= 契约基础 ================= */
     const pids = started.map((s) => Number(s.data.pid));
     const stops = await Promise.all(started.map((s) => api('GET', `/api/v1/browser/stop?user_id=${s.profile.profile_id}`)));
-    check('3 个环境都停掉', stops.every((r) => r.json.code === 0 && r.json.data?.stopped === true));
+    check('3 个环境都停掉', stops.every((r) => r.json.code === 0 && r.json.data === undefined));
     const gone = await Promise.all(pids.map((pid) => waitPidGone(pid)));
     check('主进程全部退出', gone.every(Boolean), pids.join(','));
-    await sleep(1500);
-
-    const leftovers = chromePidsMatching('freepower').filter((x) => /^\d+$/.test(x));
-    check('无残留 chrome 进程', leftovers.length === 0, leftovers.join(',') || 'none');
 
     const stopAgain = await api('GET', `/api/v1/browser/stop?user_id=${started[0].profile.profile_id}`);
     check('重复 stop 返回 800002', stopAgain.json.code === 800002, String(stopAgain.json.code));
 
-    const active = await api('GET', '/api/v1/browser/active');
-    check('active 列表为空', active.json.data?.list?.length === 0, JSON.stringify((active.json.data?.list || []).map((x) => x.profile_id)));
+    const active = await api('GET', `/api/v1/browser/active?user_id=${started[0].profile.profile_id}`);
+    check('active：停掉后是 {status:"Inactive"}', active.json.data?.status === 'Inactive', JSON.stringify(active.json.data));
+    const activeNoId = await api('GET', '/api/v1/browser/active');
+    check('active：缺 id 报 100002', activeNoId.json.code === 100002, String(activeNoId.json.code));
+
+    /* ================= P4-B：真起 3 个 + 批量停 ================= */
+    {
+      const ids3 = started.map((s) => s.profile.profile_id);
+      const b2 = await api('POST', '/api/v2/browser-profile/batch-start', { profile_ids: ids3, concurrency: 3 });
+      const d2 = b2.json.data || {};
+      check('批量启动：一次起 3 个', b2.json.code === 0 && d2.started?.length === 3 && d2.failed?.length === 0, JSON.stringify(d2.failed));
+      check('批量启动：每个都有 ws/debug_port', (d2.started || []).every((x) => x.ws?.puppeteer && typeof x.debug_port === 'string'));
+      for (const x of d2.started || []) extraPids.push(Number(x.pid));
+      check('批量启动：并发上限生效（3）', d2.concurrency === 3, String(d2.concurrency));
+
+      const act2 = await api('GET', `/api/v2/browser-profile/active?profile_id=${ids3[0]}`);
+      check('active：开着的时候是 {status:"Active"}', act2.json.data?.status === 'Active' && !!act2.json.data?.ws?.puppeteer, JSON.stringify(act2.json.data));
+      const la2 = await api('GET', '/api/v1/browser/local-active');
+      check('local-active：3 个都在列表里', la2.json.data?.list?.length === 3, String(la2.json.data?.list?.length));
+
+      const b3 = await api('POST', '/api/v2/browser-profile/batch-stop', { profile_ids: ids3, concurrency: 5 });
+      check('批量停止：3 个都停掉', b3.json.code === 0 && b3.json.data?.stopped?.length === 3, JSON.stringify(b3.json.data));
+      const la3 = await api('GET', '/api/v1/browser/local-active');
+      check('批量停止后 local-active 为空', la3.json.data?.list?.length === 0);
+      await Promise.all((d2.started || []).map((x) => waitPidGone(Number(x.pid))));
+      await sleep(800);
+    }
+
+    const leftovers = chromePidsMatching('freepower').filter((x) => /^\d+$/.test(x));
+    check('无残留 chrome 进程', leftovers.length === 0, leftovers.join(',') || 'none');
   } catch (e) {
     check('冒烟异常', false, e.stack || e.message);
   } finally {

@@ -55,6 +55,57 @@ export function findChrome() {
   return resolved;
 }
 
+/**
+ * 本机可用的内核清单（kernels 路由用）。
+ * 只报「磁盘上真的有可执行文件」的版本：系统 Chrome 的版本子目录 + 我们的内核矩阵目录。
+ */
+export function listKernels({ type = 'chrome' } = {}) {
+  const t = String(type).toLowerCase();
+  if (t !== 'chrome') return [];
+  const out = [];
+  const seen = new Set();
+  const push = (version, exePath, source) => {
+    if (!version || seen.has(`${version}|${exePath}`)) return;
+    seen.add(`${version}|${exePath}`);
+    out.push({ kernel_type: 'chrome', kernel: version, is_downloaded: true, path: exePath, source });
+  };
+
+  if (CHROME_BIN && fs.existsSync(CHROME_BIN)) {
+    push(versionFromPath(CHROME_BIN) || 'unknown', CHROME_BIN, 'env');
+  }
+  if (fs.existsSync(KERNELS_DIR)) {
+    for (const v of fs.readdirSync(KERNELS_DIR).filter((x) => /^\d+\.\d+\.\d+\.\d+$/.test(x))) {
+      for (const rel of ['chrome.exe', 'chrome-win64\\chrome.exe', 'chrome-win\\chrome.exe']) {
+        const p = path.join(KERNELS_DIR, v, rel);
+        if (fs.existsSync(p)) { push(v, p, 'kernel-matrix'); break; }
+      }
+    }
+  }
+  for (const dir of CANDIDATE_DIRS) {
+    if (!dir || !fs.existsSync(dir)) continue;
+    const versions = fs.readdirSync(dir).filter((v) => /^\d+\.\d+\.\d+\.\d+$/.test(v));
+    for (const v of versions) {
+      const p = exeIn(path.join(dir, v));
+      if (p) push(v, p, 'system');
+    }
+    const direct = exeIn(dir);
+    if (direct) push(versionFromPath(direct) || 'unknown', direct, 'system');
+  }
+  const current = findChrome();
+  const known = readKnownVersion();
+  return out
+    .map((k) => {
+      const item = { ...k, in_use: !!current && current.path === k.path };
+      // 目录名只是猜：同一个 chrome.exe 的版本子目录可能有多个（实测有 156/157，跑的是 156）。
+      // 启动探测过就报真值，把目录猜测留在 guessed_kernel 里，别让调用方按错版本号挑内核。
+      if (known && known.path === k.path && known.version !== k.kernel) {
+        return { ...item, kernel: known.version, guessed_kernel: k.kernel, probed: true };
+      }
+      return item;
+    })
+    .sort((a, b) => compareVersion(b.kernel, a.kernel));
+}
+
 function resolveChrome() {
   if (CHROME_BIN && fs.existsSync(CHROME_BIN)) {
     return { path: CHROME_BIN, version: versionFromPath(CHROME_BIN), source: 'env' };
