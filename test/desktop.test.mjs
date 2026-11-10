@@ -160,6 +160,21 @@ check('安装包图标存在且是 ICO', fs.existsSync(ico) && fs.statSync(ico).
 const pngHead = fs.existsSync(tray) ? fs.readFileSync(tray).subarray(1, 4).toString() : '';
 check('托盘图标是 PNG', pngHead === 'PNG', pngHead);
 
+/* ------------------- 6. 卸载器兜底（installer.nsh） ------------------- */
+// 背景：卸载器把自己拷到 %TEMP%\~nsu.tmp 再跑，命令行不带原路径，
+// 只能靠 HKCU\Software\<APP_GUID> 的 InstallLocation 找目录；该键丢了就会
+// 「退出码 0、一个文件没删」。约定：安装时落一份标记，卸载时用它兜底。
+check('nsis.include 指向安装钩子', /include:\s*desktop\/build\/installer\.nsh/.test(yml));
+
+const hooksPath = path.join(ROOT, 'desktop', 'build', 'installer.nsh');
+const hooks = fs.existsSync(hooksPath) ? fs.readFileSync(hooksPath, 'utf8') : '';
+check('安装钩子存在', hooks.length > 0);
+check('安装时记下安装目录', /!macro customInstall[\s\S]*WriteINIStr[\s\S]*install-dir\.ini/.test(hooks));
+check('卸载时读注册表，读不到再用标记', /!macro customUnInit[\s\S]*ReadRegStr[\s\S]*install-dir\.ini/.test(hooks));
+check('兜底目录必须真的有 FreePower.exe 才认', /IfFileExists\s+"\$1\\\$\{APP_EXECUTABLE_FILENAME\}"/.test(hooks));
+check('不让兜底覆盖正常路径（注册表有值就直接走）', /StrCmp\s+\$0\s+""\s+0\s+fpUnDone/.test(hooks));
+check('README 写明诊断开关存在', /--show-tray-menu/.test(fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8')));
+
 /* ------------------------- 收尾 ------------------------- */
 await started.close();
 check('server.close() 能收干净', started.server.listening === false);

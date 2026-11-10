@@ -222,6 +222,11 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 | 开机自启 | `setLoginItemSettings`，默认关；开机进托盘不弹窗 |
 | 安全 | `contextIsolation`/`sandbox` 开、`nodeIntegration` 关、**不挂 preload**；`window.open` 一律 deny，外链丢系统浏览器，导航出本地地址也拦 |
 
+**诊断开关**（正式包里就有，不是后门；不改数据、不开新端口、不联网）：
+`FreePower.exe --selftest` 跑一遍壳自检并写 `desktop-selftest.json`；
+`--quit-after-ms=N` 到点走托盘「退出」的同一个函数（自动化验收用）；
+`--show-tray-menu` 把托盘菜单弹出来（截图/演示用）。
+
 装完：`%LOCALAPPDATA%\Programs\FreePower`，**357.4MB / 77 文件**，安装包 109.9MB；数据在 `%APPDATA%\FreePower\data`。
 
 顺带收掉一个 P5 尾巴：HTML 自检报告不再把 master `api_key` 拼进 URL，改成 **120 秒、绑定 profile 的一次性票据**
@@ -258,7 +263,9 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 20. **托盘图标在受限会话里注册不上**：Agent 令牌下 Electron 的 Tray 对象/菜单/消息窗口都建好了，但 Win11 通知区域里看不到图标（裸 Electron 同样如此，而直接调 `Shell_NotifyIcon` 的探针成功）—— 判定为环境限制。**正常桌面双击安装后要确认一次托盘**；兜底是再点一次图标，单实例锁会把窗口拉回来，不会把用户锁在后台。
 21. **在受限终端里验桌面版要加参数**：`--no-sandbox`（Chromium 沙箱起不来会秒退）且数据目录必须落在工作区内（`%APPDATA%` 之外的写入被拦）。**用户正常桌面双击不需要任何参数。**
 22. **受限环境还可能挡住内核的沙箱**：`FREEPOWER_KERNEL_NO_SANDBOX=1` 会给内核加 `--no-sandbox`，并在启动结果 `warnings` 里标 `kernel_sandbox`。默认不开 —— 沙箱该开着。
-23. **卸载没能在本机验完**：静默 `/S` 会拉起 `old-uninstaller.exe` 后停住（文件一个没删），是受限会话里的行为；安装包构造本身正常，卸载要在普通桌面点「设置 → 应用 → FreePower → 卸载」验一次。
+23. **安装/卸载已验通，但要在普通目录里跑安装包**：本机工作区里的 exe 带 Low 完整性标签，从工作区直接执行安装器，进程会被降到 Low IL，写 `HKCU\Software` 和开始菜单一律被拒（文件照装、注册项和快捷方式静默丢失，`Uninstall /S` 于是「退出码 0、一个文件没删」）。
+    拷到 `%TEMP%` 再跑就完全正常：注册表两个键齐全、快捷方式建了、`/S` 卸载把目录和键都清干净（实测记录见 [P6 文档](docs/07-P6-桌面壳.md)）。**用户从「下载」目录双击安装不受影响。**
+    另：卸载器靠 `InstallLocation` 找目录，该键丢失时会退回到 `%APPDATA%\FreePower\install-dir.ini` 里安装时写下的路径（`desktop/build/installer.nsh`），避免「删了个寂寞」。安装路径含空格时卸载后会留一个空目录。
 
 ## 八、验证
 

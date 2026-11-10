@@ -1,8 +1,9 @@
 node_modules/
-dist/
-out/
-build/
-release/
+/dist/
+/out/
+# 只忽略仓库根目录的 build/：desktop/build/ 是打包资源（icon.ico、nsis 钩子），必须进版本库
+/build/
+/release/
 *.log
 .env
 .env.*
