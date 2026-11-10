@@ -33,10 +33,11 @@ await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${server.address().port}`;
 
 /** 默认走 mcp 通道（30/s），避免测试自己被限流 */
-async function api(method, p, body, { key = apiKey, mcp = true, raw = false } = {}) {
+async function api(method, p, body, { key = apiKey, mcp = true, ui = false, raw = false } = {}) {
   const headers = { 'content-type': 'application/json' };
   if (key) headers['api-key'] = key;
   if (mcp) headers['x-freepower-client'] = 'mcp';
+  if (ui) headers['x-freepower-client'] = 'ui';
   const res = await fetch(base + p, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
   const text = await res.text();
   let json = null;
@@ -188,6 +189,56 @@ try {
   const need = [-1, 100001, 100002, 800002];
   check('错误码覆盖 -1/100001/100002/800002', need.every((c) => codes.has(c)), [...codes].join(','));
   check('错误码 800003/800005 由启动链路产生（冒烟覆盖）', true);
+
+  /* -------------------- P5：控制台依赖的接口与静态层 -------------------- */
+  const schemaRes = await api('GET', '/api/v2/browser-profile/schema');
+  const sch = schemaRes.json.data;
+  check('schema：11 组、组内字段不重复', sch?.groups?.length === 11 && sch.groups.reduce((n, g) => n + g.fields.length, 0) === sch.total, `${sch?.groups?.length} 组 / ${sch?.total} 字段`);
+  check('schema：值域与必填来自注册表', sch.groups.find((g) => g.id === 'identity').fields.find((f) => f.name === 'group_id').required === true
+    && Array.isArray(sch.groups.find((g) => g.id === 'screen_hardware').fields.find((f) => f.name === 'hardware_concurrency').values));
+
+  const vOk = await api('POST', '/api/v2/browser-profile/validate', {
+    mode: 'create',
+    profile: { name: 'v', group_id: '0', timezone: 'UTC', cookie: '', launch_args: [], hardware_concurrency: 8 },
+  });
+  check('validate：UTC 是合法时区、空 cookie 与空 launch_args 不报错',
+    vOk.json.code === 0 && vOk.json.data.ok === true, JSON.stringify(vOk.json.data?.errors));
+
+  const vBad = await api('POST', '/api/v2/browser-profile/validate', { mode: 'create', profile: { group_id: '0', timezone: 'Mars/Olympus' } });
+  check('validate：非法时区文案与 create 同源', vBad.json.data?.ok === false && vBad.json.data.errors[0].message === 'not an IANA timezone: Mars/Olympus', JSON.stringify(vBad.json.data?.errors));
+
+  const vHard = await api('POST', '/api/v2/browser-profile/validate', {
+    mode: 'create',
+    profile: { group_id: '0', ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/157.0.0.0', platform: 'MacIntel' },
+  });
+  check('validate：硬冲突进 warnings（带 severity）', vHard.json.data?.ok === true && vHard.json.data?.warnings?.some((w) => w.severity === 'hard'));
+
+  // 控制台新建时就是这么发的：只给身份字段 + country，指纹由后端生成
+  const uiCreate = await api('POST', '/api/v2/browser-profile/create', { name: 'ui-made', group_id: '0', country: 'JP', cookie: '', remark: '控制台流程' });
+  check('控制台式创建：后端补齐时区/语言/UA', uiCreate.json.code === 0 && /^Asia\//.test(uiCreate.json.data?.timezone || '') && /Chrome\//.test(uiCreate.json.data?.ua || ''), `${uiCreate.json.data?.timezone} ${uiCreate.json.data?.profile_no}`);
+  const uiId = uiCreate.json.data?.profile_id;
+  const uiNo = uiCreate.json.data?.profile_no;
+
+  // 硬删要连 user-data 一起删，否则磁盘上留垃圾
+  const envDir = path.join(dataDir, 'profiles', `${uiNo}_${String(uiId).slice(0, 8)}`);
+  fs.mkdirSync(path.join(envDir, 'userdata', 'Default'), { recursive: true });
+  fs.writeFileSync(path.join(envDir, 'userdata', 'Default', 'Cookies'), 'x');
+  const uiDel = await api('POST', '/api/v2/browser-profile/delete', { profile_id: [uiId] });
+  check('删除：返回 userdata_removed 且目录真的没了', uiDel.json.data?.userdata_removed === 1 && !fs.existsSync(envDir), JSON.stringify(uiDel.json.data));
+
+  const indexRes = await fetch(base + '/');
+  const indexHtml = await indexRes.text();
+  check('静态：/ 返回注入了 api_key 的控制台', indexRes.status === 200 && /text\/html/.test(indexRes.headers.get('content-type') || '') && indexHtml.includes(apiKey) && indexHtml.includes('window.__FP__'));
+  const jsRes = await fetch(base + '/ui/app.js');
+  check('静态：/ui/app.js 可加载且 no-store', jsRes.status === 200 && /javascript/.test(jsRes.headers.get('content-type') || '') && /no-store/.test(jsRes.headers.get('cache-control') || ''));
+  check('静态：不存在的资源 404', (await fetch(base + '/ui/nope.js')).status === 404);
+
+  const uiRate = [];
+  for (let i = 0; i < 8; i++) {
+    const r = await api('GET', '/api/v1/user/list', undefined, { mcp: false, ui: true });
+    uiRate.push(r.json.code);
+  }
+  check('限流：控制台通道（ui）额度独立，连打不被打断', uiRate.every((c) => c === 0), uiRate.join(','));
 
   /* -------------------- 数据真的落库了 -------------------- */
   const db = getDb();

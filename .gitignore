@@ -11,6 +11,7 @@ Thumbs.db
 data/
 data-smoke*/
 data-curl*/
+data-ui*/
 artifacts/
 profiles/
 user-data/

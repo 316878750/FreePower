@@ -9,7 +9,7 @@ import { checkProxy, httpGetViaProxy, normalizeProxyConfig, hasProxy, parseExitI
 import { mergeLaunchArgs, parseLaunchArgs } from '../src/kernel/launch-args.js';
 import { alignProfileToKernel } from '../src/kernel/version.js';
 import { checkProfile } from '../src/store/profiles.js';
-import { checkEgress } from '../packages/profile/src/validate.js';
+import { checkEgress, validateField, isValidTimezone } from '../packages/profile/src/validate.js';
 import { deriveNoiseSeeds, ensureNoiseSeeds, seedOf } from '../src/fingerprint/seeds.js';
 import { generateFingerprint } from '../src/fingerprint/generate.js';
 import { fingerprintView } from '../src/fingerprint/view.js';
@@ -486,4 +486,20 @@ test('cookie 存储形状：原始串与 JSON 数组串都能进，读出来是�
   assert.equal(cookieText(null), '');
   // 坏 JSON 不抛异常，按原文处理
   assert.equal(cookieText('[not json'), '[not json');
+});
+
+test('时区校验：UTC / Etc 这类合法 ID 不能被 Intl 枚举表误杀', () => {
+  // Intl.supportedValuesOf('timeZone') 不含 UTC、Etc/GMT±N、亚洲老别名，
+  // 早期直接查表，导致「环境默认时区 UTC」在控制台里永远报错、存不上。
+  assert.deepEqual(validateField('timezone', 'UTC'), []);
+  assert.deepEqual(validateField('timezone', 'Etc/UTC'), []);
+  assert.deepEqual(validateField('timezone', 'Etc/GMT+3'), []);
+  assert.deepEqual(validateField('timezone', 'Asia/Tokyo'), []);
+  assert.deepEqual(validateField('timezone', 'America/Argentina/Buenos_Aires'), []);
+  // 空格写法按 IANA 规范归一
+  assert.deepEqual(validateField('timezone', 'America/New York'), []);
+  // 真错的还是要拦，且文案不变（前端直接显示这句）
+  assert.equal(validateField('timezone', 'Mars/Olympus')[0].message, 'not an IANA timezone: Mars/Olympus');
+  assert.equal(isValidTimezone(''), false);
+  assert.equal(isValidTimezone(null), false);
 });

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FreePower 控制台</title>
+<link rel="stylesheet" href="/ui/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%232f6fed'/><path d='M9 22V10h13v3h-9v2.4h7.6v3H13V22z' fill='white'/></svg>">
+<script>/*__FP_BOOT__*/</script>
+</head>
+<body>
+  <div id="app" class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">FP</span>
+        <span class="brand-text">
+          <strong>FreePower</strong>
+          <small id="brand-version">控制台</small>
+        </span>
+      </div>
+      <nav id="nav" class="nav">
+        <a class="nav-item" data-nav="profiles" href="#/profiles">环境管理</a>
+        <a class="nav-item" data-nav="proxies" href="#/proxies">代理管理</a>
+      </nav>
+      <div class="sidebar-foot">
+        <div id="foot-port" class="muted small">—</div>
+        <div id="foot-running" class="muted small">—</div>
+      </div>
+    </aside>
+    <main class="main">
+      <header id="page-head" class="page-head"></header>
+      <section id="page" class="page"></section>
+    </main>
+  </div>
+  <div id="toasts" class="toasts"></div>
+  <div id="dialog-root"></div>
+  <script type="module" src="/ui/app.js"></script>
+</body>
+</html>

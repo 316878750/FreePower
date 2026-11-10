@@ -1,11 +1,13 @@
 import http from 'node:http';
-import { API_HOST, RATE_LIMIT_DEFAULT, RATE_LIMIT_MCP, API_PORT } from '../config.js';
+import { API_HOST, RATE_LIMIT_DEFAULT, RATE_LIMIT_MCP, RATE_LIMIT_UI, API_PORT } from '../config.js';
 import { ensureApiKey } from '../store/db.js';
 import { stopAll } from '../runtime/manager.js';
 import { ApiError, ERR, TOO_MANY_MSG } from './contract.js';
+import { isStaticPath, renderIndex, resolveStatic, sendStatic } from './static.js';
 import { buildRoutes } from './routes.js';
 
 const MAX_BODY = 2 * 1024 * 1024;
+const VERSION = '0.2.0-p5';
 
 /* ------------------------------- 限流 ------------------------------- */
 const buckets = new Map();
@@ -115,16 +117,33 @@ export function createApiServer({ port } = {}) {
       return res.end();
     }
 
+    // Web 控制台：静态页不走 API 鉴权（页面自己拿注入的 key 去调 API），
+    // 但同样受 Origin 白名单约束 —— 别的站点嵌不了这个控制台。
+    if (isStaticPath(url.pathname)) {
+      if (url.pathname === '/' || url.pathname === '/index.html') {
+        try {
+          return sendHtml(res, renderIndex({ apiKey, port: port || API_PORT, version: VERSION }));
+        } catch {
+          return sendText(res, 500, 'web console not found: missing web/index.html');
+        }
+      }
+      const file = resolveStatic(url.pathname.slice('/ui/'.length));
+      if (!file) return sendText(res, 404, 'not found');
+      return sendStatic(res, file, corsHeaders);
+    }
+
     const route = routes.find((r) => r.methods.includes(req.method) && r.path === url.pathname);
     if (!route) return send(res, 404, { code: ERR.GENERIC, msg: `no route ${req.method} ${url.pathname}`, data: { supported: false, path: url.pathname } }, corsHeaders);
 
     if (route.auth !== false) {
       const key = extractKey(req, url);
       if (!key || key !== apiKey) return send(res, 401, { code: ERR.GENERIC, msg: 'invalid api_key' }, corsHeaders);
-      const isMcp = ['mcp', '1'].includes(String(req.headers['x-freepower-client'] || '').toLowerCase())
+      const client = String(req.headers['x-freepower-client'] || '').toLowerCase();
+      const isMcp = ['mcp', '1'].includes(client)
         || String(req.headers['x-adspower-client'] || '').toLowerCase() === 'mcp';
-      const limit = isMcp ? RATE_LIMIT_MCP : RATE_LIMIT_DEFAULT;
-      const bucket = `${key}|${isMcp ? 'mcp' : 'std'}`;
+      const isUi = client === 'ui';
+      const limit = isMcp ? RATE_LIMIT_MCP : isUi ? RATE_LIMIT_UI : RATE_LIMIT_DEFAULT;
+      const bucket = `${key}|${isMcp ? 'mcp' : isUi ? 'ui' : 'std'}`;
       if (!rateLimit(bucket, limit)) {
         // 超限报文逐字对齐对手（脚本按这句判断要不要重试）
         return send(res, 200, { code: ERR.GENERIC, msg: TOO_MANY_MSG }, corsHeaders);

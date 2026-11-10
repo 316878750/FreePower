@@ -13,8 +13,9 @@
     "smoke": "node --no-warnings test/smoke.mjs",
     "test:unit": "node --no-warnings test/unit.test.mjs",
     "test:api": "node --no-warnings test/api.test.mjs",
+    "test:ui": "node --no-warnings test/ui.test.mjs",
     "test:profile": "node --no-warnings packages/profile/test/schema.test.mjs",
-    "test": "node --no-warnings packages/profile/test/schema.test.mjs && node --no-warnings test/unit.test.mjs && node --no-warnings test/api.test.mjs",
+    "test": "node --no-warnings packages/profile/test/schema.test.mjs && node --no-warnings test/unit.test.mjs && node --no-warnings test/api.test.mjs && node --no-warnings test/ui.test.mjs",
     "gen": "node tools/gen-schema.mjs"
   }
 }

@@ -21,6 +21,12 @@ export const API_PORT = Number(process.env.FREEPOWER_PORT || 53380);
 export const RATE_LIMIT_DEFAULT = Number(process.env.FREEPOWER_RATE_LIMIT || 1);
 export const RATE_LIMIT_MCP = Number(process.env.FREEPOWER_RATE_LIMIT_MCP || 30);
 
+/**
+ * Web 控制台的额度：界面一次操作会连发几个请求（列表 + 运行态 + 自检），
+ * 按 1/s 限会自己把自己挡在门外。给 60/s，仍然限量，不做成「带某头的就免限」。
+ */
+export const RATE_LIMIT_UI = Number(process.env.FREEPOWER_RATE_LIMIT_UI || 60);
+
 /** 内核：优先环境变量指定的可执行文件，其次内核矩阵目录，最后系统 Chrome */
 export const CHROME_BIN = process.env.FREEPOWER_CHROME || '';
 

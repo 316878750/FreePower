@@ -549,6 +549,19 @@ async function main() {
       await sleep(800);
     }
 
+    /* ================= P5：Web 控制台的静态层与 schema ================= */
+    {
+      const idx = await fetch(base + '/');
+      const idxText = await idx.text();
+      check('控制台首页可打开并带 api_key', idx.status === 200 && idxText.includes(apiKey) && idxText.includes('window.__FP__'), `${idx.status}`);
+      const uiJs = await fetch(base + '/ui/app.js');
+      check('控制台脚本可加载', uiJs.status === 200 && /javascript/.test(uiJs.headers.get('content-type') || ''));
+      const schema = await api('GET', '/api/v2/browser-profile/schema');
+      check('编辑表单 schema：11 组', schema.json.data?.groups?.length === 11, `${schema.json.data?.groups?.length} 组 / ${schema.json.data?.total} 字段`);
+      const vchk = await api('POST', '/api/v2/browser-profile/validate', { mode: 'create', profile: { group_id: '0', timezone: 'UTC', cookie: '' } });
+      check('表单校验接口：UTC 时区与空 cookie 都放行', vchk.json.data?.ok === true, JSON.stringify(vchk.json.data?.errors));
+    }
+
     const leftovers = chromePidsMatching('freepower').filter((x) => /^\d+$/.test(x));
     check('无残留 chrome 进程', leftovers.length === 0, leftovers.join(',') || 'none');
   } catch (e) {

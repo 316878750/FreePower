@@ -4,6 +4,23 @@ import { BY_NAME } from './fields.js';
 
 const IANA_TZ = new Set(Intl.supportedValuesOf('timeZone'));
 
+/**
+ * 时区合法性：`Intl.supportedValuesOf('timeZone')` 不含 UTC / Etc/GMT 这类
+ * 「合法但不在枚举里」的 ID（`Asia/Calcutta` 这种别名同理），
+ * 真正的判据是 Intl 自己认不认，所以先查表、表里没有再让 Intl 试一次。
+ */
+export function isValidTimezone(value) {
+  if (typeof value !== 'string' || !value) return false;
+  const tz = value.replace(/ /g, '_');
+  if (IANA_TZ.has(tz)) return true;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** 常量：值域硬约束。静态拆解与官方 API 文档冲突时取并集（见 reference/overrides.mjs DOMAIN_NOTES） */
 export const DOMAINS = {
   hardware_concurrency: ['default', 2, 3, 4, 6, 8, 10, 12, 16, 20, 24, 32],
@@ -107,7 +124,7 @@ export function validateField(name, value) {
         return [err(name, 'must be "none" | "random" | "<W>_<H>"')];
       }
       if (name === 'allow_scan_ports' && !/^[\d,\s]*$/.test(value)) return [err(name, 'must be csv ports')];
-      if (name === 'timezone' && !IANA_TZ.has(value.replace(/ /g, '_'))) {
+      if (name === 'timezone' && !isValidTimezone(value)) {
         return [err(name, `not an IANA timezone: ${value}`)];
       }
       return [];

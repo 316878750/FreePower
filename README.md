@@ -4,8 +4,8 @@
 
 内核用官方 Chrome for Testing（独立进程），指纹通过 CDP 注入与启动参数实现，不搬运 AdsPower 的私有代码、二进制、资源与商标。
 
-> 当前阶段：**P4 完成**（本地 API 完整化 + 批量启停）。之前：P1 存储/校验/启停、P3 前置代理 fail-closed、P2 自检与四维确定性噪声。
-> 阶段细节见 [P1](docs/02-P1-交付.md)、[P3 前置](docs/03-P3前置-代理与启动参数.md)、[P2](docs/04-P2-自检与注入补全.md)、[P4](docs/05-P4-本地API完整化.md)（附 [curl 实测记录](docs/05-P4-curl实测.md)），技术路线见 [技术方案](docs/00-技术方案.md)。
+> 当前阶段：**P5 完成**（Web 管理控制台：环境列表/编辑/代理/自检报告）。之前：P1 存储/校验/启停、P3 前置代理 fail-closed、P2 自检与四维确定性噪声、P4 本地 API 完整化 + 批量启停。
+> 阶段细节见 [P1](docs/02-P1-交付.md)、[P3 前置](docs/03-P3前置-代理与启动参数.md)、[P2](docs/04-P2-自检与注入补全.md)、[P4](docs/05-P4-本地API完整化.md)（附 [curl 实测记录](docs/05-P4-curl实测.md)）、[P5](docs/06-P5-Web控制台.md)，技术路线见 [技术方案](docs/00-技术方案.md)。
 
 ## 一、范围（先看这个，避免后面被要求补）
 
@@ -17,8 +17,8 @@
 - 自检：每个环境启动后自动跑一次真实页面探针，输出 15 项可读报告（覆盖度对齐字段表 full/partial/none），支持 API 与本地 HTML 页
 - 代理：HTTP/HTTPS/SOCKS5 绑定、账号密码认证（HTTP 代理）、**fail-closed**；PAC 明确拒绝（不支持就报错，不静默降级）
 - 本地 API：`/status`、环境 CRUD、分组、标签、代理列表、浏览器启停、**批量启停（并发上限 + 失败清单 + 可中断）**、自检报告；返回值形状对齐 AdsPower（`ws.puppeteer` / `ws.selenium` / `debug_port` / `status: Active|Inactive` / `cookies` / `kernels`）
+- **Web 管理控制台**（`node:http` 直接托管，浏览器打开 `127.0.0.1:<端口>/` 即用）：环境列表（启动/停止/自检状态/批量操作）、环境编辑（11 组分栏表单，值域与必填来自后端注册表）、代理管理、自检报告。四个页面全部只调自己的 Local API，没有私有通道
 - 未实现的 46 条云端透传接口（回收站、分享、成员、内核下载…）**明确报「不支持」**（`code:-1` + `data.supported:false`），不假成功、不留未知码
-- 本地 API：`/status`、环境 CRUD、浏览器启停、返回值形状对齐 AdsPower（`ws.puppeteer` / `ws.selenium` / `debug_port`）
 
 ### 不做（已和 CEO 确认，写进范围外）
 
@@ -36,7 +36,7 @@
 | 本地 API | `node:http` + 自写路由/限流/鉴权 | 零第三方依赖 |
 | CDP 客户端 | 自写 WebSocket（`src/kernel/cdp.js`） | 只实现需要的帧类型，无 `ws` 依赖 |
 | 内核 | 官方 Chrome for Testing | P0 用系统 Chrome 验链路，P1 接 CfT 版本矩阵 |
-| 主程序 UI | Electron（P1） | P0 先保证内核与 API 正确 |
+| 主程序 UI | 原生 JS + 自写极简视图层，`node:http` 托管静态页 | 不引前端框架、不建构建链；Electron 壳后续再包（见已知限制 16） |
 
 刻意保持 **零运行时依赖**：一开始就装一堆包，后面每次改内核启动参数都要跟着升级，收益不抵成本。
 
@@ -65,7 +65,7 @@ $env:FREEPOWER_CHROME='C:\path\to\chrome.exe'; npm start
 
 鉴权：`api-key` 头（对齐对手）、`api_key` 查询参数 / 头、`Authorization: Bearer`。**本地校验，离线可用**（对手是远端校验，离线不可用，这是我们有意做的差异）。
 
-限流：`/status` 不限流；其余路由默认 1 次/秒，带 `x-freepower-client: mcp` 或 `x-adspower-client: mcp` 头走 30 次/秒。超限报文与对手逐字一致（HTTP 200，脚本按这句判断要不要重试）：
+限流：`/status` 不限流；其余路由默认 1 次/秒，带 `x-freepower-client: mcp` 或 `x-adspower-client: mcp` 头走 30 次/秒。控制台自己带 `x-freepower-client: ui`，额度 60 次/秒（一次操作会连发几个请求，按 1/s 会把自己挡在门外；仍然是限量，不是「带某头就免限」）。超限报文与对手逐字一致（HTTP 200，脚本按这句判断要不要重试）：
 
 ```json
 {"code":-1,"msg":"Too many request per second, please check"}
@@ -106,6 +106,11 @@ CORS：只放行 `127.0.0.1` / `localhost` 的 Origin，其他返回 `403` + 纯
 | POST | `/api/v2/browser-profile/create` | 建环境（v2 形状：`launch_args` 出站数组、`password_filling` 单布尔） |
 | POST | `/api/v2/proxy/check` | 代理预检 |
 | GET | `/api/v2/browser-profile/selfcheck` | 自检报告（`profile_id`；`rerun=1` 重跑；`format=html` 出自检页） |
+| POST | `/api/v2/browser-profile/selfcheck-summary` | 批量取自检摘要（列表页那一列用，`{list:{id:摘要}}`） |
+| GET | `/api/v2/browser-profile/schema` | **编辑表单的 schema**：11 组 131 字段的类型/值域/必填/默认值，与后端注册表同一份 |
+| POST | `/api/v2/browser-profile/validate` | 只校验不落库：与 create/update 同一个 `validateProfile`，返回 `{ok,errors[],warnings[]}` |
+| GET | `/` | **Web 管理控制台**（静态页，注入本地 api_key；外站 Origin 403） |
+| GET | `/ui/*` | 控制台资源（`app.js` / `style.css` / `pages/*.js`），越权路径一律 404 |
 
 未实现的云端透传接口（回收站、分享、成员体系、内核下载、fb/*…）统一返回：
 
@@ -164,7 +169,32 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/user/create' -Method Post 
 Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<profile_id>' -Headers $h
 ```
 
-## 五、已知限制（必须如实告知用户，不藏着）
+## 五、Web 管理控制台
+
+`npm start` 之后浏览器直接打开 `http://127.0.0.1:<端口>/`（端口看 `data/local_api`）。不用装任何东西，也没有第二套进程。
+
+四个页面，范围就这些（CEO 定的，不扩）：
+
+| 页面 | 做什么 |
+|---|---|
+| 环境列表 | 启动/停止/批量启停/全部停止、运行态与端口、自检摘要、搜索与分组筛选、删除 |
+| 环境编辑 | 11 组分栏表单（基本信息 / 浏览器与内核 / UA 与语言 / 噪声四维 / 字体 / 屏幕与硬件 / 媒体设备 / 网络与代理 / 地理定位 / 隐私开关 / 启动与缓存），保存前实时校验 |
+| 代理管理 | 代理列表增删改、按 `proxy/check` 预检出口、显示最近一次出口 IP 与国家 |
+| 自检报告 | 评分、通过/告警/失败、覆盖度、四个噪声维度哈希与跨重启一致性、15 项逐条「声明值 vs 实测值」 |
+
+三条设计约束（都不是口号，代码里能对得上）：
+
+1. **界面只调自己的 Local API**：`web/api.js` 里每个动作都是 `fetch` 到 `/api/v2/...`，没有任何私有通道。界面出问题时用 curl 一样能做，这也是对 API 契约的日常验证。
+2. **校验只有一份**：表单的字段、值域、必填来自 `GET /api/v2/browser-profile/schema`（后端注册表生成的），错误文案来自 `POST /api/v2/browser-profile/validate`（和 create/update 同一个 `validateProfile`）。前端只做两件事：把 `errors[].field` 定位到输入框、把 `warnings[]`（含 `severity: hard|soft`）原样显示。**前端不自己编一句校验话**。
+3. **删除是危险操作**：二次确认弹窗写明「本地硬删、不可恢复、连 user-data 一起删」；环境在运行会先停再删，删完连 `data/profiles/<no>_<id8>/` 一起清掉，不留孤儿进程也不留几个 G 的脏目录。
+
+界面截图（真实环境，5 个环境 + 1 个在跑）：
+
+![环境列表](docs/shots/01-list.png)
+
+更多：[编辑页](docs/shots/02-edit.png)、[后端校验原文回填](docs/shots/03-edit-invalid.png)、[噪声四维分栏](docs/shots/04-edit-noise.png)、[代理管理](docs/shots/05-proxies.png)、[自检报告](docs/shots/08-selfcheck.png)。完整操作清单见 [P5 文档](docs/06-P5-Web控制台.md)。
+
+## 六、已知限制（必须如实告知用户，不藏着）
 
 1. **Canvas / Audio / WebGL 标识 / 字体是 JS 注入，不是内核级。**
    拆解手 08 号报告实测：AdsPower 139 个指纹字段里走 CDP 注入的是 0 个，全在内核配置和启动命令行。
@@ -186,19 +216,23 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 13. **云端依赖的接口一律不支持**：`cloud-active`、回收站、分享、成员体系、内核下载、`fb/*`、应用/分类等 17 条（对手 54 条路由里剩下的云端透传）返回 `-1` + `data.supported:false`，**不假成功**。`cloud-active` 尤其明确：脚本若以为"环境已开"会直接下错单。
 14. **批量启停的并发默认 3**（`FREEPOWER_BATCH_CONCURRENCY` 可调，请求里 `concurrency` 覆盖，夹在 1..10）。批量启动**中途失败即中断**：已经起来的保留，剩下的不硬起，返回 `failed` + `skipped`。
 15. **`kernels` 的版本号区分「实测」与「猜」**：系统 Chrome 的 `Application\` 下可能同时有几个版本目录（本机实测有 156/157），而启动器实际跑哪个由注册表决定。启动过就报 `Browser.getVersion` 的真值（`probed:true`），没启动过则按目录名猜。**不要拿目录名当真实版本用。**
-16. 主程序 UI（Electron）还没做，目前只有 API 与内核链路。
+16. **控制台是本地网页，没有 Electron 桌面壳**（P5 决定后置：包壳要先解决几十兆体积和它自己的 IPC 沙箱问题，现在不该成为阻塞项）。所以目前没有系统托盘、开机自启、单实例锁、窗口快捷键这些桌面能力。
+17. **控制台的信任边界就是本机**：首页由本地服务渲染，会把 `api_key` 注入页面（等价于「本机用户能看到自己的 key」）。外站 Origin 一律 403，但这挡不住本机上的其它程序 —— 本机多用户/共享机器上，要按「同一台机器互不设防」来理解。
+18. **表单里 138 个字段的中文名只覆盖常用项**：其余（尤其启动与缓存、隐私开关里的脚本旋钮）直接显示 API 字段名，配注册表里的 `note` 说明。硬翻一遍反而会让「字段名 ↔ 文档」对不上。
 
-## 六、验证
+## 七、验证
 
 ```powershell
-# 不需要 Chrome：schema + 单元测试 + 本地 API 契约
+# 不需要 Chrome：schema + 单元测试 + 本地 API 契约 + 控制台契约（29 项）
 npm run test
 
 # 需要真实 Chrome + 完整权限（沙箱挡命名管道和进程查询）
 npm run smoke
 ```
 
-冒烟覆盖（148 项）：
+当前实测：`npm run test` = schema **10** + unit **35** + api **61** + ui **29**；`npm run smoke` = **152/152**（真 Chrome 156.0.8078.80）。
+
+冒烟覆盖（152 项）：
 
 - `/status` 形状、鉴权、跨站 Origin 403 纯文本、限流报文
 - 建环境 → 起真 Chrome → 探针读回 UA / UA-CH / 时区 / 语言 / platform / hardwareConcurrency / WebGL / `navigator.webdriver`
@@ -214,16 +248,19 @@ npm run smoke
 - **出口地理一致性**：声明时区/语言与出口不一致时会出现在 `warnings` 里
 - **launch_args 白名单**：从真实 `CommandLine` 验证白名单参数生效、保护参数不在 argv 里
 - **UA 跟版**：旧版本 UA 启动时对齐到真实内核版本并落库
+- **控制台**：首页带 api_key、`/ui/app.js` 可加载、schema 11 组 131 字段、表单校验接口放行 UTC 与空 cookie
 
-## 七、目录
+## 八、目录
 
 ```
 src/
   main.js              入口：起 API、写发现文件、回收环境
   config.js            端口/路径/限流/批量并发配置
-  api/server.js        传输层：鉴权、限流、CORS、错误整形
+  api/server.js        传输层：鉴权、限流、CORS、静态托管、错误整形
   api/routes.js        路由表：A 类本地组装 / B 类自己实现 / 占位明确不支持
   api/contract.js      错误码、响应外壳、launch_args 与 password_filling 边界转换
+  api/schema.js        编辑表单 schema（字段分组/值域/必填，来自 packages/profile 注册表）
+  api/static.js        控制台静态托管（只放 web/，路径穿越一律 404）
   store/db.js          node:sqlite 建表、迁移补列、API Key
   store/profiles.js    环境 CRUD、分组、cookie 规范化、一致性校验
   store/tags.js        标签 CRUD（本地实现）
@@ -240,9 +277,20 @@ src/
   selfcheck/           自检：页面探针 / 报告 / 落盘 / 本地安全上下文服务 / HTML 渲染
   runtime/manager.js   启停、校验/预检/跟版、自动 attach 新标签页、自检、代理认证
   runtime/batch.js     批量启停：并发池、失败清单、中断
-test/smoke.mjs         端到端冒烟（148 项，需真实 Chrome）
-test/unit.test.mjs     零 Chrome 单元测试（34 项）
-test/api.test.mjs      本地 API 契约测试（50 项，不需要 Chrome）
+web/
+  index.html           控制台外壳（api_key 由服务端注入）
+  style.css            全部样式（无预处理器、无主题）
+  ui.js                极简视图层：h() / mount() / toast / confirm / drawer
+  api.js               Local API 客户端（界面只走这一条路）
+  app.js               hash 路由 + 侧栏 + 运行态角标
+  pages/profiles.js    环境列表：启停、批量、自检摘要、删除
+  pages/edit.js        环境编辑：11 组分栏、实时校验（文案来自后端）
+  pages/proxies.js     代理管理
+  pages/selfcheck.js   自检报告
+test/smoke.mjs         端到端冒烟（152 项，需真实 Chrome）
+test/unit.test.mjs     零 Chrome 单元测试（35 项）
+test/api.test.mjs      本地 API 契约测试（61 项，不需要 Chrome）
+test/ui.test.mjs       控制台契约测试（29 项：静态托管、schema、校验、删除清目录、限流额度）
 test/fake-proxy.mjs    假代理 / 假出口端点（冒烟不依赖公网）
-docs/                  技术方案、阶段交付（含 P2 自检样例、P4 curl 实测）
+docs/                  技术方案、阶段交付、curl 实测、控制台截图（docs/shots/）
 ```

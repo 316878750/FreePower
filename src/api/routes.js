@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   createProfile, getProfile, getProfileByNo, listProfiles, updateProfile, deleteProfiles, regroupProfiles,
-  newFingerprintFor, listGroups, createGroup, getGroup, updateGroup, deleteGroup, cookieText,
+  newFingerprintFor, listGroups, createGroup, getGroup, updateGroup, deleteGroup, cookieText, cookieToStorage,
 } from '../store/profiles.js';
 import { listTags, createTags, updateTags, deleteTags, tagIdsOf } from '../store/tags.js';
 import {
@@ -22,6 +22,9 @@ import {
 } from '../store/proxies.js';
 import { startProfile, stopProfile, listRunning, getRunning, getInstance, userDataDirFor } from '../runtime/manager.js';
 import { batchStart, batchStop } from '../runtime/batch.js';
+import { PROFILES_DIR } from '../config.js';
+import { profileFormSchema } from './schema.js';
+import { validateProfile } from '../../packages/profile/src/validate.js';
 import { checkProxy, hasProxy } from '../proxy/probe.js';
 import { pacInUse, pacMessage } from '../proxy/pac.js';
 import { runSelfCheck } from '../selfcheck/index.js';
@@ -61,6 +64,10 @@ function input(body = {}, version) {
   // PAC 明确拒绝：不静默忽略、不退化成直连（报错发生在落库之前）
   const pac = pacInUse({ ...canonical, proxy_config: body.proxy_config || body.user_proxy_config || canonical.user_proxy_config });
   if (pac) throw new ApiError(ERR.INVALID, pacMessage(pac));
+  // 空 cookie 等于「没有 cookie」：它是 JSON 数组串字段，空串/ null 过不了校验，
+  // 但控制台里每个环境都会带一个空 cookie 回传，不摘掉就永远存不上。
+  if (canonical.cookie === null) delete canonical.cookie;
+  else if (canonical.cookie !== undefined && String(canonical.cookie).trim() === '') delete canonical.cookie;
   return canonical;
 }
 
@@ -239,8 +246,15 @@ export function buildRoutes() {
     if (v === 'v2' && !Array.isArray(raw)) throw new ApiError(ERR.INVALID, 'profile_id must be an array');
     if (v === 'v1' && !Array.isArray(raw)) throw new ApiError(ERR.INVALID, '[user_ids] Incorrect format');
     const ids = idList(raw, v);
+    // 先停再删：留着运行中的内核被删了记录，就是孤儿进程，谁也回收不了
     for (const id of ids) if (getRunning(id)) await stopProfile(id);
-    return ok({ deleted: deleteProfiles(ids) });
+    const dirs = [];
+    for (const id of ids) {
+      const p = getProfile(id);
+      if (p) dirs.push(removeProfileDataDir(p));
+    }
+    const deleted = deleteProfiles(ids);
+    return ok({ deleted, userdata_removed: dirs.filter(Boolean).length });
   });
 
   add(['POST'], ['/api/v1/user/regroup', '/api/v2/browser-profile/regroup'], (ctx) => {
@@ -391,6 +405,36 @@ export function buildRoutes() {
 
   /* ============================ 4. 其余本地能力 ============================ */
 
+  /**
+   * 编辑表单的 schema：分组 / 类型 / 值域 / 必填 / 默认值，全部来自 packages/profile 注册表。
+   * 控制台按它渲染表单，值域和必填就不再有两份。
+   */
+  add(['GET'], ['/api/v2/browser-profile/schema', '/api/v1/user/schema'], () => {
+    const s = profileFormSchema();
+    return ok({ total: s.total, groups: s.groups });
+  });
+
+  /**
+   * 只校验不落库：控制台边填边调这个，文案与 create/update 完全同源（同一个 validateProfile）。
+   * 顺带也是脚本的自查工具 —— 想知道「这组参数会不会被拒」，不用真的建一个环境再删。
+   */
+  add(['POST'], ['/api/v2/browser-profile/validate', '/api/v1/user/validate'], (ctx) => {
+    const v = versionOf(ctx.path);
+    const src = ctx.body.profile || ctx.body;
+    const mode = String(ctx.body.mode || 'create') === 'update' ? 'update' : 'create';
+    const canonical = toCanonical(src, v);
+    if (v === 'v1') delete canonical.platform;
+    // 边界表示要和 create/update 完全一致，否则校验会对着「另一种形状」报错：
+    //   launch_args 对外是数组、落库是 JSON 字符串；cookie 对外是原始串、落库是 JSON 数组串。
+    if (canonical.launch_args !== undefined) canonical.launch_args = JSON.stringify(normalizeLaunchArgs(canonical.launch_args));
+    if (canonical.cookie !== undefined) {
+      if (canonical.cookie === null || String(canonical.cookie).trim() === '') delete canonical.cookie;
+      else canonical.cookie = cookieToStorage(canonical.cookie);
+    }
+    const r = validateProfile(canonical, { mode, fillDefaults: false });
+    return ok({ ok: r.ok, mode, errors: r.errors, warnings: r.warnings });
+  });
+
   add(['GET', 'POST'], ['/api/v1/browser/selfcheck', '/api/v2/browser-profile/selfcheck'], async (ctx) => {
     const v = versionOf(ctx.path);
     const p = resolveProfile(ctx, v);
@@ -410,6 +454,24 @@ export function buildRoutes() {
     const out = { ...report, running: !!inst, stale: !fresh };
     if (String(ctx.query.format).toLowerCase() === 'html') return { __html: renderHtml(out) };
     return ok(out);
+  });
+
+  /**
+   * 列表页要显示「自检状态」，但自检报告是落盘文件，不在 profiles 表里。
+   * 让列表页为每行单独调一次 selfcheck 会打出几十个请求，所以这里批量取摘要。
+   * 返回的是**上次**报告（stale:true），运行中且刚跑过则是新的。
+   */
+  add(['POST'], ['/api/v2/browser-profile/selfcheck-summary'], (ctx) => {
+    const ids = idList(ctx.body.profile_ids ?? ctx.body.profile_id, 'v2');
+    if (!ids.length) throw new ApiError(ERR.INVALID, 'profile_ids is required');
+    const list = {};
+    for (const id of ids.slice(0, 200)) {
+      const inst = getInstance(id);
+      if (inst && inst.selfcheckReport) { list[id] = summarize(inst.selfcheckReport); continue; }
+      const rep = readReportFile(id).latest;
+      list[id] = rep ? { ...summarize(rep), stale: true } : null;
+    }
+    return ok({ list });
   });
 
   add(['POST'], ['/api/v2/browser-profile/ua', '/api/v1/browser-profile/ua'], (ctx) => {
@@ -491,6 +553,26 @@ async function startHandler(ctx, v) {
     const extra = { errors: e.errors, reason: e.reason, proxy_check: e.proxy_check };
     for (const k of Object.keys(extra)) if (extra[k] === undefined) delete extra[k];
     throw new ApiError(e.code === 800005 ? ERR.CONSISTENCY : ERR.START_FAILED, `start failed: ${e.message}`, 200, extra);
+  }
+}
+
+/**
+ * 硬删环境时把它的 user-data-dir 一起删掉。
+ * 「删了记录、留几个 G 的 userdata」是最常见的脏数据来源；
+ * 但这里只允许删 PROFILES_DIR 下的目录，路径算不对就不删（宁留数据不越界）。
+ */
+function removeProfileDataDir(profile) {
+  try {
+    const base = path.resolve(PROFILES_DIR) + path.sep;
+    // userDataDirFor 给的是 <profiles>/<no>_<id8>/userdata，往上退一层才是这个环境的根
+    const dir = path.resolve(path.dirname(userDataDirFor(profile)));
+    if (!dir.startsWith(base)) return null;
+    if (!fs.existsSync(dir)) return null;
+    fs.rmSync(dir, { recursive: true, force: true });
+    return dir;
+  } catch {
+    // 文件被占用（刚停完的内核还没退干净）不能把删除整体搞失败：记录已经删了，下次启动会重建目录
+    return null;
   }
 }
 
