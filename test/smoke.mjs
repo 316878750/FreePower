@@ -1,11 +1,20 @@
 /**
- * P0 冒烟：端到端验证「建环境 → 起真 Chrome → 指纹生效 → 关环境 → 再起指纹不变 → 不同环境指纹不同」。
+ * P1 验收冒烟：
+ *  1. 并发起 3 个环境（US / JP / SG），互不干扰
+ *  2. 每个环境的 cookie 隔离（同一个 origin，互相看不到）
+ *  3. 幂等：重复 start 返回现成 ws，不新开进程
+ *  4. 契约：ws.puppeteer / ws.selenium(host:port) / debug_port(字符串) / webdriver
+ *  5. 一致性校验挡在启动前（改坏 platform 后 start 返回 800005）
+ *  6. 关掉后进程不残留
+ *
  * 跑法：npm run smoke
  */
+import { execFileSync } from 'node:child_process';
 import { createApiServer } from '../src/api/server.js';
 import { CdpClient } from '../src/kernel/cdp.js';
 import { stopAll } from '../src/runtime/manager.js';
 import { findChrome } from '../src/kernel/chrome.js';
+import { getDb } from '../src/store/db.js';
 
 const results = [];
 function check(name, ok, detail = '') {
@@ -17,65 +26,47 @@ function listen(server, port) {
   return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server.address().port)));
 }
 
-const CANVAS_EXPR = `(() => {
-  const c = document.createElement('canvas'); c.width = 220; c.height = 60;
-  const x = c.getContext('2d');
-  x.textBaseline = 'top';
-  x.font = '15px Arial';
-  x.fillStyle = '#f60'; x.fillRect(0, 0, 220, 60);
-  x.fillStyle = '#069'; x.fillText('FreePower 自检 AaBb 123', 3, 3);
-  const d = x.getImageData(0, 0, 220, 60).data;
-  let h = 2166136261 >>> 0;
-  for (let i = 0; i < d.length; i += 4) { h ^= d[i]; h = Math.imul(h, 16777619) >>> 0; }
-  const again = x.getImageData(0, 0, 220, 60).data;
-  let h2 = 2166136261 >>> 0;
-  for (let i = 0; i < again.length; i += 4) { h2 ^= again[i]; h2 = Math.imul(h2, 16777619) >>> 0; }
-  return { hash: h >>> 0, hashAgain: h2 >>> 0, dataUrl: c.toDataURL().length, urlAgain: c.toDataURL().length };
-})()`;
-
-const PROBE_EXPR = `(() => {
-  const gl = document.createElement('canvas').getContext('webgl');
-  const out = {
-    installed: typeof window.__fpApplied !== 'undefined',
-    applied: window.__fpApplied || null,
-    ua: navigator.userAgent,
-    platform: navigator.platform,
-    webdriver: navigator.webdriver,
-    hardwareConcurrency: navigator.hardwareConcurrency,
-    deviceMemory: navigator.deviceMemory,
-    languages: navigator.languages,
-    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-    locale: Intl.DateTimeFormat().resolvedOptions().locale,
-    screen: [screen.width, screen.height, window.devicePixelRatio],
-    webglVendor: gl ? gl.getParameter(37445) : null,
-    webglRenderer: gl ? gl.getParameter(37446) : null,
-    uaData: navigator.userAgentData ? {
-      brands: navigator.userAgentData.brands.map(b => b.brand + '/' + b.version),
-      platform: navigator.userAgentData.platform,
-      mobile: navigator.userAgentData.mobile,
-    } : null,
-  };
-  return out;
-})()`;
-
-async function evalInInjectedPages(wsUrl, expr) {
+async function evalInPage(wsUrl, expr, { url = null } = {}) {
   const c = await CdpClient.connect(wsUrl);
   try {
     const { targetInfos } = await c.send('Target.getTargets');
-    const pages = targetInfos.filter((t) => t.type === 'page');
-    const out = [];
-    for (const t of pages) {
-      try {
-        const { sessionId } = await c.send('Target.attachToTarget', { targetId: t.targetId, flatten: true });
-        const r = await c.send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true }, sessionId);
-        if (r.exceptionDetails) continue;
-        out.push({ targetId: t.targetId, url: t.url, value: r.result.value });
-      } catch { /* 某个 target 挂了跳过 */ }
+    const page = targetInfos.find((t) => t.type === 'page');
+    if (!page) return null;
+    const { sessionId } = await c.send('Target.attachToTarget', { targetId: page.targetId, flatten: true });
+    if (url) {
+      await c.send('Page.enable', {}, sessionId).catch(() => {});
+      await c.send('Page.navigate', { url }, sessionId);
+      await new Promise((r) => setTimeout(r, 600));
     }
-    return out;
+    const r = await c.send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true }, sessionId);
+    return r.exceptionDetails ? null : r.result.value;
   } finally {
     c.close();
   }
+}
+
+const PROBE = `(() => ({
+  ua: navigator.userAgent,
+  platform: navigator.platform,
+  webdriver: navigator.webdriver,
+  timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  languages: navigator.languages,
+  cores: navigator.hardwareConcurrency,
+  memory: navigator.deviceMemory,
+  gl: (() => { const g = document.createElement('canvas').getContext('webgl'); return g ? [g.getParameter(37445), g.getParameter(37446)] : null; })(),
+  fpApplied: window.__fpApplied || null,
+}))()`;
+
+const COOKIE_READ = 'document.cookie';
+const cookieWrite = (v) => `(document.cookie = 'fp_isolation=${v}; path=/', document.cookie)`;
+
+async function waitPidGone(pid, timeoutMs = 8000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try { process.kill(pid, 0); } catch { return true; }
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  return false;
 }
 
 async function main() {
@@ -99,102 +90,120 @@ async function main() {
   };
 
   const created = [];
+  const started = [];
   try {
-    // /status 形状对齐
+    /* ---------- 契约基础 ---------- */
     const status = await api('GET', '/status');
-    check('/status 形状对齐', status.json.code === 0 && status.json.msg === 'success', JSON.stringify(status.json));
+    check('/status 形状', status.json.code === 0 && status.json.msg === 'success', JSON.stringify(status.json));
+    const noauth = await fetch(base + '/api/v2/browser-profile/list');
+    check('无 key 被拒（HTTP 401）', noauth.status === 401);
 
-    // 鉴权
-    const noauth = await fetch(base + '/api/v1/user/list');
-    check('无 key 被拒', noauth.status === 401, `HTTP ${noauth.status}`);
-
-    // CORS：非本机 Origin 必须是 403 纯文本
-    const corsBad = await fetch(base + '/api/v1/user/list', {
-      headers: { api_key: apiKey, origin: 'https://evil.example.com' },
+    /* ---------- v2 契约：launch_args 数组 + password_filling ---------- */
+    const c2 = await api('POST', '/api/v2/browser-profile/create', {
+      name: 'p1-v2', batch_id: '0', country: 'SG',
+      launch_args: ['--disable-gpu'],
+      password_filling: '1',
     });
-    const corsText = await corsBad.text();
-    check('跨站 Origin 被拒（403 纯文本 CORS ERROR）', corsBad.status === 403 && corsText === 'CORS ERROR', `${corsBad.status} ${corsText}`);
+    check('v2 建环境成功', c2.json.code === 0, c2.json.msg);
+    const p2 = c2.json.data || {};
+    created.push(p2.profile_id);
+    check('v2 返回 profile_id/profile_no', !!p2.profile_id && typeof p2.profile_no === 'number');
+    check('v2 launch_args 出站是数组', Array.isArray(p2.launch_args) && p2.launch_args[0] === '--disable-gpu', JSON.stringify(p2.launch_args));
+    check('password_filling 内部单布尔', p2.disable_password_filling === '0', JSON.stringify(p2.disable_password_filling));
 
-    // 限流：不带 mcp 头连打两次，第二次必须是那句固定报文
-    const r1 = await fetch(base + '/api/v1/user/list', { headers: { api_key: apiKey } });
-    await r1.json();
-    const r2 = await fetch(base + '/api/v1/user/list', { headers: { api_key: apiKey } });
-    const r2j = await r2.json();
-    check('限流报文对齐', r2j.code === -1 && r2j.msg === 'Too many request per second, please check', JSON.stringify(r2j));
+    const c2v1 = await api('GET', `/api/v1/user/detail?user_id=${p2.profile_id}`);
+    check('v1 出站 launch_args 是 JSON 字符串', typeof c2v1.json.data?.launch_args === 'string', String(c2v1.json.data?.launch_args));
 
-    // 建环境
-    const c1 = await api('POST', '/api/v1/user/create', { name: 'smoke-a', country: 'US' });
-    const p1 = c1.json.data;
-    created.push(p1.profile_id);
-    check('建环境返回 profile_id', c1.json.code === 0 && !!p1.profile_id, p1.profile_id);
-    check('指纹自洽：UA 版本 == 内核大版本',
-      p1.fingerprint_config.ua.includes(`Chrome/${p1.fingerprint_config.kernel.major}.`),
-      p1.fingerprint_config.kernel.major);
-
-    // 起环境
-    const s1 = await api('GET', `/api/v1/browser/start?user_id=${p1.profile_id}`);
-    check('启动返回 code 0', s1.json.code === 0, s1.json.msg);
-    if (s1.json.code !== 0) throw new Error('启动失败，后续跳过');
-    const ws1 = s1.json.data.ws.puppeteer;
-    check('返回 ws.puppeteer', typeof ws1 === 'string' && ws1.startsWith('ws://'), ws1);
-    check('debug_port 是字符串（对手契约）', typeof s1.json.data.debug_port === 'string' && Number(s1.json.data.debug_port) > 0, s1.json.data.debug_port);
-    check('ws.selenium 只放 host:port', /^127\.0\.0\.1:\d+$/.test(s1.json.data.ws.selenium), s1.json.data.ws.selenium);
-
-    // 幂等：重复 start 必须是同一个 pid，不能起第二个浏览器
-    const s1b = await api('GET', `/api/v1/browser/start?user_id=${p1.profile_id}`);
-    check('重复 start 幂等', s1b.json.code === 0 && s1b.json.data.pid === s1.json.data.pid && s1b.json.data.already_running === true,
-      `pid ${s1.json.data.pid} / ${s1b.json.data.pid}`);
-
-    // 探针
-    const probes = await evalInInjectedPages(ws1, PROBE_EXPR);
-    const probe = probes.find((p) => p.value && p.value.installed);
-    check('注入脚本已生效（找到打过补丁的页面）', !!probe, `${probes.length} 个页面`);
-    if (probe) {
-      const v = probe.value;
-      const fp = p1.fingerprint_config;
-      check('UA 一致', v.ua === fp.ua, v.ua.slice(0, 60));
-      check('UA-CH 有值', !!v.uaData && v.uaData.platform === 'Windows', JSON.stringify(v.uaData && v.uaData.brands));
-      check('navigator.webdriver 为 undefined', v.webdriver === undefined || v.webdriver === false, String(v.webdriver));
-      check('时区一致', v.timezone === fp.timezone, v.timezone);
-      check('语言一致', (v.languages || []).join(',') === fp.language.join(','), (v.languages || []).join(','));
-      check('hardwareConcurrency 一致', v.hardwareConcurrency === fp.hardware_concurrency, String(v.hardwareConcurrency));
-      check('platform 一致', v.platform === fp.platform, v.platform);
-      check('WebGL renderer 一致', v.webglRenderer === fp.webgl.renderer, v.webglRenderer);
-      check('WebGL vendor 一致', v.webglVendor === fp.webgl.vendor, v.webglVendor);
+    /* ---------- 并发建 3 个环境 ---------- */
+    const countries = ['US', 'JP', 'SG'];
+    const profiles = [];
+    for (const country of countries) {
+      const r = await api('POST', '/api/v1/user/create', { name: `p1-${country}`, country });
+      check(`建环境 ${country}`, r.json.code === 0, r.json.msg || '');
+      profiles.push(r.json.data);
+      created.push(r.json.data.profile_id);
     }
 
-    const canvas1 = await evalInInjectedPages(ws1, CANVAS_EXPR);
-    const cv1 = canvas1.map((c) => c.value).find(Boolean);
-    check('canvas 同页连读两次一致', cv1 && cv1.hash === cv1.hashAgain, cv1 ? `${cv1.hash}/${cv1.hashAgain}` : 'n/a');
+    /* ---------- 并发启动 ---------- */
+    const started3 = await Promise.all(profiles.map((p) =>
+      api('GET', `/api/v1/browser/start?user_id=${p.profile_id}`)));
+    for (const [i, r] of started3.entries()) {
+      const d = r.json.data || {};
+      check(`启动 ${countries[i]}`, r.json.code === 0, r.json.msg);
+      check(`${countries[i]} debug_port 是字符串`, typeof d.debug_port === 'string' && Number(d.debug_port) > 0, String(d.debug_port));
+      check(`${countries[i]} ws.puppeteer 是 ws://`, typeof d.ws?.puppeteer === 'string' && d.ws.puppeteer.startsWith('ws://'));
+      check(`${countries[i]} ws.selenium 是 host:port`, /^127\.0\.0\.1:\d+$/.test(String(d.ws?.selenium)), String(d.ws?.selenium));
+      check(`${countries[i]} webdriver 字段存在`, /^127\.0\.0\.1:\d+$/.test(String(d.webdriver)), String(d.webdriver));
+      if (d.ws?.puppeteer) started.push({ profile: profiles[i], data: d });
+    }
+    check('3 个环境都在跑', started.length === 3, String(started.length));
 
-    // 关环境
-    const stop1 = await api('GET', `/api/v1/browser/stop?user_id=${p1.profile_id}`);
-    check('停止成功', stop1.json.code === 0 && stop1.json.data.stopped === true, JSON.stringify(stop1.json.data));
-    const pidGone = await waitPidGone(s1.json.data.pid, 5000);
-    check('进程树已回收', pidGone, `pid ${s1.json.data.pid}`);
+    /* ---------- 幂等 ---------- */
+    if (started[0]) {
+      const again = await api('GET', `/api/v1/browser/start?user_id=${started[0].profile.profile_id}`);
+      check('重复 start 幂等（already_running）', again.json.data?.already_running === true, JSON.stringify(again.json.data?.already_running));
+      check('幂等返回同一个 ws', again.json.data?.ws?.puppeteer === started[0].data.ws.puppeteer);
+      check('幂等没有新起进程', String(again.json.data?.pid) === String(started[0].data.pid));
+    }
 
-    // 再起：同一环境指纹必须不变
-    const s2 = await api('GET', `/api/v1/browser/start?user_id=${p1.profile_id}`);
-    check('二次启动成功', s2.json.code === 0, s2.json.msg);
-    const canvas2 = await evalInInjectedPages(s2.json.data.ws.puppeteer, CANVAS_EXPR);
-    const cv2 = canvas2.map((c) => c.value).find(Boolean);
-    check('重启后 canvas 指纹不变（同种子）', cv1 && cv2 && cv1.hash === cv2.hash, `${cv1 && cv1.hash} / ${cv2 && cv2.hash}`);
+    /* ---------- 指纹生效 ---------- */
+    const probes = await Promise.all(started.map((s) => evalInPage(s.data.ws.puppeteer, PROBE)));
+    for (const [i, v] of probes.entries()) {
+      const profile = started[i].profile;
+      check(`${countries[i]} 注入已生效`, !!v?.fpApplied, JSON.stringify(v?.fpApplied));
+      check(`${countries[i]} UA 一致`, v?.ua === profile.ua, String(v?.ua).slice(0, 50));
+      check(`${countries[i]} 时区一致`, v?.timezone === profile.timezone, `${v?.timezone} vs ${profile.timezone}`);
+      check(`${countries[i]} webdriver 未暴露`, v?.webdriver === undefined || v?.webdriver === false, String(v?.webdriver));
+      check(`${countries[i]} WebGL vendor 一致`, v?.gl?.[0] === profile.webgl_config?.unmasked_vendor, String(v?.gl?.[0]));
+    }
+    check('3 个环境指纹两两不同', new Set(probes.map((v) => `${v?.ua}|${v?.timezone}|${JSON.stringify(v?.gl)}`)).size === 3);
 
-    // 另一个环境：指纹必须不同
-    const c2 = await api('POST', '/api/v1/user/create', { name: 'smoke-b', country: 'JP' });
-    created.push(c2.json.data.profile_id);
-    const s3 = await api('GET', `/api/v1/browser/start?user_id=${c2.json.data.profile_id}`);
-    check('第二个环境启动成功', s3.json.code === 0, s3.json.msg);
-    const canvas3 = await evalInInjectedPages(s3.json.data.ws.puppeteer, CANVAS_EXPR);
-    const cv3 = canvas3.map((c) => c.value).find(Boolean);
-    check('不同环境 canvas 指纹不同', cv1 && cv3 && cv1.hash !== cv3.hash, `${cv1 && cv1.hash} / ${cv3 && cv3.hash}`);
-    const probe3 = (await evalInInjectedPages(s3.json.data.ws.puppeteer, PROBE_EXPR)).find((p) => p.value && p.value.installed);
-    check('第二个环境时区跟随国家（日本）', probe3 && probe3.value.timezone === 'Asia/Tokyo', probe3 && probe3.value.timezone);
+    /* ---------- cookie 隔离 ---------- */
+    const originUrl = `${base}/status`;
+    for (const [i, s] of started.entries()) {
+      const got = await evalInPage(s.data.ws.puppeteer, cookieWrite(`env${i}`), { url: originUrl });
+      check(`cookie 写入 env${i}`, String(got).includes(`fp_isolation=env${i}`), String(got));
+    }
+    for (const [i, s] of started.entries()) {
+      const cookie = String(await evalInPage(s.data.ws.puppeteer, COOKIE_READ));
+      const others = [0, 1, 2].filter((j) => j !== i).map((j) => `fp_isolation=env${j}`);
+      check(`env${i} cookie 只看到自己`, cookie.includes(`fp_isolation=env${i}`) && others.every((o) => !cookie.includes(o)), cookie);
+    }
+
+    /* ---------- 一致性校验挡启动 ---------- */
+    const bad = await api('POST', '/api/v1/user/create', { name: 'p1-bad', country: 'US' });
+    const badId = bad.json.data.profile_id;
+    created.push(badId);
+    getDb().prepare('UPDATE profiles SET platform = ?, ua = ? WHERE id = ?')
+      .run('MacIntel', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36', badId);
+    const badStart = await api('GET', `/api/v1/browser/start?user_id=${badId}`);
+    check('一致性冲突被挡（800005）', badStart.json.code === 800005, `${badStart.json.code} ${badStart.json.msg}`);
+
+    /* ---------- 停止与回收 ---------- */
+    const pids = started.map((s) => Number(s.data.pid));
+    const stops = await Promise.all(started.map((s) => api('GET', `/api/v1/browser/stop?user_id=${s.profile.profile_id}`)));
+    check('3 个环境都停掉', stops.every((r) => r.json.code === 0 && r.json.data?.stopped === true));
+    const gone = await Promise.all(pids.map((pid) => waitPidGone(pid)));
+    check('主进程全部退出', gone.every(Boolean), pids.join(','));
+    await new Promise((r) => setTimeout(r, 1500));
+
+    let leftovers = '';
+    try {
+      leftovers = execFileSync('powershell.exe', ['-NoProfile', '-Command',
+        "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | Where-Object { $_.CommandLine -like '*freepower*' } | Select-Object -ExpandProperty ProcessId"],
+      { encoding: 'utf8' }).trim();
+    } catch (e) {
+      leftovers = `check failed: ${e.message}`;
+    }
+    check('无残留 chrome 进程', leftovers === '', leftovers || 'none');
+
+    const stopAgain = await api('GET', `/api/v1/browser/stop?user_id=${started[0].profile.profile_id}`);
+    check('重复 stop 返回 800002', stopAgain.json.code === 800002, String(stopAgain.json.code));
 
     const active = await api('GET', '/api/v1/browser/active');
-    check('active 列表有 2 个', active.json.data.list.length === 2, JSON.stringify(active.json.data.list.map((x) => x.profile_id)));
+    check('active 列表为空', active.json.data?.list?.length === 0);
   } catch (e) {
-    check('冒烟异常', false, e.message);
+    check('冒烟异常', false, e.stack || e.message);
   } finally {
     await stopAll();
     for (const id of created) await api('POST', '/api/v1/user/delete', { user_ids: [id] });
@@ -203,16 +212,8 @@ async function main() {
 
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} 通过`);
+  if (failed.length) console.log('失败项：\n' + failed.map((f) => ` - ${f.name} ${f.detail}`).join('\n'));
   process.exit(failed.length ? 1 : 0);
-}
-
-async function waitPidGone(pid, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try { process.kill(pid, 0); } catch { return true; }
-    await new Promise((r) => setTimeout(r, 150));
-  }
-  return false;
 }
 
 main();

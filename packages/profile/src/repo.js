@@ -82,6 +82,8 @@ export function createProfile(db, input) {
   const res = validateProfile(input, { mode: 'create' });
   if (!res.ok) return { ok: false, errors: res.errors, warnings: res.warnings };
   const rec = { ...res.value };
+  // 扩展列不在字段表里，校验会当未知字段丢掉，这里显式接住
+  for (const col of EXT_COLS) if (input[col] !== undefined) rec[col] = input[col];
   rec.id = crypto.randomUUID();
   const next = db.prepare('SELECT COALESCE(MAX(profile_no), 10000) + 1 AS n FROM profiles').get();
   rec.profile_no = next.n;
@@ -116,6 +118,8 @@ export function updateProfile(db, id, input) {
   if (!res.ok) return { ok: false, errors: res.errors, warnings: res.warnings };
 
   const merged = { ...existing, ...res.value, id, updated_at: now() };
+  // 扩展列（fp_seed / kernel_version / status …）不参与字段表校验，显式合并
+  for (const col of EXT_COLS) if (input[col] !== undefined) merged[col] = input[col];
   // fingerprint_config 合并而不是覆盖（webgl_config 只改一半时不能丢字段）
   const fpPatch = {};
   for (const f of FP) if (res.value[f.name] !== undefined) fpPatch[f.name] = res.value[f.name];

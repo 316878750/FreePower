@@ -10,6 +10,8 @@
   "scripts": {
     "start": "node --no-warnings src/main.js",
     "dev": "node --no-warnings --watch src/main.js",
-    "smoke": "node --no-warnings test/smoke.mjs"
+    "smoke": "node --no-warnings test/smoke.mjs",
+    "test:profile": "node --no-warnings packages/profile/test/schema.test.mjs",
+    "gen": "node tools/gen-schema.mjs"
   }
 }
