@@ -170,7 +170,7 @@ async function injectAndOpen(instance, profile, view) {
   const client = instance.client;
   const profileId = instance.profile_id;
 
-  /** targetId -> 装配完成的 Promise */
+  /** targetId -> { prep, sessionId } */
   const pageReady = new Map();
 
   // 所有新页面（我们建的、用户 Ctrl+T 建的、页面自己 window.open 的）都在「暂停态」接住，
@@ -192,18 +192,36 @@ async function injectAndOpen(instance, profile, view) {
         }
       }
     })();
-    pageReady.set(targetInfo.targetId, prep);
+    pageReady.set(targetInfo.targetId, { prep, sessionId });
   });
 
   await client.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
 
+  /**
+   * 启动时 Chrome 自带的那张空白页在 setAutoAttach 之前就存在，脚本已经跑过一轮。
+   * 对这类「已有页面」：先装配，再重载一次让 addScriptToEvaluateOnNewDocument 生效。
+   * 不处理它就是「首帧原始指纹」的漏点。
+   */
+  async function prepareExistingTabs() {
+    const { targetInfos } = await client.send('Target.getTargets').catch(() => ({ targetInfos: [] }));
+    for (const t of targetInfos.filter((x) => x.type === 'page')) {
+      const entry = pageReady.get(t.targetId) || await waitFor(() => pageReady.get(t.targetId), 3000);
+      if (!entry) continue;
+      await entry.prep.catch(() => {});
+      if (t.url === 'about:blank' || t.url.startsWith('chrome://newtab')) {
+        await client.send('Page.reload', {}, entry.sessionId).catch(() => {});
+      }
+    }
+  }
+  await prepareExistingTabs();
+
   const urls = Array.isArray(profile.open_urls) && profile.open_urls.length ? profile.open_urls : ['about:blank'];
   for (const url of urls) {
     const { targetId } = await client.send('Target.createTarget', { url: 'about:blank' });
-    const prep = pageReady.get(targetId) || await waitFor(() => pageReady.get(targetId), 5000);
-    if (prep) await prep.catch(() => {});
+    const entry = pageReady.get(targetId) || await waitFor(() => pageReady.get(targetId), 5000);
+    if (entry) await entry.prep.catch(() => {});
     if (url && url !== 'about:blank') {
-      const sessionId = await sessionForTarget(client, targetId);
+      const sessionId = entry?.sessionId || await sessionForTarget(client, targetId);
       if (sessionId) {
         await client.send('Page.navigate', { url }, sessionId)
           .catch((e) => log(profileId, 'navigate 失败', url, e.message));

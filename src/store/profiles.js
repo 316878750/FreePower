@@ -52,6 +52,8 @@ function flattenFingerprint(input = {}) {
   for (const [k, v] of Object.entries(input)) {
     if (BY_NAME.has(k)) out[k] = v;
   }
+  // launch_args 契约：对外是数组，落库是 JSON 字符串（字段表里它是 string 列）
+  if (Array.isArray(out.launch_args)) out.launch_args = JSON.stringify(out.launch_args);
   // 兼容 v0 的嵌套写法（老客户端/脚本）
   if (input.screen && typeof input.screen === 'object') {
     out.screen_resolution = `${input.screen.width}_${input.screen.height}`;
@@ -65,8 +67,14 @@ function flattenFingerprint(input = {}) {
 export function toApi(profile) {
   if (!profile) return null;
   const view = fingerprintView(profile);
+  let launchArgs = [];
+  if (Array.isArray(profile.launch_args)) launchArgs = profile.launch_args;
+  else if (typeof profile.launch_args === 'string' && profile.launch_args.trim()) {
+    try { launchArgs = JSON.parse(profile.launch_args); } catch { launchArgs = profile.launch_args.split(/\r?\n/).filter(Boolean); }
+  }
   return {
     ...profile,
+    launch_args: launchArgs,
     profile_id: profile.id,
     group_name: groupName(profile.group_id),
     proxy_config: profile.user_proxy_config ? normalizeProxy(profile.user_proxy_config) : { ...DEFAULT_PROXY },
@@ -255,11 +263,21 @@ export function markStatus(profileId, status) {
   setStatus(getDb(), profileId, status);
 }
 
-/** 启动前一致性校验：返回 {ok, errors, warnings} */
+/**
+ * 启动前一致性校验：返回 {ok, errors, warnings}。
+ * 一致性告警在启动前一律升级为错误 —— 「一条对不上整组作废」，不能带着已知冲突的指纹出门。
+ */
 export function checkProfile(profile) {
   const input = {};
   for (const f of BY_NAME.keys()) {
     if (profile[f] !== undefined && profile[f] !== null) input[f] = profile[f];
   }
-  return validateProfile(input, { mode: 'update', fillDefaults: false });
+  // 契约层是数组，字段表里是字符串列 —— 校验前先还原成存储形态
+  if (Array.isArray(input.launch_args)) input.launch_args = JSON.stringify(input.launch_args);
+  const res = validateProfile(input, { mode: 'update', fillDefaults: false });
+  return {
+    ok: res.errors.length === 0 && res.warnings.length === 0,
+    errors: [...res.errors, ...res.warnings],
+    warnings: res.warnings,
+  };
 }

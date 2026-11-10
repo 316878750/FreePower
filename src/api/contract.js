@@ -51,9 +51,9 @@ export function normalizeLaunchArgs(value) {
   return s.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
 }
 
-/** 出站：v1 返回 JSON 字符串，v2 返回数组 */
+/** 出站：v1 返回 JSON 字符串，v2 返回数组；库里存的是 JSON 字符串，先解析 */
 export function serializeLaunchArgs(args, version) {
-  const arr = Array.isArray(args) ? args : [];
+  const arr = Array.isArray(args) ? args : normalizeLaunchArgs(args);
   return version === 'v1' ? JSON.stringify(arr) : arr;
 }
 

@@ -16,6 +16,8 @@ export { DDL };
 const FLAT = FIELDS.filter((f) => f.storage !== 'fp');
 const FP = FIELDS.filter((f) => f.storage === 'fp');
 const EXT_COLS = ['id', 'profile_no', 'fp_seed', 'kernel_version', 'proxy_id', 'status', 'created_at', 'updated_at', 'last_launch_at'];
+/** 可能存 number 也可能存 "default" 的枚举列 */
+const NUMERIC_ENUM = ['hardware_concurrency', 'device_memory'];
 
 export function openDatabase(file) {
   const db = new DatabaseSync(file);
@@ -55,7 +57,13 @@ function fromRow(row) {
   }
   const fp = safeParse(row.fingerprint_config, {});
   for (const f of FP) rec[f.name] = fp[f.name] ?? null;
-  // 派生：指纹种子
+  // 数值型枚举列（TEXT 亲和）读回来会变成 "12" / "12.0"，统一还原成 number
+  for (const k of NUMERIC_ENUM) {
+    if (rec[k] !== null && rec[k] !== undefined && rec[k] !== 'default') {
+      const n = Number(rec[k]);
+      if (Number.isFinite(n)) rec[k] = n;
+    }
+  }
   return rec;
 }
 

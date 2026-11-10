@@ -45,7 +45,7 @@ export class CdpClient {
       'Sec-WebSocket-Version: 13\r\n\r\n'
     );
 
-    await new Promise((resolve, reject) => {
+    return await new Promise((resolve, reject) => {
       let head = Buffer.alloc(0);
       const onData = (chunk) => {
         head = Buffer.concat([head, chunk]);
