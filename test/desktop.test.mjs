@@ -173,6 +173,11 @@ check('安装时记下安装目录', /!macro customInstall[\s\S]*WriteINIStr[\s\
 check('卸载时读注册表，读不到再用标记', /!macro customUnInit[\s\S]*ReadRegStr[\s\S]*install-dir\.ini/.test(hooks));
 check('兜底目录必须真的有 FreePower.exe 才认', /IfFileExists\s+"\$1\\\$\{APP_EXECUTABLE_FILENAME\}"/.test(hooks));
 check('不让兜底覆盖正常路径（注册表有值就直接走）', /StrCmp\s+\$0\s+""\s+0\s+fpUnDone/.test(hooks));
+// 空目录收尾：RMDir /r 有时「文件删了、目录还在」（含空格路径实测）。
+// 收尾必须是非递归 RMDir —— 目录非空就一定失败，绝不能变成递归删用户数据。
+check('卸载末尾补一次空目录收尾', /Function un\.onUninstSuccess[\s\S]*RMDir\s+"\$fpUnDir"/.test(hooks));
+check('收尾用的 RMDir 不带 /r（只收空壳，不递归删）', !/RMDir\s+\/r\s+"\$fpUnDir"/.test(hooks));
+check('收尾目录在主流程删文件之前记下', /!macro customUnInstall[\s\S]*StrCpy\s+\$fpUnDir\s+"\$INSTDIR"/.test(hooks));
 check('README 写明诊断开关存在', /--show-tray-menu/.test(fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8')));
 
 /* ------------------------- 收尾 ------------------------- */

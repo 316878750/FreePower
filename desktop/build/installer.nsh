@@ -30,3 +30,27 @@
     StrCpy $INSTDIR "$1"
   fpUnDone:
 !macroend
+
+; ---------------------------------------------------------------------------
+; 卸载收尾：RMDir /r $INSTDIR 在两种情况下会「文件删了、目录还在」——
+;   ① 安装路径含空格（本例实测）；
+;   ② 有句柄还压在目录上（内核/资源管理器没完全放手）。
+; 只在 un.onUninstSuccess 里补一次**非递归** RMDir：
+; 目录非空就一定失败，所以这条永远不会误删文件，只收掉空壳。
+; ---------------------------------------------------------------------------
+Var fpUnDir
+
+!macro customUnInstall
+  ; 这一步在主流程 RMDir /r 之前插入，先把目标目录记下来
+  StrCpy $fpUnDir "$INSTDIR"
+!macroend
+
+Function un.onUninstSuccess
+  StrCmp $fpUnDir "" 0 fpUnRmdir
+  ; customUnInit 没跑起来（极端情况）时退回 INI 里记的目录
+  ReadINIStr $fpUnDir "$APPDATA\FreePower\install-dir.ini" "install" "dir"
+  fpUnRmdir:
+  StrCmp $fpUnDir "" fpUnEnd
+  RMDir "$fpUnDir"
+  fpUnEnd:
+FunctionEnd
