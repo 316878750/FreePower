@@ -40,7 +40,8 @@ export function parseWindowSize(raw) {
   return m ? { width: Number(m[1]), height: Number(m[2]) } : null;
 }
 
-/** hardware_concurrency / device_memory：'default' 表示不覆盖，数字字符串也认 */function numOrDefault(v) {
+/** hardware_concurrency / device_memory：'default' 表示不覆盖，数字字符串也认 */
+function numOrDefault(v) {
   if (v === undefined || v === null || v === 'default' || v === '') return undefined;
   const n = Number(v);
   return Number.isFinite(n) && n > 0 ? n : undefined;
