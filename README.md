@@ -312,7 +312,11 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
     边界：AdsPower 的代理是**一个字符串** `host:port:user:pass`（已认，密码可含 `:`，切不出来就进 `warnings` 并写明「代理为空」，不静默丢）；cookie 是**对象数组**（落库原样保留，`JSON.parse` 回来仍是对象，不会变成 `["[object Object]"]`）；`sameSite` 用对方四值 `no_restriction/lax/strict/unspecified`，**内核没声明就写 `unspecified`，绝不补默认 `lax`**；分区 cookie（CHIPS）的 `partitionKey` / `CookiePartitionKey` 双向都认。我们自己的 cookie 导出仍是 `json` / `netscape` 两种，`expires` 对外 unix 秒（导入兼容毫秒；session 在 json 里 `-1`、netscape 里 `0`）。
 34. **cookie 导入/导出只走运行中内核（P10）**：用 CDP `Storage.getCookies` / `Storage.setCookies`，**不读 user-data-dir 里的 SQLite**（值用 DPAPI 加密，跨机器解不开），也**不为了导出偷偷起内核**。环境没在跑时两条路由都明确报 `800002`（文案写清「请先启动该环境」）。`imported > 0` 时会立刻回读，缺条目进 `warnings`，不假装成功。
     边界：`copy_cookies` 打开时要求源环境在跑，读到的 cookie 以**登录 cookie 文本**回写到新环境（`/api/v2/browser-profile/cookies` 可读），**不是**把内核实时读到的 SQLite 复制过去（那份数据既加锁又不完整）。需要「副本启动后原样带登录态」的场景，请在副本启动后用 `cookie/import` 再导入一次。
-35. **注入函数的源码可以被 `Function.prototype.toString.call` 读到（P9-C 复验发现，未修）**：`native()` 只挂了函数自己的 `toString` 属性，所以 `String(fn)` 是 `[native code]`，但 `Function.prototype.toString.call(fn)` 对任何 JS 函数都返回真源码 —— 逆向实测 9 个入口泄漏（`enumerateDevices` / `MediaDeviceInfo.toJSON` / `hardwareConcurrency` getter / `toDataURL` / `getImageData` / `getBoundingClientRect` / `WebGL.getParameter` / `AudioBuffer.getChannelData` / `getVoices`），还会把 `CFG` / `seedForCanvas` 这些内部名字一起交给页面。**这是 JS 注入路线相对内核/DLL 替换的结构性差距**（AdsPower 在内核层替换，天然没有这条）。方向是把最常被检查的几项挪到内核/CDP 层、JS 层只留兜底；在修掉之前**不要把「native() 已伪装」当成「检测方看不见」**。泄漏清单已用集合相等锁在 `npm run test:native-tostring`（不要改成计数断言），逆向裁判跑 `npm run test:p9c-judge`（恒红是现状，L1 就是这条；不放进默认 `npm test`）。
+35. **注入函数的源码会被 `Function.prototype.toString.call` 读到（P9-C 复验发现，P11 已修）**：原来 `native()` 只给每个包装函数挂了一个 own `toString` 属性，于是 `String(fn)` 是 `[native code]`，但 `Function.prototype.toString.call(fn)` 对任何 JS 函数都返回真源码 —— 逆向实测 9 个入口泄漏（`enumerateDevices` / `MediaDeviceInfo.toJSON` / `hardwareConcurrency` getter / `toDataURL` / `getImageData` / `getBoundingClientRect` / `WebGL.getParameter` / `AudioBuffer.getChannelData` / `getVoices`），连 `CFG` / `seedForCanvas` 这些内部名字一起交给页面。**这是 JS 注入路线相对内核/DLL 替换的结构性差距**（AdsPower 在内核层替换，天然没有这条）。
+    **P11 修法与实测（2026-11-11）**：① `hardwareConcurrency` 挪到 CDP（`Emulation.setHardwareConcurrencyOverride`），JS 层不再覆盖，页面里的 getter 就是内核真身；② `native()` 不再挂 own `toString`，改成**一次性接管 `Function.prototype.toString`** + `WeakSet` 白名单，命中登记表才返回 `function NAME() { [native code] }`，未命中一律交回原生实现 —— 所以页面自定义函数、箭头、class、`document.createElement` 的源码逐字不变，`fn.toString === Function.prototype.toString` 与 `hasOwnProperty(fn,'toString') === false` 同时成立；③ 补 `getImageData.length = 4` / `getChannelData.length = 1`（原生源码里**括号永远是空的**，形参个数只在 `.length` 上体现，补形参名反而更显眼）；④ `toString` 自己：`[native code]`、`name='toString'`、`length=0`、descriptor `writable:true/enumerable:false/configurable:true`、非函数 `this` 仍抛 `TypeError`。
+    hc 走 CDP 的三个实测约束（内核 157.0.8103.40，别简化成「CDP 有覆写」）：**清不掉**（传 0 → `HardwareConcurrency must be a positive number`，不传 → `Invalid parameters`，「还原」只能设回真值或换 session）；**新 target 不继承**（每张页装配时都要重设，漏一张就是同环境两个页面报不同核数）；**不传播给专用 worker**（page=2 时 worker 仍 32，所以在 worker session 上另设一次，且必须早于 evaluate）。
+    泄漏清单用集合相等锁在 `npm run test:native-tostring`（**主世界 + worker realm 都测**，不要改成计数断言）；逆向裁判 `npm run test:p9c-judge`（恒红是现状，L1 就是这条；不放进默认 `npm test`）。
+35b. **同一个补丁只在它所在的 realm 生效（P11 已知边界，未修）**：iframe / worker 里取一份**原生** `Function.prototype.toString`，再拿回来调用我们的包装函数，仍能读到真源码（逆向实测复现）。JS 侧堵不住：换成 bound function 能堵，但源码会变成无名的 `function () { [native code] }`，与裸内核不一致，等于换一个更明显的 tell。**所以按已知限制交，不要写成「已完全伪装」**。`npm run test:native-tostring` 里有一条专门钉死这个现状（跨 realm 断言），它哪天变绿说明真堵住了，届时改这条文档和那条断言。
 36. **新建环境首次启动后，cookie 罐里会有一条内核自己写的 `NID@.google.com`（P10 验收实测，不是我们干的）**：主门 K1 里一个刚建、什么都没访问的环境，`cookie/export` 读出 3 条，其中一条是 `NID@.google.com`。用我们自己的 `buildArgs` 起一个全新 `user-data-dir` 的**裸内核**、不做任何导航、等 10 秒后直接读 cookie 罐，实测 `cookie 条数 = 1 | 清单 = ["NID@.google.com"]`、`page targets = ["chrome://newtab/"]`、`chrome 残留 = 0`：`--no-first-run` 挡不住新标签页后台那一次 google 请求，裸 Chrome 同样有。
     所以：新建环境首次启动后「导出全部 cookie」会带上它，跨环境搬运也会连它一起搬 —— 无害但是噪音。**不要**为它加过滤：裸 Chrome 有、我们没有，反而成了能被动检测的特征。同理，「刚建的环境导出 cookie 不是 0 条」不是 bug，别当异常去修。
 37. **导航被我们自己掐掉（`net::ERR_ABORTED`，P12 已修；同时推翻了一条旧结论）**：现象是「环境自己那张既有页导航正常，CDP 新建空白目标导航非 HTML 地址（JSON/API）却停在 `about:blank`」，出口探测因此长期报「没有内容」。
@@ -331,7 +335,8 @@ npm run test
 npm run smoke
 ```
 
-当前实测：`npm run test` = schema **10** + unit **64** + api **95** + ui **29** + desktop **54**；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **24/24**（`test/workers.test.mjs`），真 Chrome `157.0.8103.40`。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测：`npm run test` = schema **10** + unit **67** + api **95** + ui **29** + desktop **54**；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **24/24**（`test/workers.test.mjs`），真 Chrome `157.0.8103.40`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+> 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：
 
@@ -372,8 +377,9 @@ npm run test:fileio   # 19 项：导出→删→导入逐字段+四个哈希一�
 **注入函数源码一致性（已知限制 35 的回归监视，需要真实 Chrome，约 20 秒）**：
 
 ```powershell
-npm run test:native-tostring   # 3 项：9 个入口的 Function.prototype.toString.call 泄漏集合（集合相等，不是计数；
-                               #       删一个入口或换成别的东西泄漏，计数会骗人）
+npm run test:native-tostring   # 11 项：主世界 9 个入口的泄漏集合（集合相等，不是计数）+ worker realm 同一套
+                               #       （OffscreenCanvas / WebGL / hc getter / toString 自己 / 自定义函数仍真源码）
+                               #       + 一条跨 realm 已知限制断言（README 35b，钉死现状）
 npm run test:p9c-judge         # 逆向拆解师的独立裁判（两套环境约 2 分钟）。恒红是现状：L1 = toString 泄漏，
                                #       不放进默认 npm test —— 红出来的正是这一条，别让它被习惯性忽略
 ```

@@ -947,11 +947,13 @@ test('P7 worker 层：UA 已被 CDP 给对就不重复覆盖，没给对才用 J
   assert.ok(JSON.stringify(bad.sandbox.__fpApplied).includes('userAgent'));
 });
 
-test('P7 page 层：注入后硬件/语言与声明一致，且只装一次（重复注入不叠 patch）', () => {
+test('P11 page 层：注入后硬件/语言与声明一致，且只装一次（重复注入不叠 patch）', () => {
   const view = p7View();
   const realm = makeRealm('page', view);
   assert.equal(realm.sandbox.navigator.platform, view.platform);
-  assert.equal(realm.sandbox.navigator.hardwareConcurrency, view.hardware_concurrency);
+  // hc 自 P11 起走 CDP（Emulation.setHardwareConcurrencyOverride），**JS 层一个字都不碰**：
+  // 沙箱里没有 CDP，所以读到的仍是沙箱自己那个值（4），不会被改成 view 的声明值。
+  assert.equal(realm.sandbox.navigator.hardwareConcurrency, 4, 'page 层不该再有 hardwareConcurrency 的 JS 覆盖');
   assert.equal(realm.sandbox.navigator.deviceMemory, view.device_memory);
   assert.equal(realm.sandbox.navigator.language, view.language[0]);
   assert.equal(realm.sandbox.__fpInstalled, true);
@@ -959,6 +961,62 @@ test('P7 page 层：注入后硬件/语言与声明一致，且只装一次（�
   const before = offscreenHash(realm);
   vm.runInContext(buildInjectionSource(view), realm.context); // 再来一遍
   assert.equal(offscreenHash(realm), before, '重复注入不能改变噪声结果');
+});
+
+/* ============================================================================
+ * P11：Function.prototype.toString 一致性
+ * ==========================================================================*/
+
+test('P11 toString 补丁：我们装的函数返回 [native code]，页面自定义函数与内置函数逐字不变', () => {
+  const realm = makeRealm('page', p7View());
+  const sb = realm.sandbox;
+  const T = (fn) => vm.runInContext('Function.prototype.toString', realm.context).call(fn);
+
+  // ① 藏住：字面量与裸内核逐字相同（括号永远是空的，长度只在 .length 上）
+  assert.equal(T(sb.HTMLCanvasElement.prototype.toDataURL), 'function toDataURL() { [native code] }');
+  assert.equal(T(sb.CanvasRenderingContext2D.prototype.getImageData), 'function getImageData() { [native code] }');
+  assert.equal(T(sb.AudioBuffer.prototype.getChannelData), 'function getChannelData() { [native code] }');
+  assert.equal(T(Object.getOwnPropertyDescriptor(sb.Navigator.prototype, 'platform').get),
+    'function get platform() { [native code] }');
+  // 形参个数照裸内核（getImageData 4 / getChannelData 1），源码里不展开
+  assert.equal(sb.CanvasRenderingContext2D.prototype.getImageData.length, 4);
+  assert.equal(sb.AudioBuffer.prototype.getChannelData.length, 1);
+
+  // ② own `toString` 不许有，`fn.toString` 必须就是原型上那个
+  const fn = sb.HTMLCanvasElement.prototype.toDataURL;
+  assert.equal(Object.prototype.hasOwnProperty.call(fn, 'toString'), false);
+  assert.equal(fn.toString, vm.runInContext('Function.prototype.toString', realm.context));
+
+  // ③ 别做过头：页面/沙箱自己定义的函数必须仍是真源码
+  const own = vm.runInContext('(() => { const f = function foo() { return 1; }; return [Function.prototype.toString.call(f), f.toString()]; })()', realm.context);
+  assert.match(own[0], /return 1/);
+  assert.match(own[1], /return 1/);
+  assert.doesNotMatch(own[0], /\[native code\]/);
+  assert.match(vm.runInContext('Function.prototype.toString.call(class A {})', realm.context), /class A/);
+
+  // ④ toString 自己：四项与裸内核一致 + 非函数 this 仍抛 TypeError
+  const ts = vm.runInContext('Function.prototype.toString', realm.context);
+  assert.equal(ts.call(ts), 'function toString() { [native code] }');
+  assert.equal(ts.name, 'toString');
+  assert.equal(ts.length, 0);
+  assert.deepEqual(
+    (({ writable, enumerable, configurable }) => ({ writable, enumerable, configurable }))(
+      Object.getOwnPropertyDescriptor(vm.runInContext('Function.prototype', realm.context), 'toString')),
+    { writable: true, enumerable: false, configurable: true },
+  );
+  // vm 里抛的是那个 realm 的 TypeError，不 instanceOf 宿主的，所以按消息判
+  assert.throws(() => ts.call(42), /requires that 'this' be a Function/);
+});
+
+test('P11 已知限制 35b：跨 realm 读源码仍能读到（这里钉死现状，修好就得来改这条）', () => {
+  const realm = makeRealm('page', p7View());
+  // 另一个 realm（等价于 iframe / worker）取一份**原生** toString，再拿我们的包装函数去调
+  const other = vm.createContext({});
+  const otherT = vm.runInContext('Function.prototype.toString', other);
+  const src = otherT.call(realm.sandbox.HTMLCanvasElement.prototype.toDataURL);
+  assert.equal(/\[native code\]/.test(src), false,
+    '跨 realm 目前读得到真源码 = README 35b 的已知限制；若这里变红说明跨 realm 已被堵住，改文档与这条断言');
+  assert.match(src, /seedForCanvas|toDataURL/);
 });
 
 /* ============================================================================

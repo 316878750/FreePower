@@ -81,21 +81,90 @@ const CORE = `
   }
   function clampByte(v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
 
-  /* ---------- 伪装成原生函数（浅层，深层的 toString.call 仍可识别） ---------- */
-  function native(fn, name) {
+  /* ---------- 伪装成原生函数（P11：Function.prototype.toString 也要对） ----------
+   *
+   * P11 前这里给每个包装函数挂了一个 own toString 属性，三条一行就能判的破绽：
+   *   1) Object.prototype.hasOwnProperty.call(fn,'toString') → 原生 false，我们 true；
+   *   2) fn.toString === Function.prototype.toString → 原生恒等，我们不等；
+   *   3) 最关键：Function.prototype.toString.call(fn) 照样读到**真源码**
+   *      （变量名、seedForCanvas、CFG 全交出去）—— 只骗了 String(fn)。
+   *
+   * 现在：包装函数只登记进 WeakSet，Function.prototype.toString 一次性接管；
+   * 命中登记表才返回 function NAME() { [native code] }，未命中一律交回原生实现。
+   * 所以页面自己定义的函数 / 箭头 / class / 内核自带的内置方法，源码逐字不变
+   * —— 「别做过头」和「藏住」是同一个机制的两面，不是两套开关。
+   *
+   * 字面量照裸内核（157.0.8103.40）实测对齐：**括号永远空的**，形参个数只体现在 fn.length
+   * （toString.call(CanvasRenderingContext2D.prototype.getImageData) 是
+   *   'function getImageData() { [native code] }'，而它的 length 是 4）。
+   * 补形参名会造出 'function getImageData(a, b, c, d) { [native code] }' —— 比不伪装更显眼。
+   *
+   * ⚠️ 已知边界（README 35b）：这个补丁只对它**所在 realm** 生效。iframe / worker 里取一份
+   *   原生 Function.prototype.toString 再拿回来调用，仍能读到我们的真源码。跨 realm 无法
+   *   从 JS 侧堵住（bound function 能堵，但源码会变成无名的 function () { [native code] }，
+   *   与裸内核不一致，等于换一个更明显的 tell），所以按已知限制交，不在这里假装修好。
+   */
+  const WRAPPED = new WeakSet();
+  const origFnToString = Function.prototype.toString;
+
+  /** 原生源码字面量：'function NAME() { [native code] }'（getter 的 name 自带 'get ' 前缀） */
+  function nativeSourceOf(fn) {
+    let name = '';
+    try { name = typeof fn.name === 'string' ? fn.name : ''; } catch (e) { name = ''; }
+    return 'function ' + name + '() { [native code] }';
+  }
+
+  /**
+   * 接管 Function.prototype.toString：每个 realm 各一份（page / worker 是不同的
+   * Function.prototype），每个 realm 只装一次。
+   *
+   * 四个必须和裸内核逐项相同的点（漏一个就是新的检测点，检测器会拿 toString 自己开刀）：
+   *   - toString.toString() 也要是 [native code]（把 patched 自己登记进 WRAPPED）
+   *   - name === 'toString'、length === 0
+   *   - descriptor writable:true, enumerable:false, configurable:true
+   *   - 非函数 this 仍抛 TypeError（走原生实现，不返回字符串兜底）
+   */
+  function installToStringTrap() {
     try {
-      Object.defineProperty(fn, 'name', { value: name, configurable: true });
-      Object.defineProperty(fn, 'toString', {
-        value: function toString() { return 'function ' + name + '() { [native code] }'; },
-        configurable: true, writable: true,
+      const patched = function toString() {
+        try { if (WRAPPED.has(this)) return nativeSourceOf(this); } catch (e) {}
+        return origFnToString.apply(this, arguments);
+      };
+      Object.defineProperty(patched, 'name', { value: 'toString', writable: false, enumerable: false, configurable: true });
+      Object.defineProperty(patched, 'length', { value: 0, writable: false, enumerable: false, configurable: true });
+      WRAPPED.add(patched);
+      Object.defineProperty(Function.prototype, 'toString', {
+        value: patched, writable: true, enumerable: false, configurable: true,
       });
+    } catch (e) {
+      /* 装不上就放弃伪装（宁可泄漏，也不让页面少一个 API） */
+    }
+  }
+
+  /**
+   * 登记一个「我们装的」函数，并把 name / length 对齐原生。
+   * @param {Function} fn 包装函数
+   * @param {string} [name] 原生函数名（getter 传 'get xxx'）
+   * @param {number} [length] 原生形参个数 —— **必须从裸内核量出来**，不要抄 fn.length
+   *   （我们的包装函数形参个数常常是错的：getImageData 原生 4，我们写成 0 就是一行就能判的破绽）
+   */
+  function native(fn, name, length) {
+    try { WRAPPED.add(fn); } catch (e) {}
+    try {
+      if (typeof name === 'string' && name && fn.name !== name) {
+        Object.defineProperty(fn, 'name', { value: name, writable: false, enumerable: false, configurable: true });
+      }
+      if (typeof length === 'number' && fn.length !== length) {
+        Object.defineProperty(fn, 'length', { value: length, writable: false, enumerable: false, configurable: true });
+      }
     } catch (e) {}
     return fn;
   }
   function defGetter(obj, prop, value, name) {
     try {
       Object.defineProperty(obj, prop, {
-        get: native(function () { return value; }, name || ('get ' + prop)),
+        // getter 的 length 原生恒为 0（'get hardwareConcurrency' 也是这样）
+        get: native(function () { return value; }, name || ('get ' + prop), 0),
         configurable: true, enumerable: true,
       });
       mark(prop);
@@ -104,6 +173,9 @@ const CORE = `
   function defMethod(obj, prop, fn) {
     try { Object.defineProperty(obj, prop, { value: fn, configurable: true, writable: true }); } catch (e) {}
   }
+
+  // 先接管 toString，再让各层开始登记 —— 顺序不能反（反了先装的函数会有一小段裸窗口）
+  installToStringTrap();
 
   /* ---------- 2D 像素噪声（page 的 HTMLCanvasElement 与 worker 的 OffscreenCanvas 共用） ---------- */
   function noiseImageData(img, seedStr, strength) {
@@ -153,7 +225,7 @@ const CORE = `
         defMethod(ocProto, 'getImageData', native(function getImageData() {
           const r = origOcGet.apply(this, arguments);
           try { return noiseImageData(r, CFG.canvas.seed, CFG.canvas.strength || 1); } catch (e) { return r; }
-        }, 'getImageData'));
+        }, 'getImageData', 4));
       }
       if (OffscreenCanvas.prototype.convertToBlob && origOcGet) {
         const origConvert = OffscreenCanvas.prototype.convertToBlob;
@@ -167,7 +239,7 @@ const CORE = `
             cx.putImageData(data, 0, 0);
             return origConvert.apply(c, arguments);
           } catch (e) { return origConvert.apply(this, arguments); }
-        }, 'convertToBlob'));
+        }, 'convertToBlob', 0));
       }
       mark('offscreen_canvas');
     } catch (e) {}
@@ -181,7 +253,7 @@ const CORE = `
       if (CFG.webgl && p === 37445) return CFG.webgl.vendor;
       if (CFG.webgl && p === 37446) return CFG.webgl.renderer;
       return origGetParameter.apply(this, arguments);
-    }, 'getParameter'));
+    }, 'getParameter', 1));
 
     if (CFG.webgl_image) {
       const origReadPixels = proto.readPixels;
@@ -189,7 +261,7 @@ const CORE = `
         const r = origReadPixels.apply(this, arguments);
         try { noisePixels(arguments[6], CFG.webgl_image.seed); } catch (e) {}
         return r;
-      }, 'readPixels'));
+      }, 'readPixels', 7));
     }
   };
 
@@ -208,9 +280,18 @@ const PAGE_BODY = `
   // platform 由 Emulation.setUserAgentOverride 原生覆盖；CDP 没生效时才兜底（少一层 JS 痕迹）
   if (CFG.platform && navigator.platform !== CFG.platform) defGetter(Navigator.prototype, 'platform', CFG.platform);
 
-  if (typeof CFG.hardwareConcurrency === 'number' && navigator.hardwareConcurrency !== CFG.hardwareConcurrency) {
-    defGetter(Navigator.prototype, 'hardwareConcurrency', CFG.hardwareConcurrency);
-  }
+  /* hardwareConcurrency：P11 起**不在 JS 层覆盖**，改由 CDP 原生覆写
+   * （Emulation.setHardwareConcurrencyOverride，见 src/runtime/manager.js 的 applyToSession）。
+   * 它是 9 个入口里唯一有 CDP 出口的一个 —— 挪过去之后页面里的 getter 是**内核真身**，
+   * 既没有 JS 注入痕迹，也不存在「源码/name/length 要伪装」的问题。
+   *
+   * CDP 侧的三个实测约束（同一个内核 157.0.8103.40）写在这里，免得后人踩：
+   *   ① 清不掉：传 0 → 'HardwareConcurrency must be a positive number'，不传 → 'Invalid parameters'；
+   *      「还原」只能显式设回真值或换 session；
+   *   ② 作用域是 target/session 级，**新 target 不继承** → 每次 attach / 每张新页都要重设一次；
+   *   ③ 不需要赶在首文档之前（和 media_devices 完全不同），attach 之后设也立即生效。
+   * 另外实测它**不传播给专用 worker**（page=2 / worker=32），所以 worker 层保留「值不对才补」的
+   * JS 兜底（见 WORKER_BODY），CDP 一旦生效那段就自然不装。 */
   if (typeof CFG.deviceMemory === 'number' && navigator.deviceMemory !== CFG.deviceMemory) {
     defGetter(Navigator.prototype, 'deviceMemory', CFG.deviceMemory);
   }
@@ -268,14 +349,14 @@ const PAGE_BODY = `
       const ctx = origGetContext.apply(this, arguments);
       try { if (ctx) canvasKind.set(this, String(arguments[0])); } catch (e) {}
       return ctx;
-    }, 'getContext'));
+    }, 'getContext', 1));
   }
 
   if (CFG.canvas) {
     defMethod(CanvasRenderingContext2D.prototype, 'getImageData', native(function getImageData() {
       const r = origGetImageData2d.apply(this, arguments);
       try { return noiseImageData(r, CFG.canvas.seed, CFG.canvas.strength || 1); } catch (e) { return r; }
-    }, 'getImageData'));
+    }, 'getImageData', 4));
     mark('canvas');
   }
 
@@ -285,7 +366,7 @@ const PAGE_BODY = `
       if (!spec) return origToDataURL.apply(this, arguments);
       try { return origToDataURL.apply(noisyClone(this, spec), arguments); }
       catch (e) { return origToDataURL.apply(this, arguments); }
-    }, 'toDataURL'));
+    }, 'toDataURL', 0));
 
     if (origToBlob) {
       defMethod(HTMLCanvasElement.prototype, 'toBlob', native(function toBlob() {
@@ -294,7 +375,7 @@ const PAGE_BODY = `
         const args = Array.prototype.slice.call(arguments);
         try { return origToBlob.apply(noisyClone(this, spec), args); }
         catch (e) { return origToBlob.apply(this, arguments); }
-      }, 'toBlob'));
+      }, 'toBlob', 1));
     }
   }
 
@@ -312,7 +393,7 @@ const PAGE_BODY = `
     defMethod(AudioBuffer.prototype, 'getChannelData', native(function getChannelData() {
       const arr = origGetChannelData.apply(this, arguments);
       try { return noiseChannel(arr, CFG.audio.seed, Number(arguments[0]) || 0); } catch (e) { return arr; }
-    }, 'getChannelData'));
+    }, 'getChannelData', 1));
 
     const origCopyFromChannel = AudioBuffer.prototype.copyFromChannel;
     if (origCopyFromChannel) {
@@ -320,7 +401,7 @@ const PAGE_BODY = `
         const r = origCopyFromChannel.apply(this, arguments);
         try { noiseChannel(dest, CFG.audio.seed, Number(channel) || 0); } catch (e) {}
         return r;
-      }, 'copyFromChannel'));
+      }, 'copyFromChannel', 2));
     }
     mark('audio');
   }
@@ -350,7 +431,7 @@ const PAGE_BODY = `
         const o = rectOffset(this);
         return new DOMRectCtor(r.x + o.dx, r.y + o.dy, Math.max(0, r.width + o.dx), Math.max(0, r.height + o.dy));
       } catch (e) { return r; }
-    }, 'getBoundingClientRect'));
+    }, 'getBoundingClientRect', 0));
     mark('client_rects');
   }
 
@@ -489,7 +570,7 @@ const PAGE_BODY = `
           const mapped = deviceLabels.get(this);
           if (mapped !== undefined && base && typeof base === 'object') base.label = mapped;
           return base;
-        }, 'toJSON'));
+        }, 'toJSON', 0));
       }
     } catch (e) { /* 没有 toJSON 的内核：JSON.stringify 走普通枚举，行为同原生 */ }
 
@@ -506,7 +587,7 @@ const PAGE_BODY = `
             get: native(function () {
               const v = trackLabels.get(this);
               return v === undefined ? desc.get.call(this) : v;
-            }, 'get label'),
+            }, 'get label', 0),
             enumerable: desc.enumerable,
             configurable: true,
           });
@@ -539,7 +620,7 @@ const PAGE_BODY = `
           return proj.list;
         } catch (e) { return list; }
       }), (e) => Promise.reject(e));
-    }, 'enumerateDevices'));
+    }, 'enumerateDevices', 0));
 
     if (typeof origGetUserMedia === 'function') {
       defMethod(mdProto, 'getUserMedia', native(function getUserMedia() {
@@ -557,7 +638,7 @@ const PAGE_BODY = `
             }))
             .catch(() => renameTracks(stream));
         }, (e) => Promise.reject(e));
-      }, 'getUserMedia'));
+      }, 'getUserMedia', 0));
     }
 
     mark('media_devices');
@@ -603,7 +684,7 @@ const PAGE_BODY = `
         get: native(function () {
           const v = forcedDefault.get(this);
           return v === undefined ? defaultDesc.get.call(this) : v;
-        }, 'get default'),
+        }, 'get default', 0),
         enumerable: defaultDesc.enumerable,
         configurable: true,
       });
@@ -637,7 +718,7 @@ const PAGE_BODY = `
         cache.list = list;
         return list;
       } catch (e) { return host; }
-    }, 'getVoices'));
+    }, 'getVoices', 0));
     mark('speech');
   }
 
@@ -686,6 +767,10 @@ const WORKER_BODY = `
   if (NAV_PROTO && CFG.platform && self.navigator && self.navigator.platform !== CFG.platform) {
     defGetter(NAV_PROTO, 'platform', CFG.platform);
   }
+  /* hardwareConcurrency：先看 CDP 给没给对（manager.js 会在 worker session 上也设一次
+   * Emulation.setHardwareConcurrencyOverride，实测 resume 之前就生效），给对了就一个字都不碰；
+   * 设不上（老内核 / 该类 worker 不支持）才用 JS 兜底 —— 宁可多一层包装，也不能让 worker
+   * 报宿主核数、跟主帧自相矛盾。兜底函数同样走 native() 登记，源码是 [native code]。 */
   if (NAV_PROTO && typeof CFG.hardwareConcurrency === 'number'
       && self.navigator && self.navigator.hardwareConcurrency !== CFG.hardwareConcurrency) {
     defGetter(NAV_PROTO, 'hardwareConcurrency', CFG.hardwareConcurrency);

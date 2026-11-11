@@ -556,6 +556,27 @@ async function injectAndOpen(instance, profile, view) {
     const started = Date.now();
     // 先把自己的子会话也挂上（嵌套 worker 只在这一层接得住），再注入、再放行
     await armChildAutoAttach(sessionId, type);
+    /* 核数覆写对 worker 要单独设一次：page session 上的覆写**不传播**进 worker（实测 page=2 / worker=32），
+     * 但设在 worker 自己的 session 上是生效的（实测：设 3 → resume 之前读到的就是 3）。
+     * 必须在 evaluate 之前 —— 否则注入脚本里那条「值不对才补」的兜底会先于 CDP 判断，白装一层 JS。
+     *
+     * **只对专用 worker（type='worker'）用 CDP**：实测把这条命令发到 ServiceWorker 的 session 上，
+     * 它会把「先发 evaluate 再放行」那条时序拖坏 —— SW 的顶层脚本先跑完，注入才落地
+     * （`npm run test:workers` 实测 atTop=null、自检 realm_service 变 fail）。
+     * SharedWorker / ServiceWorker 因此只走注入脚本里那条「值不对才补」的 JS 兜底
+     * （P11 之后这层兜底的源码也是 [native code]，不再是泄漏）。
+     * 再加一层超时：CDP 万一不回，也不许把注入/放行拖死（拖死 = 这个 realm 裸奔）。 */
+    if (type === 'worker') {
+      const hc = Number(view?.hardware_concurrency);
+      if (Number.isInteger(hc) && hc > 0) {
+        await withTimeout(
+          client.send('Emulation.setHardwareConcurrencyOverride', { hardwareConcurrency: hc }, sessionId)
+            .catch((e) => { log(profileId, 'WARN hc 覆写失败(worker)', type, e.message); return null; }),
+          1000,
+          'hc 覆写超时(worker)',
+        );
+      }
+    }
     // 末行回显 __fpRealm：注入真跑过才等于 'worker'，这是「真值」而不是「发过就算」
     const expression = buildWorkerInjectionSource(view, { debug: FP_DEBUG }) + '\n;(self.__fpRealm || null)';
     const pending = client
@@ -774,6 +795,21 @@ async function applyToSession(client, sessionId, profile, view) {
   }
   if (view.timezone) await client.send('Emulation.setTimezoneOverride', { timezoneId: view.timezone }, s).catch(() => {});
   if (view.locale) await client.send('Emulation.setLocaleOverride', { locale: view.locale }, s).catch(() => {});
+
+  /* hardwareConcurrency 走 CDP 原生覆写（P11）：JS 层不再有这一段，页面里的 getter 就是内核真身，
+   * `Function.prototype.toString` 也不存在「要伪装」的问题。三个实测约束（内核 157.0.8103.40）：
+   *   ① 清不掉：传 0 → `HardwareConcurrency must be a positive number`，不传 → `Invalid parameters`；
+   *      「还原」只能显式设回真值或换 session（所以别写成「设 0 = 撤销」）。
+   *   ② 作用域是 target/session 级，**新 target 不继承**：每张页面在这里装配时都要重设一次，
+   *      漏一张就是「同一个环境里两个页面一个说 4 核一个说 32 核」，比伪装不像更致命。
+   *   ③ 不传播给专用 worker（实测 page=2 时 worker 仍是 32）→ worker 那条在 injectWorkerTarget 里另设。
+   * 设不上不抛：worker / JS 兜底各自按「值不对才补」处理，宁可多一层也不能少一个值。 */
+  const hc = Number(view.hardware_concurrency);
+  if (Number.isInteger(hc) && hc > 0) {
+    await client.send('Emulation.setHardwareConcurrencyOverride', { hardwareConcurrency: hc }, s)
+      .catch((e) => log(instance_profile(profile), 'WARN hc 覆写失败', e.message));
+  }
+
   if (view.screen) {
     // 视口按「窗口」而不是「屏幕」设：窗口 == 屏幕是 headless 的默认形态，
     // creepjs 的 hasVvpScreenRes 就是查 innerWidth/outerHeight 是否等于 screen 尺寸。
