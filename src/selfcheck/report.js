@@ -248,25 +248,40 @@ export function buildReport(profile, raw, { kernelVersion = null, previous = nul
     noteWhenOn: '只改 getBoundingClientRect；getClientRects/Range 与真实布局引擎仍可交叉验证',
   }));
 
-  /* 13. 字体：只声明，不伪装 */
+  /* 13. 字体：只声明，不伪装（P9-B：把「枚举面」这件事写明白） */
   {
     const declared = view.fonts;
     const f = raw.fonts || {};
     const detected = Array.isArray(f.detected) ? f.detected : [];
+    const eastAsian = Array.isArray(f.eastAsian) ? f.eastAsian : [];
     const specific = Array.isArray(declared) && !(declared.length === 1 && declared[0] === 'all');
     const missing = specific ? declared.filter((x) => !detected.includes(x)) : [];
-    items.push(item('fonts', 'fonts', '字体可检测项', {
+    items.push(item('fonts', 'fonts', '字体枚举面', {
       match: true,
       status: 'warn',
+      coverage: 'none',
       declared,
-      actual: { detected: detected.length, sample: detected.slice(0, 8), missingDeclared: missing },
-      note: specific && missing.length
-        ? `字体未伪装，且声明的 ${missing.length} 个字体本机不存在：${missing.slice(0, 5).join(', ')}`
-        : '字体未伪装：只声明，真实字形与宽度度量仍来自系统 DirectWrite（字段表标 none）',
+      actual: {
+        detected: detected.length,
+        sample: detected.slice(0, 8),
+        eastAsian,
+        missingDeclared: missing,
+      },
+      note: (specific && missing.length
+        ? `字体未伪装，且声明的 ${missing.length} 个字体本机不存在：${missing.slice(0, 5).join(', ')}。`
+        : '字体未伪装：只声明，真实字形与宽度度量仍来自系统 DirectWrite。')
+        + `根治要**自编译 Chromium**（把宿主字体集换成目标平台字体集）；JS 层做「字体投影」只能改 measureText/document.fonts 的返回，改不了真实字形与宽度，会造出新的不一致，风险大于收益，所以明确标 none。`
+        + ` 标 none 不等于字体指纹裸奔：canvas 文本渲染噪声已覆盖字形指纹；裸的是「宿主装了哪些字体」这个枚举面`
+        + (eastAsian.length ? `（本机实测枚举到东亚字体：${eastAsian.slice(0, 6).join(', ')}）` : '')
+        + '。',
     }));
   }
 
-  /* 14. 媒体设备 */
+  /* 14. 媒体设备：真实枚举 + 只改 label（P9-C）
+   * 检测方的三条抓手都来自「伪造整套列表」：跨 origin deviceId 恒定、未授权有 label、
+   * 枚举报得出摄像头但 getUserMedia 拿到 NotFoundError。现在列表/身份来自内核，
+   * 所以这里验的不再是「数量对上声明」，而是「未授权时 label 必须为空」这条原生行为。
+   */
   {
     const m = raw.media_devices || {};
     const mode = view.media ? view.media.mode : '0';
@@ -276,22 +291,39 @@ export function buildReport(profile, raw, { kernelVersion = null, previous = nul
         note: '按配置使用真实设备（未注入）',
       }));
     } else {
-      const want = view.media.counts;
-      const got = m.counts || {};
-      const match = m.supported && String(want.audioinput_num) === String(got.audioinput || 0)
-        && String(want.videoinput_num) === String(got.videoinput || 0)
-        && String(want.audiooutput_num) === String(got.audiooutput || 0);
-      const fallback = raw.mediaMode === 'fallback';
+      const counts = m.counts || null;
+      const labelsEmpty = m.labelsEmpty !== undefined
+        ? m.labelsEmpty
+        : (Array.isArray(m.list) ? m.list.every((d) => !d.label) : null);
+      const granted = m.granted === true;
+      const declared = view.media ? view.media.counts : null;
+      let match = true;
+      let status = 'warn';
+      let note;
+      if (!m.supported) {
+        match = false;
+        note = `媒体设备接口不可用（${ctx.secure === false ? '非安全上下文' : '页面未暴露'}），本次无法验证`;
+      } else if (!granted && labelsEmpty === false) {
+        match = false;
+        status = 'fail';
+        note = '未授权却返回了设备名：原生未授权时 label 必须是空串，非空本身就是伪造痕迹（P9-C）';
+      } else if (!granted) {
+        note = `未授权，label 全部为空（与原生一致）；设备列表来自真实枚举，不按声明数量伪造。声明数量 ${JSON.stringify(declared)} 只作为授权后的命名池`;
+      } else if (labelsEmpty === true) {
+        match = false;
+        status = 'fail';
+        note = '已授权但 label 仍为空：原生授权后会给设备名，空 label 反而异常';
+      } else {
+        note = '已授权：只按配置改了 label；deviceId / groupId / 设备数量来自内核真实枚举（跨 origin 加盐由内核负责，我们不碰）';
+      }
       items.push(item('media_devices', 'media_devices', '媒体设备', {
         match,
-        status: m.supported ? undefined : 'warn',
-        declared: want,
-        actual: m.supported ? { counts: got, sample: (m.list || []).slice(0, 4).map((d) => `${d.kind}: ${d.label || '(空)'}`) } : { supported: false, error: m.error },
-        note: !m.supported
-          ? `媒体设备接口不可用（${ctx.secure === false ? '非安全上下文' : '页面未暴露'}），数量无法验证`
-          : (match
-            ? `enumerateDevices 已按声明数量返回${fallback ? '（非安全上下文，由注入兜底实现；真实设备行为拦不住）' : '；getUserMedia 的真实设备行为拦不住'}`
-            : 'enumerateDevices 与声明数量不一致'),
+        status,
+        declared: { counts: declared, source: 'naming-pool-only' },
+        actual: m.supported
+          ? { counts, granted, labelsEmpty, permissions: m.permissions || null, sample: (m.list || []).slice(0, 4).map((d) => `${d.kind}: ${d.label || '(空)'}`) }
+          : { supported: false, error: m.error },
+        note,
       }));
     }
   }

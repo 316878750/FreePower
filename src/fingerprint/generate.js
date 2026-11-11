@@ -167,7 +167,8 @@ export function generateFingerprint(opts = {}) {
     },
     // 字体：MVP 不伪装系统字体（CDP 路线硬伤，标黄）
     fonts: ['all'],
-    // 媒体设备：0=真实 1=随机 2=手动（字段表语义），默认随机数量；手动模式没配 config 时由数量派生
+    // 媒体设备：0=真实 1=随机 2=手动（字段表语义）。P9-C 起设备列表来自内核真实枚举，
+    // 这里的数量只决定「授权后给多少个名字」，不再决定列表长度（伪造数量会被三条检测面同时抓）。
     media_devices: '1',
     media_devices_num: { audioinput_num: audioIn, videoinput_num: videoIn, audiooutput_num: 2 },
     // 网络：默认禁非代理 UDP；端口扫描白名单空 = 一个都不许

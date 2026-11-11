@@ -181,11 +181,16 @@ export function buildProbeSource() {
     out.client_rects = { ...a, hash2: b.hash, stable: a.hash === b.hash };
   } catch (e) { out.client_rects = { error: String(e) }; }
 
-  /* ---------- 字体：检测真实安装的字体（不伪装，只观察） ---------- */
+  /* ---------- 字体：检测真实安装的字体（不伪装，只观察） ----------
+   * P9-B：这一项的价值不是「值对上了」，而是把「宿主装了哪些字体」这个枚举面摆出来
+   * （creepjs 的 platform hints 就是靠它暴露 Microsoft YaHei UI 的）。
+   */
   try {
     const FONTS = ['Arial', 'Arial Black', 'Calibri', 'Cambria', 'Comic Sans MS', 'Consolas',
       'Courier New', 'Georgia', 'Impact', 'Segoe UI', 'Tahoma', 'Times New Roman',
-      'Trebuchet MS', 'Verdana', 'Microsoft YaHei', 'SimSun', 'Segoe UI Emoji', 'Wingdings'];
+      'Trebuchet MS', 'Verdana', 'Microsoft YaHei', 'Microsoft YaHei UI', 'SimSun', 'SimHei',
+      'KaiTi', 'FangSong', 'Microsoft JhengHei', 'Segoe UI Emoji', 'Wingdings'];
+    const EAST_ASIAN = /YaHei|SimSun|SimHei|KaiTi|FangSong|JhengHei|MingLiU|PMingLiU|Yu Gothic|Meiryo|MS Gothic|Malgun/i;
     const probeCanvas = document.createElement('canvas');
     const pc = probeCanvas.getContext('2d');
     const base = ['monospace', 'sans-serif', 'serif'];
@@ -204,6 +209,7 @@ export function buildProbeSource() {
     out.fonts = {
       probed: FONTS,
       detected,
+      eastAsian: detected.filter((f) => EAST_ASIAN.test(f)),
       declared: out.fontsDeclared,
       check: (() => {
         try { return FONTS.filter((f) => document.fonts && document.fonts.check('12px "' + f + '"')).slice(0, 18); }
@@ -212,12 +218,26 @@ export function buildProbeSource() {
     };
   } catch (e) { out.fonts = { error: String(e) }; }
 
-  /* ---------- 媒体设备 ---------- */
+  /* ---------- 媒体设备 ----------
+   * P9-C 起设备列表来自**真实枚举**，我们只改 label；所以这里要一起读「权限状态」，
+   * 否则分不清「label 为空」是原生（未授权）还是注入没生效。
+   */
   try {
     if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+      let permissions = null;
+      try {
+        if (navigator.permissions && navigator.permissions.query) {
+          const states = await Promise.all(['camera', 'microphone'].map((name) => navigator.permissions
+            .query({ name }).then((s) => s.state).catch(() => 'unknown')));
+          permissions = { camera: states[0], microphone: states[1] };
+        }
+      } catch (e) { permissions = null; }
       const list = await navigator.mediaDevices.enumerateDevices();
       out.media_devices = {
         supported: true,
+        permissions,
+        granted: !!(permissions && (permissions.camera === 'granted' || permissions.microphone === 'granted')),
+        labelsEmpty: list.every((d) => !d.label),
         list: list.map((d) => ({ kind: d.kind, label: d.label, deviceId: d.deviceId, groupId: d.groupId })),
         counts: list.reduce((acc, d) => { acc[d.kind] = (acc[d.kind] || 0) + 1; return acc; }, {}),
       };

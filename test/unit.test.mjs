@@ -377,7 +377,14 @@ function fakeRaw(p) {
     audio: { hash: 'cccc0003', stable: true },
     client_rects: { hash: 'dddd0004', stable: true },
     fonts: { detected: ['Arial', 'Calibri'], declared: v.fonts },
-    media_devices: { supported: true, counts: mc, list: [] },
+    media_devices: {
+      supported: true,
+      permissions: { camera: 'prompt', microphone: 'prompt' },
+      granted: false,
+      labelsEmpty: true,
+      counts: mc,
+      list: [{ kind: 'audioinput', label: '', deviceId: '', groupId: '' }],
+    },
     webrtc: { supported: true, count: 0, types: [], addresses: [] },
   };
 }
@@ -395,6 +402,8 @@ test('自检报告：声明一致时 full=pass、partial=warn、字体=none 标�
   assert.equal(byId.canvas.status, 'warn');
   assert.equal(byId.fonts.coverage, 'none');
   assert.equal(byId.fonts.status, 'warn');
+  assert.match(byId.fonts.note, /自编译 Chromium/, 'P9-B：要说清根治路径');
+  assert.match(byId.fonts.note, /不等于字体指纹裸奔/, 'P9-B：none 不等于裸奔，这一句必须在');
   assert.equal(byId.webrtc.status, 'pass');
   assert.equal(report.summary.full, 7, JSON.stringify(report.summary));
   assert.equal(report.summary.partial, 10);
@@ -416,6 +425,34 @@ test('自检报告：三类 worker 未跑到时标「未验证」而不是「通
   assert.equal(byId.audio_worklet.status, 'warn');
   assert.equal(byId.audio_worklet.coverage, 'none');
   assert.equal(report.summary.fail, 0, '「没跑到」不许算成 fail，否则自检天天红');
+});
+
+test('自检报告：媒体设备（P9-C）未授权 label 为空=标黄，未授权有名字=fail', () => {
+  const p = selfProfile();
+  const base = fakeRaw(p);
+  const withMedia = (m) => {
+    const raw = {
+      ...base,
+      media_devices: { supported: true, counts: { audioinput: 1, audiooutput: 1 }, ...m },
+    };
+    return Object.fromEntries(buildReport(p, raw, { kernelVersion: '156.0.8078.80' }).items.map((i) => [i.id, i])).media_devices;
+  };
+
+  const unauthorized = withMedia({ granted: false, labelsEmpty: true, list: [{ kind: 'audioinput', label: '' }] });
+  assert.equal(unauthorized.status, 'warn');
+  assert.match(unauthorized.note, /真实枚举/);
+  assert.match(unauthorized.note, /label 全部为空/);
+
+  const leaked = withMedia({ granted: false, labelsEmpty: false, list: [{ kind: 'audioinput', label: 'Microphone (Realtek)' }] });
+  assert.equal(leaked.status, 'fail', '未授权却有设备名，正是检测方抓的那条');
+  assert.match(leaked.note, /未授权却返回了设备名/);
+
+  const granted = withMedia({ granted: true, labelsEmpty: false, list: [{ kind: 'audioinput', label: 'Microphone (Realtek(R) Audio)' }] });
+  assert.equal(granted.status, 'warn');
+  assert.match(granted.note, /只按配置改了 label/);
+
+  const grantedEmpty = withMedia({ granted: true, labelsEmpty: true, list: [{ kind: 'audioinput', label: '' }] });
+  assert.equal(grantedEmpty.status, 'fail', '授权后 label 仍为空反而异常');
 });
 
 test('自检报告：双 Realm 三态 —— 首行前注入+同值=pass，值漂移=warn，首行读到 null=fail', () => {
@@ -711,8 +748,37 @@ function makeRealm(kind, view, navOverrides = {}) {
   }
   sandbox.AudioBuffer = AudioBuffer;
 
-  class MediaDevices { enumerateDevices() { return Promise.resolve([]); } }
+  // 媒体设备：列表来自「内核」（这里是一份固定样本），注入层只许改 label
+  const MEDIA_LIST = [
+    { deviceId: 'default', groupId: 'g-mic', kind: 'audioinput', label: '' },
+    { deviceId: 'a1b2c3d4e5f6', groupId: 'g-mic', kind: 'audioinput', label: '' },
+    { deviceId: 'default', groupId: 'g-out', kind: 'audiooutput', label: '' },
+  ];
+  class MediaDevices { enumerateDevices() { return Promise.resolve(MEDIA_LIST.map((d) => ({ ...d }))); } }
   sandbox.MediaDevices = MediaDevices;
+  class MediaDeviceInfo {}
+  sandbox.MediaDeviceInfo = MediaDeviceInfo;
+
+  // 语音合成：宿主样本 = 中文 2 条 + 英文 2 条（形状与真机一致：字段都在原型上，原生 default 是中文那条）
+  const HOST_VOICES = [
+    { name: 'Microsoft Huihui - Chinese (Simplified, PRC)', lang: 'zh-CN', localService: true, default: true },
+    { name: 'Microsoft Mark - English (United States)', lang: 'en-US', localService: true, default: false },
+    { name: 'Microsoft Kangkang - Chinese (Simplified, PRC)', lang: 'zh-CN', localService: true, default: false },
+    { name: 'Microsoft Zira - English (United States)', lang: 'en-US', localService: true, default: false },
+  ].map((v) => ({ ...v, voiceURI: v.name }));
+  class SpeechSynthesisVoice {
+    constructor(o) { Object.defineProperty(this, '_v', { value: o, enumerable: false }); }
+    get name() { return this._v.name; }
+    get lang() { return this._v.lang; }
+    get voiceURI() { return this._v.voiceURI; }
+    get localService() { return this._v.localService; }
+    get default() { return this._v.default; }
+  }
+  const VOICE_OBJS = HOST_VOICES.map((o) => new SpeechSynthesisVoice(o));
+  class SpeechSynthesis { getVoices() { return VOICE_OBJS.slice(); } }
+  sandbox.SpeechSynthesisVoice = SpeechSynthesisVoice;
+  sandbox.SpeechSynthesis = SpeechSynthesis;
+  sandbox.speechSynthesis = new SpeechSynthesis();
 
   // Navigator：值全挂在原型上，注入层改的也是原型 —— 与真实浏览器一致
   const NavClass = kind === 'page' ? class Navigator {} : class WorkerNavigator {};
@@ -727,6 +793,7 @@ function makeRealm(kind, view, navOverrides = {}) {
     webdriver: false,
     vendor: 'Google Inc.',
     mediaDevices: new MediaDevices(),
+    permissions: { query: () => Promise.resolve({ state: 'prompt' }) },
     ...navOverrides,
   };
   for (const [k, v] of Object.entries(navValues)) {
@@ -872,6 +939,37 @@ test('P7 page 层：注入后硬件/语言与声明一致，且只装一次（�
   vm.runInContext(buildInjectionSource(view), realm.context); // 再来一遍
   assert.equal(offscreenHash(realm), before, '重复注入不能改变噪声结果');
 });
+
+/* ============================================================================
+ * P9-C 媒体设备：真实枚举 + 只改 label（检测方实测三条抓手的根因）
+ * ==========================================================================*/
+
+test('P9-C 媒体设备：未授权不改 label、授权后只改 label，deviceId / 条数保持内核原值', async () => {
+  const view = p7View();
+
+  const prompt = makeRealm('page', view);
+  const raw = await prompt.sandbox.navigator.mediaDevices.enumerateDevices();
+  assert.equal(raw.length, 3, '条数必须来自内核枚举，不能被配置里的数量改写');
+  assert.deepEqual(raw.map((d) => d.label), ['', '', ''], '未授权时不许自己造设备名（原生是空串）');
+  assert.deepEqual(raw.map((d) => d.deviceId), ['default', 'a1b2c3d4e5f6', 'default'], 'deviceId 必须是内核原值');
+
+  const granted = makeRealm('page', view, { permissions: { query: () => Promise.resolve({ state: 'granted' }) } });
+  const named = await granted.sandbox.navigator.mediaDevices.enumerateDevices();
+  assert.equal(named.length, 3);
+  assert.deepEqual(named.map((d) => d.deviceId), ['default', 'a1b2c3d4e5f6', 'default'], '改名不许改身份');
+  assert.equal(named[0].kind, 'audioinput');
+  assert.match(named[0].label, /Microphone|Microphone Array|Line In/);
+  assert.equal(named[2].label, 'Speakers (Realtek(R) Audio)', '按 kind 各自取名');
+});
+
+test('P9-C 媒体设备：注入源里不再留「伪造整套列表 / 派生 deviceId」的痕迹', () => {
+  const page = buildInjectionSource(p7View());
+  assert.ok(!page.includes('buildFakeDevices'), '不许再伪造整套设备列表');
+  assert.ok(!page.includes('fakeDeviceId'), '不许再派生 deviceId —— 那正是跨 origin 恒定的根因');
+  assert.ok(page.includes('origEnumerate'), '必须基于真实 enumerateDevices 改名');
+  assert.ok(page.includes("query({ name })") || page.includes('query({name})'), '授权判定要问 Permissions API');
+});
+
 /* ============================================================================
  * P8-B 代理健康检查：并发上限 / 单条超时 / 失败归类
  * ==========================================================================*/

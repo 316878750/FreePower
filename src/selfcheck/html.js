@@ -52,6 +52,21 @@ export function renderHtml(report) {
   const workletItem = (report.items || []).find((it) => it.id === 'audio_worklet');
   const workletKey = (report.raw && report.raw.audioworklet) ? report.raw.audioworklet : null;
 
+  /* 字体单独开一节：和 AudioWorklet 一样是「明确不做的设计选择」，要写清裸的是什么 */
+  const fontItem = (report.items || []).find((it) => it.id === 'fonts');
+  const fontRaw = (report.raw && report.raw.fonts) ? report.raw.fonts : null;
+  const eastAsian = (fontRaw && Array.isArray(fontRaw.eastAsian)) ? fontRaw.eastAsian : [];
+  const fontSection = fontItem ? `
+<h2>字体枚举面（覆盖度 none，这是设计选择）</h2>
+<div class="note"><b>「字体标 none」不等于「字体指纹裸奔」。</b>
+字形指纹（canvas 文本渲染的像素）已经由 canvas 噪声覆盖（见上表 canvas 项）；
+这里裸着的是「<b>宿主装了哪些字体</b>」这个<b>枚举面</b> —— 页面用 <code>measureText</code> /
+<code>document.fonts.check</code> 逐条试就能列出本机字体，creepjs 的 <code>platform hints</code> 正是这么暴露
+<code>Microsoft YaHei UI</code> 的，且 <code>plain</code> 与 <code>ours</code> 完全一致。
+<b>根治要自编译 Chromium</b>（把宿主字体集换成目标平台字体集）；JS 层做「字体投影」只能改返回值，
+改不了真实字形与宽度度量，会造出新的不一致 —— 风险大于收益，所以明确不做。
+${eastAsian.length ? `本次实测枚举到的东亚字体：<span class="mono">${esc(eastAsian.slice(0, 8).join(', '))}</span>。` : ''}</div>` : '';
+
   return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -98,6 +113,7 @@ export function renderHtml(report) {
 <p class="muted">同页确定性：canvas=${esc(det.canvas)} · webgl_image=${esc(det.webgl_image)} · audio=${esc(det.audio)} · client_rects=${esc(det.client_rects)} ·
 跨重启一致：${esc(det.cross_restart == null ? '本次不判断（无同内核历史报告）' : det.cross_restart)}${det.compared_with ? `（对比 ${esc(det.compared_with)}）` : ''}</p>
 ${realmSection}
+${fontSection}
 ${workletItem ? `<h2>AudioWorklet 作用域（覆盖度 none，这是设计选择）</h2>
 <div class="note"><b>「AudioWorklet 标 none」不等于「音频指纹裸奔」。</b>
 这个作用域没有独立 target、也没有干净的注入通道，靠拦截 JS 改源码会被 <code>import.meta.url</code> 与模块完整性检测直接抓，所以明确不做。

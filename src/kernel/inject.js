@@ -349,69 +349,160 @@ const PAGE_BODY = `
     mark('client_rects');
   }
 
-  /* ---------- 媒体设备：只改 enumerateDevices 的返回（getUserMedia 拦截不了，标 partial） ---------- */
-  function fakeDeviceId(seedStr, kind, i) {
-    let out = '';
-    for (let k = 0; k < 8; k++) out += fnv(seedStr + ':' + kind + ':' + i + ':' + k).toString(16).padStart(8, '0');
-    return out;
-  }
+  /* ---------- 媒体设备：真实枚举 + 只改 label（不伪造列表、不伪造 deviceId） ----------
+   *
+   * 为什么改成这样（P9-C，检测方实测三条，全是伪造列表带来的）：
+   *   1) **跨 origin deviceId 恒定**：原来用 fnv(seed:kind:i:k) 派生，跟 origin 无关，
+   *      两个 origin 各读一次就能对上；而 Chrome 原生 deviceId 是**按 origin 加盐**的。
+   *   2) **未授权就有 label**：原生未授权时 label 是空串，我们却直接给了名字。
+   *   3) **枚举与真实能力对不上**：报得出摄像头，getUserMedia({video:true}) 却 NotFoundError。
+   *
+   * 所以这里只做一件事：拿真实的 enumerateDevices 列表，按配置改 label。
+   * deviceId / groupId / kind 原样保留 —— 跨 origin 加盐、授权前后条数变化（实测：未授权 1 麦 1 喇叭，
+   * 授权后 3 麦 8 喇叭）全由内核负责，我们不掺和。**「给真实设备改名」比「造一整套假设备」隐蔽**，
+   * 这也是对手走的路（docs/08 落点矩阵的 media_devices 一行）。
+   *
+   * 未授权时原样返回（label 本来就是空串）；只有权限变成 granted 之后才改名。
+   */
   const DEVICE_LABELS = {
     audioinput: ['Microphone (Realtek(R) Audio)', 'Microphone Array (2- Conexant SmartAudio HD)', 'Line In (Realtek(R) Audio)'],
     videoinput: ['HD WebCam', 'USB Video Device', 'Integrated Camera'],
     audiooutput: ['Speakers (Realtek(R) Audio)', 'Headphones (Realtek(R) Audio)', 'Digital Audio (S/PDIF)'],
   };
-  function buildFakeDevices() {
-    const media = CFG.media || {};
-    const counts = media.counts || {};
-    const custom = Array.isArray(media.devices) ? media.devices : [];
-    const out = [];
-    for (const kind of ['audioinput', 'videoinput', 'audiooutput']) {
-      const n = Math.max(0, Math.min(Number(counts[kind + '_num']) || 0, 9));
-      const pool = custom.filter((d) => d && d.kind === kind && d.label);
-      const labels = DEVICE_LABELS[kind];
-      for (let i = 0; i < n; i++) {
-        const label = (pool[i] && pool[i].label) || labels[i % labels.length];
-        out.push({ deviceId: fakeDeviceId(CFG.seed, kind, i), groupId: fakeDeviceId(CFG.seed, 'group', 0), kind, label });
-      }
-    }
-    return out;
-  }
-  function toDeviceInfo(d) {
-    try {
-      if (!window.MediaDeviceInfo) return d;
-      const o = Object.create(MediaDeviceInfo.prototype);
-      Object.defineProperties(o, {
-        deviceId: { value: d.deviceId, enumerable: true },
-        groupId: { value: d.groupId, enumerable: true },
-        kind: { value: d.kind, enumerable: true },
-        label: { value: d.label, enumerable: true },
-      });
-      return o;
-    } catch (e) { return d; }
-  }
 
-  if (CFG.media && CFG.media.mode !== '0') {
-    const fakeEnumerate = native(function enumerateDevices() {
-      try { return Promise.resolve(buildFakeDevices().map(toDeviceInfo)); }
-      catch (e) { return Promise.reject(e); }
-    }, 'enumerateDevices');
+  if (CFG.media && CFG.media.mode !== '0'
+      && typeof navigator !== 'undefined' && navigator.mediaDevices
+      && typeof MediaDevices !== 'undefined' && MediaDevices.prototype.enumerateDevices) {
+    const mdProto = MediaDevices.prototype;
+    const origEnumerate = mdProto.enumerateDevices;
+    const origGetUserMedia = mdProto.getUserMedia;
+    /** getUserMedia 成功过一次 = 该 origin 已授权（Permissions API 不可用时的兜底） */
+    let gumGranted = false;
+
+    /** 与原生同源：只看 Permissions API，不缓存（授权/撤销都要立刻反映到 label 上） */
+    const permissionGranted = () => {
+      try {
+        if (typeof navigator.permissions === 'undefined' || !navigator.permissions.query) {
+          return Promise.resolve(gumGranted);
+        }
+        return Promise.all(['camera', 'microphone'].map((name) => navigator.permissions
+          .query({ name })
+          .then((s) => s.state === 'granted')
+          .catch(() => false)))
+          .then((states) => states.some(Boolean))
+          .catch(() => gumGranted);
+      } catch (e) { return Promise.resolve(gumGranted); }
+    };
+
+    /** 真实 label → 我们的 label。给 getUserMedia 的 track 用：
+     *  原生里 track.label 就等于对应设备的 label，只改枚举不改 track 会立刻对不上。 */
+    const labelMap = {};
+    /** track → 我们给的 label（不污染原生对象，自己的 WeakMap 兜住） */
+    const trackLabels = new WeakMap();
+
+    /** 按 kind 的第 i 个设备取名字：自定义配置优先，否则用内置命名池。
+     *  设备数超过命名池时用 Windows 自己的去重写法 "2- " 前缀（宿主真名里就有
+     *  "Microphone Array (2- Conexant SmartAudio HD)" 这种），**不能让两个不同 deviceId
+     *  挂同一个 label** —— 重复 label 本身就是「批量伪造」的破绽。 */
+    const labelFor = (kind, i) => {
+      const media = CFG.media || {};
+      const custom = Array.isArray(media.devices) ? media.devices : [];
+      const pool = custom.filter((d) => d && d.kind === kind && d.label).map((d) => d.label);
+      const base = pool.length ? pool : (DEVICE_LABELS[kind] || []);
+      if (!base.length) return null;
+      const name = base[i % base.length];
+      const round = Math.floor(i / base.length);
+      return round === 0 ? name : (round + 1) + '- ' + name;
+    };
+
+    /** 只换 label，其余字段（deviceId / groupId / kind）用真实值；顺带记下映射 */
+    const project = (list) => {
+      const counter = {};
+      const map = {};
+      const out = list.map((d) => {
+        const kind = String(d.kind || '');
+        const i = counter[kind] = (counter[kind] || 0);
+        counter[kind] = i + 1;
+        const label = labelFor(kind, i);
+        if (!label) return d;
+        try {
+          if (d.label) map[d.label] = label;
+          if (typeof MediaDeviceInfo === 'undefined') return d;
+          const o = Object.create(MediaDeviceInfo.prototype);
+          Object.defineProperties(o, {
+            deviceId: { value: d.deviceId, enumerable: true },
+            groupId: { value: d.groupId, enumerable: true },
+            kind: { value: d.kind, enumerable: true },
+            label: { value: label, enumerable: true },
+          });
+          return o;
+        } catch (e) { return d; }
+      });
+      return { list: out, map };
+    };
+
+    const remember = (map) => {
+      for (const k of Object.keys(map || {})) labelMap[k] = map[k];
+    };
+
+    /* track.label 跟着枚举一起改：原生两者相等，只改一边就是新的破绽 */
     try {
-      let mode = 'fallback';
-      if (navigator.mediaDevices && window.MediaDevices && MediaDevices.prototype.enumerateDevices) {
-        defMethod(MediaDevices.prototype, 'enumerateDevices', fakeEnumerate);
-        mode = 'native';
-      } else {
-        // 非安全上下文里 navigator.mediaDevices 为空：补一个最小对象，
-        // 否则页面会直接看到 undefined（比数量不对更容易被抓）。
-        const fake = {
-          enumerateDevices: fakeEnumerate,
-          addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
-        };
-        defGetter(Navigator.prototype, 'mediaDevices', fake);
+      if (typeof MediaStreamTrack !== 'undefined') {
+        const desc = Object.getOwnPropertyDescriptor(MediaStreamTrack.prototype, 'label');
+        if (desc && desc.get && desc.configurable) {
+          Object.defineProperty(MediaStreamTrack.prototype, 'label', {
+            get: native(function () {
+              const v = trackLabels.get(this);
+              return v === undefined ? desc.get.call(this) : v;
+            }, 'get label'),
+            enumerable: desc.enumerable,
+            configurable: true,
+          });
+        }
       }
-      mark('media_devices');
-      try { Object.defineProperty(window, '__fpMediaMode', { value: mode, enumerable: false, configurable: false }); } catch (e) {}
     } catch (e) {}
+
+    const renameTracks = (stream) => {
+      try {
+        const tracks = stream && stream.getTracks ? stream.getTracks() : [];
+        for (const t of tracks) {
+          const mapped = labelMap[t.label];
+          if (mapped) trackLabels.set(t, mapped);
+        }
+      } catch (e) {}
+      return stream;
+    };
+
+    defMethod(mdProto, 'enumerateDevices', native(function enumerateDevices() {
+      const p = origEnumerate.apply(this, arguments);
+      return Promise.resolve(p).then((list) => permissionGranted().then((ok) => {
+        if (!ok) return list;          // 未授权：原生 label 是空串，原样返回，别自己造
+        try {
+          const proj = project(list);
+          remember(proj.map);
+          return proj.list;
+        } catch (e) { return list; }
+      }), (e) => Promise.reject(e));
+    }, 'enumerateDevices'));
+
+    if (typeof origGetUserMedia === 'function') {
+      defMethod(mdProto, 'getUserMedia', native(function getUserMedia() {
+        const p = origGetUserMedia.apply(this, arguments);
+        if (!p || typeof p.then !== 'function') return p;
+        const self = this;
+        return p.then((stream) => {
+          gumGranted = true;
+          if (Object.keys(labelMap).length) return renameTracks(stream);
+          // 还没枚举过：先补一次真实枚举把映射建起来，再改 track.label
+          return Promise.resolve(origEnumerate.call(self))
+            .then((list) => { try { remember(project(list).map); } catch (e) {} return renameTracks(stream); })
+            .catch(() => renameTracks(stream));
+        }, (e) => Promise.reject(e));
+      }, 'getUserMedia'));
+    }
+
+    mark('media_devices');
+    try { Object.defineProperty(window, '__fpMediaMode', { value: 'native', enumerable: false, configurable: false }); } catch (e) {}
   }
 
   /* ---------- 字体：只声明，不伪造 ---------- */
