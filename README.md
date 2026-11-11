@@ -281,6 +281,10 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 24. **对手的远端运营黑名单不接**：`DynamicConfig` 里实测多出 `BlockList` / `StrongBlockList` 两个键，是**远端下发的国内站点名单 + 版本号**，跟指纹无关，属于对手自己的运营数据。接它等于同步对手的运营策略，还得养一条下发通道，没有产品价值。
     我们做的是**用户级**名单：字段表里 `blacklist` / `whitelist`（`privacy_switches` 组）。当前覆盖度 `partial`：能存、能校验、能进 API，**注入层还没挂 `Network.setBlockedURLs`**，在接上之前按「存了但没生效」理解。
 25. **我们不落任何内核配置文件，所以没有 mtime 可盯**：对手的三份配置（StaticConfig / DynamicConfig / 命令行快照）实测「内容不变就不重写、mtime 不动」——这本来是他们的反检测优点（盯 mtime 抓不到改动），但对我们反而更简单：CDP 路线改时区/地理/指纹**一律不写文件**，磁盘上没有任何「指纹配置文件」可抓、也没有 mtime 侧信道。这条是我们比对手干净的地方，写在这里当依据，不当卖点吹。
+26. **外部检测站对照：我们目前比裸 Chrome 更像 headless（38% vs 25%）—— 正在修，不要当卖点**：用 creepjs 在同一台机器跑两遍（`plain` = 同内核同参数零注入，`ours` = 走 FreePower 起环境），`like headless` 是 25% → 38%。也就是说这 13 个百分点是**注入自己造出来的**，不是环境。同时 `navigator.deviceMemory` 报 8GB 而 `performance.memory.jsHeapSizeLimit` 是 4.09GB 那一档（这个值跟真实内存走、我们没改），creepjs 把两个数并排显示，检测方不用算就能看出矛盾。
+    - 复跑：`node tools\detector-compare.mjs`（出对照表，落 `artifacts/detector-compare.json`），实测记录见 [docs/11](docs/11-外部检测对照.md)。
+    - 另有两条**不是注入造成**、属这台中文 Windows 的固有泄漏：creepjs 的 `platform hints` 暴露 `Microsoft YaHei UI`，`speechSynthesis` 第一条声音是 `Microsoft Huihui (zh-CN)`；`plain` 与 `ours` 完全一致。它意味着「在国内机器上伪装 en-US 环境」会被这两项一眼看穿，属跨机一致性的硬伤，等字体/语音那一轮再动。
+    - **别把自检的 `pass 10 / warn 9 / fail 0` 读成「过了检测站」**：自检只证明我们注入的东西自己一致，五处 canvas 哈希相同也只证明噪声同源。唯一的对外证据是上面那张对照表。
 
 ## 八、验证
 
@@ -293,6 +297,14 @@ npm run smoke
 ```
 
 当前实测：`npm run test` = schema **10** + unit **46** + api **61** + ui **29** + desktop **54**；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **24/24**（`test/workers.test.mjs`），真 Chrome `157.0.8103.40`。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+
+**外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：
+
+```powershell
+node tools\detector-compare.mjs   # plain（零注入基线）与 ours 各跑一遍 creepjs，直接出对照表
+```
+
+结果落 `artifacts/detector-compare.json`，实测结论与限制见 [docs/11](docs/11-外部检测对照.md) 与已知限制第 26 条 —— **这份表是唯一能对外说「检测方怎么看我们」的证据**，自检数字不算。
 
 冒烟覆盖（152 项，双 Realm 的 24 项在 `test/workers.test.mjs` 里单独列）：
 
