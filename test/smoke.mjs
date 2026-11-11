@@ -82,12 +82,34 @@ function chromeProcs() {
   }
 }
 
-/** 只算落在指定目录下的内核（大小写不敏感，Windows 路径） */
+/** 从命令行里取 `--user-data-dir`（带引号或不带），解析成绝对路径（小写、去尾部分隔符） */
+function uddOf(cmd) {
+  const m = /--user-data-dir=(?:"([^"]+)"|(\S+))/i.exec(String(cmd || ''));
+  const raw = m ? (m[1] || m[2] || '') : '';
+  if (!raw) return '';
+  return path.resolve(raw).toLowerCase().replace(/\\+$/, '');
+}
+
+/**
+ * 只算「落在指定目录下」的内核（绝对路径前缀比较，不会把 `…\data-old` 误判成 `…\data`）。
+ *
+ * 归属判定（2026-11-11 定，两条都是 fail-closed 方向）：
+ *   - 进程列表读不到（`ps-error`）→ 算残留；
+ *   - 命令行读不到（空字符串，说明没权限查）→ 算残留：**无法证明它不是我们的**；
+ *   - 命令行能读但没有 `--user-data-dir`（用户自己的正常浏览器）→ 不算我们的，忽略；
+ *   - `--user-data-dir` 不在本测试的数据目录下（已安装应用、别人的环境）→ 忽略。
+ */
 function chromePidsUnder(dir) {
-  const want = String(dir).toLowerCase().replace(/\\+$/, '');
-  return chromeProcs()
-    .filter((p) => p.cmd.toLowerCase().includes(want))
-    .map((p) => p.pid);
+  const root = path.resolve(String(dir)).toLowerCase().replace(/\\+$/, '');
+  const out = [];
+  for (const p of chromeProcs()) {
+    const pid = String(p.pid);
+    if (!/^\d+$/.test(pid)) { out.push(pid); continue; }   // ps-error 等
+    if (!String(p.cmd || '').trim()) { out.push(pid); continue; }   // 命令行读不到
+    const abs = uddOf(p.cmd);
+    if (abs && (abs === root || abs.startsWith(root + path.sep))) out.push(pid);
+  }
+  return out;
 }
 
 async function waitPidGone(pid, timeoutMs = 8000) {
@@ -600,16 +622,14 @@ async function main() {
       check('表单校验接口：UTC 时区与空 cookie 都放行', vchk.json.data?.ok === true, JSON.stringify(vchk.json.data?.errors));
     }
 
-    // 只数「本轮测试自己的」内核：--user-data-dir 落在本测试的 data 目录下。
+    // 只数「本轮测试自己的」内核：`--user-data-dir` 落在本测试的 data 目录下（前缀比较）。
     // 用户自己开着的 FreePower 应用（%APPDATA%\FreePower\…）与他自己的浏览器不计入。
     //
-    // fail-closed（2026-11-11 补，FreePower 指出的第二处病灶）：读不到进程列表时必须红。
-    // 旧写法把 'ps-error: …' 用 /^\d+$/ 过滤掉，PowerShell 一失败这条断言就静默通过 ——
-    // 比「恒红」更坏，因为它把真残留也藏了。
-    const procs = chromeProcs();
-    const psErr = procs.find((p) => String(p.pid).startsWith('ps-error'));
-    const leftovers = psErr ? [String(psErr.pid)] : chromePidsUnder(DATA_DIR).filter((x) => /^\d+$/.test(x));
-    const others = psErr ? [] : chromePidsMatching('freepower').filter((x) => /^\d+$/.test(x) && !leftovers.includes(x));
+    // fail-closed（2026-11-11，FreePower 审出来的两处）：进程列表读不到、或某个 chrome 的
+    // 命令行读不到，都算残留 —— 旧写法用 /^\d+$/ 把 'ps-error: …' 过滤掉，PowerShell 一失败
+    // 这条断言就静默通过；那比恒红更坏，因为它把真残留一起藏了。
+    const leftovers = chromePidsUnder(DATA_DIR);
+    const others = chromePidsMatching('freepower').filter((x) => /^\d+$/.test(x) && !leftovers.includes(x));
     check('无残留 chrome 进程', leftovers.length === 0,
       (leftovers.join(',') || 'none') + (others.length ? `（另有 ${others.length} 个不属于本测试，未计入）` : ''));
   } catch (e) {
