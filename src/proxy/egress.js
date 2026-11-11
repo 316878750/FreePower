@@ -57,9 +57,13 @@ export async function probeEgressInBrowser(client, {
     if (!text.trim()) {
       const href = await client.send('Runtime.evaluate', { expression: 'location.href', returnByValue: true }, sessionId)
         .then((r) => String(r?.result?.value ?? '')).catch(() => '');
-      // 诊断字段：下次复现时能区分「页面没加载」和「读错 target / 被拦截」
+      // 诊断字段：下次复现时能区分「页面没加载」和「读错 target / 被拦截」。
+      // 文案保持中性 —— 实测过「readyState=complete + finalUrl=about:blank」这种导航根本没提交的情况，
+      // 那既不是被代理拦，也不是没加载完，而是探测目标（或它上游）不可达。
+      // 另一种典型：探测 URL 在 HSTS 预载列表里（如 example.com），http 被升到 https → 需要 CONNECT，
+      // 而代理不支持 CONNECT 就会落成 chrome-error://chromewebdata/ —— 这时 finalUrl 会直接显示它。
       return {
-        ok: false, url, error: '出口探测页没有内容（代理拦截或页面没加载完）',
+        ok: false, url, error: '出口探测页没有内容（探测目标不可达或被拦截）',
         targetId, readyState: state || '(空)', finalUrl: href || '(空)',
       };
     }
