@@ -486,7 +486,7 @@ export function buildReport(profile, raw, { kernelVersion = null, previous = nul
     declared: declaredSnapshot(profile, view),
     context: ctx,
     items,
-    caveat: 'CDP 天花板是结构性的：值对得上不等于过检测站。partial 项仍可从 Function.prototype.toString、双 Realm、字体度量、驱动行为等方向识别。',
+    caveat: 'CDP 天花板是结构性的：值对得上不等于过检测站。partial 项仍可被识别——本机实测的残留方向：嵌套 worker（worker 内再起 worker，未覆盖）、OOPIF 子帧（只计数不注入）、AudioWorklet 作用域（标 none）、Function.prototype.toString 痕迹、字体度量与驱动行为。',
     raw,
   };
 }

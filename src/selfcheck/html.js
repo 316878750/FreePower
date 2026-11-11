@@ -46,7 +46,8 @@ export function renderHtml(report) {
   }).join('')}</tbody></table>
 <p class="muted">主帧对照：DOM canvas <span class="mono">${esc((mainCanvas && mainCanvas.canvas_dom) || '—')}</span> ·
 主帧 OffscreenCanvas <span class="mono">${esc((mainCanvas && mainCanvas.canvas_offscreen) || '—')}</span>。
-三者一致说明 worker 与主帧用的是同一份噪声实现（种子相同、算法相同）。</p>` : '';
+五处一致说明 worker 与主帧用的是同一份噪声实现（种子相同、算法相同）；但这只证明噪声同源，不等于通过检测站。</p>
+<p class="muted">覆盖范围：仅「由页面直接创建」的 worker。worker 内部再创建的嵌套 worker、OOPIF 子帧、AudioWorklet 作用域都不在这三行断言内（见 README 已知限制第 6 条）。</p>` : '';
 
   const workletItem = (report.items || []).find((it) => it.id === 'audio_worklet');
   const workletKey = (report.raw && report.raw.audioworklet) ? report.raw.audioworklet : null;
