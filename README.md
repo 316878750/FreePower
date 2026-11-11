@@ -335,6 +335,13 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
     - **我们自己的往返无损**：`blockToItem` 读回时把第 4 段里的 `%3A` 还原成 `:`，实测 `ours → ours` 逐字回到 `pa:ss:word`。
     - **反向失真（真实存在）**：别人的文件里密码**本来就有**字面量 `%3A`（密码真值是 `a%3Ab`）时，我们读回会变成 `a:b`。代码路径没有条件区分「是我们写的」还是「对方本来就有」。
     - 结论：**`.txt` 只适合「人看 + 对方能吃」的搬运，不是保真备份**；要保真用 JSON（JSON 侧不编码，密码里的 `:` 原样保留）。这一条与已知限制 33 里「txt 不是环境全量备份」是同一件事的两面。
+39. **`/S` 装包不会弹「应用正在运行」的对话框 —— 它会直接杀掉应用（2026-11-12 复核，推翻旧判断）**：旧判断是「静默装会挂在隐藏的『应用正在运行』对话框上，所以必须先停应用」，当时标的是**推断、未实测**。**今天复核推翻了它**，依据是装这个包的那套 NSIS 模板源码（`node_modules\app-builder-lib@26.0.12\templates\nsis\`，仓库 `devDependencies` 是 `^26.0.12`、装的就是 26.0.12）：
+    - `include\allowOnlyOneInstallerInstance.nsh:65` 是 `MessageBox MB_OKCANCEL|MB_ICONEXCLAMATION "$(appRunning)" /SD IDOK IDOK doStopProcess`。NSIS 的 `/SD` 就是「静默模式下取这个默认值、**且不显示窗口**」，所以 `/S` 下**根本不会有 `#32770`** —— 那次「枚举窗口没看到对话框」不是这次没抓到，而是**方法上永远抓不到**。
+    - 静默默认 `IDOK` 会跳到 `doStopProcess`，即 `taskkill /im "FreePower.exe" /fi "PID ne $pid" /fi "USERNAME eq %USERNAME%"`（`:76` 先软、`:94` 加 `/f`）。**结论：`/S` 装包会把用户正在跑的 FreePower.exe 直接硬杀，不弹窗、不问。**「装包必须先停应用」因此仍然成立，但理由换了：不是「有对话框在等」，而是「不停就被 `taskkill`」。
+    - `installSection.nsh:33`（oneClick 分支）先 `CHECK_APP_RUNNING` 再 `uninstallOldVersion`，顺序与上面两条对得上。
+    - 「无窗口、永不返回」的真实机制在 `include\extractAppPackage.nsh:116`：`MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION ... /SD IDRETRY IDCANCEL AbortExtract7za` —— 静默默认 `IDRETRY` ⇒ `CopyFiles` 连败 5 次后**无限重试**。所以判「卡住」的判据只能是 **pid + 看门狗**，**用窗口枚举判这个问题在方法上无效**（静默模式下安装器没有窗口可看）。对照：`installUtil.nsh:219` 是 `/SD IDCANCEL`，会返回，不是死循环。
+    - 证据等级如实标：这是**模板源码事实 + 版本一致**，**不是二进制里验过** —— 115,330,938 B 的 `setup.exe` 全读一遍，utf8/utf16 搜 `appRunning` 风格串 **0 命中**，负载是压缩的。
+    - 另记一条当天实测（与上面分开，不混进「对话框」那个结论）：本机用 `Start-Process -FilePath setup.exe -ArgumentList '/S' -PassThru` 起安装器，**6 分钟没返回**，20 秒的窗口枚举循环一次都没跑到；同一 exe 用 `CreateProcessW(CREATE_SUSPENDED)` 直接起是 **ok、532 ms**，收尾安装目录一字未变。即进程创建本身通得过，差别在 ShellExecute 那条路。**本地安装脚本因此改用 `Process.Start(UseShellExecute=$false)` + 180 s 看门狗 + 按 pid 收尾**（`.tmp\install-032.ps1`，gitignored，不进版本库）。
 
 
 ## 八、验证
@@ -412,6 +419,52 @@ npm run test:nav-type   # 5 项（已知限制 32 的 P13 回归）：CDP 直建
 ```powershell
 npm run test:proxy-health   # 15 项：好代理/密码错/死端口/黑洞四态、批量并发与超时、脏 id、只读、控制台点击
 ```
+
+**在产物 `app.asar` 上跑门（验的是「打进去的那份代码」，不是工作区；全离线，只读安装包，不执行安装器）**：
+
+```powershell
+# 1) 从安装包里取 asar。解到仓库 .tmp\（gitignored）：7za 往 %TEMP% 解会报「拒绝访问」。
+#    取 'resources\*' 而不是只取 app.asar —— 旁边的 app.asar.unpacked 少文件时 extractAll 会 ENOENT。
+node_modules\7zip-bin\win\x64\7za.exe x 'release\FreePower-0.3.2-setup.exe' '-o.tmp\p16-asar' 'resources\*'
+
+# 2) 整包解开，并把判据原样拷到同一个根：测试用自身位置算 ROOT（../../src），
+#    所以路径自然指向包内那份 src\，判据一个字都不用改。
+node -e "require('@electron/asar').extractAll('.tmp/p16-asar/resources/app.asar','.tmp/p16-run')"
+New-Item -ItemType Directory -Force .tmp\p16-run\test\helpers | Out-Null
+Copy-Item test\helpers\profile-probe.mjs .tmp\p16-run\test\helpers\
+Copy-Item test\media-label.test.mjs,test\nav-type.test.mjs .tmp\p16-run\test\
+
+# 3) 跑（需要真实 Chrome，各约 20-30 秒）
+node --no-warnings .tmp\p16-run\test\media-label.test.mjs   # 16/16
+node --no-warnings .tmp\p16-run\test\nav-type.test.mjs      # 5/5，含「文档请求 2 次」
+
+# 4) 逐字节核对关键文件（参照物：包内 asar 解出的那份 vs 工作区文件；别拿 blob 比，见下）
+$files = 'src/kernel/inject.js','src/runtime/manager.js','src/store/transfer.js','src/proxy/egress.js',
+         'src/store/adspower-txt.js','src/api/routes.js','src/api/server.js','desktop/main.js'
+foreach ($f in $files) {
+  $a = (Get-FileHash (Join-Path '.tmp\p16-run' $f) -Algorithm SHA256).Hash
+  $b = (Get-FileHash (Join-Path '.' $f) -Algorithm SHA256).Hash
+  "{0} {1} {2}" -f $(if ($a -eq $b) { 'SAME' } else { 'DIFF' }), $a.Substring(0,12), $f
+}
+```
+
+0.3.2 的实测读数（2026-11-12，纯只读，没执行安装器）。**每一层都带参照物，别混层**：
+
+| 层 | 比的双方 | 读数 |
+|---|---|---|
+| ① 产物 ↔ 构建时工作区 | 包内 asar 解出的那份 vs **工作区文件** | **8/8 逐字节相同**：`inject.js a0fd1741…`、`manager.js 45856070…`、`transfer.js 085c4b2b…`、`egress.js 1719aecf…`、`adspower-txt.js 0ea1930b…`、`routes.js 308ad411…`、`server.js e9ec4a37…`、`desktop/main.js 0c217b69…`。另：安装包内的 asar 与 `release\win-unpacked\resources\app.asar` sha256 也相同 = `A9FEB33B72A93BCEBDE2C056D620D1D2551B286C4BA10A48CF3FCC6821157825`（673,488 B），`package.json` 语义版 `0.3.2` |
+| ② 工作区 ↔ `HEAD` blob | `git cat-file blob HEAD:<path>` vs **工作区文件** | **2/8 逐字节相同**：`src/api/routes.js` 45,123 B、`desktop/main.js` 14,297 B（都是纯 LF）。**6/8 仅差行尾**（blob 是 LF、工作区是 CRLF）：`inject.js` 46,069→46,964（CRLF 895 条）、`manager.js` 44,843→45,750（907）、`transfer.js` 12,465→12,750（285）、`egress.js` 4,989→5,077（88）、`adspower-txt.js` 16,198→16,573（375）、`server.js` 7,618→7,806（188）。**每个字节差正好等于该文件的 CRLF 条数**，去掉 `CR` 后逐字节相同，**真差异 0** |
+| ③ 根因 | — | 仓库 `core.autocrlf=true` 且**没有 `.gitattributes`**，checkout 时 LF→CRLF；**打包读的是工作区**，所以 asar 里存的是 CRLF |
+
+所以「8 个文件与提交逐字节相同」这句**不能裸写** —— 它对 ① 成立、对 ② 只有 2/8 成立。**规矩：凡是写「逐字节」，必须注明参照物是 blob、工作区、还是哪两份 asar，不许裸写「与提交一致」。**
+
+**这次不要加 `.gitattributes`**：它会把整棵树重新归一化，在「还没装 0.3.2、还在产物核对期」动它，等于自己制造一次全树大 diff —— 等装完、验完再单独立项。
+
+**还有第三条口径：`git archive` 导出的副本不能当字节基线** —— 它按 `core.autocrlf` 转换，既会**造**假差异（LF→CRLF，上面那 6 个 `src/**/*.js` 就被误判成「仅换行」），也会**掩盖**真差异（两边都被转成 CRLF 后看着一样：0.3.1 的 `desktop/main.js` 就栽在这一面，曾判「仅换行」而实际逐字节相同）。**两个方向都真出现过**，所以比产物直接比工作区文件或 asar 解出的文件，不经过 `git archive`。
+
+两条行为在**包内代码**上：`media-label` **16/16**、`nav-type` **5/5**（「文档请求 2 次」= 2）。装机里的 0.3.1 是另一份 asar（`CCBBBC62…FFAB`，666,084 B），**别拿它当 0.3.2**。
+
+**为什么不给测试加 `--app-root=<dir>` 参数**：上面这套「解包 + 原样拷两个文件」已经做到两个前提同时成立 —— **判据零修改**、**代码来自包内**，读数就能当产物级证据用。给测试加参数等于动判据本身：一旦这条路径和源码路径行为不一致，红/绿到底是产品的问题还是参数的问题就分不清了。真要改，得配「同一份判据跑源码能绿、跑 asar 也能绿」的双向证明，那是另一个活。**顺手提醒**：比产物别用 `git archive` 导出再比 —— 本仓库 `core.autocrlf=true`，导出的 `src/**/*.js` 会变 CRLF，凭空造出「仅换行」的假差异（`src/api/routes.js` 工作区与 asar 都是 45,123 B 纯 LF）。
 
 
 冒烟覆盖（152 项，双 Realm 的 24 项在 `test/workers.test.mjs` 里单独列）：
