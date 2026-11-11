@@ -1605,7 +1605,7 @@
       "apiV2AliasFrom": null,
       "default": "default",
       "defaultSource": "official",
-      "domainNote": "拆解表只到 8（deviceMemory 上限 8G 的年代）；Chrome 157 实测 32G 机器返回 32 → 扩到 16|32（P8-D）",
+      "domainNote": "拆解表只到 8（deviceMemory 上限 8G 的年代）；Chrome 157.0.8103.40 在本机（96G 实机）实测返回 32 → 扩到 16|32（P8-D）",
       "coverage": "full",
       "note": null,
       "evidence": "实测"

@@ -271,15 +271,19 @@ export const DOMAIN_NOTES = {
   do_not_track: '拆解只列 true|false；官方还有 "default"',
   allow_scan_ports: '拆解是 csv 字符串，官方 API 是 ["4000","4001"] 数组 → 两种都收，内部存 csv',
   screen_resolution: '官方还允许 "random"',
-  device_memory: '拆解表只到 8（deviceMemory 上限 8G 的年代）；Chrome 157 实测 32G 机器返回 32 → 扩到 16|32（P8-D）',
+  device_memory: '拆解表只到 8（deviceMemory 上限 8G 的年代）；Chrome 157.0.8103.40 在本机（96G 实机）实测返回 32 → 扩到 16|32（P8-D）',
 };
 
 /**
  * 值域扩域：在拆解表的 values 后面追加。
  *
+ * 规矩：**只放「内核实测真的会返回的值」**，不许为了自洽凭空扩域。
+ * 每次扩都要在注释里写清 内核版本 / 机器 / 实测到什么。
+ *
  * `device_memory` 是**我们改**的，而 `performance.memory.jsHeapSizeLimit` 跟着真实物理内存走。
- * 旧域封顶 8，在 32G 机器上就成了「声明 8G / 堆上限 4.09GB」并排显示（P8-D 实测）。
- * 所以按真实内核实测能返回的值扩到 32。
+ * 旧域封顶 8，在 96G 实机上就成了「声明 8G / 堆上限 4.09GB」并排显示（P8-D 实测）；
+ * Chrome 157.0.8103.40 在同一台机器上报 `navigator.deviceMemory = 32`（2 的幂、封顶 32），
+ * 所以扩到 32 是照着实测值走，不是定价。
  */
 export const VALUES_EXTRA = {
   device_memory: [16, 32],

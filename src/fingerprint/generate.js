@@ -110,7 +110,7 @@ export function generateFingerprint(opts = {}) {
   const gl = pick(rng, WEBGL_WINDOWS);
   const cores = pick(rng, [8, 12, 16, 4, 6]);
   // deviceMemory 真实值域是 2|4|8（旧版 Chrome 上限 8G），但 **jsHeapSizeLimit 跟真实内存走**，
-  // 报一个小档位会和它当场打架（P8-D；实测这台机器真实 32G、堆上限 4.09GB）。
+  // 报一个小档位会和它当场打架（P8-D；实测这台机器物理内存 96G、Chrome 157 报 32、堆上限 4.09GB）。
   // 所以默认就报真实档位（`realMemoryTier()`），单环境想伪装再显式改字段。
   const memory = realMemoryTier();
   const audioIn = pick(rng, [1, 2, 3]);
