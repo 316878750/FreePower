@@ -305,6 +305,8 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 
 31. **语音投影的边界（P9-A）**：只从内核真实列表里**保留环境语言（含同语种变体）**，其余原样丢弃；不新建 voice 对象，只覆盖 `default`（正好一条），所以 `speak` / `cancel` / `SpeechSynthesisUtterance` 行为不受影响。**宿主连一条该语言的声音都没有时保持原生、不凭空造**（本机实测缺 `vi-VN` / `th-TH`，造出来的名字 `speak` 点不着，反而多一层破绽）；声音未加载时照原生返回空数组，`onvoiceschanged` 由内核触发一次、我们不补造。`speech_switch` 默认开（关掉要显式写 `'0'`）。
 32. **CDP 直建带 URL 的标签要补一次重载（P9-C 复验第三轮）**：外部自动化常用 `Target.createTarget({ url })`，attach 时首个文档已在加载，`addScriptToEvaluateOnNewDocument` 只对下一个文档生效 —— 首帧是裸指纹（实测 `hardwareConcurrency` 是宿主 32，配置是 6）。现在 attach 后对**非空白页**统一等文档就绪、确认 `window.__fpApplied`，没有就补一次 `Page.reload`（比按 URL 猜可靠，也不会多刷已注入好的页面）。真机断言：`npm run test:cdp-page`。**代价**：这张页面会多一次加载，页面里若有「首屏就上报」的埋点会看到两次 load；残留一条 `performance.getEntriesByType('navigation')[0].type === 'reload'` —— 页面读自己的性能时间线就能知道刚被刷过一次（逆向实测）。
+     **P13（2026-11-11 已改）：兜底那一次从 `Page.reload` 换成「重新导航到同一 URL」，`reload` 这条残留消失。** 现在 `navigation.type` 是 `navigate`（修前实测 `reload`）。改动只对 `http(s)/file` 生效，空白页与内部页仍走 reload；顺带修掉一个既有问题：同一张页面被两个会话各判一次、补加载做两遍（实测文档请求 3 次），现在按 targetId 去重，回到 2 次。真机断言：`npm run test:nav-type`。
+     **代价没变，别把它读成「无痕迹」**：仍然是**两次文档加载**（首文档 + 补的那一次），服务器日志/前端埋点照样数得到 2 次 —— 变的只是 `reload` 这个标记（测试里 `文档请求 2 次` 是判据，不是打印）。为什么「零额外加载」做不到：`Target.setAutoAttach + waitForDebuggerOnStart` 确实能把新页面停在首文档之前（裸内核单会话实测能覆盖首文档），但**第二个会话一 attach，暂停就被放掉**（谁都不发 `Runtime.runIfWaitingForDebugger`，页面照样加载完），而外部自动化建页后必然紧跟一次 `Target.attachToTarget`。
 
 33. **环境导入/导出是「搬运」，复制是「克隆配置换指纹」（P10）**：导出里**包含代理密码明文**（这是本机用户自己的数据，本地 API 已鉴权 —— 但别把导出文件当可公开分享的文件）。导入会**重新生成 id / profile_no / 时间戳**，其余字段（含 `fp_seed` 与 `canvas_id` / `webgl_image_id` / `audio_id` / `client_rects_id`）原样落库，所以导出 → 删掉 → 再导入，四个噪点哈希不变（`npm run test:fileio` 实测 0 字段差异、四个哈希完全一致）。未知字段只进 `warnings`（不报错、不影响其它条）。
     复制**必须**换掉全部四个种子：只换 canvas 会在 WebGL 图像噪声那条上仍然同源，等于把两个账号主动关联起来。实测复制体 `canvas / webgl_image / audio / client_rects` 四个哈希全不同，UA / 时区 / 屏幕 / 核数与源一致。
@@ -397,6 +399,9 @@ npm run test:p9c-judge         # 逆向拆解师的独立裁判（两套环境�
 npm run test:nav-race   # 13 项：open_urls 指向慢 JSON / 出口探测页 / CDP 新建空白目标导航慢 JSON
                         #       （断言 href、body 正文、navigation type ≠ reload）+ 两条反面对照
                         #       （纯空白页仍补注入、CDP 直建带 URL 的快页面仍注入成功）
+npm run test:nav-type   # 5 项（已知限制 32 的 P13 回归）：CDP 直建带 URL 的页面 navigation.type=navigate、
+                        #       注入生效、hc 是配置值、最终 URL 对得上、**文档请求恰好 2 次**
+                        #       （判 2 而不是打印 2：多补一次会变 3，真做到零额外加载会变 1，两种都要有人看见）
 ```
 
 **代理健康检查真机验证**（需要真实 Chrome + 本机起 HTTP 服务，约 20 秒）：

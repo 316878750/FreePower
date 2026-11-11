@@ -11,8 +11,11 @@
  *   ② 注入仍然生效（`__fpApplied` 是 object）；
  *   ③ hardwareConcurrency 是配置值（首帧不是宿主值）。
  *
- * 同时**打印**文档请求次数：这条路径即使去掉了 reload 标记，仍然是两次文档加载
+ * 同时**判**文档请求次数 = 2：这条路径即使去掉了 reload 标记，仍然是两次文档加载
  * （首文档 + 补的那一次），别把它读成「零额外加载」——服务器端/埋点仍然看得见。
+ * 判成 2 而不是随便打印，是为了让「悄悄多补一次」（2026-11-11 修过：两个会话各补一次 → 3 次）
+ * 和「真的只加载一次」（将来做到了 → 1 次，这条会红，届时改判据并改 README）都能被看见。
+ * 读不到计数时这里是 0，同样红 —— 这条断言得能证明自己真的量到了。
  *
  * 跑法：npm run test:nav-type
  */
@@ -67,6 +70,8 @@ try {
         Number(seen.hc) === wantHc, `实测 ${seen.hc}，配置 ${wantHc}`);
       check('CDP 直建带 URL 的页面：最终文档就是目标 URL',
         String(seen.href).startsWith(url), String(seen.href));
+      check('CDP 直建带 URL 的页面：文档请求 2 次（仍加载两次，只去掉 reload 标记）',
+        docRequests === 2, `实测 ${docRequests} 次`);
     } finally {
       await client.send('Target.closeTarget', { targetId }).catch(() => {});
     }

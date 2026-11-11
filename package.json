@@ -37,6 +37,7 @@
     "test:fileio": "node --no-warnings test/fileio.test.mjs",
     "test:native-tostring": "node --no-warnings test/native-tostring.test.mjs",
     "test:nav-race": "node --no-warnings test/nav-race.test.mjs",
+    "test:nav-type": "node --no-warnings test/nav-type.test.mjs",
     "test:p9c-judge": "node --no-warnings tools/p9c-judge.mjs"
   },
   "devDependencies": {

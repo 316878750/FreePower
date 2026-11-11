@@ -59,14 +59,26 @@ function commandLineOf(pid) {
   }
 }
 
-/** 找命令行里带某段文字的 chrome 进程（fail-closed 断言「一个都没起」） */
-function chromePidsMatching(fragment) {
-  try {
-    const out = ps(`Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -like '*${fragment}*' } | Select-Object -ExpandProperty ProcessId`);
-    return out ? out.split(/\s+/).filter(Boolean) : [];
-  } catch (e) {
-    return [`ps-error: ${e.message}`];
+/**
+ * 找命令行里带某段文字的 chrome 进程（fail-closed 断言「一个都没起」）。
+ *
+ * 判据方向与 `chromePidsUnder` 一致（2026-11-11）：
+ *   - 进程列表读不到 → 返回 `ps-error: …`（非数字 ⇒ `length !== 0` ⇒ 红）；
+ *   - 某条命令行读不到 → 同样算命中：证明不了它不是我们起的那个环境的内核。
+ *     注意 `before`/`after` 必须各自取时间点，**不许共用一份快照**，否则「启动前 vs 启动后」
+ *     就变成同一时刻，断言失效。
+ */
+function chromePidsMatching(fragment, rows) {
+  const want = String(fragment).toLowerCase();
+  const out = [];
+  for (const p of (rows || chromeProcs())) {
+    const pid = String(p.pid);
+    if (!/^\d+$/.test(pid)) { out.push(pid); continue; }
+    const cmd = String(p.cmd || '');
+    if (!cmd.trim()) { out.push(pid); continue; }   // 命令行读不到
+    if (cmd.toLowerCase().includes(want)) out.push(pid);
   }
+  return out;
 }
 
 /**
@@ -108,10 +120,10 @@ function uddOf(cmd) {
  *   - 命令行能读但没有 `--user-data-dir`（用户自己的正常浏览器）→ 不算我们的，忽略；
  *   - `--user-data-dir` 不在本测试的数据目录下（已安装应用、别人的环境）→ 忽略。
  */
-function chromePidsUnder(dir) {
+function chromePidsUnder(dir, rows) {
   const root = path.resolve(String(dir)).toLowerCase().replace(/\\+$/, '');
   const out = [];
-  for (const p of chromeProcs()) {
+  for (const p of (rows || chromeProcs())) {
     const pid = String(p.pid);
     if (!/^\d+$/.test(pid)) { out.push(pid); continue; }   // ps-error 等
     if (!String(p.cmd || '').trim()) { out.push(pid); continue; }   // 命令行读不到
@@ -637,10 +649,18 @@ async function main() {
     // fail-closed（2026-11-11，FreePower 审出来的两处）：进程列表读不到、或某个 chrome 的
     // 命令行读不到，都算残留 —— 旧写法用 /^\d+$/ 把 'ps-error: …' 过滤掉，PowerShell 一失败
     // 这条断言就静默通过；那比恒红更坏，因为它把真残留一起藏了。
-    const leftovers = chromePidsUnder(DATA_DIR);
-    const others = chromePidsMatching('freepower').filter((x) => /^\d+$/.test(x) && !leftovers.includes(x));
+    // 一次快照两处复用：`leftovers`（判据）与 `others`（只用于 detail 的「另有 N 个」）。
+    // 这两处问的是同一时刻的全表，分开取会让 detail 在第二次 ps 失败时悄悄少一个数字
+    // （2026-11-11 FreePower 指出；判据本身没受影响，因为 leftovers 自己就是 fail-closed）。
+    // 坏代理/PAC 那两处**不能**这样合并：它们的 before/after 必须是两个时间点。
+    const chromeRows = chromeProcs();
+    const psBroken = chromeRows.some((p) => !/^\d+$/.test(String(p.pid)));
+    const leftovers = chromePidsUnder(DATA_DIR, chromeRows);
+    const others = chromePidsMatching('freepower', chromeRows).filter((x) => !leftovers.includes(x));
     check('无残留 chrome 进程', leftovers.length === 0,
-      (leftovers.join(',') || 'none') + (others.length ? `（另有 ${others.length} 个不属于本测试，未计入）` : ''));
+      psBroken
+        ? `进程列表读不到（${leftovers.join(',')}），按 fail-closed 判残留`
+        : (leftovers.join(',') || 'none') + (others.length ? `（另有 ${others.length} 个不属于本测试，未计入）` : ''));
   } catch (e) {
     check('冒烟异常', false, e.stack || e.message);
   } finally {
