@@ -1,5 +1,12 @@
-# This workflow will do a clean installation of node dependencies, cache/restore them, build the source code and run tests across different versions of node
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-nodejs
+# FreePower CI
+#
+# 为什么是 windows：这个项目的测试要用 PowerShell 读进程表、要起内核（真实 Chrome），
+# 原来的 ubuntu-latest 跑不起来；Node 版本按 package.json 的 engines（>=22.5）只留 22.x。
+#
+# 为什么不全量 `npm test`：`test:desktop` 需要 Electron GUI，`smoke` / `nav-race` /
+# `native-tostring` / `p9c-judge` 需要本机内核（真实 Chrome）+ 本机回环服务，这些在
+# CI 上要么没有显示、要么不稳；它们继续在本地按 README 的清单跑。
+# CI 只兜「纯 Node 也能判」的那三套：schema / unit / api。
 
 name: Node.js CI
 
@@ -8,24 +15,29 @@ on:
     branches: [ "master" ]
   pull_request:
     branches: [ "master" ]
+  workflow_dispatch:
 
 jobs:
   build:
-
-    runs-on: ubuntu-latest
-
-    strategy:
-      matrix:
-        node-version: [18.x, 20.x, 22.x]
-        # See supported Node.js release schedule at https://nodejs.org/en/about/releases/
+    runs-on: windows-latest
+    timeout-minutes: 20
 
     steps:
     - uses: actions/checkout@v4
-    - name: Use Node.js ${{ matrix.node-version }}
+
+    - name: Use Node.js 22.x
       uses: actions/setup-node@v4
       with:
-        node-version: ${{ matrix.node-version }}
+        node-version: '22.x'
         cache: 'npm'
+
     - run: npm ci
-    - run: npm run build --if-present
-    - run: npm test
+
+    - name: schema
+      run: npm run test:profile
+
+    - name: unit
+      run: npm run test:unit
+
+    - name: api
+      run: npm run test:api
