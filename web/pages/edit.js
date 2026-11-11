@@ -6,7 +6,7 @@
  *   2. 校验文案全部来自后端 /browser-profile/validate（和 create/update 同一个 validateProfile），
  *      前端只负责把 errors[].field 定位到那个输入框，不自己编一句话。
  */
-import { h, mount, clear, toast, debounce, drawer, confirmDialog } from '../ui.js';
+import { h, mount, clear, toast, debounce, drawer, confirmDialog, downloadText, pickFile } from '../ui.js';
 import { api } from '../api.js';
 
 const COUNTRIES = [
@@ -303,6 +303,7 @@ export default async function renderEdit({ head, page, params }) {
   function field(f) {
     const val = state.model[f.name];
     let input;
+    let extra = null;
     const wide = ['list', 'json', 'cookie'].includes(f.kind) || f.name === 'launch_args' || f.name === 'ua';
     const onChange = (v) => setValue(f.name, v);
 
@@ -354,6 +355,12 @@ export default async function renderEdit({ head, page, params }) {
     } else if (f.kind === 'cookie') {
       input = h('textarea', { rows: 2, placeholder: 'sid=xxx; uid=7（原始 cookie 串）', onInput: (e) => onChange(e.target.value) });
       input.value = val || '';
+      // cookie 导入/导出走运行中内核的 CDP，和这个「登录 cookie 文本」不是一份数据
+      extra = h('div', { class: 'row', style: { marginTop: '6px' } },
+        h('button', { class: 'btn sm', type: 'button', onClick: () => cookieExport('json') }, '导出 cookie（JSON）'),
+        h('button', { class: 'btn sm', type: 'button', onClick: () => cookieExport('netscape') }, '导出 cookie（netscape）'),
+        h('button', { class: 'btn sm', type: 'button', onClick: cookieImport }, '导入 cookie 文件'),
+        h('span', { class: 'muted small' }, '需要环境运行中：cookie 在内核里'));
     } else {
       input = h('input', { type: 'text', value: val === undefined || val === null ? '' : String(val), onInput: (e) => onChange(e.target.value) });
     }
@@ -367,9 +374,55 @@ export default async function renderEdit({ head, page, params }) {
         f.coverage !== 'n/a' && f.coverage ? h('span', { class: 'tag' }, f.coverage) : null),
       input,
       hintOf(f) ? h('span', { class: 'hint' }, hintOf(f)) : null,
+      extra,
       errEl);
     state.refs[f.name] = wrap;
     return wrap;
+  }
+
+  /* ------------------------ cookie 导入 / 导出（P10） ------------------------ */
+
+  async function envRunning() {
+    if (!state.editing) return false;
+    const live = await api.running().catch(() => ({ list: [] }));
+    state.running = (live.list || []).some((i) => i.profile_id === state.editing);
+    return state.running;
+  }
+
+  async function cookieExport(format) {
+    if (!(await envRunning())) { toast('需要环境运行中：cookie 存在内核里，请先在列表里启动这个环境', 'bad'); return; }
+    try {
+      const d = await api.cookieExport(state.editing, format);
+      const no = state.model.profile_no || state.editing;
+      if (format === 'netscape') downloadText(`cookies-${no}.txt`, d.content, 'text/plain');
+      else downloadText(`cookies-${no}.json`, JSON.stringify(d.cookies, null, 2));
+      toast(`已从内核导出 ${d.count} 条 cookie`, 'ok');
+    } catch (e) { toast(`导出 cookie 失败：${e.message}`, 'bad'); }
+  }
+
+  async function cookieImport() {
+    if (!(await envRunning())) { toast('需要环境运行中：cookie 只能写进内核，请先启动这个环境', 'bad'); return; }
+    const file = await pickFile('.txt,.json,text/plain,application/json');
+    if (!file) return;
+    const text = await file.text();
+    let body;
+    if (/^\s*[[{]/.test(text)) {
+      try {
+        const p = JSON.parse(text);
+        body = { cookies: Array.isArray(p) ? p : p.cookies };
+      } catch (e) { toast(`JSON 解析失败：${e.message}`, 'bad'); return; }
+      if (!Array.isArray(body.cookies)) { toast('JSON 里没有 cookies 数组', 'bad'); return; }
+    } else {
+      body = { format: 'netscape', content: text };
+    }
+    try {
+      const r = await api.cookieImport(state.editing, body);
+      const bits = [`导入 cookie：${r.imported} 条`];
+      if (r.failed?.length) bits.push(`失败 ${r.failed.length} 条`);
+      if (r.warnings?.length) bits.push(r.warnings[0]);
+      toast(bits.join(' · '), r.failed?.length ? 'bad' : 'ok');
+      if (r.imported > 0) toast(`内核回读校验通过 ${r.verified ?? r.imported} 条`, 'ok');
+    } catch (e) { toast(`导入 cookie 失败：${e.message}`, 'bad'); }
   }
 
   /* ------------------------------ 数据 ------------------------------ */

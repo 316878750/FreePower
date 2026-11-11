@@ -17,6 +17,9 @@ import {
   newFingerprintFor, listGroups, createGroup, getGroup, updateGroup, deleteGroup, cookieText, cookieToStorage,
 } from '../store/profiles.js';
 import { listTags, createTags, updateTags, deleteTags, tagIdsOf } from '../store/tags.js';
+import { importProfiles, copyProfile } from '../store/transfer.js';
+import { parseAdspowerTxt, formatAdspowerTxt, txtFilename } from '../store/adspower-txt.js';
+import { readCookies, writeCookies, formatNetscape, parseNetscape, missingAfterWrite } from '../kernel/cookies.js';
 import {
   createProxies, updateProxy, listProxies, deleteProxies, rememberProxyCheck, getProxy,
 } from '../store/proxies.js';
@@ -198,8 +201,11 @@ export function buildRoutes() {
   const listHandler = (ctx) => {
     const v = versionOf(ctx.path);
     const src = { ...ctx.query, ...ctx.body };
+    // v2 的分页参数叫 limit，但 `page/page_size` 是两条版本共用的分页写法：
+    // 显式给了 page_size 就按它翻页（P10 验收门与老脚本都这么传），
+    // “limit 不传只回 1 条”那个坑只在两个都没给时成立。
     const limitRaw = v === 'v2'
-      ? pick(src, ['limit'])
+      ? pick(src, ['limit', 'page_size'])
       : pick(src, ['page_size', 'limit']);
     // v2 的坑：limit 不传只回 1 条（对手如此，照抄）
     const size = limitRaw === null ? (v === 'v2' ? 1 : 50) : Number(limitRaw);
@@ -591,6 +597,27 @@ export function buildRoutes() {
     });
   });
 
+  /* ==================== 4.6 P10：环境导入/导出、复制、cookie 导入/导出 ==================== */
+
+  /**
+   * import：三种 body 形状都认（`{list}` / `{data:{list}}` / 裸数组）。
+   * 一条失败不影响其余；未知字段只进 warnings。整体 code 仍是 0（部分失败不算接口失败）。
+   */
+  add(['POST'], ['/api/v1/browser-profile/import', '/api/v2/browser-profile/import', '/api/v1/user/import'], importHandler);
+
+  /** export：POST `{profile_id: [...]}`，或 GET `?profile_id=a&profile_id=b`（逗号串也认） */
+  add(['GET', 'POST'], ['/api/v1/browser-profile/export', '/api/v2/browser-profile/export', '/api/v1/user/export'], exportHandler);
+
+  /**
+   * copy：指纹字段原样复制，**四个噪声种子整组重生**。
+   * copy_cookies 默认关；打开时源环境必须在跑（cookie 在内核里），不会静默跳过。
+   */
+  add(['POST'], ['/api/v1/browser-profile/copy', '/api/v2/browser-profile/copy', '/api/v1/user/copy'], (ctx) => copyHandler(ctx));
+
+  /** cookie 导出/导入都只走运行中内核的 CDP（Storage.*），不读 SQLite、不偷偷起内核 */
+  add(['GET'], ['/api/v1/browser-profile/cookie/export', '/api/v2/browser-profile/cookie/export', '/api/v1/user/cookie/export'], cookieExportHandler);
+  add(['POST'], ['/api/v1/browser-profile/cookie/import', '/api/v2/browser-profile/cookie/import', '/api/v1/user/cookie/import'], cookieImportHandler);
+
   /* ============================ 5. 占位：明确不支持 ============================ */
   const placeholders = [
     '/api/v1/application/list', '/api/v2/category/list',
@@ -687,6 +714,220 @@ async function restartHandler(ctx, v) {
     throw new ApiError(e.code === 800005 ? ERR.CONSISTENCY : ERR.START_FAILED,
       `restart failed, profile is stopped: ${e.message}`, 200, extra);
   }
+}
+
+/* ------------------------------ P10：导入 / 导出 / 复制 / cookie ------------------------------ */
+
+/** GET 里同一个 key 可能重复（?profile_id=a&profile_id=b），Object.fromEntries 会丢，直接读原始 query */
+function queryAll(ctx, name) {
+  try {
+    return new URL(ctx.req.url, 'http://127.0.0.1').searchParams.getAll(name)
+      .flatMap((s) => String(s).split(','))
+      .map((s) => s.trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function extractImportList(body) {
+  if (Array.isArray(body)) return body;
+  if (Array.isArray(body?.list)) return body.list;
+  if (Array.isArray(body?.data?.list)) return body.data.list;
+  if (Array.isArray(body?.data)) return body.data;
+  throw new ApiError(ERR.INVALID, 'list is required：支持 {list:[...]}、{data:{list:[...]}} 或裸数组');
+}
+
+function importHandler(ctx) {
+  const body = ctx.body;
+  const format = String(body?.format || '').toLowerCase();
+  // .txt 块格式（AdsPower 环境导出）：18 字段 + 18 星号收尾；能建就建，失败的块带块号
+  if (format === 'txt') {
+    const content = body?.content;
+    if (typeof content !== 'string' || !content.trim()) {
+      throw new ApiError(ERR.INVALID, 'format=txt 需要 content 字符串（整份文件的内容）');
+    }
+    const parsed = parseAdspowerTxt(content);
+    if (parsed.items.length > 1000) throw new ApiError(ERR.INVALID, '单次导入最多 1000 条');
+    const r = importProfiles(parsed.items);
+    const list = r.list.map((p) => present(p, 'v2'));
+    const failed = [...parsed.failed, ...r.failed];
+    const warnings = [...parsed.warnings, ...r.warnings];
+    return {
+      code: 0,
+      msg: 'success',
+      imported: r.imported,
+      failed,
+      warnings,
+      data: { format: 'txt', list, imported: r.imported, failed, warnings },
+    };
+  }
+  const items = extractImportList(body);
+  if (items.length > 1000) throw new ApiError(ERR.INVALID, '单次导入最多 1000 条');
+  const r = importProfiles(items);
+  const list = r.list.map((p) => present(p, 'v2'));
+  // imported / failed / warnings 顶层与 data 各放一份：脚本按契约读顶层，控制台按 data 读
+  return {
+    code: 0,
+    msg: 'success',
+    imported: r.imported,
+    failed: r.failed,
+    warnings: r.warnings,
+    data: { list, imported: r.imported, failed: r.failed, warnings: r.warnings },
+  };
+}
+
+/** AdsPower 兼容键：导出的顶层与 fingerprint_config 里各给一份（导入时两种位置都认） */
+function proxyCompat(p) {
+  const px = p.proxy_config || {};
+  return {
+    proxy_type: px.proxy_type || 'http',
+    proxy_host: px.host || '',
+    proxy_port: Number(px.port) || 0,
+    proxy_user: px.username || '',
+    proxy_password: px.password || '',
+  };
+}
+
+function exportRecord(p) {
+  const base = present(p, 'v2');
+  const px = proxyCompat(p);
+  const fp = { ...(base.fingerprint_config || {}) };
+  fp.seed = String(p.fp_seed ?? '');
+  Object.assign(fp, px);
+  base.fingerprint_config = fp;
+  Object.assign(base, px);
+  return base;
+}
+
+function exportHandler(ctx) {
+  const body = ctx.body || {};
+  const ids = idList(body.profile_id ?? body.user_id ?? body.user_ids, 'v2');
+  const all = [...new Set([...ids, ...queryAll(ctx, 'profile_id'), ...queryAll(ctx, 'user_id')])];
+  if (!all.length) throw new ApiError(ERR.INVALID, 'Require profile_id');
+  const profiles = [];
+  const missing = [];
+  for (const id of all) {
+    const p = getProfile(id);
+    if (!p) { missing.push(id); continue; }
+    profiles.push(p);
+  }
+  const format = String(body.format || ctx.query.format || 'json').toLowerCase();
+  if (format === 'txt') {
+    // AdsPower 互操作格式：只回文本，不再夹带 list（两边都塞会让调用方不知道该信哪份）
+    let built;
+    try {
+      built = formatAdspowerTxt(profiles);
+    } catch (e) {
+      // 自校验失败就不许输出半坏的文件
+      throw new ApiError(ERR.GENERIC, `导出 txt 失败：${e.message}`);
+    }
+    return ok({
+      format: 'txt',
+      count: profiles.length,
+      filename: txtFilename(),
+      content: built.content,
+      warnings: built.warnings,
+      missing,
+    });
+  }
+  if (format !== 'json') throw new ApiError(ERR.INVALID, 'format must be json or txt');
+  const list = profiles.map(exportRecord);
+  return ok({ list, count: list.length, missing });
+}
+
+async function copyHandler(ctx) {
+  const p = resolveProfile(ctx, 'v2');
+  const copyCookies = ['1', 'true', 'yes'].includes(String(ctx.body?.copy_cookies ?? '').toLowerCase());
+  // 先判「源没跑」再建副本：否则会留一个半成品环境
+  if (copyCookies && !getRunning(p.id)) {
+    throw new ApiError(ERR.NOT_RUNNING, 'copy_cookies 需要源环境在运行：cookie 存在内核里，请先启动该环境（不会静默跳过）');
+  }
+  const created = copyProfile(p.id, { name: ctx.body?.name });
+  if (!created) throw new ApiError(ERR.NOT_FOUND, 'Profile does not exist');
+
+  let cookiesCopied = 0;
+  if (copyCookies) {
+    const inst = getInstance(p.id);
+    let live = [];
+    try { live = await readCookies(inst.client); } catch (e) {
+      throw new ApiError(ERR.GENERIC, `读取源环境 cookie 失败：${e.message}`);
+    }
+    if (live.length) {
+      // cookie 以「登录 cookie 文本」回写到新环境（/cookies 接口可读）；
+      // 不是把内核实时读到的 SQLite 文件复制过去（那份数据既加锁又不完整）。
+      const text = live.map((c) => `${c.name}=${c.value}`).join('; ');
+      updateProfile(created.profile_id, { login_cookie: text });
+      cookiesCopied = live.length;
+    }
+  }
+  const fresh = getProfile(created.profile_id) || created;
+  return ok({ ...present(fresh, 'v2'), seeds_regenerated: true, cookies_copied: cookiesCopied });
+}
+
+async function cookieExportHandler(ctx) {
+  const p = resolveProfile(ctx, 'v2');
+  const format = String(ctx.query.format || 'json').toLowerCase();
+  if (format !== 'json' && format !== 'netscape') throw new ApiError(ERR.INVALID, 'format must be json or netscape');
+  const inst = getInstance(p.id);
+  if (!inst) {
+    throw new ApiError(ERR.NOT_RUNNING, '环境未在运行：cookie 存在内核里，请先启动该环境再导出（不会为了导出偷偷起内核）');
+  }
+  let cookies;
+  try { cookies = await readCookies(inst.client); } catch (e) {
+    throw new ApiError(ERR.GENERIC, `读取 cookie 失败：${e.message}`);
+  }
+  if (format === 'netscape') return ok({ format, count: cookies.length, content: formatNetscape(cookies) });
+  return ok({ format, count: cookies.length, cookies });
+}
+
+async function cookieImportHandler(ctx) {
+  const p = resolveProfile(ctx, 'v2');
+  const inst = getInstance(p.id);
+  if (!inst) {
+    throw new ApiError(ERR.NOT_RUNNING, '环境未在运行：cookie 要写进内核，请先启动该环境（不会为了导入偷偷起内核）');
+  }
+  const body = ctx.body || {};
+  let list = body.cookies;
+  let failed = [];
+  if (!Array.isArray(list)) {
+    const content = body.content;
+    const format = String(body.format || '').toLowerCase();
+    if (typeof content !== 'string' || !content.trim()) {
+      throw new ApiError(ERR.INVALID, '提供 cookies 数组，或 {format:"netscape", content:"..."}');
+    }
+    if (format && format !== 'netscape') throw new ApiError(ERR.INVALID, 'format 只支持 netscape；数组请用 cookies 字段');
+    const parsed = parseNetscape(content);
+    list = parsed.cookies;
+    failed = parsed.failed;
+  }
+  if (list.length > 5000) throw new ApiError(ERR.INVALID, '单次最多导入 5000 条 cookie');
+  const r = await writeCookies(inst.client, list);
+  const warnings = [];
+  let verified = 0;
+  if (r.written.length) {
+    // 契约要求的回读校验：imported > 0 时立刻读回，缺了就告警，不假装成功
+    try {
+      const now = await readCookies(inst.client);
+      const missing = missingAfterWrite(r.written, now);
+      verified = r.written.length - missing.length;
+      if (missing.length) {
+        warnings.push(`${missing.length} 条写入后回读不到（可能被内核按策略丢弃）：${missing.slice(0, 5).map((c) => `${c.name}@${c.domain}`).join('、')}`);
+      }
+    } catch (e) {
+      warnings.push(`回读校验失败：${e.message}`);
+    }
+  }
+  const allFailed = [...failed, ...r.failed];
+  return {
+    code: 0,
+    msg: 'success',
+    imported: r.written.length,
+    failed: allFailed,
+    warnings,
+    verified,
+    data: { imported: r.written.length, failed: allFailed, warnings, verified },
+  };
 }
 
 /**

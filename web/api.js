@@ -80,6 +80,16 @@ export const api = {
   batchStop: (ids, opts) => call('/api/v2/browser-profile/batch-stop', { method: 'POST', body: { profile_ids: ids, ...opts } }),
   stopAll: () => call('/api/v2/browser-profile/stop-all', { method: 'POST', body: {} }),
 
+  /* ---- 导入 / 导出 / 复制（P10） ---- */
+  importProfiles: (list) => call('/api/v2/browser-profile/import', { method: 'POST', body: { list } }),
+  /** AdsPower `.txt` 块格式（账号+代理+cookie+UA 的搬运单，不是全量备份） */
+  importProfilesTxt: (content) => call('/api/v2/browser-profile/import', { method: 'POST', body: { format: 'txt', content } }),
+  exportProfiles: (ids, format = 'json') => call('/api/v2/browser-profile/export', { method: 'POST', body: { profile_id: ids, format } }),
+  copyProfile: (id, name) => call('/api/v2/browser-profile/copy', { method: 'POST', body: { profile_id: id, name } }),
+  /** cookie 只走运行中的内核；环境没在跑会拿到 800002（不会为了导出偷偷起内核） */
+  cookieExport: (id, format = 'json') => call('/api/v2/browser-profile/cookie/export', { query: { profile_id: id, format } }),
+  cookieImport: (id, body) => call('/api/v2/browser-profile/cookie/import', { method: 'POST', body: { profile_id: id, ...body } }),
+
   /* ---- schema / 校验 ---- */
   schema: () => call('/api/v2/browser-profile/schema'),
   validate: (profile, mode) => call('/api/v2/browser-profile/validate', { method: 'POST', body: { mode, profile } }),

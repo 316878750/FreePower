@@ -96,29 +96,45 @@ export function toApi(profile) {
 
 /**
  * cookie 字段的存储形状：对手要求它是「JSON 数组字符串」（校验文案 `cookie must be list string`），
- * 但脚本里经常直接传 `sid=xxx; uid=7` 这种原始串。两种都收：
- *   - 已经是 JSON 数组串 → 规整成数组串
+ * 但脚本里经常直接传 `sid=xxx; uid=7` 这种原始串。三种都收：
+ *   - 对象数组（AdsPower 导出的形状：`[{name,value,domain,expires,…}]`）→ **原样**序列化，
+ *     元素不许 `String()`（那会把整条 cookie 变成 `"[object Object]"`，导入成功、cookie 全毁）
+ *   - 已经是 JSON 数组串 → 规整成数组串（对象元素保留，字符串元素保留）
  *   - 原始串 → 包成单元素数组（读出来还是原文）
  */
+function cookieEntry(x) {
+  return x && typeof x === 'object' && !Array.isArray(x) ? x : String(x);
+}
+
 export function cookieToStorage(v) {
+  if (Array.isArray(v)) return JSON.stringify(v.map(cookieEntry));
   const s = String(v ?? '').trim();
   if (!s) return '';
   if (s.startsWith('[')) {
     try {
       const parsed = JSON.parse(s);
-      if (Array.isArray(parsed)) return JSON.stringify(parsed.map(String));
+      if (Array.isArray(parsed)) return JSON.stringify(parsed.map(cookieEntry));
     } catch { /* 不是 JSON，按原始串处理 */ }
   }
   return JSON.stringify([s]);
 }
 
-/** 存储形状 → 对外「原文」（单元素直接返回，多元素按 ; 拼成可用的 cookie 串） */
+/**
+ * 存储形状 → 对外「原文」（单元素直接返回，多元素按 ; 拼成可用的 cookie 串）。
+ * 结构化元素（AdsPower 形状）按 `name=value` 重建；没有 name 的元素跳过 ——
+ * 绝不把 `[object Object]` 当 cookie 串交出去。
+ */
 export function cookieText(v) {
   const s = String(v ?? '');
   if (!s.trim()) return '';
   try {
     const parsed = JSON.parse(s);
-    if (Array.isArray(parsed)) return parsed.map(String).join('; ');
+    if (Array.isArray(parsed)) {
+      return parsed.map((x) => {
+        if (x && typeof x === 'object' && !Array.isArray(x)) return x.name ? `${x.name}=${x.value ?? ''}` : '';
+        return String(x);
+      }).filter(Boolean).join('; ');
+    }
   } catch { /* 老数据就是原始串 */ }
   return s;
 }

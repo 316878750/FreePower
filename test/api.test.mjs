@@ -216,6 +216,146 @@ try {
   const stopAll = await api('POST', '/api/v2/browser-profile/stop-all', {});
   check('stop-all：空列表也正常', stopAll.json.code === 0 && Array.isArray(stopAll.json.data?.stopped));
 
+  /* -------------------- P10：环境导入 / 导出 / 复制 -------------------- */
+  const impBase = (name) => ({
+    name, group_id: '0', timezone: 'Europe/Berlin', language: ['en-US', 'en'], screen_resolution: '1920_1080',
+    fingerprint_config: { proxy_host: '127.0.0.1', proxy_port: 18080, proxy_user: 'pu', proxy_password: 'pp', proxy_type: 'http' },
+  });
+  const im1 = await api('POST', '/api/v2/browser-profile/import', { list: [impBase('imp-a')] });
+  check('导入：{list} 形状，imported 在顶层', im1.json.code === 0 && im1.json.imported === 1
+    && im1.json.data?.list?.length === 1, JSON.stringify({ code: im1.json.code, imported: im1.json.imported }));
+  const im2 = await api('POST', '/api/v2/browser-profile/import', { data: { list: [{ ...impBase('imp-b'), unknown_field_xyz: 'x' }] } });
+  check('导入：{data:{list}} 形状 + 未知字段进 warnings（不报错）',
+    im2.json.code === 0 && im2.json.imported === 1 && /unknown_field_xyz/.test(JSON.stringify(im2.json.warnings)),
+    JSON.stringify(im2.json.warnings).slice(0, 120));
+  const im3 = await api('POST', '/api/v2/browser-profile/import', [impBase('imp-c')]);
+  check('导入：裸数组形状', im3.json.code === 0 && im3.json.imported === 1);
+
+  const im4 = await api('POST', '/api/v2/browser-profile/import', {
+    list: [impBase('imp-d'), { ...impBase('imp-bad'), timezone: 'Mars/Olympus' }],
+  });
+  check('导入：一条失败不影响其余（failed 带 index/reason）',
+    im4.json.code === 0 && im4.json.imported === 1 && im4.json.failed?.[0]?.index === 1
+    && /timezone|IANA/i.test(im4.json.failed[0].reason), JSON.stringify(im4.json.failed));
+
+  const listP10 = await api('GET', '/api/v2/browser-profile/list?page=1&page_size=100');
+  const p10Rows = listP10.json.data?.list || [];
+  const rowA = p10Rows.find((p) => p.name === 'imp-a');
+  const rowB = p10Rows.find((p) => p.name === 'imp-b');
+  check('导入：AdsPower proxy_* 落库（proxy_config 能读回）',
+    rowB && rowB.proxy_config?.host === '127.0.0.1' && rowB.proxy_config?.port === 18080
+    && rowB.proxy_config?.username === 'pu' && rowB.proxy_config?.password === 'pp',
+    JSON.stringify(rowB?.proxy_config));
+  check('list：v2 显式 page_size 也按它翻页（不再只回 1 条）', p10Rows.length >= 4, String(p10Rows.length));
+
+  const exp1 = await api('POST', '/api/v2/browser-profile/export', { profile_id: [rowA.profile_id] });
+  const e1 = exp1.json.data?.list?.[0] || {};
+  check('导出：{list} + AdsPower 兼容键 + 代理密码原样',
+    exp1.json.code === 0 && e1.fingerprint_config?.proxy_host === '127.0.0.1'
+    && e1.fingerprint_config?.proxy_port === 18080 && e1.fingerprint_config?.proxy_password === 'pp'
+    && e1.proxy_host === '127.0.0.1' && e1.screen_resolution === '1920_1080',
+    JSON.stringify({ fp: e1.fingerprint_config, host: e1.proxy_host }).slice(0, 160));
+
+  await api('POST', '/api/v2/browser-profile/delete', { profile_id: [rowA.profile_id] });
+  const re1 = await api('POST', '/api/v2/browser-profile/import', { list: [e1] });
+  const reId = re1.json.data?.list?.[0]?.profile_id;
+  const reRow = (await api('GET', `/api/v2/browser-profile/detail?profile_id=${reId}`)).json.data;
+  check('往返：导出 → 删 → 导入，关键字段一致',
+    re1.json.imported === 1 && reRow.timezone === 'Europe/Berlin' && reRow.screen_resolution === '1920_1080'
+    && reRow.proxy_config?.host === '127.0.0.1' && reRow.proxy_config?.password === 'pp',
+    JSON.stringify({ tz: reRow?.timezone, screen: reRow?.screen_resolution }));
+
+  const cp1 = await api('POST', '/api/v2/browser-profile/copy', { profile_id: reId, name: 'imp-copy' });
+  const cpId1 = cp1.json.data?.profile_id;
+  const cpRow = (await api('GET', `/api/v2/browser-profile/detail?profile_id=${cpId1}`)).json.data;
+  check('复制：新 id + seeds_regenerated + 四个种子与 fp_seed 全部换掉',
+    cp1.json.code === 0 && cpId1 !== reId && cp1.json.data.seeds_regenerated === true
+    && cpRow.timezone === reRow.timezone && cpRow.screen_resolution === reRow.screen_resolution
+    && cpRow.fp_seed !== reRow.fp_seed
+    && ['canvas_id', 'webgl_image_id', 'audio_id', 'client_rects_id'].every((k) => cpRow[k] !== reRow[k]),
+    JSON.stringify({ seed: [reRow.fp_seed, cpRow.fp_seed] }));
+
+  const cpBad = await api('POST', '/api/v2/browser-profile/copy', { profile_id: reId, copy_cookies: true });
+  check('复制：copy_cookies 打开但源没在跑 → 800002（不静默跳过）',
+    cpBad.json.code === 800002 && /运行/.test(cpBad.json.msg), `${cpBad.json.code} ${cpBad.json.msg}`);
+
+  const ckIdle = await api('GET', `/api/v2/browser-profile/cookie/export?profile_id=${reId}&format=json`);
+  check('cookie 导出：环境没在跑 → 800002 且文案说清要启动',
+    ckIdle.json.code === 800002 && /运行/.test(ckIdle.json.msg), `${ckIdle.json.code} ${ckIdle.json.msg}`);
+  const ckBadFmt = await api('GET', `/api/v2/browser-profile/cookie/export?profile_id=${reId}&format=sqlite`);
+  check('cookie 导出：非法 format → 100002', ckBadFmt.json.code === 100002, ckBadFmt.json.msg);
+  const ckIdleIn = await api('POST', '/api/v2/browser-profile/cookie/import', {
+    profile_id: reId, cookies: [{ name: 'a', value: 'b', domain: '127.0.0.1' }],
+  });
+  check('cookie 导入：环境没在跑 → 800002（不会偷偷起内核）',
+    ckIdleIn.json.code === 800002 && /运行/.test(ckIdleIn.json.msg), `${ckIdleIn.json.code} ${ckIdleIn.json.msg}`);
+
+  /* ---- P10 补：AdsPower `.txt` 互操作 + 代理字符串 / cookie 对象数组（缺陷回归） ---- */
+  const adsCookie = JSON.stringify([
+    { domain: '.example.com', expires: 1793580000, httpOnly: true, name: 'session_id', path: '/', sameSite: 'no_restriction', secure: true, session: true, value: 'abc123' },
+    { domain: '.example.com', expires: -1, httpOnly: false, name: 'uid', path: '/', sameSite: 'unspecified', secure: false, session: true, value: 'u-42' },
+  ]);
+  const adsTxt = [
+    'acc_id=1', 'id=ads-1001', 'group=', 'name=ads-txt-a', 'remark=', 'platform=facebook.com',
+    'username=', 'password=', 'fakey=', `cookie=${adsCookie}`, 'proxytype=http', 'ipchecker=ip2geo',
+    'proxy=198.51.100.10:1080:proxyuser:proxypass', 'proxyurl=', 'proxyid=', 'ip=203.0.113.7',
+    'countrycode=US', 'ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/142.0.0.0 Safari/537.36',
+    '*'.repeat(18), '',
+  ].join('\n');
+  const tImp = await api('POST', '/api/v2/browser-profile/import', { format: 'txt', content: adsTxt });
+  const tId = tImp.json.data?.list?.[0]?.profile_id;
+  check('txt 导入：18 字段块被认下（imported=1、无 failed）',
+    tImp.json.code === 0 && tImp.json.data?.imported === 1 && !(tImp.json.data?.failed || []).length,
+    JSON.stringify({ code: tImp.json.code, imported: tImp.json.data?.imported, failed: tImp.json.data?.failed }));
+  const tRow = tId ? (await api('GET', `/api/v2/browser-profile/detail?profile_id=${tId}`)).json.data : {};
+  check('txt 导入：proxy 四段字符串落库（密码不静默丢）',
+    tRow.proxy_config?.host === '198.51.100.10' && tRow.proxy_config?.port === 1080
+    && tRow.proxy_config?.username === 'proxyuser' && tRow.proxy_config?.password === 'proxypass',
+    JSON.stringify(tRow.proxy_config));
+  let tCookies = null;
+  try { tCookies = JSON.parse(String(tRow.cookie || '')); } catch { tCookies = null; }
+  check('txt 导入：cookie 落库后 JSON.parse 仍是对象数组（不是 ["[object Object]"]）',
+    Array.isArray(tCookies) && tCookies.length === 2 && tCookies.every((c) => c && typeof c === 'object')
+    && tCookies[0].name === 'session_id' && !/\[object Object\]/.test(String(tRow.cookie)),
+    Array.isArray(tCookies) ? `${tCookies.length} 条` : String(tRow.cookie).slice(0, 60));
+
+  const tExp = await api('POST', '/api/v2/browser-profile/export', { profile_id: [tId], format: 'txt' });
+  const td = tExp.json.data || {};
+  const tContent = String(td.content || '');
+  check('txt 导出：只有 data.{format,count,filename,content}，不夹带 list',
+    tExp.json.code === 0 && td.format === 'txt' && td.count === 1 && td.list === undefined
+    && /^profiles_\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}\.txt$/.test(String(td.filename)),
+    JSON.stringify({ format: td.format, count: td.count, filename: td.filename, hasList: td.list !== undefined }));
+  const tLines = tContent.split('\n').filter(Boolean);
+  const tKeys = tLines.slice(0, 18).map((l) => l.slice(0, l.indexOf('=')));
+  check('txt 导出：每块 19 行（18 字段 + 星号）、键序与对手一致、无 CR',
+    tLines.length === 19 && tKeys.join(',') === 'acc_id,id,group,name,remark,platform,username,password,fakey,cookie,proxytype,ipchecker,proxy,proxyurl,proxyid,ip,countrycode,ua'
+    && tLines[18] === '*'.repeat(18) && !tContent.includes('\r'),
+    JSON.stringify({ lines: tLines.length, last: tLines[18]?.slice(0, 8) }));
+  let tExportCookies = null;
+  try { tExportCookies = JSON.parse(tLines[9].slice('cookie='.length)); } catch { tExportCookies = null; }
+  check('txt 导出：cookie 单行 JSON + sameSite 用对方四值（unspecified 不被改成 lax）',
+    Array.isArray(tExportCookies) && tExportCookies[0].sameSite === 'no_restriction'
+    && tExportCookies.some((c) => c.sameSite === 'unspecified') && Number(tExportCookies[0].expires) === 1793580000,
+    JSON.stringify(tExportCookies?.map((c) => c.sameSite)));
+
+  const nlC = await api('POST', '/api/v2/browser-profile/create', { name: 'nl-x', group_id: '0', remark: '第一行\n第二行\r第三行' });
+  const nlExp = await api('POST', '/api/v2/browser-profile/export', { profile_id: [nlC.json.data.profile_id], format: 'txt' });
+  const nlContent = String(nlExp.json.data?.content || '');
+  check('txt 导出：值里的换行被替换，文件仍是 19 行且 warnings 说了「换行」',
+    nlContent.split('\n').filter(Boolean).length === 19 && !nlContent.includes('\r')
+    && /换行/.test(JSON.stringify(nlExp.json.data?.warnings || [])),
+    JSON.stringify(nlExp.json.data?.warnings));
+
+  const badTxt = adsTxt.replace('proxy=198.51.100.10:1080:proxyuser:proxypass', 'proxy=not-a-proxy').replace('name=ads-txt-a', 'name=ads-txt-bad');
+  const badTImp = await api('POST', '/api/v2/browser-profile/import', { format: 'txt', content: badTxt });
+  check('txt 导入：代理切不出来进 warnings 点名原文，环境仍可建（能建就建）',
+    badTImp.json.code === 0 && badTImp.json.data?.imported === 1
+    && /代理/.test(JSON.stringify(badTImp.json.data?.warnings)) && /not-a-proxy/.test(JSON.stringify(badTImp.json.data?.warnings)),
+    JSON.stringify(badTImp.json.data?.warnings).slice(0, 120));
+  const tBadFmt = await api('POST', '/api/v2/browser-profile/export', { profile_id: [tId], format: 'yaml' });
+  check('txt 导出：非法 format → 100002', tBadFmt.json.code === 100002, tBadFmt.json.msg);
+
   /* -------------------- 占位：明确不支持，不假成功 -------------------- */
   const ph = await api('POST', '/api/v2/browser-profile/recycle-bin/list', { page: 1 });
   check('占位路由：明确不支持（code -1 + supported:false）', ph.json.code === -1 && ph.json.data?.supported === false && /不支持/.test(ph.json.msg), ph.json.msg);

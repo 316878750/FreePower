@@ -107,6 +107,56 @@ export function confirmDialog({ title, body, okLabel = '确定', cancelLabel = '
   });
 }
 
+/**
+ * 单行输入弹窗（复制环境改名字、重命名这类短输入）。
+ * @returns {Promise<string|null>} null = 取消
+ */
+export function promptDialog({ title, label = '', value = '', placeholder = '', okLabel = '确定', cancelLabel = '取消' }) {
+  return new Promise((resolve) => {
+    const root = document.getElementById('dialog-root');
+    const input = h('input', { type: 'text', value, placeholder });
+    const done = (v) => { overlay.remove(); resolve(v); };
+    const okBtn = h('button', { class: 'btn primary', onClick: () => done(input.value) }, okLabel);
+    const overlay = h('div', { class: 'overlay', onClick: (e) => { if (e.target === overlay) done(null); } },
+      h('div', { class: 'dialog', role: 'dialog' },
+        h('h3', null, title),
+        h('div', { class: 'body' },
+          h('label', { class: 'field' }, h('span', { class: 'lbl' }, label), input)),
+        h('div', { class: 'foot' },
+          h('button', { class: 'btn', onClick: () => done(null) }, cancelLabel),
+          okBtn)));
+    root.appendChild(overlay);
+    input.focus();
+    input.select();
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') done(input.value); });
+  });
+}
+
+/** 浏览器里下载一段文本（导出环境/导出 cookie 用，不经过任何外部服务） */
+export function downloadText(filename, text, type = 'application/json') {
+  const blob = new Blob([text], { type: `${type};charset=utf-8` });
+  const url = URL.createObjectURL(blob);
+  const a = h('a', { href: url, download: filename });
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+
+/** 选一个本地文件并读成文本（导入用） */
+export function pickFile(accept = '.json,application/json') {
+  return new Promise((resolve) => {
+    const input = h('input', { type: 'file', accept, style: { display: 'none' } });
+    input.addEventListener('change', () => {
+      const file = input.files && input.files[0] ? input.files[0] : null;
+      input.remove();
+      resolve(file);
+    });
+    document.body.appendChild(input);
+    input.click();
+  });
+}
+
 /** 右侧抽屉，用于新建/编辑代理这种短表单 */
 export function drawer({ title, body, footer, onClose }) {
   const root = document.getElementById('dialog-root');

@@ -1,5 +1,5 @@
 /** 环境列表：启动/停止/自检状态/批量操作。所有动作都打 Local API，没有私有通道。 */
-import { h, mount, clear, toast, confirmDialog, pill, empty, fmtTime } from '../ui.js';
+import { h, mount, clear, toast, confirmDialog, promptDialog, downloadText, pickFile, pill, empty, fmtTime } from '../ui.js';
 import { api } from '../api.js';
 
 const state = {
@@ -38,6 +38,8 @@ export default async function renderProfiles({ head, page }) {
     h('span', { class: 'grow' }),
     selBar,
     h('button', { class: 'btn primary', onClick: () => { location.hash = '#/profiles/new'; } }, '新建环境'),
+    h('button', { class: 'btn', onClick: importFile, title: 'JSON（{list} / {data:{list}} / 裸数组）或 AdsPower 的 .txt 块格式；未知字段会列在结果里' }, '导入'),
+    h('button', { class: 'btn', onClick: exportTxt, title: 'AdsPower .txt：账号+代理+cookie+UA 的搬运单，不含指纹配置；保真备份请用每行的「导出」JSON' }, '导出 txt'),
     h('button', { class: 'btn', onClick: () => batch('start') }, '批量启动'),
     h('button', { class: 'btn', onClick: () => batch('stop') }, '批量停止'),
     h('button', { class: 'btn', onClick: stopAll }, '全部停止'));
@@ -55,7 +57,7 @@ export default async function renderProfiles({ head, page }) {
               h('th', null, '代理'),
               h('th', null, '状态'),
               h('th', null, '自检'),
-              h('th', { style: { width: '210px' } }, '操作'))),
+              h('th', { style: { width: '330px' } }, '操作'))),
           body))));
 
   await loadGroups();
@@ -183,6 +185,10 @@ export default async function renderProfiles({ head, page }) {
         ' ',
         h('button', { class: 'btn sm ghost', onClick: () => { location.hash = `#/profiles/${id}/selfcheck`; } }, '自检'),
         ' ',
+        h('button', { class: 'btn sm ghost', onClick: () => exportOne(r) }, '导出'),
+        ' ',
+        h('button', { class: 'btn sm ghost', onClick: () => copyOne(r) }, '复制'),
+        ' ',
         h('button', { class: 'btn sm danger', onClick: () => removeOne(r) }, '删除')));
   }
 
@@ -254,6 +260,95 @@ export default async function renderProfiles({ head, page }) {
       toast(`已停止 ${(r.stopped || []).length} 个`, 'ok');
     } catch (e) { toast(e.message, 'bad'); }
     await load(false);
+  }
+
+  /* ------------------------ 导入 / 导出 / 复制（P10） ------------------------ */
+
+  async function importFile() {
+    const file = await pickFile('.json,.txt,application/json,text/plain');
+    if (!file) return;
+    const text = await file.text();
+    // .txt（AdsPower 块格式）不是 JSON：按扩展名或首字符判断，别拿 JSON.parse 去硬解
+    const isTxt = /\.txt$/i.test(file.name) || !/^\s*[[{]/.test(text);
+    if (isTxt) {
+      try {
+        const r = await api.importProfilesTxt(text);
+        reportImport(r);
+        await load(false);
+      } catch (e) { toast(`导入失败：${e.message}`, 'bad'); }
+      return;
+    }
+    let parsed;
+    try { parsed = JSON.parse(text); } catch (e) { toast(`JSON 解析失败：${e.message}`, 'bad'); return; }
+    const list = Array.isArray(parsed) ? parsed
+      : Array.isArray(parsed?.list) ? parsed.list
+        : Array.isArray(parsed?.data?.list) ? parsed.data.list : null;
+    if (!list) { toast('文件里没有 list 数组（支持 {list} / {data:{list}} / 裸数组）', 'bad'); return; }
+    try {
+      const r = await api.importProfiles(list);
+      reportImport(r);
+      await load(false);
+    } catch (e) { toast(`导入失败：${e.message}`, 'bad'); }
+  }
+
+  function reportImport(r) {
+    const bits = [`导入完成：成功 ${r.imported} 条`];
+    if (r.failed?.length) bits.push(`失败 ${r.failed.length} 条`);
+    if (r.warnings?.length) bits.push(`${r.warnings.length} 条告警`);
+    toast(bits.join(' · '), r.failed?.length ? 'bad' : 'ok');
+    if (r.failed?.length || r.warnings?.length) showImportDetail(r);
+  }
+
+  /** AdsPower `.txt` 互操作导出（当前勾选的，或筛选出来的全部） */
+  async function exportTxt() {
+    const rows = state.selected.size
+      ? state.rows.filter((r) => state.selected.has(r.profile_id))
+      : filtered();
+    if (!rows.length) { toast('没有可导出的环境'); return; }
+    try {
+      const d = await api.exportProfiles(rows.map((r) => r.profile_id), 'txt');
+      downloadText(d.filename || 'profiles.txt', d.content, 'text/plain');
+      const bits = [`已导出 ${d.count} 个环境为 AdsPower .txt`];
+      if (d.warnings?.length) bits.push(d.warnings.join('；'));
+      toast(bits.join(' · '), 'ok');
+    } catch (e) { toast(`导出失败：${e.message}`, 'bad'); }
+  }
+
+  function showImportDetail(r) {
+    const lines = [];
+    for (const f of r.failed || []) lines.push(`✗ 第 ${Number(f.index) + 1} 条：${f.reason}`);
+    for (const w of r.warnings || []) lines.push(`- ${w}`);
+    confirmDialog({
+      title: '导入结果',
+      body: h('div', null,
+        h('div', null, `成功 ${r.imported} 条${r.failed?.length ? `，失败 ${r.failed.length} 条` : ''}。`),
+        h('div', { class: 'code-block', style: { whiteSpace: 'pre-wrap' } }, lines.join('\n') || '（没有问题）')),
+      okLabel: '知道了', cancelLabel: '关闭',
+    });
+  }
+
+  async function exportOne(r) {
+    try {
+      const d = await api.exportProfiles([r.profile_id]);
+      const safe = String(r.name || 'profile').replace(/[\\/:*?"<>|]/g, '_');
+      downloadText(`freepower-${r.profile_no}-${safe}.json`, JSON.stringify({ list: d.list }, null, 2));
+      toast(`已导出 ${r.name}（含指纹与代理，代理密码原样）`, 'ok');
+    } catch (e) { toast(`导出失败：${e.message}`, 'bad'); }
+  }
+
+  async function copyOne(r) {
+    const name = await promptDialog({
+      title: '复制环境',
+      label: '新环境名称',
+      value: `${r.name}-copy`,
+      okLabel: '复制',
+    });
+    if (name === null) return;
+    try {
+      const c = await api.copyProfile(r.profile_id, name || undefined);
+      toast(`已复制为 ${c.name}：配置一致，${c.seeds_regenerated ? '四个指纹种子已重生' : '种子状态未知'}`, 'ok');
+      await load(false);
+    } catch (e) { toast(`复制失败：${e.message}`, 'bad'); }
   }
 
   async function removeOne(r) {

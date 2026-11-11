@@ -21,6 +21,9 @@ import { buildArgs } from '../src/kernel/chrome.js';
 import { ok, unsupported } from '../src/api/contract.js';
 import { clampConcurrency } from '../src/runtime/batch.js';
 import { cookieToStorage, cookieText } from '../src/store/profiles.js';
+import { publicCookie, cdpCookieParam } from '../src/kernel/cookies.js';
+import { normalizeImportItem } from '../src/store/transfer.js';
+import { parseAdspowerTxt, formatAdspowerTxt, proxyLineOf } from '../src/store/adspower-txt.js';
 import { startFakeProxy } from './fake-proxy.mjs';
 import vm from 'node:vm';
 import { buildInjectionSource, buildWorkerInjectionSource, sharedNoiseCoreSource } from '../src/kernel/inject.js';
@@ -1108,4 +1111,69 @@ test('代理健康检查：错误归类（CONNECT 被拒 / DNS / 配置）', () 
   assert.equal(classifyProxyFailure('连接 example.invalid:443 失败：ENOTFOUND'), 'dns');
   assert.equal(classifyProxyFailure('代理配置不完整（host/port 为空）'), 'config');
   assert.equal(classifyProxyFailure(''), 'other');
+});
+
+test('cookie：publicCookie 不补默认 sameSite（未声明不许写成 Lax）', () => {
+  const c = publicCookie({ name: 'a', value: 'b', domain: '.x.com', path: '/', expires: 1700000000, httpOnly: false, secure: false });
+  assert.equal('sameSite' in c, false, '内核没给 sameSite 时不许补默认值');
+  assert.equal(publicCookie({ name: 'a', value: 'b', domain: '.x.com', sameSite: 'None' }).sameSite, 'None');
+  assert.equal(publicCookie({ name: 'a', value: 'b', domain: '.x.com', sameSite: 'Strict' }).sameSite, 'Strict');
+});
+
+test('cookie：分区键双向（CDP partitionKey ↔ AdsPower CookiePartitionKey）', () => {
+  const c = publicCookie({
+    name: 'p', value: 'v', domain: '.x.com',
+    partitionKey: { topLevelSite: 'https://a.com', hasCrossSiteAncestor: true },
+  });
+  assert.equal(c.partitionKey.topLevelSite, 'https://a.com');
+  assert.equal(c.CookiePartitionKey, 'https://a.com');
+  const p1 = cdpCookieParam({ name: 'p', value: 'v', domain: '.x.com', CookiePartitionKey: 'https://a.com' });
+  assert.deepEqual(p1.param.partitionKey, { topLevelSite: 'https://a.com' });
+  const p2 = cdpCookieParam({ name: 'p', value: 'v', domain: '.x.com', partitionKey: { topLevelSite: 'a.com' } });
+  assert.equal(p2.param.partitionKey.topLevelSite, 'https://a.com');
+});
+
+test('cookie：cookieToStorage 保留对象数组（不是 "[object Object]"）', () => {
+  const arr = [{ name: 'sid', value: 'v1', domain: '.example.com' }];
+  assert.deepEqual(JSON.parse(cookieToStorage(arr)), arr);
+  assert.deepEqual(JSON.parse(cookieToStorage(JSON.stringify(arr))), arr);
+  assert.equal(cookieText(cookieToStorage(arr)), 'sid=v1');
+  assert.deepEqual(JSON.parse(cookieToStorage('sid=v1; uid=2')), ['sid=v1; uid=2']);
+  assert.equal(cookieText(cookieToStorage('sid=v1; uid=2')), 'sid=v1; uid=2');
+});
+
+test('导入：proxy 字符串 host:port:user:pass 切四段，密码里的冒号保留', () => {
+  const n = normalizeImportItem({ name: 'p', proxy: '198.51.100.10:1080:proxyuser:proxypass:with:colons' });
+  assert.equal(n.input.proxy_config.proxy_host, '198.51.100.10');
+  assert.equal(n.input.proxy_config.proxy_port, 1080);
+  assert.equal(n.input.proxy_config.proxy_user, 'proxyuser');
+  assert.equal(n.input.proxy_config.proxy_password, 'proxypass:with:colons');
+  const two = normalizeImportItem({ name: 'p', proxy: '198.51.100.10:1080' });
+  assert.equal(two.input.proxy_config.proxy_user, '');
+  const bad = normalizeImportItem({ name: 'p', proxy: 'not-a-proxy' });
+  assert.equal(bad.input.proxy_config, undefined);
+  assert.ok(bad.warnings.some((w) => /代理/.test(w) && /not-a-proxy/.test(w)), JSON.stringify(bad.warnings));
+});
+
+test('txt：写出 → 读回（19 行/块、18 星、换行替换、sameSite 四值）', () => {
+  const cookie = JSON.stringify([
+    { name: 'sid', value: 'abc=def==', domain: '.example.com', path: '/', expires: 1793580000, httpOnly: true, secure: true, sameSite: 'no_restriction' },
+    { name: 'uid', value: '1', domain: '.example.com', path: '/', expires: -1, httpOnly: false, secure: false, sameSite: 'unspecified' },
+  ]);
+  const { content, warnings } = formatAdspowerTxt([{
+    profile_id: 'id-1', profile_no: 7, group_id: '0', name: 'a\nb', remark: 'r\r\nr2', domain_name: 'facebook.com',
+    cookie, proxy_config: { host: '198.51.100.10', port: 1080, username: 'u', password: 'p:q', proxy_type: 'http' },
+    ua: 'Mozilla/5.0 X',
+  }]);
+  const lines = content.split('\n').filter(Boolean);
+  assert.equal(lines.length, 19);
+  assert.equal(lines[18], '*'.repeat(18));
+  assert.equal(content.includes('\r'), false);
+  assert.ok(warnings.some((w) => /换行/.test(w)), JSON.stringify(warnings));
+  const back = parseAdspowerTxt(content).items[0];
+  assert.equal(back.name, 'a b');
+  assert.equal(back.proxy, '198.51.100.10:1080:u:p:q');
+  assert.equal(back.cookie[0].sameSite, 'no_restriction');
+  assert.equal(back.cookie[1].sameSite, 'unspecified');
+  assert.equal(proxyLineOf({ proxy_config: { host: 'h', port: 1 } }), 'h:1');
 });
