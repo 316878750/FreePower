@@ -14,6 +14,8 @@
  *   ③ 硬件、语言、时区、UA 在 worker 与主帧一致
  *   ④ workerStats.injected 精确等于 3（不多不少），failed 为空
  *   ⑤ 自检报告里四项新条目（三个 realm + AudioWorklet）存在且状态符合预期
+ *   ⑥ **嵌套 worker**（worker 里再 `new Worker`）也被注入：两层 atTop 都是 worker，
+ *      主帧 / 外层 / 嵌套三者的 hardwareConcurrency 一致（这条防的是「伪装值与真实值同台」）
  *
  * 自带起环境与收尾：本地 http 源、临时数据目录、退出前 stop + 杀进程、删临时目录。
  * 需要真实 Chrome 与完整权限（沙箱挡命名管道，Chrome 起不来）。
@@ -150,7 +152,46 @@ try {
   check('没有注入失败', Array.isArray(stats.failed) && stats.failed.length === 0,
     (stats.failed || []).map((f) => `${f.type}:${f.reason}`).join('; ') || '无');
 
-  /* ---------- 4. 自检报告四项 ---------- */
+  /* ---------- 4. 嵌套 worker：worker 里再 new Worker（P7 修复项，钉死防退化） ----------
+   * 这一层只有「父 worker 会话上也挂 setAutoAttach」才接得住。
+   * 没接住时实测会读到真实 hardwareConcurrency，跟主帧的伪装值当场自相矛盾 ——
+   * 检测方连比对都不用做，两行 new Worker 就能证明「硬件参数被改过」。
+   */
+  {
+    const before = { injected: stats.injected, workers: stats.by_type.worker || 0 };
+    const innerSrc = `const t = self.__fpRealm || null;
+      self.postMessage({ layer: 'inner', atTop: t, cores: self.navigator.hardwareConcurrency });`;
+    const outerSrc = `const t = self.__fpRealm || null;
+      const src = ${JSON.stringify(innerSrc)};
+      const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+      w.onmessage = (e) => self.postMessage({ layer: 'outer', atTop: t, cores: self.navigator.hardwareConcurrency, inner: e.data });
+      w.onerror = (e) => self.postMessage({ layer: 'outer', atTop: t, cores: self.navigator.hardwareConcurrency, error: String(e.message) });`;
+    const expression = `(async () => {
+      const outer = new Worker(URL.createObjectURL(new Blob([${JSON.stringify(outerSrc)}], { type: 'text/javascript' })));
+      const r = await new Promise((res, rej) => {
+        outer.onmessage = (e) => res(e.data);
+        outer.onerror = (e) => rej(new Error(String(e.message || 'worker error')));
+        setTimeout(() => rej(new Error('嵌套 worker 超时')), 5000);
+      });
+      return { mainCores: navigator.hardwareConcurrency, mainRealm: self.__fpRealm || null, ...r };
+    })()`;
+    const r = await inst.client.send('Runtime.evaluate', {
+      expression, awaitPromise: true, returnByValue: true, userGesture: true,
+    }, page.sessionId);
+    const n = r.result?.value || {};
+    console.log(`\n  嵌套 worker：${JSON.stringify(n)}`);
+    check('嵌套 worker：外层与嵌套层都在脚本首行之前注入（atTop 都是 worker）',
+      n.atTop === 'worker' && n.inner?.atTop === 'worker',
+      `outer=${JSON.stringify(n.atTop ?? null)} inner=${JSON.stringify(n.inner?.atTop ?? null)}`);
+    check('嵌套 worker：主帧 / 外层 / 嵌套三者的 hardwareConcurrency 一致（不泄漏真实核数）',
+      n.mainCores !== undefined && n.mainCores === n.cores && n.cores === n.inner?.cores,
+      `主帧 ${n.mainCores} / 外层 ${n.cores} / 嵌套 ${n.inner?.cores}`);
+    check('嵌套 worker：两层都算进注入计数（by_type.worker 至少 +2）',
+      stats.injected - before.injected >= 2 && (stats.by_type.worker || 0) - before.workers >= 2,
+      `injected ${before.injected}→${stats.injected}，worker ${before.workers}→${stats.by_type.worker}`);
+  }
+
+  /* ---------- 5. 自检报告四项 ---------- */
   const report = await runSelfCheck(inst, getProfile(id));
   const byId = Object.fromEntries((report.items || []).map((it) => [it.id, it]));
   for (const [key, label] of [['realm_dedicated', '专用 Worker'], ['realm_shared', 'SharedWorker'], ['realm_service', 'ServiceWorker']]) {

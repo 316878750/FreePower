@@ -249,8 +249,9 @@ async function main() {
     /* ================= P2：启动后自动自检 ================= */
     for (const [i, s] of started.entries()) {
       const sc = s.data.selfcheck || {};
-      check(`${countries[i]} 启动后自动自检`, sc.total === 15 && sc.fail === 0, JSON.stringify(sc));
-      check(`${countries[i]} 自检覆盖度对齐字段表 (7/7/1)`, sc.full === 7 && sc.partial === 7 && sc.none === 1, `${sc.full}/${sc.partial}/${sc.none}`);
+      check(`${countries[i]} 启动后自动自检`, sc.total === 19 && sc.fail === 0, JSON.stringify(sc));
+      // P7：15 项 → 19 项（+3 个 realm 标 partial，+1 个 AudioWorklet 标 none），覆盖度由 7/7/1 变 7/10/2
+      check(`${countries[i]} 自检覆盖度对齐字段表 (7/10/2)`, sc.full === 7 && sc.partial === 10 && sc.none === 2, `${sc.full}/${sc.partial}/${sc.none}`);
       check(`${countries[i]} 四个噪点哈希都有`, !!sc.hashes?.canvas && !!sc.hashes?.webgl_image && !!sc.hashes?.audio && !!sc.hashes?.client_rects, JSON.stringify(sc.hashes));
       check(`${countries[i]} 同页两次读取一致`, sc.determinism?.canvas === true && sc.determinism?.webgl_image === true && sc.determinism?.audio === true && sc.determinism?.client_rects === true, JSON.stringify(sc.determinism));
     }
@@ -260,7 +261,7 @@ async function main() {
       const scj = await api('GET', `/api/v1/browser/selfcheck?user_id=${first}`);
       const report = scj.json.data || {};
       const byId = Object.fromEntries((report.items || []).map((x) => [x.id, x]));
-      check('自检 API 返回 15 项报告', scj.json.code === 0 && report.items?.length === 15, scj.json.msg);
+      check('自检 API 返回 19 项报告', scj.json.code === 0 && report.items?.length === 19, scj.json.msg);
       check('字体项覆盖度 none 且标黄', byId.fonts?.coverage === 'none' && byId.fonts?.status === 'warn', JSON.stringify(byId.fonts));
       check('自检注明 CDP 结构性上限', /结构性/.test(String(report.caveat)), String(report.caveat).slice(0, 60));
       check('自检在安全上下文里跑（UA-CH 可验证）', report.context?.secure === true, JSON.stringify(report.context));

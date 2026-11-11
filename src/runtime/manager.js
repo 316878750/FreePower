@@ -405,6 +405,29 @@ async function injectAndOpen(instance, profile, view) {
   }
 
   /**
+   * 给 worker 会话自己也挂一次 auto-attach —— 这是「嵌套 worker」的唯一接法。
+   *
+   * worker 里再 `new Worker` 出来的子 target 只挂到**父 worker 的会话**下，页面层和
+   * 浏览器层的 auto-attach 都够不着；不挂这一层，嵌套 worker 就裸跑（实测泄漏真实
+   * hardwareConcurrency，跟主帧的伪装值当场自相矛盾）。每层都挂，自然覆盖任意深度，
+   * 所以不设递归深度上限。
+   *
+   * 必须**先于** evaluate（也就先于 resume）：否则父 worker 顶层已经跑完，子 worker
+   * 早建出来了，挂晚了接不住。代价是每层多一次本地 CDP 往返。
+   */
+  async function armChildAutoAttach(sessionId, type) {
+    try {
+      await client.send('Target.setAutoAttach', {
+        autoAttach: true, waitForDebuggerOnStart: true, flatten: true,
+      }, sessionId);
+    } catch (e) {
+      // 挂不上就要如实记账：这个 worker 的嵌套层本轮没覆盖，别当成已支持
+      workerStats.failed.push({ type: `${type}#child-auto-attach`, url: '', reason: e.message });
+      log(profileId, 'WARN worker 子会话 auto-attach 失败', type, e.message);
+    }
+  }
+
+  /**
    * worker 注入的三步顺序（实测得来，反过来就有裸窗口）：
    *   ① 先发 Runtime.evaluate（**不 await**）—— 暂停态里脚本已生效
    *   ② 再 runIfWaitingForDebugger 放行
@@ -414,6 +437,8 @@ async function injectAndOpen(instance, profile, view) {
    */
   async function injectWorkerTarget({ sessionId, type, url, waitingForDebugger }) {
     const started = Date.now();
+    // 先把自己的子会话也挂上（嵌套 worker 只在这一层接得住），再注入、再放行
+    await armChildAutoAttach(sessionId, type);
     // 末行回显 __fpRealm：注入真跑过才等于 'worker'，这是「真值」而不是「发过就算」
     const expression = buildWorkerInjectionSource(view, { debug: FP_DEBUG }) + '\n;(self.__fpRealm || null)';
     const pending = client
