@@ -70,8 +70,11 @@ function blockToItem(block) {
 
   const pt = proxyTypeOf(block.proxytype);
   if (pt) item.proxy_type = pt;
-  // 代理字符串原样交给 normalizeImportItem 里的 parseProxyString（host:port[:user:pass]）
-  put('proxy', typeof block.proxy === 'string' ? block.proxy.trim() : block.proxy);
+  // 代理字符串原样交给 normalizeImportItem 里的 parseProxyString（host:port[:user:pass]），
+  // 只把我们自己写出去的密码 `%3A` 还原成 `:` —— 对方真实导出里密码的 `:` 是原样出现的，
+  // 那条路径靠 parseProxyString 的「其余全归密码」兜住，不走这个解码。
+  const rawProxy = typeof block.proxy === 'string' ? block.proxy.trim() : block.proxy;
+  put('proxy', typeof rawProxy === 'string' ? decodeProxyPasswordInLine(rawProxy) : rawProxy);
 
   // 分组：AdsPower 里是**分组名**，我们是分组 id。纯数字才认，否则进默认分组并告警
   const g = String(block.group ?? '').trim();
@@ -180,7 +183,7 @@ function sameSiteForTxt(v) {
 }
 
 /** 我们存的 cookie（JSON 数组串）→ AdsPower 的 cookie 对象数组 */
-function cookieForTxt(profile) {
+function cookieForTxt(profile, issues = []) {
   const s = String(profile.cookie ?? '').trim();
   if (!s) return '';
   try {
@@ -189,6 +192,10 @@ function cookieForTxt(profile) {
     const domain = String(profile.domain_name || '');
     const out = parsed.map((x) => {
       if (x && typeof x === 'object' && !Array.isArray(x)) {
+        // 数值码不映射（那是对手内部镜像形状），但**不许静默**：点名后按 unspecified 写
+        if (typeof x.sameSite === 'number') {
+          issues.push(`cookie「${String(x.name || '?')}」的 sameSite 是数值码 ${x.sameSite}，已按 unspecified 写出（未知数值码不做映射）`);
+        }
         return { ...x, sameSite: sameSiteForTxt(x.sameSite) };
       }
       // 老数据是 `sid=xxx; uid=7` 文本 → 拆成对象，domain 用站点域名（没有就留空）
@@ -210,8 +217,35 @@ function cookieForTxt(profile) {
   } catch { return ''; }
 }
 
-/** 代理对象 → AdsPower 的 `host:port:user:pass`（无认证 `host:port`） */
-export function proxyLineOf(p) {
+/**
+ * 代理行：**同一字段两套规则，不要统一**（写在注释里，免得以后有人来「顺手一致化」）。
+ *
+ *   - JSON 导出/导入：`host:port:user:pass` **原样保真**，密码里的 `:` 保留。我们的解析器
+ *     认「前 3 段定宽、其余全归密码」，所以 JSON 往返无损。
+ *   - AdsPower `.txt`：对方 150/150 块**恒 4 段**（逆向实测），密码里带 `:` 会被写成 6 段，
+ *     对方多半按 4 段切 → 密码截断 → 导入成功但认证失败（最难查的一类）。所以 txt 里
+ *     把密码的 `:` 写成 `%3A`（仍是 4 段），并在 warnings 里点名「导入后代理认证可能失败」。
+ *     我们自己读回时会把 `%3A` 还原成 `:`，所以「自己导出 → 自己导入」仍然无损。
+ */
+function encodeProxyPassword(pass) {
+  return String(pass).replace(/:/g, '%3A');
+}
+
+/** 读回时的还原：只处理第 4 段之后的密码部分（前 3 段是 host/port/user，不动） */
+function decodeProxyPasswordInLine(line) {
+  const s = String(line ?? '');
+  if (s.indexOf('%3A') < 0) return s;
+  const parts = s.split(':');
+  if (parts.length < 4) return s;
+  return [...parts.slice(0, 3), parts.slice(3).join(':').replace(/%3A/g, ':')].join(':');
+}
+
+/**
+ * 代理对象 → AdsPower 的 `host:port:user:pass`（无认证 `host:port`）。
+ * @param {object} p 环境
+ * @param {{forTxt?: boolean}} [opt] `forTxt: true` 时按对手的 4 段形状写（密码 `:` 转 `%3A`）
+ */
+export function proxyLineOf(p, { forTxt = false } = {}) {
   const px = p.proxy_config || p.user_proxy_config || {};
   const host = String(px.host || px.proxy_host || '').trim();
   if (!host) return '';
@@ -220,30 +254,41 @@ export function proxyLineOf(p) {
   const pass = String(px.password || px.proxy_password || '');
   if (!port) return host;
   if (!user && !pass) return `${host}:${port}`;
-  return `${host}:${port}:${user}:${pass}`;
+  return `${host}:${port}:${user}:${forTxt ? encodeProxyPassword(pass) : pass}`;
 }
 
 /** 一条环境的 18 个字段值（写出去之前的样子） */
-function blockValues(p) {
+function blockValues(p, issues = []) {
   const px = p.proxy_config || p.user_proxy_config || {};
+  const pass = String(px.password || px.proxy_password || '');
+  if (pass.includes(':')) {
+    issues.push('代理密码含冒号，AdsPower 导出格式无法表示（只能 4 段），导入后代理认证可能失败');
+  }
+  const name = String(p.name ?? '');
+  if (name.length >= 100) {
+    issues.push('name 已达 100 字符上限（创建/导入时截断过的话，导出的是截断后的值；对方再导入也是这个长度）');
+  }
   return {
     acc_id: p.profile_no ?? '',
     id: p.profile_id || p.id || '',
-    group: p.group_id ?? '0',
-    name: p.name ?? '',
+    // group：AdsPower 真实导出 150/150 恒空（我们存的是分组 id）。txt 写空串，
+    // JSON 里仍然保留 group_id —— 两种格式不合并（分组语义只在我们的库里成立）
+    group: '',
+    name,
     remark: p.remark ?? '',
     platform: p.domain_name ?? '',
     username: p.username ?? '',
     password: p.password ?? '',
     fakey: p.fakey ?? '',
-    cookie: cookieForTxt(p),
+    cookie: cookieForTxt(p, issues),
     proxytype: String(px.proxy_type || px.type || 'http'),
     ipchecker: p.ipchecker ?? '',
-    proxy: proxyLineOf(p),
+    proxy: proxyLineOf(p, { forTxt: true }),
     proxyurl: '',
     proxyid: p.proxy_id ?? '',
     ip: p.ip ?? '',
-    countrycode: p.ip_country ?? '',
+    // countrycode：真实导出 150/150 全小写（我们库里是 `US`）→ txt 小写，JSON 保持原样
+    countrycode: String(p.ip_country ?? '').trim().toLowerCase(),
     ua: p.ua ?? '',
   };
 }
@@ -289,19 +334,28 @@ function selfCheck(content, expected) {
 
 /** 一条环境 → AdsPower 的一块文本（字段顺序按实测） */
 export function formatAdspowerBlock(p) {
-  const v = blockValues(p);
+  const v = blockValues(p, []);
   const stats = { newlines: 0 };
   return ADP_FIELDS.map((k) => `${k}=${k === 'cookie' ? v[k] : flattenNewlines(v[k], stats)}`).join('\n');
 }
 
 /**
  * 多条环境 → 整份 `.txt`（每块以 18 个星号收尾，最后一块之后也有星号行，结尾一个换行）。
+ *
+ * `warnings` 里每条都带块号（「第 N 块：…」），因为用户要能拿着告警去文件里定位：
+ *   - 换行被替换（会改变值本身）；
+ *   - 代理密码含冒号（对方格式只能 4 段，导入后认证可能失败）；
+ *   - cookie 的 sameSite 是未知数值码（按 unspecified 写，不静默）；
+ *   - name 已到 100 字符上限（存储层截断过的话，导出的就是截断值）。
  * @returns {{content:string, warnings:string[]}}
  */
 export function formatAdspowerTxt(profiles = []) {
   const stats = { newlines: 0 };
-  const expected = profiles.map((p) => {
-    const v = blockValues(p);
+  const warnings = [];
+  const expected = profiles.map((p, i) => {
+    const issues = [];
+    const v = blockValues(p, issues);
+    for (const w of issues) warnings.push(`第 ${i + 1} 块：${w}`);
     const out = {};
     for (const k of ADP_FIELDS) out[k] = k === 'cookie' ? v[k] : flattenNewlines(v[k], stats);
     return out;
@@ -310,8 +364,7 @@ export function formatAdspowerTxt(profiles = []) {
     .map((v) => `${ADP_FIELDS.map((k) => `${k}=${v[k]}`).join('\n')}\n${ADP_BLOCK_SEP}`)
     .join('\n') + '\n';
   selfCheck(content, expected);
-  const warnings = [];
-  if (stats.newlines) warnings.push(`${stats.newlines} 个字段的换行已替换为空格（该格式一行一字段）`);
+  if (stats.newlines) warnings.unshift(`${stats.newlines} 个字段的换行已替换为空格（该格式一行一字段）`);
   return { content, warnings };
 }
 

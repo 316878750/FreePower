@@ -1246,3 +1246,61 @@ ${'*'.repeat(18)}
   assert.equal(r.failed.length, 0);
   assert.ok(r.warnings.some((w) => /ua 是空值/.test(w)), JSON.stringify(r.warnings));
 });
+
+/* ============================================================================
+ * 逆向侧 .txt 兼容性核对（8.9.23/14）的 5 条：3 条「不许静默」+ 2 条对齐
+ * ==========================================================================*/
+
+test('txt 必修 #1：代理仍是 4 段，密码里的冒号写成 %3A 并点名；JSON 那条规则不动', () => {
+  const { content, warnings } = formatAdspowerTxt([{
+    profile_id: 'id-1', name: 'n',
+    proxy_config: { host: 'h', port: 1080, username: 'u', password: 'p:q:r', proxy_type: 'http' },
+  }]);
+  const line = content.split('\n').find((l) => l.startsWith('proxy='));
+  assert.equal(line.slice('proxy='.length), 'h:1080:u:p%3Aq%3Ar');
+  assert.equal(line.slice('proxy='.length).split(':').length, 4, 'txt 里必须还是 4 段（对方 150/150 恒 4 段）');
+  assert.ok(warnings.some((w) => /第 1 块/.test(w) && /密码含冒号/.test(w) && /认证可能失败/.test(w)), JSON.stringify(warnings));
+  // 自己读回：%3A 还原，所以「我们导出 → 我们导入」无损
+  assert.equal(parseAdspowerTxt(content).items[0].proxy, 'h:1080:u:p:q:r');
+  // JSON 侧规则没被改：默认仍原样保真（密码里的冒号保留）
+  assert.equal(proxyLineOf({ proxy_config: { host: 'h', port: 1, username: 'u', password: 'p:q' } }), 'h:1:u:p:q');
+  // 对方真实导出里密码原样带冒号 → 仍靠「前 3 段定宽、其余全归密码」读回
+  const peer = parseAdspowerTxt(`name=n\nproxy=h:1080:u:p:q\n${'*'.repeat(18)}\n`);
+  assert.equal(peer.items[0].proxy, 'h:1080:u:p:q');
+});
+
+test('txt 必修 #2：sameSite 未知数值码不静默塌成 unspecified（仍写 unspecified，但点名）', () => {
+  const cookie = JSON.stringify([
+    { name: 'a', value: '1', domain: '.x.com', path: '/', expires: -1, sameSite: 1 },
+    { name: 'b', value: '2', domain: '.x.com', path: '/', expires: -1, sameSite: 'lax' },
+  ]);
+  const { content, warnings } = formatAdspowerTxt([{ profile_id: 'id-2', name: 'n2', cookie }]);
+  const arr = JSON.parse(content.split('\n').find((l) => l.startsWith('cookie=')).slice('cookie='.length));
+  assert.deepEqual(arr.map((c) => c.sameSite), ['unspecified', 'lax']);
+  assert.ok(warnings.some((w) => /第 1 块/.test(w) && /sameSite 是数值码 1/.test(w) && /unspecified/.test(w)),
+    JSON.stringify(warnings));
+});
+
+test('txt 必修 #3：name 100 字符上限 —— 导入截断要点名，导出到上限也点名', () => {
+  const long = 'x'.repeat(120);
+  const n = normalizeImportItem({ name: long });
+  assert.equal(n.input.name.length, 100);
+  assert.ok(n.warnings.some((w) => /截断/.test(w) && /120/.test(w)), JSON.stringify(n.warnings));
+
+  const { warnings } = formatAdspowerTxt([{ profile_id: 'id-3', name: 'y'.repeat(100) }]);
+  assert.ok(warnings.some((w) => /第 1 块/.test(w) && /100 字符上限/.test(w)), JSON.stringify(warnings));
+});
+
+test('txt 对齐：group 写空串、countrycode 写小写（JSON 侧各自保持原样）', () => {
+  const { content } = formatAdspowerTxt([{
+    profile_id: 'id-4', profile_no: 12, group_id: '7', name: 'n4', ip_country: 'US', domain_name: 'facebook.com',
+  }]);
+  const get = (k) => content.split('\n').find((l) => l.startsWith(`${k}=`)).slice(k.length + 1);
+  assert.equal(get('group'), '', '真实导出 150/150 恒空 → 我们也写空串');
+  assert.equal(get('countrycode'), 'us', '真实导出 150/150 全小写');
+  // 读回：group 空 → 落默认分组；countrycode 原样进 ip_country（大小写不再翻转）
+  const back = parseAdspowerTxt(content).items[0];
+  assert.equal(back.ip_country, 'us');
+  assert.equal(back.group_id, undefined, 'group 空串不产生 group_id（normalize 时会补默认 0）');
+  assert.equal(normalizeImportItem(back).input.group_id, '0');
+});

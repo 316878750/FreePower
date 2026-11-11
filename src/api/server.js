@@ -8,7 +8,7 @@ import { buildRoutes } from './routes.js';
 import { redeemTicket } from './tickets.js';
 
 const MAX_BODY = 2 * 1024 * 1024;
-const VERSION = '0.3.0-p6';
+const VERSION = '0.3.1-p6';
 
 /* ------------------------------- 限流 ------------------------------- */
 const buckets = new Map();

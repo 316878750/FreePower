@@ -189,7 +189,12 @@ export function normalizeImportItem(raw) {
   if (proxy.proxy) input.proxy_config = proxy.proxy;
   if (proxy.error) warn(proxy.error);
   if (input.group_id === undefined || input.group_id === null || String(input.group_id).trim() === '') input.group_id = '0';
-  if (input.name !== undefined) input.name = String(input.name).slice(0, 100);
+  // 环境名上限 100（存储层同样会截）：截断可以有，但**不许静默** —— 导入时点名，导出时另有一条
+  if (input.name !== undefined) {
+    const rawName = String(input.name);
+    if (rawName.length > 100) warn(`name 超过 100 字符，已截断到 100（原长 ${rawName.length}）`);
+    input.name = rawName.slice(0, 100);
+  }
 
   return { input, warnings };
 }
