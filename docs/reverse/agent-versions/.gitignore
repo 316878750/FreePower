@@ -1,0 +1,4 @@
+# 只留判定方法、md5 对照表与 README；原始 bundle 8.4MB 不进 git。
+# 需要复现时从本机 lib/version/ 重新拷，README §5 有命令。
+*.min.js
+*.pretty.js
