@@ -29,6 +29,8 @@
     "test:all": "npm run test && npm run test:workers",
     "test:restart": "node --no-warnings test/restart.test.mjs",
     "test:media-devices": "node --no-warnings test/media-devices.test.mjs",
+    "test:speech": "node --no-warnings test/speech.test.mjs",
+    "test:media-speech": "node --no-warnings test/media-devices.test.mjs && node --no-warnings test/speech.test.mjs",
     "test:cmdline": "node --no-warnings test/cmdline-leak.test.mjs"
   },
   "devDependencies": {

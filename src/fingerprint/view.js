@@ -86,8 +86,11 @@ function noiseConfig(profile, field, strength = 1) {
 
 /**
  * 媒体设备视图：
- *   media_devices 0=真实（不注入）、1=随机（按数量随机生成）、2=手动（用 media_devices_config）
- * 数量字段在拆解里是字符串 "1".."9"，这里统一成数字。
+ *   media_devices 0=真实（不注入）、1=随机（按数量随机生成命名池）、2=手动（用 media_devices_config）
+ *
+ * P9-C 起**设备列表来自内核真实 enumerateDevices**，这里只决定「授权后叫什么名字」：
+ * 第 i 个同类设备用命名池里第 i 个名字。数量字段不再决定列表长度 ——
+ * 伪造数量会同时踩三条检测面（跨 origin deviceId、未授权 label、枚举与 getUserMedia 不一致）。
  */
 function mediaView(profile) {
   const mode = String(profile.media_devices ?? '0');
@@ -104,6 +107,19 @@ function mediaView(profile) {
   };
   const devices = Array.isArray(profile.media_devices_config) ? profile.media_devices_config : [];
   return { mode, counts, devices };
+}
+
+/**
+ * 语音合成视图（P9-A）：`speech_switch` '1' = 按环境语言投影 `getVoices()`。
+ *
+ * 默认**开**：宿主声音列表是跨机一致性的硬伤（本机中文 Windows 上 en-US 环境第一条声音是
+ * `Microsoft Huihui - Chinese (Simplified, PRC)`，裸 Chrome 与注入后都是 25 条中文）。
+ * 显式写 '0' 才关。投影只做「按环境语言过滤」，不改 voice 的名字，也不造 `speak` 点不着的声音。
+ */
+function speechView(profile) {
+  const raw = profile.speech_switch;
+  const on = raw === undefined || raw === null || raw === '' ? true : String(raw) === '1';
+  return on ? { enabled: true } : null;
 }
 
 /**
@@ -150,6 +166,7 @@ export function fingerprintView(profile) {
     device_scale_factor: typeof p.device_scale === 'number' ? p.device_scale : 1,
     webrtc: p.webrtc || 'disabled',
     media: mediaView(p),
+    speech: speechView(p),
     fonts: stringList(p.fonts, ['all']),
     kernel_version: p.kernel_version || null,
   };
@@ -172,6 +189,7 @@ export function declaredSnapshot(profile, view = fingerprintView(profile)) {
     webrtc: view.webrtc,
     media_devices: view.media ? view.media.mode : '0',
     media_counts: view.media ? view.media.counts : null,
+    speech: !!view.speech,
     fonts: view.fonts,
     seed: String(view.seed),
   };

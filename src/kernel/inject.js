@@ -33,6 +33,11 @@ function injectionConfig(fp) {
     audio: fp.audio || null,
     client_rects: fp.client_rects || null,
     media: fp.media || null,
+    /**
+     * 语音合成：`{ enabled, voices }`。
+     * enabled = 按环境 language 投影 getVoices()；voices 是可选的自定义命名池。
+     */
+    speech: fp.speech || null,
     fonts: Array.isArray(fp.fonts) ? fp.fonts.slice() : null,
     /**
      * 屏幕尺寸 + 可用区（avail*）。CDP 的 setDeviceMetricsOverride 只能设 screen 尺寸，
@@ -503,6 +508,83 @@ const PAGE_BODY = `
 
     mark('media_devices');
     try { Object.defineProperty(window, '__fpMediaMode', { value: 'native', enumerable: false, configurable: false }); } catch (e) {}
+  }
+
+  /* ---------- 语音合成：按环境 language 投影 getVoices() ----------
+   *
+   * 宿主是中文 Windows：裸 Chrome 在 https 页返回 25 条声音，第一条是
+   * Microsoft Huihui - Chinese (Simplified, PRC)（zh-CN）。同一份 en-US 环境在中文机器和
+   * 英文机器上产出的声音列表不一样 —— 这是跨机一致性的硬伤（P9-A 实测，plain 与 ours 都是 25 条中文）。
+   *
+   * 做法：从内核真实列表里**只保留环境语言（含同语种变体）的声音**，其它原样丢弃。
+   * 三个必须守住的点：
+   *   1) voice 对象形状完整：name / lang / voiceURI / localService / default 全在（原生本来就在原型上）。
+   *      我们只纠正 default：被过滤掉的恰好是原生 default 那条时，取剩余列表的第一条当 default。
+   *   2) 宿主还没加载完时照原生返回空数组；onvoiceschanged 仍由内核触发一次，**不自己造事件**。
+   *   3) SpeechSynthesisUtterance / speak / cancel 一个字不碰 —— 返回的本来就是原生 voice 对象，
+   *      所以 speak 行为不受影响（这条比「自己 new 一批 voice」稳）。
+   *
+   * 边界：宿主连一条该语言的声音都没有时（本机实测缺 vi-VN / th-TH），**保持原生**，
+   * 不凭空造 voice 名 —— 造出来的名字 speak 点不着，反而多一层破绽。已写进 README 已知限制。
+   */
+  if (CFG.speech && CFG.speech.enabled
+      && typeof speechSynthesis !== 'undefined'
+      && typeof SpeechSynthesis !== 'undefined'
+      && typeof SpeechSynthesisVoice !== 'undefined') {
+    const langs = (CFG.language || []).map(function (x) { return String(x).toLowerCase(); });
+    const primary = langs[0] || '';
+    const baseLang = primary.split('-')[0];
+    const wanted = function (lang) {
+      const l = String(lang || '').toLowerCase();
+      if (!l) return false;
+      if (langs.indexOf(l) >= 0) return true;
+      return !!baseLang && l.split('-')[0] === baseLang;
+    };
+
+    const VOICE_PROTO = SpeechSynthesisVoice.prototype;
+    const defaultDesc = Object.getOwnPropertyDescriptor(VOICE_PROTO, 'default');
+    const forcedDefault = new WeakMap();
+    if (defaultDesc && defaultDesc.get && defaultDesc.configurable) {
+      Object.defineProperty(VOICE_PROTO, 'default', {
+        get: native(function () {
+          const v = forcedDefault.get(this);
+          return v === undefined ? defaultDesc.get.call(this) : v;
+        }, 'get default'),
+        enumerable: defaultDesc.enumerable,
+        configurable: true,
+      });
+    }
+    const nativeDefault = function (v) {
+      try { return !!(defaultDesc && defaultDesc.get && defaultDesc.get.call(v)); } catch (e) { return false; }
+    };
+
+    const origGetVoices = SpeechSynthesis.prototype.getVoices;
+    const cache = { sig: null, list: null };
+    defMethod(SpeechSynthesis.prototype, 'getVoices', native(function getVoices() {
+      const host = origGetVoices.call(this);
+      try {
+        if (!host || !host.length) return host;   // 还没加载：和原生一样给空数组
+        const keep = Array.prototype.filter.call(host, function (v) {
+          try { return wanted(v.lang); } catch (e) { return false; }
+        });
+        // 宿主没有该语言的任何声音：不造，保持原生（见上面边界）
+        if (!keep.length) return host;
+        const sig = keep.map(function (v) {
+          return v.name + '|' + v.lang + '|' + v.voiceURI + '|' + (nativeDefault(v) ? 1 : 0);
+        }).join('~');
+        if (cache.sig === sig && cache.list) return cache.list;
+        let def = null;
+        for (let i = 0; i < keep.length; i++) {
+          if (nativeDefault(keep[i])) { def = keep[i]; break; }
+        }
+        if (!def) def = keep[0];
+        const list = keep.map(function (v) { forcedDefault.set(v, v === def); return v; });
+        cache.sig = sig;
+        cache.list = list;
+        return list;
+      } catch (e) { return host; }
+    }, 'getVoices'));
+    mark('speech');
   }
 
   /* ---------- 字体：只声明，不伪造 ---------- */

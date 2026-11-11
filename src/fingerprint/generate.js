@@ -171,6 +171,8 @@ export function generateFingerprint(opts = {}) {
     // 这里的数量只决定「授权后给多少个名字」，不再决定列表长度（伪造数量会被三条检测面同时抓）。
     media_devices: '1',
     media_devices_num: { audioinput_num: audioIn, videoinput_num: videoIn, audiooutput_num: 2 },
+    // 语音合成：按环境语言投影 getVoices()（P9-A）。默认开：宿主声音列表是跨机一致性硬伤
+    speech_switch: '1',
     // 网络：默认禁非代理 UDP；端口扫描白名单空 = 一个都不许
     webrtc: 'disable_udp',
     scan_port_type: '1',

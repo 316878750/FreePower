@@ -971,6 +971,38 @@ test('P9-C 媒体设备：注入源里不再留「伪造整套列表 / 派生 de
 });
 
 /* ============================================================================
+ * P9-A 语音合成：按环境 language 投影 getVoices()
+ * ==========================================================================*/
+
+test('P9-A 语音：按环境语言投影，中文声音被挡掉、default 仍恰好一条、形状完整', () => {
+  const view = p7View(); // en-US
+  const realm = makeRealm('page', view);
+  const voices = realm.sandbox.speechSynthesis.getVoices();
+
+  assert.equal(voices.length, 2, '只保留 en-US 的声音');
+  assert.ok(voices.every((v) => v.lang === 'en-US'));
+  assert.ok(voices.every((v) => !/Huihui|Kangkang|zh-CN/.test(v.name + '|' + v.lang)));
+  assert.equal(voices.filter((v) => v.default === true).length, 1, 'default 必须恰好一条（原生也正好一条）');
+  assert.equal(voices[0].default, true, '原生 default 被过滤掉时，取剩余列表第一条');
+
+  // 形状完整：五个字段都能读到（原生挂在原型上，不该变成自有字段）
+  for (const k of ['name', 'lang', 'voiceURI', 'localService', 'default']) assert.notEqual(voices[0][k], undefined, k);
+  assert.equal(Object.keys(voices[0]).join(','), '', 'voice 上不许挂自有可枚举字段（原生没有）');
+
+  // 跨次调用稳定：同一批对象，不是每次 new 一批
+  assert.equal(realm.sandbox.speechSynthesis.getVoices()[0], voices[0]);
+  assert.ok(JSON.stringify(realm.sandbox.__fpApplied).includes('speech'));
+});
+
+test('P9-A 语音：宿主没有该语言的声音时不凭空造（保持原生列表）', () => {
+  const view = p7View();
+  view.language = ['vi-VN', 'vi'];
+  view.locale = 'vi-VN';
+  const realm = makeRealm('page', view);
+  const voices = realm.sandbox.speechSynthesis.getVoices();
+  assert.equal(voices.length, 4, '一条都不匹配时返回原生列表，不造 speak 点不着的声音');
+});
+/* ============================================================================
  * P8-B 代理健康检查：并发上限 / 单条超时 / 失败归类
  * ==========================================================================*/
 

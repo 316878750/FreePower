@@ -200,6 +200,9 @@ export const DEFAULTS = {
   audio: '1',
   client_rects: '0',
   media_devices: '0',
+  // P9-A：默认开。宿主声音列表（中文 Windows 上 en-US 环境第一条是 Microsoft Huihui）是
+  // 跨机一致性的硬伤，关掉才是显式选择。投影只按环境语言过滤，不改声音名。
+  speech_switch: '1',
   // 官方：webrtc 默认 disabled
   webrtc: 'disabled',
   location: 'ask',
@@ -252,6 +255,7 @@ export const DEFAULT_SOURCE = {
   device_scale: 'guessed',
   client_rects: 'guessed',
   media_devices: 'guessed',
+  speech_switch: 'guessed',
   automation_controlled: 'guessed',
   timezone: 'guessed',
   fonts: 'guessed',
