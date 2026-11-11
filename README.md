@@ -430,11 +430,12 @@ node_modules\7zip-bin\win\x64\7za.exe x 'release\FreePower-0.3.2-setup.exe' '-o.
 # 2) 整包解开，并把判据原样拷到同一个根：测试用自身位置算 ROOT（../../src），
 #    所以路径自然指向包内那份 src\，判据一个字都不用改。
 node -e "require('@electron/asar').extractAll('.tmp/p16-asar/resources/app.asar','.tmp/p16-run')"
+# 成功时无输出；用 Get-ChildItem .tmp\p16-run 确认（应看到 desktop / packages / src / web / package.json）
 New-Item -ItemType Directory -Force .tmp\p16-run\test\helpers | Out-Null
 Copy-Item test\helpers\profile-probe.mjs .tmp\p16-run\test\helpers\
 Copy-Item test\media-label.test.mjs,test\nav-type.test.mjs .tmp\p16-run\test\
 
-# 3) 跑（需要真实 Chrome，各约 20-30 秒）
+# 3) 跑（需要真实 Chrome；包内代码热态实测 media-label 约 6 秒、nav-type 约 2 秒，冷机首次更久）
 node --no-warnings .tmp\p16-run\test\media-label.test.mjs   # 16/16
 node --no-warnings .tmp\p16-run\test\nav-type.test.mjs      # 5/5，含「文档请求 2 次」
 
@@ -463,6 +464,8 @@ foreach ($f in $files) {
 **还有第三条口径：`git archive` 导出的副本不能当字节基线** —— 它按 `core.autocrlf` 转换，既会**造**假差异（LF→CRLF，上面那 6 个 `src/**/*.js` 就被误判成「仅换行」），也会**掩盖**真差异（两边都被转成 CRLF 后看着一样：0.3.1 的 `desktop/main.js` 就栽在这一面，曾判「仅换行」而实际逐字节相同）。**两个方向都真出现过**，所以比产物直接比工作区文件或 asar 解出的文件，不经过 `git archive`。
 
 两条行为在**包内代码**上：`media-label` **16/16**、`nav-type` **5/5**（「文档请求 2 次」= 2）。装机里的 0.3.1 是另一份 asar（`CCBBBC62…FFAB`，666,084 B），**别拿它当 0.3.2**。
+
+**收尾判「无残留」别用瞬时读数**：门刚结束那一刻 `chrome` 计数可能仍然偏高 —— 实测读到 **21**，**12 秒后回到 17**。所以要么等十来秒再数，要么按 `--user-data-dir` 归类：实测带 `.tmp` 路径的 **0 个**，17 个全是 `…\10002_f58f4ac4\userdata`（用户自己那份已安装应用的内核）。**瞬时读数会把正常的收尾当成残留。**
 
 **为什么不给测试加 `--app-root=<dir>` 参数**：上面这套「解包 + 原样拷两个文件」已经做到两个前提同时成立 —— **判据零修改**、**代码来自包内**，读数就能当产物级证据用。给测试加参数等于动判据本身：一旦这条路径和源码路径行为不一致，红/绿到底是产品的问题还是参数的问题就分不清了。真要改，得配「同一份判据跑源码能绿、跑 asar 也能绿」的双向证明，那是另一个活。**顺手提醒**：比产物别用 `git archive` 导出再比 —— 本仓库 `core.autocrlf=true`，导出的 `src/**/*.js` 会变 CRLF，凭空造出「仅换行」的假差异（`src/api/routes.js` 工作区与 asar 都是 45,123 B 纯 LF）。
 
