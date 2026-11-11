@@ -1,9 +1,11 @@
 # AdsPower Global 8.9.23 · `browser/start` 请求/响应契约（脱敏样例）
 
+> ⚠️ **基线**：本文偏移基于 **agent v2.8.9.2**（8800604 字节 / md5 `846185c9…`）。当前线上运行版本已是 **v2.9.0.1**（8854556 字节 / md5 `3b0d2fc7…`，**+53952 字节**），偏移已漂移，**引用前必须按 `agent-versions/README.md` 的方法重核**，否则会查到错误的代码位置。
+
 > 用途：给 FreePower 照着实现接口形状。
 > 证据等级：
 > - **【码】** 从 `cwd_global\lib\main.min.js` 直接读出（模块 96525 = v1 StartHandler，`@` 后为字符偏移）。
-> - **【实】** 从本机真实落盘文件读出（`C:\.ADSPOWER_GLOBAL\cache\j41kc54_h99epb\`）。
+> - **【实】** 从本机真实落盘文件读出（`C:\.ADSPOWER_GLOBAL\cache\p5demo2_a1b2c3\`）。
 > - **【未抓】** 实时 HTTP 往返没抓到——本机 Local API agent 已退出，`Get-NetTCPConnection -LocalPort 50325` 无监听。等有环境在运行时补一轮。
 >
 > 时间 2026-11-09 15:2x。所有凭据已脱敏。
@@ -67,7 +69,7 @@
 ### 1.3 脱敏请求样例【码 + 实】
 
 ```http
-GET /api/v1/browser/start?user_id=j41kc54&launch_args=%5B%5D&headless=0&open_tabs=1&ip_tab=0&cdp_mask=0&device_scale=1&disable_password_filling=0&clear_cache_after_closing=0&timeout=60
+GET /api/v1/browser/start?user_id=p5demo2&launch_args=%5B%5D&headless=0&open_tabs=1&ip_tab=0&cdp_mask=0&device_scale=1&disable_password_filling=0&clear_cache_after_closing=0&timeout=60
 Host: 127.0.0.1:50325
 Origin: http://local.adspower.net
 api-key: <32 位，已脱敏>
@@ -78,7 +80,7 @@ v2 等价：
 ```json
 POST /api/v2/browser-profile/start
 {
-  "profile_id": "j41kc54",
+  "profile_id": "p5demo2",
   "launch_args": [],
   "headless": "0",
   "last_opened_tabs": "0",
@@ -136,7 +138,7 @@ POST /api/v2/browser-profile/start
 ### 2.3 脱敏响应样例【实 + 码】
 
 `ws` 的端口和 uuid 不是编的——来自本机上一次真实启动后内核留下的文件
-`C:\.ADSPOWER_GLOBAL\cache\j41kc54_h99epb\DevToolsActivePort`（60 字节）：
+`C:\.ADSPOWER_GLOBAL\cache\p5demo2_a1b2c3\DevToolsActivePort`（60 字节）：
 
 ```
 60328
@@ -155,7 +157,7 @@ POST /api/v2/browser-profile/start
       "selenium": "127.0.0.1:60328"
     },
     "debug_port": "60328",
-    "webdriver": "C:\\Users\\1\\AppData\\Roaming\\adspower_global\\cwd_global\\chrome_142\\chromedriver.exe"
+    "webdriver": "C:\\Users\\<user>\\AppData\\Roaming\\adspower_global\\cwd_global\\chrome_142\\chromedriver.exe"
   }
 }
 ```

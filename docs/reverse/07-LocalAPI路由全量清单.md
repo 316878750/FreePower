@@ -1,5 +1,7 @@
 # AdsPower Global 8.9.23 · Local API 路由全量清单
 
+> ⚠️ **基线**：本文按 **agent v2.9.0.1**（8854556 字节 / md5 `3b0d2fc7…`）采集，路由 54 条。引用文中偏移前，先核当前 `lib\main.min.js` 的 md5 是否等于 `3b0d2fc7984f051de23b3d66192bdd4c`；不等说明已热更新，偏移需重核（方法见 `agent-versions/README.md`）。
+
 > 采集：2026-11-09。版本 8.9.23（agent `v2.9.0.1`）。
 > 证据标签：**【码】** `%APPDATA%\adspower_global\cwd_global\lib\main.min.js`（8.85 MB，仅 minify，`@数字`=字符偏移）；**【官】** 客户端内置官方文档 `cwd_global\lib\internal\adspower-browser\skills\references\*.md`（upstream `adspower-browser@2.1.1`）；**【实】** 本机实测。
 > 更正：早前记录 53 条，**实际 54 条**。漏掉的是 `/api/v2/browser-tags/delete`——它的处理器别名是 `$`，首轮正则 `\w+` 没匹配到【码】@841027。
