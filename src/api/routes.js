@@ -140,6 +140,16 @@ export function buildRoutes() {
     return ok(null);
   });
 
+  /**
+   * restart：stop → apply 变更 → start，一个请求内完成。
+   *
+   * 为什么不做「运行中热改注入参数」：CDP override 能热改，但注入脚本已经在页面里跑过一轮，
+   * 热改只会让主帧与 worker 出现两套值 —— 那正是我们自己的双 Realm 漏洞。宁可重启。
+   *
+   * fail-closed：apply 失败就不启动；start 失败则保持 stopped，绝不留一个「还在跑旧配置」的内核。
+   */
+  add(['POST'], both('browser/restart', 'browser-profile/restart'), (ctx) => restartHandler(ctx, versionOf(ctx.path)));
+
   add(['GET'], both('browser/active', 'browser-profile/active'), (ctx) => {
     const v = versionOf(ctx.path);
     const p = resolveProfile(ctx, v);
@@ -568,6 +578,64 @@ async function startHandler(ctx, v) {
     const extra = { errors: e.errors, reason: e.reason, proxy_check: e.proxy_check };
     for (const k of Object.keys(extra)) if (extra[k] === undefined) delete extra[k];
     throw new ApiError(e.code === 800005 ? ERR.CONSISTENCY : ERR.START_FAILED, `start failed: ${e.message}`, 200, extra);
+  }
+}
+
+/**
+ * 只报真正变化的字段。restart 的 `changed` 是给人和脚本看的证据，
+ * 不能把整份入参回显成「全改了」（那样等于没信息）。
+ */
+function diffFields(before, patch) {
+  const out = [];
+  for (const [k, v] of Object.entries(patch || {})) {
+    if (v === undefined) continue;
+    const old = before[k];
+    const same = JSON.stringify(old ?? null) === JSON.stringify(v ?? null);
+    if (!same) out.push(k);
+  }
+  return out.sort();
+}
+
+/**
+ * 重启一个环境：stop → apply → start。
+ * 运行中 / 未运行都接受（未运行时等价于「改完直接启动」，restarted=false）。
+ */
+async function restartHandler(ctx, v) {
+  const cur = resolveProfile(ctx, v);
+  const patch = input(ctx.body, v);
+  const changed = diffFields(cur, patch);
+  const wasRunning = !!getRunning(cur.id);
+
+  // 1) 先停：不停就改配置，等于让运行中的内核继续用旧代理/旧指纹
+  if (wasRunning) {
+    const r = await stopProfile(cur.id);
+    if (!r.stopped && getRunning(cur.id)) {
+      throw new ApiError(ERR.GENERIC, 'restart aborted: failed to stop the running kernel', 200,
+        { restarted: false, changed, stopped: false });
+    }
+  }
+
+  // 2) 再落库。失败就停在这里 —— 环境已经是 stopped，返回错误，不启动
+  let profile;
+  try {
+    profile = updateProfile(cur.id, patch);
+  } catch (e) {
+    throw new ApiError(ERR.INVALID, `restart aborted, profile is stopped: ${e.message}`, 200,
+      { restarted: false, changed, stopped: true, errors: e.fieldErrors });
+  }
+
+  // 3) 最后启动；启动失败同样保持 stopped（不会留下旧配置的内核）
+  try {
+    const data = await startProfile({ ...profile, id: profile.id });
+    return ok({ ...data, restarted: wasRunning, changed });
+  } catch (e) {
+    const extra = {
+      restarted: false, changed, stopped: true,
+      reason: e.reason, errors: e.errors, proxy_check: e.proxy_check,
+    };
+    for (const k of Object.keys(extra)) if (extra[k] === undefined) delete extra[k];
+    throw new ApiError(e.code === 800005 ? ERR.CONSISTENCY : ERR.START_FAILED,
+      `restart failed, profile is stopped: ${e.message}`, 200, extra);
   }
 }
 

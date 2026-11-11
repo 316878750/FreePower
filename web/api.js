@@ -70,6 +70,8 @@ export const api = {
   detail: (id) => call('/api/v2/browser-profile/detail', { query: { profile_id: id } }),
   create: (p) => call('/api/v2/browser-profile/create', { method: 'POST', body: p }),
   update: (p) => call('/api/v2/browser-profile/update', { method: 'POST', body: p }),
+  /** 运行中改配置：stop → apply → start，一个请求里做完（不用用户先停再启） */
+  restart: (p) => call('/api/v2/browser-profile/restart', { method: 'POST', body: p }),
   remove: (ids) => call('/api/v2/browser-profile/delete', { method: 'POST', body: { profile_id: ids } }),
   start: (id) => call('/api/v2/browser-profile/start', { query: { profile_id: id } }),
   stop: (id) => call('/api/v2/browser-profile/stop', { query: { profile_id: id } }),

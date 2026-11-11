@@ -57,9 +57,16 @@ export default async function renderEdit({ head, page, params }) {
   const id = params.id;
   state.editing = id || null;
   state.model = id ? await loadProfile(id) : newProfile();
+  // 运行状态以运行时注册表为准（profile.status 是库里的快照，内核崩了会滞后）
+  state.running = false;
+  if (id) {
+    const live = await api.running().catch(() => ({ list: [] }));
+    state.running = (live.list || []).some((i) => i.profile_id === id);
+  }
 
   const title = id ? `编辑环境 #${state.model.profile_no || ''}` : '新建环境';
-  const saveBtn = h('button', { class: 'btn primary', onClick: save }, id ? '保存修改' : '创建环境');
+  const saveLabel = !id ? '创建环境' : state.running ? '保存并重启' : '保存修改';
+  const saveBtn = h('button', { class: 'btn primary', onClick: save }, saveLabel);
   mount(head,
     h('h1', null, title),
     h('span', { class: 'sub', id: 'dirty-flag' }, ''),
@@ -73,6 +80,11 @@ export default async function renderEdit({ head, page, params }) {
 
   mount(page,
     h('div', { class: 'stack' },
+      state.running
+        ? h('div', { class: 'notice info' },
+          h('div', null, h('strong', null, '这个环境正在运行')),
+          h('div', null, '代理 / 时区 / 指纹的改动要重启内核才生效。点「保存并重启」会先停掉当前内核、落库、再按新配置启动；重启期间该环境会短暂离线，页面会重新加载。'))
+        : null,
       checkBox,
       h('div', { class: 'panel' }, tabBar, formArea)));
 
@@ -436,8 +448,16 @@ export default async function renderEdit({ head, page, params }) {
         return;
       }
       if (state.editing) {
-        await api.update({ ...payload, profile_id: state.editing });
-        toast('已保存', 'ok');
+        if (state.running) {
+          // 运行中：stop → apply → start 由后端一个请求做完（前端不自己停，避免半路失败留下停着的环境）
+          saveBtn.textContent = '重启中…';
+          const r = await api.restart({ ...payload, profile_id: state.editing });
+          const n = (r && r.changed) ? r.changed.length : 0;
+          toast(n ? `已按新配置重启（变更 ${n} 项）` : '已重启（没有字段变化）', 'ok');
+        } else {
+          await api.update({ ...payload, profile_id: state.editing });
+          toast('已保存', 'ok');
+        }
       } else {
         const p = await api.create(payload);
         toast(`已创建 #${p.profile_no || ''}`, 'ok');
@@ -446,14 +466,17 @@ export default async function renderEdit({ head, page, params }) {
       location.hash = '#/profiles';
     } catch (e) {
       const errs = (e.data && e.data.errors) || [];
+      const stopped = !!(e.data && e.data.stopped);
       mount(checkBox, h('div', { class: 'notice bad' },
         h('div', null, `保存失败：${e.message}`),
+        stopped ? h('div', { class: 'muted small' }, '这个环境现在是「已停止」：重启失败不会留下还在跑旧配置的内核，修好再点一次就行。') : null,
         errs.length ? h('ul', null, errs.slice(0, 8).map((x) => h('li', null, h('span', { class: 'mono' }, x.field), ' — ', x.message))) : null));
       paintFieldErrors({ errors: errs });
       toast(e.message, 'bad');
     } finally {
       state.busy = false;
       saveBtn.disabled = false;
+      saveBtn.textContent = saveLabel;
     }
   }
 

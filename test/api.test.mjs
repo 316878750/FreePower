@@ -127,6 +127,24 @@ try {
   codes.add(stopIdle.json.code);
   check('800002：停一个没开的', stopIdle.json.code === 800002, `${stopIdle.json.code} ${stopIdle.json.msg}`);
 
+  /* -------------------- restart：stop → apply → start -------------------- */
+  const rsNoId = await api('POST', '/api/v1/browser/restart', {});
+  codes.add(rsNoId.json.code);
+  check('restart：缺 user_id 报 100002', rsNoId.json.code === 100002, rsNoId.json.msg);
+
+  // apply 失败必须 fail-closed：返回错误、环境停在 stopped、不能试图启动
+  const rsBad = await api('POST', '/api/v2/browser-profile/restart', { profile_id: id1, screen_resolution: 'abc' });
+  codes.add(rsBad.json.code);
+  check('restart：apply 失败 → 100002 且不启动', rsBad.json.code === 100002 && rsBad.json.data?.stopped === true && rsBad.json.data?.restarted === false,
+    `${rsBad.json.code} stopped=${rsBad.json.data?.stopped}`);
+  check('restart：失败文案点明环境已停', /profile is stopped/.test(rsBad.json.msg), rsBad.json.msg);
+  const afterBad = await api('GET', `/api/v1/browser/active?user_id=${id1}`);
+  check('restart：apply 失败后仍是 Inactive（没被偷偷启动）', afterBad.json.data?.status === 'Inactive', JSON.stringify(afterBad.json.data));
+
+  const rsGhost = await api('POST', '/api/v2/browser-profile/restart', { profile_id: '00000000-0000-4000-8000-000000000000' });
+  codes.add(rsGhost.json.code);
+  check('restart：不存在的 profile → 100001', rsGhost.json.code === 100001, rsGhost.json.msg);
+
   /* -------------------- cloud-active：必须报错 -------------------- */
   const cloud = await api('POST', '/api/v1/browser/cloud-active', { user_ids: `${id1},${id1}` });
   codes.add(cloud.json.code);
