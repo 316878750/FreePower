@@ -26,7 +26,8 @@
     "test": "node --no-warnings packages/profile/test/schema.test.mjs && node --no-warnings test/unit.test.mjs && node --no-warnings test/api.test.mjs && node --no-warnings test/ui.test.mjs && node --no-warnings test/desktop.test.mjs",
     "gen": "node tools/gen-schema.mjs",
     "test:workers": "node --no-warnings test/workers.test.mjs",
-    "test:all": "npm run test && npm run test:workers"
+    "test:all": "npm run test && npm run test:workers",
+    "test:restart": "node --no-warnings test/restart.test.mjs"
   },
   "devDependencies": {
     "electron": "^45.2.3",
