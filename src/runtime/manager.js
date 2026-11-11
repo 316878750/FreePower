@@ -332,6 +332,9 @@ async function injectAndOpen(instance, profile, view) {
 
   /** targetId -> { prep, sessionId } */
   const pageReady = new Map();
+  // 同一张页面会被两个会话各判一次（外部自动化自己再 attach 一次）→ 补加载只做一次，
+  // 否则一张页会被补两遍（实测文档请求从 2 次变 3 次）。
+  const repairedTargets = new Set();
 
   /* ============================================================================
    * 导航自掐（net::ERR_ABORTED）：空白页补 reload 时，不许顶掉**正在飞**的导航
@@ -625,13 +628,16 @@ async function injectAndOpen(instance, profile, view) {
         }
       }
       if (blank) scheduleBlankReload({ targetId: targetInfo.targetId, sessionId });
-      else await ensureInjectedOrReload(client, sessionId).catch(() => {});
+      else if (!repairedTargets.has(targetInfo.targetId)) {
+        repairedTargets.add(targetInfo.targetId);
+        await ensureInjectedOrReload(client, sessionId).catch(() => {});
+      }
     })();
     pageReady.set(targetInfo.targetId, { prep, sessionId });
   });
 
   await client.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
-  client.on('Target.detachedFromTarget', (params) => { pageReady.delete(params.targetId); });
+  client.on('Target.detachedFromTarget', (params) => { pageReady.delete(params.targetId); repairedTargets.delete(params.targetId); });
 
   /**
    * 启动时 Chrome 自带的那张空白页在 setAutoAttach 之前就存在，脚本已经跑过一轮。
@@ -692,8 +698,21 @@ async function injectAndOpen(instance, profile, view) {
  * 会在 attach 之前就把首个文档建好，`addScriptToEvaluateOnNewDocument` 只对下一个文档生效，
  * 于是这张页面的首帧是原始指纹（hardwareConcurrency 等全是宿主值）。
  *
- * 做法：等文档就绪后确认 `__fpApplied`，没有就补一次 Page.reload —— 比按 URL 猜可靠，
- * 也不会把「已经注入好的页面」多刷一次。
+ * 做法：等文档就绪后确认 `__fpApplied`，没有就补一次**重新导航到当前 URL**（不是 `Page.reload`）。
+ *
+ * 为什么不用 reload（P13，2026-11-11 实测）：页面读一条
+ * `performance.getEntriesByType('navigation')[0].type` 就能知道「刚被 reload 过」，这是逆向裁判 C4
+ * 记录的残留。改成同 URL 导航后，那个值是 `navigate`，页面自己看不出被重来过。
+ *
+ * **代价照实说**：仍然是**两次文档加载**（首次文档 + 这一次），服务器日志/前端埋点照样看得见；
+ * 变的只是「reload 这个标记」。别把这里读成「只加载了一次」。
+ *
+ * 为什么不能靠「暂停 → 注入 → 放行」省掉这一次（2026-11-11 裸内核 + 本仓库环境实测，读数记在提交说明里）：
+ * `Target.setAutoAttach + waitForDebuggerOnStart` 确实能把新页面停在首文档之前，裸内核单会话
+ * 实测也能靠它把注入覆盖到首文档（`__p13=1`、文档请求 1 次）。但**外部自动化建页后必然紧跟一次
+ * `Target.attachToTarget`**，而第二会话一 attach，暂停就被放掉（实测：谁都不发
+ * `Runtime.runIfWaitingForDebugger`，页面照样 load 完），于是我们注册的脚本永远赶不上首文档。
+ * 也就是说这条路上「零额外加载」做不到，能消掉的只有 reload 标记。
  */
 async function ensureInjectedOrReload(client, sessionId, timeoutMs = 2500) {
   const deadline = Date.now() + timeoutMs;
@@ -710,7 +729,8 @@ async function ensureInjectedOrReload(client, sessionId, timeoutMs = 2500) {
   const href = await client.send('Runtime.evaluate', { expression: 'location.href', returnByValue: true }, sessionId)
     .then((r) => String(r?.result?.value ?? '')).catch(() => '');
   if (href === '' || href === 'about:blank') return false;   // 空白页另有 scheduleBlankReload
-  await reloadSession(client, sessionId).catch(() => {});
+  if (/^(https?|file):/i.test(href)) await renavigateSession(client, sessionId, href).catch(() => {});
+  else await reloadSession(client, sessionId).catch(() => {});
   return false;
 }
 
@@ -744,6 +764,20 @@ async function reloadSession(client, sessionId, timeoutMs = 6000) {
   await client.send('Page.reload', {}, sessionId).catch(() => {});
   await loaded;
   // load 之后脚本可能还在跑最后几行（注入是同步的，但给一帧余量）
+  await new Promise((r) => setTimeout(r, 30));
+}
+
+/**
+ * 重新导航到同一个 URL（P13）：效果上等于再加载一次，但 `navigation.type` 是 `navigate` 而不是 `reload`。
+ * 只用于「文档已经在、注入没赶上」的兜底；空白页与内部页仍用 reloadSession。
+ */
+async function renavigateSession(client, sessionId, url, timeoutMs = 6000) {
+  const loaded = new Promise((resolve) => {
+    const off = client.on('Page.loadEventFired', (params, sid) => { if (sid === sessionId) { off(); resolve(); } });
+    setTimeout(() => { off(); resolve(); }, timeoutMs);
+  });
+  await client.send('Page.navigate', { url }, sessionId).catch(() => {});
+  await loaded;
   await new Promise((r) => setTimeout(r, 30));
 }
 
