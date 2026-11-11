@@ -30,6 +30,7 @@
     "test:restart": "node --no-warnings test/restart.test.mjs",
     "test:proxy-health": "node --no-warnings test/proxy-health.test.mjs",
     "test:media-devices": "node --no-warnings test/media-devices.test.mjs",
+    "test:media-label": "node --no-warnings test/media-label.test.mjs",
     "test:cdp-page": "node --no-warnings test/cdp-target.test.mjs",
     "test:speech": "node --no-warnings test/speech.test.mjs",
     "test:media-speech": "node --no-warnings test/media-devices.test.mjs && node --no-warnings test/speech.test.mjs",

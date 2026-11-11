@@ -34,13 +34,29 @@ function asObject(v) {
   return null;
 }
 
-/** 顶层结构键：不是字段，但也不该报「未知」 */
+/**
+ * 顶层结构键：不是字段，但也不该报「未知」。
+ *
+ * 2026-11-11（P14 之后）：我们自己导出的 JSON 再导入会报 7 条「未知字段」——
+ * 因为导出是 `present(p,'v2')` **整行映射**（快照要全），而这些列本来就**不导入**。
+ * 这不是「导出多了字段」，所以改法不是收窄导出（那会让快照少东西），而是把
+ * 「认识、但不导入」的写在这里，并逐条说清为什么：
+ *   - `created_at` / `updated_at`：README 33 已定「导入重新生成 id/编号/时间戳」；
+ *   - `status` / `last_launch_at`：运行时状态，导入后必然是 idle / 空；
+ *   - `fingerprint_config_raw`：给 AdsPower 兼容的原始回显，不是可导入字段；
+ *   - `fp_seed`：真值走 `fingerprint_config.seed`（导入侧 `seed → fingerprint_seed` 已接上），
+ *     顶层这个是导出时顺手带出来的冗余别名，导入它等于同一个值写两遍；
+ *   - `kernel_version`：跟**本机**内核矩阵走（导入不锁源机器的内核版本，否则换机必挂）。
+ * 反过来：**真正不认识的字段仍然要点名**（见 `test/fileio.test.mjs` 的反向断言）。
+ */
 const STRUCTURAL = new Set([
   'id', 'profile_id', 'user_id', 'profile_no', 'serial_number',
   'fingerprint_config', 'proxy_config', 'user_proxy_config', 'proxy',
   'login_cookie', 'country', 'fingerprint_seed', 'seed',
   'group_name', 'password_filling', 'disable_password_filling',
   'proxy_id', 'proxy_soft', 'proxy_type', 'proxy_host', 'proxy_port', 'proxy_user', 'proxy_password', 'proxy_pwd',
+  'created_at', 'updated_at', 'status', 'last_launch_at', 'kernel_version',
+  'fingerprint_config_raw', 'fp_seed',
 ]);
 
 /** fingerprint_config 里我们认识的派生键（导出里本来就有，别再报未知） */

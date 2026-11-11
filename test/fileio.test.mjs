@@ -186,6 +186,26 @@ try {
   created.push(reId);
   check('往返：删掉后用导出的那份重新导入', reRes.json.code === 0 && reRes.json.imported === 1 && !!reId, JSON.stringify({ code: reRes.json.code, imported: reRes.json.imported, msg: reRes.json.msg }));
 
+  /* ---- 自家导出 → 自家导入：不许报「未知字段」；但真不认识的字段仍要点名 ---- */
+  // 导出是 `present(profile,'v2')` 的整行快照，会带上 7 个「认识但不导入」的列
+  // （created_at / updated_at / status / last_launch_at / kernel_version /
+  //   fingerprint_config_raw / fp_seed）。收窄导出换安静会丢快照，改法是把它们写进
+  //   `STRUCTURAL`。这条断言盯的是「安静」，下一条盯的是「别安静过头」。
+  const selfWarn = (reRes.json.warnings || []).filter((w) => /未知字段/.test(String(w)));
+  check('往返：自己导出的 JSON 再导入，没有「未知字段」告警', selfWarn.length === 0,
+    selfWarn.length ? `${selfWarn.length} 条：${selfWarn.slice(0, 3).join(' / ')}` : `0 条（warnings 共 ${(reRes.json.warnings || []).length} 条）`);
+
+  const unknownImp = await call('POST', '/api/v2/browser-profile/import', {
+    list: [{ ...exp, name: 'p10-unknown-field', foo: 1, fingerprint_config: { ...(exp.fingerprint_config || {}), bar: 2 } }],
+  });
+  const unkId = unknownImp.json.data?.list?.[0]?.profile_id;
+  if (unkId) created.push(unkId);
+  const unkWarn = (unknownImp.json.warnings || []).join(' / ');
+  check('反向：真正不认识的字段仍然被点名（顶层 foo + 嵌套 bar）',
+    unknownImp.json.code === 0 && /未知字段 foo/.test(unkWarn) && /未知字段 fingerprint_config\.bar/.test(unkWarn),
+    unkWarn || '（没有 warnings）');
+  if (unkId) await call('POST', '/api/v2/browser-profile/delete', { profile_id: [unkId] });
+
   const exp2 = (await call('POST', '/api/v2/browser-profile/export', { profile_id: [reId] })).json.data?.list?.[0] || {};
   const SKIP = new Set(['id', 'profile_id', 'user_id', 'profile_no', 'serial_number', 'created_at', 'updated_at', 'status', 'last_launch_at']);
   const diffs = [];
