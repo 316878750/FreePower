@@ -60,6 +60,13 @@ CORS 白名单（正则数组，节选）：
 `RATE_LIMIT_CONFIG` 硬编码：默认 **1 次/秒**（`RateLimiterMemory({points:1, duration:1})`）；带请求头 `x-adspower-client: mcp` 时走另一档 **30 次/秒**。运行时可用远端 `client/shell-config/get?key=SHELL_CONFIG` 覆盖（键名形如 `"1_1"` = 1 次/1 秒，`"10_1"` = 10 次/1 秒 → 对应 `/api/v1/fbbird/user/list`）。
 
 ### 3.3 路由表（51 条注册，模块 60617 `t.add(method, path, handler)`）
+
+> **更新（2026-11-11 实测修正）**：实际运行的 agent 是 **v2.9.0.1**（md5 `3b0d2fc7…`），路由 **54 条**。
+> 新增 3 条（全 POST）：`/api/v2/browser-profile/recycle-bin/list`、`/api/v2/browser-profile/recycle-bin/restore`、`/api/v2/proxy/dynamic-proxy-traffic`。
+> **这 3 条是 v2.9.0.1 带来的，不是 v2.9.0.2**；v2.9.0.2（已下载未激活）与 v2.9.0.1 路由集合完全相同。
+> 下面 51 条对应静态解包的 v2.8.9.2。版本存档与判定方法见 `agent-versions\README.md`，差异详见 `09-动态验证.md` §7。
+>
+> **版本基线声明：后续静态引用以 agent v2.9.0.1 为准。** 早期偏移基于 v2.8.9.2（8800604 字节），v2.9.0.1 增大了 53952 字节，**偏移只能作定位起点，必须重新核对**。
 v1（GET 为主）：
 ```
 /status
@@ -89,6 +96,7 @@ v2（`N.default.V2` 实例化，语义从 user_id 换成 profile_id）：
 - 没有本地密码校验：API Key 由**远端**校验 —— `validateAPIKey()` → `POST https://api.adspower.net/sys/user/api/check-api-key?_local_api=adspower`（baseUrl 随发行版切换，Global 版是 `api-global.adspower.net`）。意味着**离线状态下 API Key 无法自行验证**，实际可用性依赖缓存/远端可达性（待验证离线行为）。
 - 除 `api_key` 外还接受 `login-token` 请求头（内部 RPA 调 `GET /api/v1/browser/start?...&type=rpa&cdp_mask=0&device_scale=1` 时就用 `login-token`），这是脚本复用的一条捷径。
 - 例外路由：`/checkIntranet`、`/` 无鉴权；`/status` 无鉴权（实测）。
+- **⚠️ 实测重大发现（2026-11-11）：不带任何 `api_key` / `login-token`，直接 `GET /api/v1/user/list` 也能成功返回 `code:0` + 数据。** 说明该环境的鉴权是「配了才校验、没配就放行」，或者校验结果有本地缓存。**复刻时必须明确：这是否只发生在已登录且 API 开关打开时**——待补测（需要新装/未登录环境对照）。**【实测，09 §6】**
 
 ## 4. 数据与配置
 
@@ -108,13 +116,14 @@ v2（`N.default.V2` 实例化，语义从 user_id 换成 profile_id）：
 
 已确认：
 1. 架构是「Electron 壳 + node agent 子进程 + 定制 Chromium 内核 + N-API/FFI」四层，agent 与内核都可热更新。
-2. Local API 是 koa，端口 50325，51 条路由，1 req/s 默认限流，CORS 白名单严格，API Key 走远端校验、也认 `login-token`。
+2. Local API 是 koa，端口 50325，v2.8.9.2 有 51 条路由（v2.9.0.1 起增至 54），1 req/s 默认限流，CORS 白名单严格，API Key 走远端校验、也认 `login-token`；**但实测无 key 也能读数据**（§3.4）。
 3. 可读的攻击面优先级：`main.min.js`（未混淆）> `app.asar` 其余 > `dist/main.js`（混淆）。
 
 下一步（按价值排序）：
-1. 通关 `main.min.js` 的 `browser/start` 处理器 → 拿完整启动参数（`--user-data-dir`、`--remote-debugging-port`、指纹相关 flag 生成逻辑）。
-2. 抓 `chrome.dll` 的指纹模块特征（字符串/导出表），确认 UA/Canvas/WebGL/字体注入在内核层还是扩展层。
-3. 实抓 50325 一轮完整 `start` 请求/响应，记录 `ws.puppeteer` 与 `ws.selenium` 字段格式。
-4. 定位 sqlite 库文件与表结构（账号/指纹配置落库格式）。
+1. ~~通关 `main.min.js` 的 `browser/start` 处理器~~ **已完成**，见 `03`/`03b`/`09`。
+2. ~~抓 `chrome.dll` 的指纹模块特征~~ **已完成**，见 `04`/`08`。
+3. ~~实抓 50325 一轮完整 `start` 请求/响应~~ **已完成**，见 `05-browser-start契约.md`、`09` §6。
+4. 定位 sqlite 库文件与表结构（账号/指纹配置落库格式）—— **仍未做**。
+5. 补测：未登录/全新环境下 Local API 是否仍无鉴权（决定复刻要不要照抄这个行为）。
 
-> 注：路径 `C:\Users\1\.dsh\bot\workspace\adspower-reverse\`，脚本在 `tools\`，本报告在 `8.9.23\`。
+> 注：路径 `C:\Users\<user>\.dsh\bot\workspace\adspower-reverse\`，脚本在 `tools\`，本报告在 `8.9.23\`。
