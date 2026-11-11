@@ -502,6 +502,7 @@ async function injectAndOpen(instance, profile, view) {
         }
       }
       if (blank) scheduleBlankReload(client, sessionId);
+      else await ensureInjectedOrReload(client, sessionId).catch(() => {});
     })();
     pageReady.set(targetInfo.targetId, { prep, sessionId });
   });
@@ -561,6 +562,33 @@ async function injectAndOpen(instance, profile, view) {
   instance.closePage = async (targetId) => {
     try { await client.send('Target.closeTarget', { targetId }); } catch { /* 已关闭 */ }
   };
+}
+
+/**
+ * 非空白页的兜底：CDP 的 `Target.createTarget({ url })`（外部自动化/ puppeteer 最常见的开页方式）
+ * 会在 attach 之前就把首个文档建好，`addScriptToEvaluateOnNewDocument` 只对下一个文档生效，
+ * 于是这张页面的首帧是原始指纹（hardwareConcurrency 等全是宿主值）。
+ *
+ * 做法：等文档就绪后确认 `__fpApplied`，没有就补一次 Page.reload —— 比按 URL 猜可靠，
+ * 也不会把「已经注入好的页面」多刷一次。
+ */
+async function ensureInjectedOrReload(client, sessionId, timeoutMs = 2500) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const r = await client.send('Runtime.evaluate', {
+      expression: 'typeof window.__fpApplied + "|" + document.readyState',
+      returnByValue: true,
+    }, sessionId).catch(() => null);
+    const [applied, ready] = String(r?.result?.value ?? '').split('|');
+    if (applied === 'object') return true;
+    if (ready === 'complete' || ready === 'interactive' || Date.now() >= deadline) break;
+    await new Promise((resolve) => setTimeout(resolve, 60));
+  }
+  const href = await client.send('Runtime.evaluate', { expression: 'location.href', returnByValue: true }, sessionId)
+    .then((r) => String(r?.result?.value ?? '')).catch(() => '');
+  if (href === '' || href === 'about:blank') return false;   // 空白页另有 scheduleBlankReload
+  await reloadSession(client, sessionId).catch(() => {});
+  return false;
 }
 
 /**
