@@ -279,8 +279,13 @@ export async function startProfile(profile, { force = false } = {}) {
         warnings.push(...checkEgress(effective, egress));
         persistEgress(id, egress);
       } else {
-        log(id, 'WARN 出口探测失败', egress.error || '');
-        warnings.push(soft('ip', `浏览器出口探测失败：${egress.error || '未知原因'}`));
+        // 失败时把诊断字段一起带出来：代理侧看到隧道建成、我们却读到空 body 时，
+        // 需要 readyState / finalUrl / target 才能区分「没加载」和「读错 target」
+        const diag = egress.readyState || egress.finalUrl
+          ? `（readyState=${egress.readyState || '?'} finalUrl=${egress.finalUrl || '?'} target=${String(egress.targetId || '?').slice(0, 8)}）`
+          : '';
+        log(id, 'WARN 出口探测失败', `${egress.error || ''}${diag}`);
+        warnings.push(soft('ip', `浏览器出口探测失败：${egress.error || '未知原因'}${diag}`));
       }
 
       // 6) 自检：在环境自己的页面里读回真实指纹，逐项对照声明值。

@@ -31,20 +31,38 @@ export async function probeEgressInBrowser(client, {
     const deadline = Date.now() + timeoutMs;
     let text = '';
     let state = '';
-    while (Date.now() < deadline) {
+    const read = async () => {
       const r = await client.send('Runtime.evaluate', {
-        expression: 'document.readyState + "\\u0000" + (document.body ? document.body.innerText : "")',
+        // innerText 在某些响应（JSON 走 <pre>、重定向中途）会是空串，退回 textContent 兜一层
+        expression: 'document.readyState + "\\u0000" + ((document.body && document.body.innerText) || (document.documentElement && document.documentElement.textContent) || "")',
         returnByValue: true,
       }, sessionId).catch(() => null);
       const value = String(r?.result?.value ?? '');
       const sep = value.indexOf('\u0000');
       state = sep >= 0 ? value.slice(0, sep) : '';
       text = sep >= 0 ? value.slice(sep + 1) : '';
+    };
+    while (Date.now() < deadline) {
+      await read();
       if (state === 'complete' && text.trim()) break;
       await sleep(150);
     }
+    // 认证代理上实测出现过「隧道已建成、代理侧看到 200，但这一轮读到空 body」：
+    // 不直接判死，给页面半拍再读一次（重定向/HSTS 升级后的落点常常慢半拍）。
+    if (!text.trim()) {
+      await sleep(200);
+      await read();
+    }
 
-    if (!text.trim()) return { ok: false, url, error: '出口探测页没有内容（代理拦截或页面没加载完）' };
+    if (!text.trim()) {
+      const href = await client.send('Runtime.evaluate', { expression: 'location.href', returnByValue: true }, sessionId)
+        .then((r) => String(r?.result?.value ?? '')).catch(() => '');
+      // 诊断字段：下次复现时能区分「页面没加载」和「读错 target / 被拦截」
+      return {
+        ok: false, url, error: '出口探测页没有内容（代理拦截或页面没加载完）',
+        targetId, readyState: state || '(空)', finalUrl: href || '(空)',
+      };
+    }
     const info = parseExitInfo(text, url);
     if (info.error) return { ok: false, url, error: info.error, raw: text.slice(0, 200) };
     if (!info.ip) return { ok: false, url, error: `出口探测页不是预期格式：${text.slice(0, 120)}` };
