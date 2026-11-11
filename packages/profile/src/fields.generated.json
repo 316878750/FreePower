@@ -1589,7 +1589,9 @@
         2,
         4,
         6,
-        8
+        8,
+        16,
+        32
       ],
       "range": null,
       "requires_kernel": null,
@@ -1603,7 +1605,7 @@
       "apiV2AliasFrom": null,
       "default": "default",
       "defaultSource": "official",
-      "domainNote": null,
+      "domainNote": "拆解表只到 8（deviceMemory 上限 8G 的年代）；Chrome 157 实测 32G 机器返回 32 → 扩到 16|32（P8-D）",
       "coverage": "full",
       "note": null,
       "evidence": "实测"

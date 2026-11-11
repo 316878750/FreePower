@@ -24,7 +24,7 @@ export function isValidTimezone(value) {
 /** 常量：值域硬约束。静态拆解与官方 API 文档冲突时取并集（见 reference/overrides.mjs DOMAIN_NOTES） */
 export const DOMAINS = {
   hardware_concurrency: ['default', 2, 3, 4, 6, 8, 10, 12, 16, 20, 24, 32],
-  device_memory: ['default', 2, 4, 6, 8],
+  device_memory: ['default', 2, 4, 6, 8, 16, 32],
   webgl: ['0', '2', '3'],
   webrtc: ['disabled', 'forward', 'proxy', 'local', 'disable_udp'],
   location: ['block', 'allow', 'ask'],

@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { STORAGE, COVERAGE, DEFAULTS, DEFAULT_SOURCE, DOMAIN_NOTES, NOTES } from '../packages/profile/reference/overrides.mjs';
+import { STORAGE, COVERAGE, DEFAULTS, DEFAULT_SOURCE, DOMAIN_NOTES, NOTES, VALUES_EXTRA } from '../packages/profile/reference/overrides.mjs';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const refPath = path.join(root, 'packages/profile/reference/ads-8.9.23-fields.json');
@@ -31,7 +31,7 @@ for (const [group, defs] of Object.entries(ref.profile)) {
       type: def.type,
       storage,
       sqlType: storage === 'column' ? (INT_FIELDS.has(name) ? 'INTEGER' : SQL_TYPE[def.type] ?? 'TEXT') : 'TEXT',
-      values: def.values ?? null,
+      values: VALUES_EXTRA[name] ? [...(def.values ?? []), ...VALUES_EXTRA[name]] : (def.values ?? null),
       range: def.range ?? null,
       requires_kernel: def.requires_kernel ?? null,
       precision: def.precision ?? null,

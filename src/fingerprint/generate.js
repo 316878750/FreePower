@@ -7,6 +7,22 @@
  */
 import { seededRng, pick, newSeed } from './rng.js';
 import { deriveNoiseSeeds } from './seeds.js';
+import os from 'node:os';
+
+/**
+ * 真实内存档位（2 的幂，GB）。
+ *
+ * 为什么要跟真实值对齐：`navigator.deviceMemory` 是我们改的，`performance.memory.
+ * jsHeapSizeLimit` 跟着**真实**物理内存走、我们没改。两者摆在同一个页面上（creepjs 就是
+ * 并排显示 `ram` 和 `memory`），差太远等于自己给自己开了个「这台机器被改过」的标签。
+ * 所以默认取真实档位；想伪装某个环境再显式改 `device_memory` 字段。
+ */
+export function realMemoryTier(totalBytes = os.totalmem()) {
+  const gb = Math.max(1, totalBytes / 1024 / 1024 / 1024);
+  // 与 Chrome 的算法对齐：向上取到 2 的幂，封顶 32（实测这台 96G 机器裸 Chrome 报 32）
+  const tier = 2 ** Math.ceil(Math.log2(gb));
+  return Math.max(2, Math.min(32, tier));
+}
 
 /** 内核真实版本兜底（找不到系统 Chrome 时用） */
 export const FALLBACK_KERNEL = '156.0.8078.80';
@@ -93,9 +109,10 @@ export function generateFingerprint(opts = {}) {
   const screen = pick(rng, SCREENS);
   const gl = pick(rng, WEBGL_WINDOWS);
   const cores = pick(rng, [8, 12, 16, 4, 6]);
-  // deviceMemory 的真实值域只有 2|4|6|8（Chromium 上限 8G），别造 16/32 这种不存在的机器；
-  // 高核数配 4G 会触发「不像真实机器」的软冲突，所以 8 核以上统一 8G。
-  const memory = cores <= 4 ? pick(rng, [4, 8]) : 8;
+  // deviceMemory 真实值域是 2|4|8（旧版 Chrome 上限 8G），但 **jsHeapSizeLimit 跟真实内存走**，
+  // 报一个小档位会和它当场打架（P8-D；实测这台机器真实 32G、堆上限 4.09GB）。
+  // 所以默认就报真实档位（`realMemoryTier()`），单环境想伪装再显式改字段。
+  const memory = realMemoryTier();
   const audioIn = pick(rng, [1, 2, 3]);
   const videoIn = pick(rng, [1, 2]);
   // 四个噪点维度各自一个种子，落库后跨重启不变（换种子 = 换指纹，必须整组换）
