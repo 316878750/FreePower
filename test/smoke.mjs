@@ -37,8 +37,17 @@ async function deadPort() {
   return port;
 }
 
+/**
+ * 跑一段 PowerShell 并把输出当 UTF-8 读。
+ *
+ * 必须先把控制台输出编码设成 UTF-8：Windows PowerShell 5.1 默认按 ANSI 代码页（这里是 GBK）
+ * 输出，而我们用 `encoding: 'utf8'` 解码。只要路径里有中文（例如用户名 `C:\Users\张三\…`），
+ * 读回来的字符串就是乱码，命令行里的 `--user-data-dir` 与 `DATA_DIR` 比较必然失配 ——
+ * 那会让「无残留 chrome 进程」变成假绿（FreePower 2026-11-11 复核指出）。
+ */
 function ps(script) {
-  return execFileSync('powershell.exe', ['-NoProfile', '-Command', script], { encoding: 'utf8' }).trim();
+  const prelude = '[Console]::OutputEncoding=[Text.Encoding]::UTF8; $OutputEncoding=[Console]::OutputEncoding; ';
+  return execFileSync('powershell.exe', ['-NoProfile', '-Command', prelude + script], { encoding: 'utf8' }).trim();
 }
 
 /** 读某个 pid 的真实命令行（验证参数真的进了 argv，而不是只在我们自己的响应里） */
