@@ -367,7 +367,15 @@ const PAGE_BODY = `
    * 授权后 3 麦 8 喇叭）全由内核负责，我们不掺和。**「给真实设备改名」比「造一整套假设备」隐蔽**，
    * 这也是对手走的路（docs/08 落点矩阵的 media_devices 一行）。
    *
-   * 未授权时原样返回（label 本来就是空串）；只有权限变成 granted 之后才改名。
+   * 未授权时原样返回（label 本来就是空串）；只有该 kind 权限 granted 之后才改名。
+   * **权限按 kind 判**：Chrome 只给摄像头时，音频 label 仍是空串（实测 media_devices=0 基线）；
+   * 所以 videoinput 看 camera，audioinput/audiooutput 看 microphone，不能一把梭。
+   *
+   * 复验后补的两条（P9-C 第二轮，CEO 实测）：
+   *   - 必须改**真实对象**，不能 Object.create(MediaDeviceInfo.prototype) 造假的：
+   *     假对象没有内核内部槽位，页面一 JSON.stringify 就抛 Illegal invocation；
+   *   - 原生 MediaDeviceInfo.prototype.toJSON 按槽位取宿主真名，等于绕过改名，必须一起覆盖。
+   *     残留：own property 的 label（我们定义成 non-enumerable，getOwnPropertyDescriptor 能看出差异）。
    */
   const DEVICE_LABELS = {
     audioinput: ['Microphone (Realtek(R) Audio)', 'Microphone Array (2- Conexant SmartAudio HD)', 'Line In (Realtek(R) Audio)'],
@@ -384,19 +392,24 @@ const PAGE_BODY = `
     /** getUserMedia 成功过一次 = 该 origin 已授权（Permissions API 不可用时的兜底） */
     let gumGranted = false;
 
-    /** 与原生同源：只看 Permissions API，不缓存（授权/撤销都要立刻反映到 label 上） */
-    const permissionGranted = () => {
-      try {
-        if (typeof navigator.permissions === 'undefined' || !navigator.permissions.query) {
-          return Promise.resolve(gumGranted);
-        }
-        return Promise.all(['camera', 'microphone'].map((name) => navigator.permissions
-          .query({ name })
-          .then((s) => s.state === 'granted')
-          .catch(() => false)))
-          .then((states) => states.some(Boolean))
-          .catch(() => gumGranted);
-      } catch (e) { return Promise.resolve(gumGranted); }
+    /** 与原生同源：分别查 camera / microphone，**按设备类型分别给名字**。
+     *  Chrome 就是按 kind 判权限：只授权了摄像头，音频设备的 label 仍然是空串。
+     *  之前用 some(Boolean) 一把梭，只给摄像头时音频也被改名 —— 一眼能抓的不一致
+     *  （真实基线 media_devices=0 实测：camera=granted、microphone=denied 时音频 label 全空）。 */
+    const permissionState = () => {
+      const query = (name) => {
+        try {
+          if (typeof navigator.permissions === 'undefined' || !navigator.permissions.query) {
+            return Promise.resolve(gumGranted);
+          }
+          return navigator.permissions.query({ name })
+            .then((s) => s.state === 'granted')
+            .catch(() => gumGranted);
+        } catch (e) { return Promise.resolve(gumGranted); }
+      };
+      return Promise.all([query('camera'), query('microphone')]).then(function (states) {
+        return { camera: !!states[0], microphone: !!states[1] };
+      });
     };
 
     /** 真实 label → 我们的 label。给 getUserMedia 的 track 用：
@@ -404,6 +417,22 @@ const PAGE_BODY = `
     const labelMap = {};
     /** track → 我们给的 label（不污染原生对象，自己的 WeakMap 兜住） */
     const trackLabels = new WeakMap();
+    /** 真实设备对象 → 我们给它的 label（MediaDeviceInfo.prototype.toJSON 要用） */
+    const deviceLabels = new WeakMap();
+    /** 被我们打过补丁的真实对象（授权撤销 / 该 kind 未授权时要还原） */
+    const patched = new WeakSet();
+
+    /** 还原成内核原样：删掉我们挂上去的 label，让原型 getter 重新生效 */
+    const resetDevice = (d) => {
+      try {
+        if (patched.has(d)) {
+          delete d.label;
+          patched.delete(d);
+          deviceLabels.delete(d);
+        }
+      } catch (e) { /* 冻结对象等极端情况：保持现状 */ }
+      return d;
+    };
 
     /** 按 kind 的第 i 个设备取名字：自定义配置优先，否则用内置命名池。
      *  设备数超过命名池时用 Windows 自己的去重写法 "2- " 前缀（宿主真名里就有
@@ -420,31 +449,49 @@ const PAGE_BODY = `
       return round === 0 ? name : (round + 1) + '- ' + name;
     };
 
-    /** 只换 label，其余字段（deviceId / groupId / kind）用真实值；顺带记下映射 */
-    const project = (list) => {
+    /** 只换 label：直接在**真实对象**上定义，instanceof 仍 true、原生内部槽位还在。
+     *  不能再 Object.create(MediaDeviceInfo.prototype) —— 那种对象没有内部槽位，
+     *  JSON.stringify 一调原生 toJSON 就抛 Illegal invocation（P9-C 复验实测）。 */
+    const project = (list, perm) => {
       const counter = {};
       const map = {};
       const out = list.map((d) => {
         const kind = String(d.kind || '');
         const i = counter[kind] = (counter[kind] || 0);
         counter[kind] = i + 1;
-        const label = labelFor(kind, i);
-        if (!label) return d;
+        const allowed = kind === 'videoinput' ? !!perm.camera
+          : (kind === 'audioinput' || kind === 'audiooutput') ? !!perm.microphone : false;
+        const label = allowed ? labelFor(kind, i) : null;
+        if (!label) return resetDevice(d);
         try {
           if (d.label) map[d.label] = label;
-          if (typeof MediaDeviceInfo === 'undefined') return d;
-          const o = Object.create(MediaDeviceInfo.prototype);
-          Object.defineProperties(o, {
-            deviceId: { value: d.deviceId, enumerable: true },
-            groupId: { value: d.groupId, enumerable: true },
-            kind: { value: d.kind, enumerable: true },
-            label: { value: label, enumerable: true },
+          Object.defineProperty(d, 'label', {
+            value: label, enumerable: false, configurable: true, writable: false,
           });
-          return o;
+          deviceLabels.set(d, label);
+          patched.add(d);
+          return d;
         } catch (e) { return d; }
       });
       return { list: out, map };
     };
+
+    /* MediaDeviceInfo.prototype.toJSON 按内核内部槽位取字段：
+     *   - 对 Object.create 出来的假对象直接抛 Illegal invocation（页面里任何 JSON.stringify 都会炸）；
+     *   - 对真实对象返回宿主真名，等于绕过我们的改名。
+     * 所以覆盖掉：先用原生 toJSON 拿到完整字段，再把 label 换成我们给的。 */
+    try {
+      if (typeof MediaDeviceInfo !== 'undefined' && typeof MediaDeviceInfo.prototype.toJSON === 'function') {
+        const mdInfoProto = MediaDeviceInfo.prototype;
+        const origToJSON = mdInfoProto.toJSON;
+        defMethod(mdInfoProto, 'toJSON', native(function toJSON() {
+          const base = origToJSON.call(this);
+          const mapped = deviceLabels.get(this);
+          if (mapped !== undefined && base && typeof base === 'object') base.label = mapped;
+          return base;
+        }, 'toJSON'));
+      }
+    } catch (e) { /* 没有 toJSON 的内核：JSON.stringify 走普通枚举，行为同原生 */ }
 
     const remember = (map) => {
       for (const k of Object.keys(map || {})) labelMap[k] = map[k];
@@ -480,10 +527,14 @@ const PAGE_BODY = `
 
     defMethod(mdProto, 'enumerateDevices', native(function enumerateDevices() {
       const p = origEnumerate.apply(this, arguments);
-      return Promise.resolve(p).then((list) => permissionGranted().then((ok) => {
-        if (!ok) return list;          // 未授权：原生 label 是空串，原样返回，别自己造
+      return Promise.resolve(p).then((list) => permissionState().then((perm) => {
+        if (!perm.camera && !perm.microphone) {
+          // 未授权：原生 label 是空串，原样返回；之前打过补丁的对象要还原，别把假名粘在上面
+          for (let i = 0; i < list.length; i++) resetDevice(list[i]);
+          return list;
+        }
         try {
-          const proj = project(list);
+          const proj = project(list, perm);
           remember(proj.map);
           return proj.list;
         } catch (e) { return list; }
@@ -500,7 +551,10 @@ const PAGE_BODY = `
           if (Object.keys(labelMap).length) return renameTracks(stream);
           // 还没枚举过：先补一次真实枚举把映射建起来，再改 track.label
           return Promise.resolve(origEnumerate.call(self))
-            .then((list) => { try { remember(project(list).map); } catch (e) {} return renameTracks(stream); })
+            .then((list) => permissionState().then((perm) => {
+              try { remember(project(list, perm).map); } catch (e) {}
+              return renameTracks(stream);
+            }))
             .catch(() => renameTracks(stream));
         }, (e) => Promise.reject(e));
       }, 'getUserMedia'));

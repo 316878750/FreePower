@@ -980,6 +980,18 @@ test('P9-C 媒体设备：未授权不改 label、授权后只改 label，device
   assert.equal(named[2].label, 'Speakers (Realtek(R) Audio)', '按 kind 各自取名');
 });
 
+test('P9-C 媒体设备：权限按 kind 判，只给摄像头时音频设备不改名', async () => {
+  const view = p7View();
+  const realm = makeRealm('page', view, {
+    permissions: {
+      query: ({ name }) => Promise.resolve({ state: name === 'camera' ? 'granted' : 'denied' }),
+    },
+  });
+  const list = await realm.sandbox.navigator.mediaDevices.enumerateDevices();
+  assert.deepEqual(list.filter((d) => d.kind !== 'videoinput').map((d) => d.label), ['', '', ''],
+    '只授权摄像头时，音频 label 必须保持空串（原生按 kind 判权限）');
+});
+
 test('P9-C 媒体设备：注入源里不再留「伪造整套列表 / 派生 deviceId」的痕迹', () => {
   const page = buildInjectionSource(p7View());
   assert.ok(!page.includes('buildFakeDevices'), '不许再伪造整套设备列表');

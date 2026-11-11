@@ -79,12 +79,12 @@ export async function withProbe(fn) {
       await client.send('Page.navigate', { url }, sessionId);
       await sleep(1200);
     };
-    const grant = async (origin) => {
-      await client.send('Browser.grantPermissions', { permissions: ['videoCapture', 'audioCapture'], origin }, sessionId).catch(() => {});
+    const grant = async (origin, permissions = ['videoCapture', 'audioCapture']) => {
+      await client.send('Browser.grantPermissions', { permissions, origin }, sessionId).catch(() => {});
     };
 
     await fn({
-      evalIn, nav, grant,
+      evalIn, nav, grant, client, profileId,
       URL_A: `http://127.0.0.1:${port}/a`,
       URL_B: `http://localhost:${port}/b`,
     });
