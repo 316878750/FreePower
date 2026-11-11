@@ -658,9 +658,12 @@ async function applyToSession(client, sessionId, profile, view) {
   if (view.timezone) await client.send('Emulation.setTimezoneOverride', { timezoneId: view.timezone }, s).catch(() => {});
   if (view.locale) await client.send('Emulation.setLocaleOverride', { locale: view.locale }, s).catch(() => {});
   if (view.screen) {
+    // 视口按「窗口」而不是「屏幕」设：窗口 == 屏幕是 headless 的默认形态，
+    // creepjs 的 hasVvpScreenRes 就是查 innerWidth/outerHeight 是否等于 screen 尺寸。
+    const win = view.window || { width: view.screen.width, height: view.screen.height };
     await client.send('Emulation.setDeviceMetricsOverride', {
-      width: view.screen.width,
-      height: view.screen.height,
+      width: win.width,
+      height: win.height,
       deviceScaleFactor: view.device_scale_factor || 1,
       mobile: false,
       screenWidth: view.screen.width,

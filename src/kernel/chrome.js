@@ -171,6 +171,8 @@ export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, use
   const fp = profile.fingerprint_config || {};
   const view = fingerprintView(profile);
   const screen = view.screen || { width: 1920, height: 1080 };
+  // 窗口默认比屏幕小一圈：窗口 == 屏幕是 headless 的默认形态（creepjs hasVvpScreenRes 就是查这个）
+  const win = view.window || { width: screen.width, height: screen.height };
 
   const disableFeatures = ['Translate', 'OptimizationHints', 'MediaRouter', 'CalculateNativeWinOcclusion'];
   if (fp.webgl_config?.webgpu?.webgpu_switch === '0') disableFeatures.push('WebGPU', 'WebGPUService');
@@ -186,7 +188,7 @@ export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, use
     '--disable-blink-features=AutomationControlled',
     `--lang=${view.locale || 'en-US'}`,
     `--accept-lang=${(view.language || ['en-US']).join(',')}`,
-    `--window-size=${profile.window_size || `${screen.width},${screen.height}`}`,
+    `--window-size=${profile.window_size || `${win.width},${win.height}`}`,
     `--disable-features=${[...new Set(disableFeatures)].join(',')}`,
     '--disable-search-engine-choice-screen',
     '--hide-crash-restore-bubble',

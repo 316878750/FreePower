@@ -34,6 +34,16 @@ function injectionConfig(fp) {
     client_rects: fp.client_rects || null,
     media: fp.media || null,
     fonts: Array.isArray(fp.fonts) ? fp.fonts.slice() : null,
+    /**
+     * 屏幕尺寸 + 可用区（avail*）。CDP 的 setDeviceMetricsOverride 只能设 screen 尺寸，
+     * availWidth/availHeight 会被撑成和它一样 —— 而「没有任务栏」正是 headless 的特征。
+     */
+    screen: fp.screen ? {
+      width: fp.screen.width,
+      height: fp.screen.height,
+      avail_width: fp.screen.avail_width ?? fp.screen.width,
+      avail_height: fp.screen.avail_height ?? (fp.screen.height - 40),
+    } : null,
   };
 }
 
@@ -211,6 +221,17 @@ const PAGE_BODY = `
   // --disable-blink-features=AutomationControlled 已让原生 webdriver=false；只有兜底失败才改，别主动造痕迹
   try { if (navigator.webdriver) defGetter(Navigator.prototype, 'webdriver', false); } catch (e) {}
   try { if (navigator.vendor !== 'Google Inc.') defGetter(Navigator.prototype, 'vendor', 'Google Inc.'); } catch (e) {}
+
+  /* ---------- Screen：avail* 必须留出任务栏 ---------- */
+  // CDP 只能设 screen 尺寸，availWidth/availHeight 于是等于它 → screen.height === screen.availHeight。
+  // creepjs 的 like-headless 里 noTaskbar 查的正是这两组相等；裸 Chrome 对照是 1440 / 1392
+  // （差的 48 就是 Win11 任务栏）。这里按视图里的 avail_* 改回来。
+  if (CFG.screen && typeof Screen !== 'undefined') {
+    defGetter(Screen.prototype, 'availWidth', CFG.screen.avail_width);
+    defGetter(Screen.prototype, 'availHeight', CFG.screen.avail_height);
+    defGetter(Screen.prototype, 'availTop', 0);
+    defGetter(Screen.prototype, 'availLeft', 0);
+  }
 
   /* ---------- Canvas 2D：确定性像素噪声 ---------- */
   const origGetImageData2d = CanvasRenderingContext2D.prototype.getImageData;

@@ -16,8 +16,31 @@ function parseScreen(screenResolution) {
   return { width, height, color_depth: 24, avail_width: width, avail_height: height - 40 };
 }
 
-/** hardware_concurrency / device_memory：'default' 表示不覆盖，数字字符串也认 */
-function numOrDefault(v) {
+/**
+ * 窗口尺寸：**默认不等于屏幕尺寸**。
+ *
+ * creepjs 的 like-headless 里有一条 `hasVvpScreenRes`：
+ *   (innerWidth === screen.width && outerHeight === screen.height)
+ *   || (visualViewport.width === screen.width && visualViewport.height === screen.height)
+ * 我们原来把窗口和视口都按屏幕尺寸拉满，正好命中这一条（P8-C 实测：这条 + `noTaskbar`
+ * 两条一起，把 `like headless` 从裸 Chrome 的 25% 抬到 38%）。
+ * 屏幕分辨率本身仍是配置值（Emulation 的 screenWidth/screenHeight 不变），只是窗口小一圈。
+ */
+export function windowSizeFor(screen) {
+  if (!screen) return null;
+  const width = Math.max(800, Math.min(1600, screen.width - 100));
+  const height = Math.max(600, Math.min(900, screen.height - 120));
+  return { width: Math.min(width, screen.width), height: Math.min(height, screen.height) };
+}
+
+/** profile.window_size 支持 `1280,800` / `1280x800` 两种写法 */
+export function parseWindowSize(raw) {
+  if (!raw) return null;
+  const m = /^(\d{2,5})\s*[,x]\s*(\d{2,5})$/.exec(String(raw).trim());
+  return m ? { width: Number(m[1]), height: Number(m[2]) } : null;
+}
+
+/** hardware_concurrency / device_memory：'default' 表示不覆盖，数字字符串也认 */function numOrDefault(v) {
   if (v === undefined || v === null || v === 'default' || v === '') return undefined;
   const n = Number(v);
   return Number.isFinite(n) && n > 0 ? n : undefined;
@@ -104,6 +127,8 @@ export function fingerprintView(profile) {
   const gl = p.webgl_config || {};
   const webglOn = String(p.webgl) === '2' && gl.unmasked_vendor && gl.unmasked_renderer;
   const language = Array.isArray(p.language) && p.language.length ? p.language : ['en-US'];
+  const screen = parseScreen(p.screen_resolution);
+  const windowSize = parseWindowSize(p.window_size) || windowSizeFor(screen);
   return {
     seed: String(p.fp_seed ?? p.canvas_id ?? p.id ?? 'freepower'),
     platform: p.platform || 'Win32',
@@ -119,7 +144,8 @@ export function fingerprintView(profile) {
     webgl_image: noiseConfig(p, 'webgl_image'),
     audio: noiseConfig(p, 'audio'),
     client_rects: noiseConfig(p, 'client_rects'),
-    screen: parseScreen(p.screen_resolution),
+    screen,
+    window: windowSize,
     device_scale_factor: typeof p.device_scale === 'number' ? p.device_scale : 1,
     webrtc: p.webrtc || 'disabled',
     media: mediaView(p),
