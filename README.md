@@ -325,6 +325,11 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
     **旧判断（两周前，错）**：把「认证代理下启动期出口探测读到空 body」判成 HSTS 预载 → 升 https → 假代理不支持 CONNECT，并据此说「不用修竞态」。**2026-11-11 复核推翻了它**：真根因不是 HSTS、不是代理、不是网络 —— 是我们自己把导航顶掉了。旧判断只解释了当时的症状，`example.com` 这类快页面碰巧能过，才让「换个域名就好了」看起来像结论。
     **根因**：新建标签的首个文档早于 `Page.addScriptToEvaluateOnNewDocument`，所以要补一次 `Page.reload`（否则首帧裸指纹，`bff86c6` 就是干这个的）。旧写法是「400ms 后读 `location.href`，还是 `about:blank` 就 reload」——慢导航在 400ms 时**还没 commit**，href 仍是 `about:blank`，reload 把在飞的导航顶掉。
     **修法**：改用 CDP 事件判「这张页有人在导航」（`Page.frameRequestedNavigation` / `Page.frameStartedLoading` → 打标记；`Page.frameNavigated` 落到非 `about:blank` 才清），带标记就跳过 reload、改登记「导航落地后再确认一次注入」；出口探测页这类**我们自己建、自己关**的目标走显式豁免，不靠「看起来是空白」去推断；这条路径上**永不用 `Page.stopLoading`**。回归测试 `npm run test:nav-race`（本地延迟 800ms 的 JSON 服务，不依赖外网）：修前 9/13（出口探测空 body、`href=about:blank`、`navType=reload` 三条红），修后 13/13。
+38. **AdsPower `.txt` 里，含冒号的代理密码只能写成 `%3A`，对对方而言密码已失真（P12 定案，三条代价都要说清）**：对手导出实测 150/150 块恒 4 段（`host:port:user:pass`），而我们的密码允许含 `:`。为了仍是 4 段，txt 里把密码的 `:` 写成 `%3A`（例：`198.51.100.10:1080:proxyuser:pa%3Ass%3Aword`）。
+    - **对对方已失真（固有代价，不是 bug）**：AdsPower 会不会把 `%3A` 还原成 `:` **没人验过**。没有还原就是**导入成功但认证失败**——最难查的一类。所以**不能**写成「我们导出的 txt 拿去 AdsPower 是安全的」。
+    - **我们自己的往返无损**：`blockToItem` 读回时把第 4 段里的 `%3A` 还原成 `:`，实测 `ours → ours` 逐字回到 `pa:ss:word`。
+    - **反向失真（真实存在）**：别人的文件里密码**本来就有**字面量 `%3A`（密码真值是 `a%3Ab`）时，我们读回会变成 `a:b`。代码路径没有条件区分「是我们写的」还是「对方本来就有」。
+    - 结论：**`.txt` 只适合「人看 + 对方能吃」的搬运，不是保真备份**；要保真用 JSON（JSON 侧不编码，密码里的 `:` 原样保留）。这一条与已知限制 33 里「txt 不是环境全量备份」是同一件事的两面。
 
 
 ## 八、验证

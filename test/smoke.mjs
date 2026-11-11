@@ -14,6 +14,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import net from 'node:net';
+import path from 'node:path';
 import { startFakeProxy, startEchoServer } from './fake-proxy.mjs';
 
 const results = [];
@@ -59,6 +60,32 @@ function chromePidsMatching(fragment) {
   }
 }
 
+/**
+ * 全部 chrome 的 (pid, 命令行)。断言「残留」时必须按 `--user-data-dir` 判归属，
+ * 不能按映像名数全机 —— 用户自己开着的 FreePower 应用、他自己的浏览器都会被抓进来，
+ * 于是「产品开着」就恒红，一条恒红的断言等于没有断言（2026-11-11 CEO 实测：
+ * 15 个 pid 的 --user-data-dir 全在 AppData\Roaming\FreePower\data\profiles\…）。
+ */
+function chromeProcs() {
+  try {
+    const out = ps(`Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | ForEach-Object { "$($_.ProcessId)|$($_.CommandLine)" }`);
+    return out ? out.split(/\r?\n/).filter(Boolean).map((line) => {
+      const i = line.indexOf('|');
+      return { pid: line.slice(0, i).trim(), cmd: line.slice(i + 1) || '' };
+    }) : [];
+  } catch (e) {
+    return [{ pid: `ps-error: ${e.message}`, cmd: '' }];
+  }
+}
+
+/** 只算落在指定目录下的内核（大小写不敏感，Windows 路径） */
+function chromePidsUnder(dir) {
+  const want = String(dir).toLowerCase().replace(/\\+$/, '');
+  return chromeProcs()
+    .filter((p) => p.cmd.toLowerCase().includes(want))
+    .map((p) => p.pid);
+}
+
 async function waitPidGone(pid, timeoutMs = 8000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -86,6 +113,7 @@ async function main() {
   const { stopAll } = await import('../src/runtime/manager.js');
   const { findChrome } = await import('../src/kernel/chrome.js');
   const { getDb } = await import('../src/store/db.js');
+  const { DATA_DIR } = await import('../src/config.js');
 
   const chrome = findChrome();
   if (!chrome) {
@@ -568,8 +596,12 @@ async function main() {
       check('表单校验接口：UTC 时区与空 cookie 都放行', vchk.json.data?.ok === true, JSON.stringify(vchk.json.data?.errors));
     }
 
-    const leftovers = chromePidsMatching('freepower').filter((x) => /^\d+$/.test(x));
-    check('无残留 chrome 进程', leftovers.length === 0, leftovers.join(',') || 'none');
+    // 只数「本轮测试自己的」内核：--user-data-dir 落在本测试的 data 目录下。
+    // 用户自己开着的 FreePower 应用（%APPDATA%\FreePower\…）与他自己的浏览器不计入。
+    const leftovers = chromePidsUnder(DATA_DIR).filter((x) => /^\d+$/.test(x));
+    const others = chromePidsMatching('freepower').filter((x) => /^\d+$/.test(x) && !leftovers.includes(x));
+    check('无残留 chrome 进程', leftovers.length === 0,
+      (leftovers.join(',') || 'none') + (others.length ? `（另有 ${others.length} 个不属于本测试，未计入）` : ''));
   } catch (e) {
     check('冒烟异常', false, e.stack || e.message);
   } finally {
