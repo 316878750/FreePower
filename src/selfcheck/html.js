@@ -28,6 +28,29 @@ export function renderHtml(report) {
   const hashRows = Object.entries(report.hashes || {})
     .map(([k, v]) => `<tr><td>${esc(k)}</td><td class="mono">${esc(v || '—')}</td></tr>`).join('');
 
+  /* 双 Realm 单独开一节：这是检测方最容易交叉验证的地方，值得单独看 */
+  const realmItems = (report.items || []).filter((it) => String(it.id || '').startsWith('realm_'));
+  const mainCanvas = (report.raw && report.raw.workers && report.raw.workers.main) ? report.raw.workers.main : null;
+  const realmSection = realmItems.length ? `
+<h2>双 Realm（worker 内实测，与主帧对照）</h2>
+<table><thead><tr><th>Realm</th><th>结果</th><th>首行注入</th><th>canvas 哈希</th><th>说明</th></tr></thead>
+<tbody>${realmItems.map((it) => {
+    const a = it.actual || {};
+    return `<tr class="${esc(it.status)}">
+      <td><b>${esc(it.label)}</b><div class="muted">${esc(it.field)}</div></td>
+      <td><span class="badge ${esc(it.status)}">${esc(STATUS_LABEL[it.status] || it.status)}</span></td>
+      <td class="mono">${esc(a.atTop == null ? '—' : a.atTop)}</td>
+      <td class="mono">${esc(a.canvas || '—')}</td>
+      <td>${esc(it.note || '')}</td>
+    </tr>`;
+  }).join('')}</tbody></table>
+<p class="muted">主帧对照：DOM canvas <span class="mono">${esc((mainCanvas && mainCanvas.canvas_dom) || '—')}</span> ·
+主帧 OffscreenCanvas <span class="mono">${esc((mainCanvas && mainCanvas.canvas_offscreen) || '—')}</span>。
+三者一致说明 worker 与主帧用的是同一份噪声实现（种子相同、算法相同）。</p>` : '';
+
+  const workletItem = (report.items || []).find((it) => it.id === 'audio_worklet');
+  const workletKey = (report.raw && report.raw.audioworklet) ? report.raw.audioworklet : null;
+
   return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -73,6 +96,13 @@ export function renderHtml(report) {
 <table><tbody>${hashRows}</tbody></table>
 <p class="muted">同页确定性：canvas=${esc(det.canvas)} · webgl_image=${esc(det.webgl_image)} · audio=${esc(det.audio)} · client_rects=${esc(det.client_rects)} ·
 跨重启一致：${esc(det.cross_restart == null ? '本次不判断（无同内核历史报告）' : det.cross_restart)}${det.compared_with ? `（对比 ${esc(det.compared_with)}）` : ''}</p>
+${realmSection}
+${workletItem ? `<h2>AudioWorklet 作用域（覆盖度 none，这是设计选择）</h2>
+<div class="note"><b>「AudioWorklet 标 none」不等于「音频指纹裸奔」。</b>
+这个作用域没有独立 target、也没有干净的注入通道，靠拦截 JS 改源码会被 <code>import.meta.url</code> 与模块完整性检测直接抓，所以明确不做。
+真正的音频指纹本体是主帧 <code>OfflineAudioContext</code> 的浮点采样，已经由 audio 噪声覆盖（见上表 audio 项）；
+在这个作用域里裸着的只有 <code>sampleRate</code> / <code>currentTime</code>
+${workletKey && workletKey.ok ? `（本次实测 ${esc(workletKey.sampleRate)} / ${esc(workletKey.currentTime)}）` : ''}。</div>` : ''}
 
 <div class="note">${esc(report.caveat || '')}</div>
 <div class="foot">覆盖度来自字段表 coverage 标注：full=值可完全对齐，partial=值能对上但维度本身仍可被识别，none=未伪装。自检只证明「声明已按声明生效」，不等于通过检测站。</div>

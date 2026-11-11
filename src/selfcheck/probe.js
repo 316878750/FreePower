@@ -2,9 +2,11 @@
  * 自检探针：在**目标环境自己的页面里**跑，读回页面真实看到的指纹。
  *
  * 不在主进程里「模拟」，因为主进程不知道 CDP/注入有没有真的生效。
- * 这个脚本对页面只读 + 建临时 DOM（测完删掉），不联网（WebRTC 不配 STUN），
- * 所以代理环境里也能跑，不依赖出口接口。
+ * 这个脚本对页面只读 + 建临时 DOM（测完删掉）、起临时 worker/SW（测完注销），
+ * 不联网（WebRTC 不配 STUN），所以代理环境里也能跑，不依赖出口接口。
  */
+import { REALM_RECIPE } from './worker-probe.js';
+
 export function buildProbeSource() {
   return `(async () => {
   'use strict';
@@ -264,6 +266,92 @@ export function buildProbeSource() {
       };
     }
   } catch (e) { out.webrtc = { supported: false, error: String(e) }; }
+
+  /* ---------- 双 Realm：专用 worker / SharedWorker / ServiceWorker ----------
+   * 配方与 worker 脚本共用 worker-probe.js 里那一份（主帧这边只多一个 DOM canvas 对照）。
+   * 只有真 http(s) 源才能构造 SharedWorker（opaque origin 会 SecurityError），
+   * 且 ServiceWorker 必须用真实 URL 注册 —— 所以这几项在 about:blank 下如实标「未验证」。
+   */
+${REALM_RECIPE}
+  const realmOut = { main: null, dedicated: null, shared: null, service: null, note: null };
+  const withTimeout = (p, ms, label) => Promise.race([
+    p,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(label)), ms)),
+  ]);
+  try {
+    realmOut.main = Object.assign(fpNavSnapshot(), { realm: 'page', canvas_dom: fpCanvasDomHash(), canvas_offscreen: fpCanvasOffscreenHash() });
+    const httpOrigin = /^https?:$/.test(location.protocol);
+    if (!httpOrigin) {
+      realmOut.note = '自检页不在 http(s) 源（' + location.href + '）：SharedWorker 在 opaque origin 下构造会 SecurityError，ServiceWorker 无法注册，三项本次未验证';
+    } else {
+      /* 专用 worker */
+      try {
+        const w = new Worker('/fp-worker.js');
+        try {
+          const data = await withTimeout(new Promise((res, rej) => {
+            w.onmessage = (e) => res(e.data);
+            w.onerror = (e) => rej(new Error((e && e.message) || 'worker error'));
+            w.postMessage({ go: 1 });
+          }), 6000, 'dedicated worker 超时');
+          realmOut.dedicated = data;
+        } finally { try { w.terminate(); } catch (e) {} }
+      } catch (e) { realmOut.dedicated = { ok: false, error: String(e.message || e) }; }
+
+      /* SharedWorker */
+      try {
+        const sw = new SharedWorker('/fp-worker.js');
+        try {
+          sw.port.start();
+          const data = await withTimeout(new Promise((res) => {
+            sw.port.onmessage = (e) => res(e.data);
+            sw.port.postMessage({ go: 1 });
+          }), 6000, 'SharedWorker 超时');
+          realmOut.shared = data;
+        } finally { try { sw.port.close(); } catch (e) {} }
+      } catch (e) { realmOut.shared = { ok: false, error: String(e.message || e) }; }
+
+      /* ServiceWorker：注册 → 等 active → 端口取数 → **必须注销**
+       * 不注销就会给环境留一个常驻注册，下次启动时它已「在运行」，按已知限制就不在覆盖范围里了。
+       */
+      try {
+        if (!navigator.serviceWorker) throw new Error('navigator.serviceWorker 不可用');
+        const reg = await navigator.serviceWorker.register('/fp-sw.js', { scope: '/' });
+        try {
+          await withTimeout(navigator.serviceWorker.ready, 8000, 'SW ready 超时');
+          const target = reg.active || reg.waiting || reg.installing;
+          if (!target) throw new Error('SW 未进入 active');
+          const ch = new MessageChannel();
+          const data = await withTimeout(new Promise((res) => {
+            ch.port1.onmessage = (e) => res(e.data);
+            target.postMessage({ go: 1 }, [ch.port2]);
+          }), 8000, 'SW 消息超时');
+          realmOut.service = data;
+        } finally {
+          try { await reg.unregister(); } catch (e) {}
+        }
+      } catch (e) { realmOut.service = { ok: false, error: String(e.message || e) }; }
+    }
+  } catch (e) { realmOut.error = String(e.message || e).split('\\n')[0]; }
+  out.workers = realmOut;
+
+  /* ---------- AudioWorklet：故意不注入，只把「这里有什么」读出来 ---------- */
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) {
+      out.audioworklet = { supported: false, error: '没有 AudioContext' };
+    } else if (!/^https?:$/.test(location.protocol)) {
+      out.audioworklet = { supported: false, error: '非安全上下文，AudioWorklet 不可用' };
+    } else {
+      let ctx = null;
+      try {
+        ctx = new AC();
+        await withTimeout(ctx.audioWorklet.addModule('/fp-worklet.js'), 6000, 'AudioWorklet addModule 超时');
+        const node = new AudioWorkletNode(ctx, 'fp-probe');
+        const data = await withTimeout(new Promise((res) => { node.port.onmessage = (e) => res(e.data); }), 5000, 'AudioWorklet 取数超时');
+        out.audioworklet = data;
+      } finally { try { if (ctx) await ctx.close(); } catch (e) {} }
+    }
+  } catch (e) { out.audioworklet = { supported: false, error: String(e.message || e) }; }
 
   return out;
 })()`;

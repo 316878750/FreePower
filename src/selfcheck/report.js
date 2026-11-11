@@ -326,6 +326,127 @@ export function buildReport(profile, raw, { kernelVersion = null, previous = nul
     }));
   }
 
+  /* ---------- 16-18. 双 Realm：专用 worker / SharedWorker / ServiceWorker ----------
+   * 这是 P7 的核心断言：worker 里取一遍原生函数、再和主帧比对，是检测方的常规套路。
+   * 所以这里不只要求「注入过」，还要求「脚本首行之前就注入了」+「关键值与主帧同值」。
+   */
+  {
+    const realm = raw.workers || {};
+    const main = realm.main || null;
+    const realmNote = realm.note || null;
+    /** 必须与主帧一致的字段（canvas 单独比，因为它才是噪声同源的直接证据） */
+    const REALM_FIELDS = [
+      ['ua', 'UA'],
+      ['platform', 'platform'],
+      ['cores', '核数'],
+      ['memory', '内存'],
+      ['language', '语言'],
+      ['languages', 'languages'],
+      ['timezone', '时区'],
+    ];
+    const kinds = [
+      ['worker', 'dedicated', '专用 Worker'],
+      ['shared_worker', 'shared', 'SharedWorker'],
+      ['service_worker', 'service', 'ServiceWorker'],
+    ];
+    for (const [field, key, label] of kinds) {
+      const id = `realm_${key}`;
+      const w = realm[key] || null;
+      if (!w) {
+        items.push(item(id, field, `${label}（双 Realm）`, {
+          match: true,
+          status: 'warn',
+          coverage: 'partial',
+          declared: '首行前注入 + 与主帧同值',
+          actual: null,
+          note: realmNote || `${label} 本次没有跑到，未能验证`,
+        }));
+        continue;
+      }
+      if (w.ok === false) {
+        items.push(item(id, field, `${label}（双 Realm）`, {
+          match: false,
+          status: 'warn',
+          coverage: 'partial',
+          declared: '首行前注入 + 与主帧同值',
+          actual: { error: w.error || 'unknown' },
+          note: `${label} 本次未能取到数：${w.error || 'unknown'}（属于「本次未验证」，不是「已验证失败」）`,
+        }));
+        continue;
+      }
+
+      const diffs = [];
+      for (const [k, name] of REALM_FIELDS) {
+        const a = main ? main[k] : undefined;
+        if (a === undefined || a === null) continue;
+        if (String(a) !== String(w[k])) diffs.push(`${name} 主帧 ${a} / worker ${w[k]}`);
+      }
+      if (main && main.canvas_dom && w.canvas && main.canvas_dom !== w.canvas) {
+        diffs.push(`canvas 主帧 DOM ${main.canvas_dom} / worker ${w.canvas}`);
+      }
+      if (main && main.canvas_offscreen && w.canvas && main.canvas_offscreen !== w.canvas) {
+        diffs.push(`canvas 主帧 OffscreenCanvas ${main.canvas_offscreen} / worker ${w.canvas}`);
+      }
+
+      const injectedAtTop = w.atTop === 'worker';
+      let status;
+      let note;
+      if (!injectedAtTop) {
+        status = 'fail';
+        note = `注入没有在脚本首行之前生效（首行读到 realm=${JSON.stringify(w.atTop == null ? null : w.atTop)}），worker 顶层存在裸窗口`;
+      } else if (diffs.length) {
+        status = 'warn';
+        note = `与主帧不一致：${diffs.slice(0, 4).join('；')}`;
+      } else {
+        status = 'pass';
+        note = '脚本首行即已注入；硬件、语言、时区、canvas 哈希与主帧同值';
+      }
+      items.push(item(id, field, `${label}（双 Realm）`, {
+        match: status === 'pass',
+        status,
+        coverage: 'partial',
+        declared: '首行前注入 + 与主帧同值',
+        actual: {
+          atTop: w.atTop,
+          realm: w.realm || null,
+          ua: w.ua || null,
+          platform: w.platform || null,
+          cores: w.cores ?? null,
+          memory: w.memory ?? null,
+          timezone: w.timezone || null,
+          canvas: w.canvas || null,
+          applied: Array.isArray(w.applied) ? w.applied : [],
+        },
+        note,
+      }));
+    }
+  }
+
+  /* 19. AudioWorklet：明确 none，并说清「裸的不是音频指纹本体」 */
+  {
+    const wl = raw.audioworklet || {};
+    const detail = wl.ok === false || wl.error
+      ? { supported: false, error: wl.error || 'unknown' }
+      : {
+        hasNavigator: wl.hasNavigator,
+        hasCanvas: wl.hasCanvas,
+        fpInjected: wl.fpInjected,
+        sampleRate: wl.sampleRate,
+        currentTime: wl.currentTime,
+        surfaces: wl.surfaces || null,
+      };
+    items.push(item('audio_worklet', 'audio', 'AudioWorklet 作用域', {
+      match: true,
+      status: 'warn',
+      coverage: 'none',
+      declared: 'none（明确不注入）',
+      actual: detail,
+      note: wl.error ? `本次未能取到 AudioWorklet 实测值：${wl.error}`
+        : `AudioWorkletGlobalScope 没有独立 target、没有干净注入通道，靠 Fetch 改 JS 会被 import.meta.url 与模块完整性检测抓，所以明确标 none。`
+          + `但**音频指纹本体不在这里**：本体是主帧 OfflineAudioContext 的浮点采样，已由 audio 维度覆盖；这个作用域里裸的只有 sampleRate / currentTime（实测 ${wl.sampleRate} / ${wl.currentTime}）。`,
+    }));
+  }
+
   /* ---------- 汇总 ---------- */
   const summary = {
     total: items.length,

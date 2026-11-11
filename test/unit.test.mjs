@@ -385,7 +385,8 @@ test('自检报告：声明一致时 full=pass、partial=warn、字体=none 标�
   const p = selfProfile();
   const report = buildReport(p, fakeRaw(p), { kernelVersion: '156.0.8078.80' });
   const byId = Object.fromEntries(report.items.map((i) => [i.id, i]));
-  assert.equal(report.items.length, 15);
+  // 15 项（P6）+ 3 项双 Realm + 1 项 AudioWorklet = 19
+  assert.equal(report.items.length, 19);
   assert.equal(byId.ua.status, 'pass');
   assert.equal(byId.ua.coverage, 'full');
   assert.equal(byId.webgl.status, 'warn');
@@ -395,11 +396,112 @@ test('自检报告：声明一致时 full=pass、partial=warn、字体=none 标�
   assert.equal(byId.fonts.status, 'warn');
   assert.equal(byId.webrtc.status, 'pass');
   assert.equal(report.summary.full, 7, JSON.stringify(report.summary));
-  assert.equal(report.summary.partial, 7);
-  assert.equal(report.summary.none, 1);
+  assert.equal(report.summary.partial, 10);
+  assert.equal(report.summary.none, 2);
   assert.equal(report.summary.fail, 0);
   assert.equal(report.determinism.cross_restart, null);
   assert.ok(report.summary.score > 70 && report.summary.score < 100);
+});
+
+test('自检报告：三类 worker 未跑到时标「未验证」而不是「通过」', () => {
+  const p = selfProfile();
+  // fakeRaw 里没有 workers / audioworklet 字段 —— 等价于「自检页回落 about:blank 跑不到 worker」
+  const report = buildReport(p, fakeRaw(p), { kernelVersion: '156.0.8078.80' });
+  const byId = Object.fromEntries(report.items.map((i) => [i.id, i]));
+  for (const key of ['realm_dedicated', 'realm_shared', 'realm_service']) {
+    assert.equal(byId[key].status, 'warn', key);
+    assert.match(byId[key].note, /没有跑到|未验证/, key);
+  }
+  assert.equal(byId.audio_worklet.status, 'warn');
+  assert.equal(byId.audio_worklet.coverage, 'none');
+  assert.equal(report.summary.fail, 0, '「没跑到」不许算成 fail，否则自检天天红');
+});
+
+test('自检报告：双 Realm 三态 —— 首行前注入+同值=pass，值漂移=warn，首行读到 null=fail', () => {
+  const p = selfProfile();
+  const base = fakeRaw(p);
+  const main = {
+    realm: 'page',
+    ua: base.ua,
+    platform: base.platform,
+    cores: base.cores,
+    memory: base.memory,
+    language: base.language,
+    languages: base.languages.join(','),
+    timezone: base.timezone,
+    canvas_dom: 'aaaa0001',
+    canvas_offscreen: 'aaaa0001',
+  };
+  const good = { ok: true, atTop: 'worker', realm: 'worker', ua: base.ua, platform: base.platform,
+    cores: base.cores, memory: base.memory, language: base.language, languages: base.languages.join(','),
+    timezone: base.timezone, canvas: 'aaaa0001', applied: ['canvas'] };
+
+  // 全部一致 + 首行前注入 → pass
+  let report = buildReport(p, {
+    ...base,
+    workers: { main, dedicated: good, shared: good, service: good },
+    audioworklet: { ok: true, sampleRate: 48000, currentTime: 0, fpInjected: false, surfaces: ['sampleRate', 'currentTime'] },
+  }, { kernelVersion: '156.0.8078.80' });
+  let byId = Object.fromEntries(report.items.map((i) => [i.id, i]));
+  assert.equal(byId.realm_dedicated.status, 'pass');
+  assert.equal(byId.realm_shared.status, 'pass');
+  assert.equal(byId.realm_service.status, 'pass');
+  assert.equal(byId.realm_dedicated.actual.canvas, 'aaaa0001');
+  assert.equal(byId.realm_dedicated.actual.atTop, 'worker');
+
+  // canvas 不同 → warn，并把两边的值都写进说明
+  report = buildReport(p, {
+    ...base,
+    workers: { main, dedicated: { ...good, canvas: 'ffff9999' }, shared: good, service: good },
+    audioworklet: { ok: true, sampleRate: 48000, currentTime: 0, fpInjected: false, surfaces: ['sampleRate', 'currentTime'] },
+  }, { kernelVersion: '156.0.8078.80' });
+  byId = Object.fromEntries(report.items.map((i) => [i.id, i]));
+  assert.equal(byId.realm_dedicated.status, 'warn');
+  assert.match(byId.realm_dedicated.note, /ffff9999/);
+  assert.match(byId.realm_dedicated.note, /aaaa0001/);
+
+  // 首行读到 null → fail（真洞，不许糊成 warn）
+  report = buildReport(p, {
+    ...base,
+    workers: { main, dedicated: { ...good, atTop: null, realm: 'worker' }, shared: good, service: good },
+    audioworklet: { ok: true, sampleRate: 48000, currentTime: 0, fpInjected: false, surfaces: ['sampleRate', 'currentTime'] },
+  }, { kernelVersion: '156.0.8078.80' });
+  byId = Object.fromEntries(report.items.map((i) => [i.id, i]));
+  assert.equal(byId.realm_dedicated.status, 'fail');
+  assert.match(byId.realm_dedicated.note, /裸窗口/);
+
+  // 硬件不一致也要抓到（双 Realm 取一遍核数是最省事的检测手法）
+  report = buildReport(p, {
+    ...base,
+    workers: { main, dedicated: { ...good, cores: 2 }, shared: good, service: good },
+    audioworklet: { ok: true, sampleRate: 48000, currentTime: 0, fpInjected: false, surfaces: ['sampleRate', 'currentTime'] },
+  }, { kernelVersion: '156.0.8078.80' });
+  byId = Object.fromEntries(report.items.map((i) => [i.id, i]));
+  assert.equal(byId.realm_dedicated.status, 'warn');
+  assert.match(byId.realm_dedicated.note, /核数/);
+});
+
+test('自检 HTML：双 Realm 一节与「音频指纹没裸奔」都要出现', () => {
+  const p = selfProfile();
+  const base = fakeRaw(p);
+  const main = {
+    realm: 'page', ua: base.ua, platform: base.platform, cores: base.cores, memory: base.memory,
+    language: base.language, languages: base.languages.join(','), timezone: base.timezone,
+    canvas_dom: 'aaaa0001', canvas_offscreen: 'aaaa0001',
+  };
+  const good = { ok: true, atTop: 'worker', realm: 'worker', ua: base.ua, platform: base.platform,
+    cores: base.cores, memory: base.memory, language: base.language, languages: base.languages.join(','),
+    timezone: base.timezone, canvas: 'aaaa0001', applied: ['canvas'] };
+  const report = buildReport(p, {
+    ...base,
+    workers: { main, dedicated: good, shared: good, service: good },
+    audioworklet: { ok: true, sampleRate: 48000, currentTime: 0, fpInjected: false, surfaces: ['sampleRate', 'currentTime'] },
+  }, { kernelVersion: '156.0.8078.80' });
+  const html = renderHtml(report);
+  assert.match(html, /双 Realm/);
+  assert.match(html, /音频指纹裸奔/);
+  assert.match(html, /sampleRate/);
+  assert.match(html, /48000/);
 });
 
 test('自检报告：声明没生效要报 fail（UA / WebGL / WebRTC 泄漏）', () => {

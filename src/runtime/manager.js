@@ -334,6 +334,8 @@ async function injectAndOpen(instance, profile, view) {
     injected: 0,
     skipped_extension: 0,
     iframes: 0,
+    /** AudioWorklet 也是独立 target（type='worklet'），但按设计不注入，单独记账 */
+    worklets: 0,
     other: 0,
     failed: [],
     last: null,
@@ -367,6 +369,14 @@ async function injectAndOpen(instance, profile, view) {
     // 本轮不覆盖（P2 起就是放行），只计数，写进已知限制。
     if (type === 'iframe') {
       workerStats.iframes += 1;
+      resumeNow(sessionId, waitingForDebugger);
+      return;
+    }
+    // AudioWorklet 有独立 target（type='worklet'），但里面没有可注入的指纹表面
+    // （见自检 audio_worklet 项与 README），按设计不注入，只放行并单独计数 ——
+    // 不能让它掉进 other 里变成「不知道怎么就没处理」。
+    if (type === 'worklet') {
+      workerStats.worklets += 1;
       resumeNow(sessionId, waitingForDebugger);
       return;
     }

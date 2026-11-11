@@ -17,6 +17,18 @@ export function getDb() {
   return db;
 }
 
+/**
+ * 关掉库连接。
+ * 需要它的场景只有一个：**删掉整个数据目录**（测试收尾）。
+ * Windows 上 SQLite 的 .db / -wal 句柄还开着时，rmSync 会 EPERM —— 表现是「临时目录删不掉」，
+ * 看起来像内核没退干净，其实是自己的库没放手。
+ */
+export function closeDb() {
+  if (!db) return;
+  try { db.close(); } catch { /* 已经关了 */ }
+  db = null;
+}
+
 /* ------------------------------------------------------------------ */
 /* 迁移：老 payload 整包 JSON 模型 → 平铺字段模型（schema 事实源是    */
 /* packages/profile）。只迁移不删除，旧数据留在 profiles_legacy_v0。  */

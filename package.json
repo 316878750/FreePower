@@ -17,14 +17,16 @@
     "desktop": "node tools/run-desktop.mjs",
     "desktop:selftest": "node tools/run-desktop.mjs --selftest",
     "dist:win": "electron-builder --win --x64",
-    "smoke": "node --no-warnings test/smoke.mjs",
+    "smoke": "node --no-warnings test/smoke.mjs && node --no-warnings test/workers.test.mjs",
     "test:unit": "node --no-warnings test/unit.test.mjs",
     "test:api": "node --no-warnings test/api.test.mjs",
     "test:ui": "node --no-warnings test/ui.test.mjs",
     "test:desktop": "node --no-warnings test/desktop.test.mjs",
     "test:profile": "node --no-warnings packages/profile/test/schema.test.mjs",
     "test": "node --no-warnings packages/profile/test/schema.test.mjs && node --no-warnings test/unit.test.mjs && node --no-warnings test/api.test.mjs && node --no-warnings test/ui.test.mjs && node --no-warnings test/desktop.test.mjs",
-    "gen": "node tools/gen-schema.mjs"
+    "gen": "node tools/gen-schema.mjs",
+    "test:workers": "node --no-warnings test/workers.test.mjs",
+    "test:all": "npm run test && npm run test:workers"
   },
   "devDependencies": {
     "electron": "^45.2.3",
