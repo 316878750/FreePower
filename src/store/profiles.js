@@ -42,7 +42,7 @@ function normalizeProxy(p = {}) {
     host: p.host || p.proxy_host || '',
     port: Number(p.port || p.proxy_port || 0),
     username: p.username || p.proxy_user || '',
-    password: p.password || p.proxy_pwd || '',
+    password: p.password || p.proxy_password || p.proxy_pwd || '',
     proxy_id: p.proxy_id || p.proxyid || '',
   };
 }

@@ -11,7 +11,7 @@ import { alignProfileToKernel } from '../kernel/version.js';
 import { fingerprintView } from '../fingerprint/view.js';
 import { ensureNoiseSeeds } from '../fingerprint/seeds.js';
 import { checkProfile, markStatus, applyProfileFields, persistEgress } from '../store/profiles.js';
-import { checkProxy, hasProxy } from '../proxy/probe.js';
+import { checkProxy, hasProxy, normalizeProxyConfig } from '../proxy/probe.js';
 import { pacInUse, pacMessage } from '../proxy/pac.js';
 import { probeEgressInBrowser } from '../proxy/egress.js';
 import { runSelfCheck } from '../selfcheck/index.js';
@@ -671,8 +671,10 @@ async function applyToSession(client, sessionId, profile, view) {
     }, s).catch(() => {});
   }
 
-  const proxy = profile.user_proxy_config || profile.proxy_config;
-  if (proxy && proxy.username && proxy.host) {
+  // 与预检 / --proxy-server 同源：AdsPower 形状（proxy_user / proxy_password）也要认，
+  // 否则账号密码挂不上，内核收到 407 后页面直接空白。
+  const proxy = normalizeProxyConfig(profile.user_proxy_config || profile.proxy_config || {});
+  if (proxy.username && proxy.host) {
     await setupProxyAuth(client, s, proxy).catch((e) => log(profile.id, 'proxy auth 挂载失败', e.message));
   }
 }

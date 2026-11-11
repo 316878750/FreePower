@@ -3,6 +3,7 @@ import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { CHROME_BIN, DATA_DIR, KERNELS_DIR, START_TIMEOUT_MS } from '../config.js';
 import { fingerprintView } from '../fingerprint/view.js';
+import { normalizeProxyConfig } from '../proxy/probe.js';
 import { mergeLaunchArgs } from './launch-args.js';
 
 const CANDIDATE_DIRS = [
@@ -237,9 +238,17 @@ export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, use
     args.push('--proxy-bypass-list=<-loopback>');
   }
 
-  if (proxy && proxy.host && proxy.port) {
-    const scheme = proxy.proxy_type === 'https' ? 'https' : proxy.proxy_type === 'socks5' ? 'socks5' : 'http';
-    args.push(`--proxy-server=${scheme}://${proxy.host}:${proxy.port}`);
+  // 代理字段统一走 normalizeProxyConfig：AdsPower 形状是 proxy_host / proxy_port / proxy_user /
+  // proxy_password，这里直读 proxy.host 会让 --proxy-server 拼不出来 —— 预检通过、内核却直连（fail-open）。
+  const px = proxy ? normalizeProxyConfig(proxy) : null;
+  if (proxyBound && !(px && px.host && px.port > 0)) {
+    throw Object.assign(new Error('已绑定代理但代理配置不完整（host/port 为空）：拒绝以直连方式启动'), {
+      code: 800003, reason: 'proxy_config_incomplete',
+    });
+  }
+  if (px && px.host && px.port > 0) {
+    const scheme = px.type === 'https' ? 'https' : px.type === 'socks5' ? 'socks5' : 'http';
+    args.push(`--proxy-server=${scheme}://${px.host}:${px.port}`);
   }
 
   if (String(profile.is_multi_level_proxy) === '1' || String(profile.mutli_level_proxy) === '1') {

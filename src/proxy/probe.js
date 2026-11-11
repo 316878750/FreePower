@@ -24,7 +24,9 @@ export function normalizeProxyConfig(p = {}) {
     host: String(p.host ?? p.proxy_host ?? '').trim(),
     port: Number(p.port ?? p.proxy_port ?? 0),
     username: String(p.username ?? p.proxy_user ?? ''),
-    password: String(p.password ?? p.proxy_pwd ?? ''),
+    // AdsPower 官方形状用 proxy_password；我方字段是 password。少认一个就是「导入带密代理 →
+    // 密码静默变空 → 407 → fail-closed 拒绝启动」（R3-B 实测，见 docs/08 落点矩阵）。
+    password: String(p.password ?? p.proxy_password ?? p.proxy_pwd ?? ''),
   };
 }
 

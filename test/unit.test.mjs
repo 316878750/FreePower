@@ -91,6 +91,24 @@ test('代理预检：配置不完整 / 不支持的类型都不放行', async ()
   assert.match(socks4.error, /不支持/);
 });
 
+test('代理字段：AdsPower 形状（proxy_host/proxy_port/proxy_user/proxy_password）全链路认', () => {
+  const adspower = {
+    proxy_type: 'http', proxy_host: '203.0.113.5', proxy_port: 8000,
+    proxy_user: 'u1', proxy_password: 'p1',
+  };
+  const c = normalizeProxyConfig(adspower);
+  assert.deepEqual(c, { type: 'http', host: '203.0.113.5', port: 8000, username: 'u1', password: 'p1' });
+  assert.equal(hasProxy(adspower), true);
+
+  // buildArgs：形状不同也必须拼出 --proxy-server（否则预检过、内核直连 = fail-open）
+  const built = buildArgs({ webgl_config: {} }, { userDataDir: 'C:\\fp\\udd', proxy: adspower, proxyBound: true, userArgs: [] });
+  assert.ok(built.args.includes('--proxy-server=http://203.0.113.5:8000'), built.args.join(' '));
+  assert.ok(built.args.includes('--proxy-bypass-list=<-loopback>'));
+
+  // proxyBound 但配置不可用：宁可抛错也不许起一个直连内核
+  assert.throws(() => buildArgs({ webgl_config: {} }, { userDataDir: 'C:\\fp\\udd', proxy: { proxy_type: 'http' }, proxyBound: true }), /不完整|直连/);
+});
+
 test('httpGetViaProxy：非 200 也完整返回，交给上层判断', async () => {
   const fake = await startFakeProxy();
   try {
