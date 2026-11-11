@@ -1,5 +1,9 @@
 # P4 curl 实测记录（本地 API 完整化 + 批量启停）
 
+> ⚠️ 本文是 P4 阶段的记录，描述的是当时状态；当前能力以 [README](../README.md) 为准。
+> 正文里的自检摘要是 P4 当时的值（15 项、`7 pass / 8 warn`）；当前是 19 项、`10 pass / 9 warn / 0 fail`。
+> 第 5 节 `local-active` 的样例已按 P7 后的真实响应重采（见该节标注）。
+
 这轮不是跑 mock，是真起了一个 FreePower 服务、真起 Chrome、真用系统 `curl.exe` 打的。
 下面的命令与响应都是从终端原样抄下来的，只做了三处处理，都在这儿说明白：
 
@@ -118,6 +122,9 @@ $ curl -s $FP/api/v1/browser/start?user_id=de0745f1-9c16-428a-9c12-bda86a8b4bdc 
 
 `ws.puppeteer` 直接喂给 puppeteer `connect()` 就能接；`ws.selenium` 是给 Selenium 的 `127.0.0.1:port` 形式。`real_version` 是内核自己报的，不是我们猜的。
 
+> 上面两条响应里的 `selfcheck` 摘要是 P4 当时的真值（15 项、`7 pass / 8 warn`、score 79）；
+> 当前是 19 项、`10 pass / 9 warn`、score 81，结构不变（见第 5 节重采的 `local-active` 样例）。
+
 批量起 3 个（第一个已经在跑）：
 
 ```bash
@@ -215,7 +222,8 @@ $ curl -s $FP/api/v1/browser/active?user_id=de0745f1-9c16-428a-9c12-bda86a8b4bdc
 
 `status` 是 **`"Active"` 首字母大写**，跟对手一致；`start` 返回的 `status` 是 `"running"`。两个接口字段名一样但取值不同，这是照着对手的形状来的，不是我们随便定的。
 
-本机全部已开：
+本机全部已开（**2026-11-11 复采，P7 后**；`pid` / 端口 / ws / 哈希每次不同，结构稳定。
+P4 当时的样例里 `ws` 还是字符串、没有 `workers` 字段，已按当前代码重采，不手改）：
 
 ```bash
 $ curl -s $FP/api/v1/browser/local-active -H "api-key: $FP_KEY" -H 'x-freepower-client: mcp'
@@ -226,17 +234,56 @@ $ curl -s $FP/api/v1/browser/local-active -H "api-key: $FP_KEY" -H 'x-freepower-
   "code": 0,
   "msg": "success",
   "data": {
-    "count": 3,
     "list": [
-      { "profile_id": "de0745f1-…", "pid": 45880, "status": "Active", "ws": "ws://127.0.0.1:55755/devtools/browser/cd28791c-…" },
-      { "profile_id": "2c70b230-…", "pid": 81076, "status": "Active", "ws": "ws://127.0.0.1:54947/devtools/browser/ce63b344-…" },
-      { "profile_id": "0aae21b3-…", "pid": 61908, "status": "Active", "ws": "ws://127.0.0.1:54948/devtools/browser/857856ea-…" }
+      {
+        "profile_id": "67f52c82-d9eb-4197-b6a9-7de0fa784e45",
+        "pid": 64552,
+        "debug_port": "56425",
+        "ws": {
+          "puppeteer": "ws://127.0.0.1:56425/devtools/browser/baf831a2-c950-4127-b10c-5bcc4a6bbc52",
+          "selenium": "127.0.0.1:56425"
+        },
+        "webdriver": "127.0.0.1:56425",
+        "status": "Active",
+        "real_version": "157.0.8103.40",
+        "started_at": 1794380104,
+        "already_running": false,
+        "proxy": null,
+        "egress": {
+          "ok": false,
+          "url": "http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,timezone,isp,query",
+          "error": "出口探测页没有内容（代理拦截或页面没加载完）"
+        },
+        "ua_aligned": null,
+        "launch_args": { "applied": [], "rejected": [] },
+        "warnings": [
+          { "field": "proxy", "message": "未绑定代理：出口即本机 IP，跑真实账号请务必绑代理", "severity": "soft" },
+          { "field": "ip", "message": "浏览器出口探测失败：出口探测页没有内容（代理拦截或页面没加载完）", "severity": "soft" }
+        ],
+        "workers": {
+          "total": 13, "injected": 3, "skipped_extension": 4, "iframes": 1, "worklets": 1, "other": 3,
+          "failed": [],
+          "last": { "type": "service_worker", "url": "http://127.0.0.1:57940/fp-sw.js", "ms": 6 },
+          "by_type": { "browser_ui": 2, "service_worker": 6, "iframe": 1, "other": 1, "worker": 1, "shared_worker": 1, "worklet": 1 }
+        },
+        "selfcheck": {
+          "ok": true, "score": 81, "total": 19, "pass": 10, "warn": 9, "fail": 0,
+          "full": 7, "partial": 10, "none": 2,
+          "hashes": { "canvas": "a769b7fa", "webgl_image": "49a86523", "audio": "4ed404a1", "client_rects": "1b03423c" },
+          "determinism": { "canvas": true, "webgl_image": true, "audio": true, "client_rects": true,
+            "cross_restart": null, "compared_with": null,
+            "note": "没有同内核留存的上一份报告，本次不判断跨重启一致性" },
+          "generated_at": "2026-11-11T06:55:14.989Z",
+          "report_url": "/api/v2/browser-profile/selfcheck?profile_id=67f52c82-d9eb-4197-b6a9-7de0fa784e45"
+        }
+      }
     ]
   }
 }
 ```
 
-（`count` 是我为了裁剪方便加的投影，真实响应是每个元素完整的启动信息，没有这层 count。）
+要点：`ws` 是对象（`puppeteer` 是完整 ws 地址、`selenium` 是 `host:port`），每个元素是**完整的启动信息**；
+`workers` 是 P7 新增的注入实况；`selfcheck` 是启动时自动跑的那次摘要（19 项 / `10 pass / 9 warn` / score 81）。
 
 ---
 
@@ -472,6 +519,6 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\curl-record.ps1
 不跑 Chrome 的契约测试（快，CI 友好）：
 
 ```bash
-node test/api.test.mjs   # 50/50
-node test/unit.test.mjs  # 34/34
+node test/api.test.mjs   # 61/61（P4 当时 50）
+node test/unit.test.mjs  # 46/46（P4 当时 34）
 ```

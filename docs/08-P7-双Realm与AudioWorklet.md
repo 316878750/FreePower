@@ -1,5 +1,7 @@
 # P7 · 双 Realm 与 AudioWorklet（W4 结论）
 
+> ⚠️ 本文是 P7 阶段的记录，描述的是当时状态；当前能力以 [README](../README.md) 为准。
+
 > 这一份只回答一个问题：**worker 那几种「另一个 JS 世界」到底覆盖到什么程度，哪些明确不做、为什么不做的不是「音频指纹」。**
 > 所有数字都是本机真机实测（Chrome 157.0.8103.40），复跑命令在最后。
 
@@ -10,6 +12,7 @@
 | 专用 worker | **已覆盖** | 脚本首行 `self.__fpRealm === 'worker'`；canvas 与主帧同值 | 首行前注入，无裸窗口 |
 | SharedWorker | **已覆盖** | 同上 | UA 靠 JS 补（CDP 不传播） |
 | ServiceWorker（新建） | **已覆盖** | 同上 | 卡在脚本顶层之前注入 |
+| 嵌套 worker（worker 里再 `new Worker`） | **已覆盖** | 外层与嵌套层首行都是 `realm='worker'`；实测五层深链（页→w4→…→w0）核数全等于主帧 | 每个 worker 会话自己再挂 `setAutoAttach`，递归覆盖、不设深度上限；P7 收尾时补，`injected` 精确 +2 |
 | ServiceWorker（启动前已在运行） | **未覆盖** | — | 只在其下次被激活时接入 |
 | AudioWorkletGlobalScope | **明确不做（none）** | 实测 `fpInjected=false`，可测表面只有 `sampleRate`/`currentTime` | 见第 3 节三条理由 |
 | OOPIF 子帧 | **未覆盖** | 只计数不注入 | 子帧里取原生函数仍可能看到两套 |
@@ -68,6 +71,8 @@ service          9b2e7181
   剩下 2 个是同一个 SW 被浏览器层与页面层各接住一次 —— 按 **targetId** 去重，不按 sessionId。
 - `worklets: 1` 是 AudioWorklet（`type='worklet'` 的独立 target），按设计不注入但单独记账，
   不让它掉进 `other` 里变成「不知道怎么就没处理」。
+- 上面是「三类 worker 探针」那一轮的实况。`test/workers.test.mjs` 之后还会单独起一组嵌套 worker（两层），
+  所以那一轮的 `injected` 会到 5、`by_type.worker` 到 3 —— 这是嵌套修复生效的证据，不是重复计数。
 
 ## 3. AudioWorklet：为什么明确标 `none`
 
@@ -100,7 +105,7 @@ service          9b2e7181
 ## 4. 怎么复跑
 
 ```powershell
-# 双 Realm 真机测试（自带起环境、收尾、删临时目录，21 项断言）
+# 双 Realm 真机测试（自带起环境、收尾、删临时目录，24 项断言）
 node test/workers.test.mjs
 
 # 或跟着冒烟一起跑
@@ -112,5 +117,6 @@ curl "http://127.0.0.1:53380/api/v2/browser-profile/selfcheck?profile_id=<id>&fo
 ```
 
 `test/workers.test.mjs` 断言的就是上面 2.1 / 2.2 / 2.3 三节的事实：
-五处哈希一致、三类 worker 的 `atTop === 'worker'`、`injected === 3`、自检四项状态符合预期。
+五处哈希一致、三类 worker 的 `atTop === 'worker'`、`injected === 3`、自检四项状态符合预期；
+外加三条嵌套 worker 断言（外层与嵌套层 `atTop`、主帧/外层/嵌套三层核数一致、两层都进注入计数）。
 换台机器、换个人都能复跑，不依赖 `.tmp`。

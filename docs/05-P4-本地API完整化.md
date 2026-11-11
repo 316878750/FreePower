@@ -1,5 +1,7 @@
 # P4 交付：本地 API 完整化 + 批量启停
 
+> ⚠️ 本文是 P4 阶段的记录，描述的是当时状态；当前能力以 [README](../README.md) 为准。
+
 > 目标（CEO 定的顺序）：先让现有 AdsPower 脚本低成本迁过来 —— API 兼容比再补注入维度值钱。
 > 本文对应 4 件事：8 条本地组装路由 1:1、CRUD 自己重写、批量启停、错误码与限流。
 
@@ -61,18 +63,19 @@
 ## 二、怎么验证
 
 ```powershell
-npm run test     # schema 10 + 单元 34 + 本地 API 契约 50（都不需要 Chrome）
-npm run smoke    # 148 项，需要真实 Chrome + 完整权限
+npm run test     # schema 10 + unit 46 + api 61 + ui 29 + desktop 54（都不需要 Chrome）
+npm run smoke    # test/smoke.mjs 152 + test/workers.test.mjs 24，需要真实 Chrome + 完整权限
 ```
 
-实测结果（2026-11-10）：
+实测结果（P4 当时 2026-11-10；下面数字已按 2026-11-11 复核刷新）：
 
-| 套件 | 结果 |
+| 套件 | 结果（当前） |
 |---|---|
 | `packages/profile/test/schema.test.mjs` | 10/10 |
-| `test/unit.test.mjs` | 34/34 |
-| `test/api.test.mjs`（新增） | 50/50 |
-| `test/smoke.mjs` | **148/148**（P1+P3 前置 95 + P2 34 + P4 新增 19） |
+| `test/unit.test.mjs` | 46/46（P4 当时 34） |
+| `test/api.test.mjs` | 61/61（P4 当时 50） |
+| `test/smoke.mjs` | **152/152**（P4 当时 148：P1+P3 前置 95 + P2 34 + P4 新增 19） |
+| `test/workers.test.mjs`（P7 新增） | 24/24 |
 
 P4 在冒烟里覆盖的关键断言：
 
