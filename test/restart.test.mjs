@@ -50,8 +50,11 @@ function alive(pid) {
   return Boolean(ps(`(Get-Process -Id ${pid} -ErrorAction SilentlyContinue).Id`));
 }
 /** 只数浏览器主进程：子进程带 --type=xxx，主进程不带；靠这个区分，别靠调试端口
- *  （我们是 --remote-debugging-pipe，命令行里根本没有 --remote-debugging-port）
- *  过滤放在 JS 里做：PS 那层的 -notlike 转义容易出错，实测会静默返回 0。 */
+ *  ——命令行里确实有 `--remote-debugging-port=0`（`src/kernel/chrome.js` 的固定参数，真端口由系统随机分配、
+ *  回读到 DevToolsActivePort），但**别拿它当判据**：同机还有别的 Chrome 时会把别人的进程数进来，
+ *  0 也不带任何身份信息，靠它分不清是谁的。
+ *  过滤放在 JS 里做：PS 那层的 -notlike 组合过滤容易出错，实测会静默返回 0；
+ *  user-data-dir 里只含 id 的前 8 位，用完整 uuid 匹配同样得到 0（都实测过）。 */
 function browserProcessCount(id) {
   const frag = id.split('-')[0];   // user-data-dir 里只有 id 的前 8 位，用完整 uuid 匹配会得到 0（实测）
   const out = ps(`Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Select-Object -ExpandProperty CommandLine`);

@@ -27,7 +27,8 @@
     "gen": "node tools/gen-schema.mjs",
     "test:workers": "node --no-warnings test/workers.test.mjs",
     "test:all": "npm run test && npm run test:workers",
-    "test:restart": "node --no-warnings test/restart.test.mjs"
+    "test:restart": "node --no-warnings test/restart.test.mjs",
+    "test:cmdline": "node --no-warnings test/cmdline-leak.test.mjs"
   },
   "devDependencies": {
     "electron": "^45.2.3",
