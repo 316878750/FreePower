@@ -456,7 +456,8 @@ const PAGE_BODY = `
    *   - 必须改**真实对象**，不能 Object.create(MediaDeviceInfo.prototype) 造假的：
    *     假对象没有内核内部槽位，页面一 JSON.stringify 就抛 Illegal invocation；
    *   - 原生 MediaDeviceInfo.prototype.toJSON 按槽位取宿主真名，等于绕过改名，必须一起覆盖。
-   *     残留：own property 的 label（我们定义成 non-enumerable，getOwnPropertyDescriptor 能看出差异）。
+   *     这条下面原来还挂着「own property 的 label」这个残留（逆向裁判 R1）；P14 已经把 label
+   *     挪到原型 getter 上，实例上不再有任何 own 属性 —— 见下面 labelOnProto 那段。
    */
   const DEVICE_LABELS = {
     audioinput: ['Microphone (Realtek(R) Audio)', 'Microphone Array (2- Conexant SmartAudio HD)', 'Line In (Realtek(R) Audio)'],
@@ -503,7 +504,8 @@ const PAGE_BODY = `
     /** 被我们打过补丁的真实对象（授权撤销 / 该 kind 未授权时要还原） */
     const patched = new WeakSet();
 
-    /** 还原成内核原样：删掉我们挂上去的 label，让原型 getter 重新生效 */
+    /** 还原成内核原样：清掉 WeakMap 里的映射（原型 getter 立刻回落到原生 getter）；
+     *  兜底路径（拿不到原型、只能挂实例属性）时再把那个 own property 删掉。 */
     const resetDevice = (d) => {
       try {
         if (patched.has(d)) {
@@ -530,7 +532,54 @@ const PAGE_BODY = `
       return round === 0 ? name : (round + 1) + '- ' + name;
     };
 
-    /** 只换 label：直接在**真实对象**上定义，instanceof 仍 true、原生内部槽位还在。
+    /* P14：label 走 MediaDeviceInfo.prototype 的 getter，实例上不再挂 own property。
+     *
+     * 破绽（逆向裁判 R1）：原来用 Object.defineProperty(d,'label',…) 往实例上写，
+     * 实例就多出一个 own property label；而原生设备对象上**一个 own 属性都没有**
+     * （本机 media_devices=0 基线实测：8 个实例的 Object.getOwnPropertyNames 全是 []）。
+     * 页面一行 Object.getOwnPropertyNames(device) 就能读出「这个环境被改过」。
+     *
+     * 先量后改（157.0.8103.40，.tmp/p14-measure.mjs）：
+     *   - 原型上的 label 是 accessor：enumerable:true、configurable:true、get 是原生函数；
+     *   - 整条 descriptor 能换（defineProperty 成功；包一层 getter 后 d.label 立刻走新 getter）；
+     *   - 原生 getter 用 this = 真实设备对象 调得通（返回宿主真名，不是抛 Illegal invocation）；
+     *   - 音频输入设备的原型是 InputDeviceInfo.prototype（MediaDeviceInfo 的子类），
+     *     它自己不定义 label（own 只有 constructor / getCapabilities），所以也走这条链 ——
+     *     只改 MediaDeviceInfo.prototype 就够，不必逐个 constructor 补。
+     *
+     * getter 用**对象字面量的 getter 语法**取出来，而不是普通函数表达式：方法/访问器定义
+     * 没有 own prototype，和原生 getter 的 own 属性形状一致（都是 length + name）。
+     *
+     * 边界（别读成「已消除」）：
+     *   - 只在这一层 realm 生效；iframe 是另一个 realm、另一份原型，仍走原生（README 35b）；
+     *   - 内核若换成不可 configurable 的原型 accessor，这里装不上，就退回实例 own property
+     *     （labelOnProto = false）—— 那时 R1 会重新出现，这是已知的降级，不是修好了。
+     */
+    let labelOnProto = false;
+    try {
+      if (typeof MediaDeviceInfo !== 'undefined' && MediaDeviceInfo.prototype) {
+        const mdInfoProto = MediaDeviceInfo.prototype;
+        const d0 = Object.getOwnPropertyDescriptor(mdInfoProto, 'label');
+        if (d0 && typeof d0.get === 'function' && d0.configurable) {
+          const origLabelGet = d0.get;
+          const wrappedGet = Object.getOwnPropertyDescriptor({
+            get label() {
+              const mapped = deviceLabels.get(this);
+              return mapped === undefined ? origLabelGet.call(this) : mapped;
+            },
+          }, 'label').get;
+          Object.defineProperty(mdInfoProto, 'label', {
+            get: native(wrappedGet, 'get label', 0),
+            enumerable: d0.enumerable,
+            configurable: true,
+          });
+          labelOnProto = true;
+        }
+      }
+    } catch (e) { labelOnProto = false; }
+
+    /** 只换 label：设备对象本身仍是**真实对象**（instanceof 仍 true、原生内部槽位还在），
+     *  但名字记在 WeakMap 里、由上面那个原型 getter 投影出去 —— 实例上一个 own 属性都不挂。
      *  不能再 Object.create(MediaDeviceInfo.prototype) —— 那种对象没有内部槽位，
      *  JSON.stringify 一调原生 toJSON 就抛 Illegal invocation（P9-C 复验实测）。 */
     const project = (list, perm) => {
@@ -545,14 +594,18 @@ const PAGE_BODY = `
         const label = allowed ? labelFor(kind, i) : null;
         if (!label) return resetDevice(d);
         try {
+          // 读的这一刻 WeakMap 里还没有这条，getter 回落到原生 → 拿到宿主真名做映射
           if (d.label) map[d.label] = label;
-          Object.defineProperty(d, 'label', {
-            value: label, enumerable: false, configurable: true, writable: false,
-          });
           deviceLabels.set(d, label);
           patched.add(d);
+          // 兜底：原型改不动时只能挂 own property（R1 会重现，见上面边界）
+          if (!labelOnProto) {
+            Object.defineProperty(d, 'label', {
+              value: label, enumerable: false, configurable: true, writable: false,
+            });
+          }
           return d;
-        } catch (e) { return d; }
+        } catch (e) { deviceLabels.delete(d); patched.delete(d); return d; }
       });
       return { list: out, map };
     };
