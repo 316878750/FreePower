@@ -67,6 +67,10 @@ function chromePidsMatching(fragment) {
  * 15 个 pid 的 --user-data-dir 全在 AppData\Roaming\FreePower\data\profiles\…）。
  */
 function chromeProcs() {
+  // 自检钩子：证明「读不到进程列表」时这条断言是 fail-closed（红），而不是静默通过。
+  if (process.env.FREEPOWER_SMOKE_BREAK_PS === '1') {
+    return [{ pid: 'ps-error: forced by FREEPOWER_SMOKE_BREAK_PS', cmd: '' }];
+  }
   try {
     const out = ps(`Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | ForEach-Object { "$($_.ProcessId)|$($_.CommandLine)" }`);
     return out ? out.split(/\r?\n/).filter(Boolean).map((line) => {
@@ -598,8 +602,14 @@ async function main() {
 
     // 只数「本轮测试自己的」内核：--user-data-dir 落在本测试的 data 目录下。
     // 用户自己开着的 FreePower 应用（%APPDATA%\FreePower\…）与他自己的浏览器不计入。
-    const leftovers = chromePidsUnder(DATA_DIR).filter((x) => /^\d+$/.test(x));
-    const others = chromePidsMatching('freepower').filter((x) => /^\d+$/.test(x) && !leftovers.includes(x));
+    //
+    // fail-closed（2026-11-11 补，FreePower 指出的第二处病灶）：读不到进程列表时必须红。
+    // 旧写法把 'ps-error: …' 用 /^\d+$/ 过滤掉，PowerShell 一失败这条断言就静默通过 ——
+    // 比「恒红」更坏，因为它把真残留也藏了。
+    const procs = chromeProcs();
+    const psErr = procs.find((p) => String(p.pid).startsWith('ps-error'));
+    const leftovers = psErr ? [String(psErr.pid)] : chromePidsUnder(DATA_DIR).filter((x) => /^\d+$/.test(x));
+    const others = psErr ? [] : chromePidsMatching('freepower').filter((x) => /^\d+$/.test(x) && !leftovers.includes(x));
     check('无残留 chrome 进程', leftovers.length === 0,
       (leftovers.join(',') || 'none') + (others.length ? `（另有 ${others.length} 个不属于本测试，未计入）` : ''));
   } catch (e) {
