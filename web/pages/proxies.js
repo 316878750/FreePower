@@ -203,13 +203,13 @@ export default async function renderProxies({ head, page }) {
             h('div', { class: 'muted small' }, 'ok'),
             okList.length
               ? h('ul', null, okList.map((x) => h('li', null,
-                h('span', { class: 'mono' }, nameOf(x.proxy_id)), ' — ', `${x.ip || '?'} · ${x.latency_ms}ms`)))
+                h('span', { class: 'mono' }, x.remark || nameOf(x.proxy_id)), ' — ', `${x.ip || '?'} · ${x.latency_ms}ms`)))
               : h('div', { class: 'muted small' }, '（无）')),
           h('div', { style: { flex: '1' } },
             h('div', { class: 'muted small' }, 'fail'),
             failList.length
               ? h('ul', null, failList.map((x) => h('li', null,
-                h('span', { class: 'mono' }, nameOf(x.proxy_id)), ' — ',
+                h('span', { class: 'mono' }, x.remark || nameOf(x.proxy_id)), ' — ',
                 h('strong', null, x.error_label || '失败'),
                 h('span', { class: 'muted small' }, ` ${String(x.error || '').slice(0, 60)}`))))
               : h('div', { class: 'muted small' }, '（无）')))));

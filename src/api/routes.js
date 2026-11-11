@@ -557,6 +557,9 @@ export function buildRoutes() {
       valid.push({
         index: i,
         proxy_id: p.proxy_id,
+        // 结果里带上可读标识：只给 uuid 的话，API 消费者的日志里全是不可读的 id
+        remark: p.remark || null,
+        name: p.remark || `${p.host}:${p.port}`,
         proxy: { proxy_type: p.type, host: p.host, port: p.port, username: p.user, password: p.password },
       });
     }
@@ -565,14 +568,14 @@ export function buildRoutes() {
     const list = new Array(ids.length);
     valid.forEach((x, k) => {
       const r = batch.list[k] || {};
-      list[x.index] = { ...r, proxy_id: x.proxy_id };
+      list[x.index] = { ...r, proxy_id: x.proxy_id, remark: x.remark, name: x.name };
       if (r.ok) rememberProxyCheck(x.proxy_id, r);
     });
     const stamp = new Date().toISOString();
     for (let i = 0; i < ids.length; i++) {
       if (list[i]) continue;
       list[i] = {
-        index: i, proxy_id: ids[i], ok: false, error_kind: 'not_found',
+        index: i, proxy_id: ids[i], remark: null, name: null, ok: false, error_kind: 'not_found',
         error_label: '代理不存在', error: 'proxy not found', latency_ms: 0, checked_at: stamp,
       };
     }

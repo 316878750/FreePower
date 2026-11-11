@@ -265,7 +265,12 @@ async function main() {
       check('字体项覆盖度 none 且标黄', byId.fonts?.coverage === 'none' && byId.fonts?.status === 'warn', JSON.stringify(byId.fonts));
       check('自检注明 CDP 结构性上限', /结构性/.test(String(report.caveat)), String(report.caveat).slice(0, 60));
       check('自检在安全上下文里跑（UA-CH 可验证）', report.context?.secure === true, JSON.stringify(report.context));
-      check('媒体设备数量与声明一致', byId.media_devices?.status === 'warn' && byId.media_devices?.actual?.counts?.audioinput === report.declared?.media_counts?.audioinput_num, JSON.stringify(byId.media_devices?.actual));
+      // P9-C：媒体设备改成「真实枚举 + 只改 label」，数量不再由配置决定；
+      // 自检要验的是原生行为：未授权时 label 全为空，授权后才给名字。
+      const md = byId.media_devices?.actual || {};
+      check('媒体设备：未授权 label 全空、列表来自真实枚举（P9-C）',
+        byId.media_devices?.status === 'warn' && (md.granted === true ? md.labelsEmpty === false : md.labelsEmpty === true),
+        JSON.stringify(md));
 
       const rerun = await api('GET', `/api/v2/browser-profile/selfcheck?profile_id=${first}&rerun=1`);
       check('rerun=1 重新跑并返回新报告', rerun.json.code === 0 && rerun.json.data?.generated_at !== report.generated_at, `${report.generated_at} -> ${rerun.json.data?.generated_at}`);

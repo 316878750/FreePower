@@ -197,6 +197,10 @@ try {
   check('批量检测：死端口归「连接被拒」', hb.json.data?.list?.[0]?.ok === false && hb.json.data.list[0].error_kind === 'connect_refused', JSON.stringify(hb.json.data?.list?.[0]));
   check('批量检测：不存在的代理单独报 not_found', hb.json.data?.list?.[1]?.error_kind === 'not_found' && hb.json.data.list[1].error_label === '代理不存在', JSON.stringify(hb.json.data?.list?.[1]));
   check('批量检测：汇总带 ok/fail/并发/上限', hb.json.data?.ok === 0 && hb.json.data?.fail === 2 && hb.json.data?.concurrency === 3 && hb.json.data?.timeout_ms === 10000, JSON.stringify({ ok: hb.json.data?.ok, fail: hb.json.data?.fail, c: hb.json.data?.concurrency, t: hb.json.data?.timeout_ms }));
+  check('批量检测：每条带可读标识（remark / name），不再是纯 uuid',
+    hb.json.data?.list?.[0]?.remark === '死端口' && hb.json.data?.list?.[0]?.name === '死端口'
+    && hb.json.data?.list?.[1]?.remark === null && hb.json.data?.list?.[1]?.name === null,
+    JSON.stringify((hb.json.data?.list || []).map((x) => ({ id: x.proxy_id, remark: x.remark, name: x.name }))));
   const hbDel = await api('POST', '/api/v2/proxy-list/delete', { proxy_id: [hbId] });
   check('批量检测：删掉测试代理', hbDel.json.code === 0);
 
