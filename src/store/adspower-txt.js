@@ -92,6 +92,8 @@ function blockToItem(block) {
 
   // 键集合不全不许整批失败：缺了就点名（空值 `key=` 是合法值，不算缺）
   if (!('ua' in block)) warnings.push('缺少字段 ua（已按默认 UA 建库，与你文件里那条不一致）');
+  // `ua=` 空值也是合法值，但空 UA 建不了库，只能补默认 —— 这也得说一声
+  else if (!String(block.ua || '').trim()) warnings.push('ua 是空值（已按默认 UA 建库，与你文件里那条不一致）');
   if (!('platform' in block)) warnings.push('缺少字段 platform（站点域名为空）');
   if (!('cookie' in block)) warnings.push('缺少字段 cookie（该环境不带登录 cookie）');
   return { item, warnings };

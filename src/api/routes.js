@@ -749,7 +749,7 @@ function importHandler(ctx) {
     }
     const parsed = parseAdspowerTxt(content);
     if (parsed.items.length > 1000) throw new ApiError(ERR.INVALID, '单次导入最多 1000 条');
-    const r = importProfiles(parsed.items);
+    const r = importProfiles(parsed.items, { unit: '块' });
     const list = r.list.map((p) => present(p, 'v2'));
     const failed = [...parsed.failed, ...r.failed];
     const warnings = [...parsed.warnings, ...r.warnings];

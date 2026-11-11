@@ -196,9 +196,11 @@ export function normalizeImportItem(raw) {
 
 /**
  * 批量导入。一条失败不影响其余：失败项带 index + 可读原因。
+ * @param {object[]} items
+ * @param {{unit?: string}} [opts] 告警前缀的单位（JSON 用「项」、.txt 用「块」）
  * @returns {{imported:number, failed:object[], warnings:string[], list:object[]}}
  */
-export function importProfiles(items = []) {
+export function importProfiles(items = [], { unit = '项' } = {}) {
   const failed = [];
   const warnings = [];
   const list = [];
@@ -208,7 +210,7 @@ export function importProfiles(items = []) {
       failed.push({ index: i, reason: n.error });
       continue;
     }
-    for (const w of n.warnings) warnings.push(`第 ${i + 1} 项：${w}`);
+    for (const w of n.warnings) warnings.push(`第 ${i + 1} ${unit}：${w}`);
     try {
       const created = createProfile(n.input);
       list.push(created);

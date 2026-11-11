@@ -1177,3 +1177,14 @@ test('txt：写出 → 读回（19 行/块、18 星、换行替换、sameSite �
   assert.equal(back.cookie[1].sameSite, 'unspecified');
   assert.equal(proxyLineOf({ proxy_config: { host: 'h', port: 1 } }), 'h:1');
 });
+
+test('txt：key= 空值是合法值（ua 空值点名，不是静默补默认）', () => {
+  const r = parseAdspowerTxt(`name=n1
+ua=
+group=
+${'*'.repeat(18)}
+`);
+  assert.equal(r.items.length, 1);
+  assert.equal(r.failed.length, 0);
+  assert.ok(r.warnings.some((w) => /ua 是空值/.test(w)), JSON.stringify(r.warnings));
+});
