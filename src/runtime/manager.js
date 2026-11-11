@@ -6,7 +6,7 @@ import {
 } from '../config.js';
 import { findChrome, buildArgs, launchChrome, waitForDevToolsPort, killProcessTree, rememberVersion } from '../kernel/chrome.js';
 import { CdpClient, fetchJson } from '../kernel/cdp.js';
-import { buildInjectionSource } from '../kernel/inject.js';
+import { buildInjectionSource, buildWorkerInjectionSource } from '../kernel/inject.js';
 import { alignProfileToKernel } from '../kernel/version.js';
 import { fingerprintView } from '../fingerprint/view.js';
 import { ensureNoiseSeeds } from '../fingerprint/seeds.js';
@@ -24,6 +24,15 @@ const running = new Map();
 const starting = new Map();
 
 const soft = (field, message) => ({ field, message, severity: 'soft' });
+
+/**
+ * worker 注入的等待上限。
+ * 正常是毫秒级（实测专用 worker 2ms、SW 在 resume 后立即回）；3s 只是「卡死就记账放弃」的兜底，
+ * 超时会把该项写进 failed 清单，**不静默丢**。
+ */
+const WORKER_INJECT_TIMEOUT_MS = 3000;
+/** 被 auto-attach 接住、需要注入 JS 的 target 类型 */
+const WORKER_TARGET_TYPES = new Set(['worker', 'shared_worker', 'service_worker']);
 
 /** 运行中实例 → 对外契约形状（ws.selenium 只放 host:port；debug_port 是字符串） */
 function toStartData(i, { alreadyRunning = false } = {}) {
@@ -43,6 +52,8 @@ function toStartData(i, { alreadyRunning = false } = {}) {
     ua_aligned: i.ua_aligned || null,
     launch_args: i.launch_args || { applied: [], rejected: [] },
     warnings: i.warnings || [],
+    // P7 新增：worker 注入实况（总挂载数 / 真注入数 / 跳过与失败清单），自检与排障都读它
+    workers: i.workerStats || null,
     // P2 新增：启动后自动跑一次自检的摘要（完整报告走 selfcheck 接口）
     selfcheck: i.selfcheck || null,
   };
@@ -314,12 +325,117 @@ async function injectAndOpen(instance, profile, view) {
   /** targetId -> { prep, sessionId } */
   const pageReady = new Map();
 
+  /**
+   * worker 注入实况（自检与排障读它，也是「不许说理论上支持」的证据）。
+   * 口径：total = 被 auto-attach 接住的非 page target 总数；injected = 注入后 realm 真标记成 worker 的。
+   */
+  const workerStats = {
+    total: 0,
+    injected: 0,
+    skipped_extension: 0,
+    iframes: 0,
+    other: 0,
+    failed: [],
+    last: null,
+    /** 按类型分账，自检和排障看这个（injected 总数不够解释「为什么是 4 不是 3」） */
+    by_type: {},
+  };
+  instance.workerStats = workerStats;
+  /**
+   * 同一个 worker 可能被浏览器层与页面层各接住一次（两个**不同的 sessionId**），
+   * 所以按 targetId 去重 —— 按 sessionId 去重会把同一个 worker 数成两个。
+   */
+  const seenWorkerTargets = new Set();
+
+  const resumeNow = (sessionId, waitingForDebugger) => {
+    if (!waitingForDebugger) return;
+    client.send('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => {});
+  };
+
+  /**
+   * 非 page target 的分流。**page 那条路径一行不动**（P2 跑通的装配 + 空白页重载不碰），
+   * 新逻辑只落在这里的 worker / shared_worker / service_worker 分支上。
+   */
+  function handleNonPageTarget({ sessionId, targetInfo, waitingForDebugger }) {
+    const type = String(targetInfo.type || '');
+    const url = String(targetInfo.url || '');
+    const targetId = String(targetInfo.targetId || '');
+    workerStats.total += 1;
+    workerStats.by_type[type] = (workerStats.by_type[type] || 0) + 1;
+
+    // iframe 是 DOM 上下文，不是 worker：塞 worker 脚本只会补半套、还多一层痕迹。
+    // 本轮不覆盖（P2 起就是放行），只计数，写进已知限制。
+    if (type === 'iframe') {
+      workerStats.iframes += 1;
+      resumeNow(sessionId, waitingForDebugger);
+      return;
+    }
+    if (!WORKER_TARGET_TYPES.has(type)) {
+      workerStats.other += 1;
+      resumeNow(sessionId, waitingForDebugger);
+      return;
+    }
+    // 扩展自带的 SW 不归我们管：注入它既没必要，还可能把扩展搞坏
+    if (/^(chrome-extension|devtools|chrome):/i.test(url)) {
+      workerStats.skipped_extension += 1;
+      resumeNow(sessionId, waitingForDebugger);
+      return;
+    }
+    // 同一个 target 只注一次；第二次接住时只放行
+    if (targetId && seenWorkerTargets.has(targetId)) {
+      resumeNow(sessionId, waitingForDebugger);
+      return;
+    }
+    if (targetId) seenWorkerTargets.add(targetId);
+
+    injectWorkerTarget({ sessionId, type, url, waitingForDebugger }).catch((e) => {
+      workerStats.failed.push({ type, url: url.slice(0, 120), reason: e.message });
+      log(profileId, 'WARN worker 注入异常', type, e.message);
+    });
+  }
+
+  /**
+   * worker 注入的三步顺序（实测得来，反过来就有裸窗口）：
+   *   ① 先发 Runtime.evaluate（**不 await**）—— 暂停态里脚本已生效
+   *   ② 再 runIfWaitingForDebugger 放行
+   *   ③ 最后取结果
+   * ServiceWorker 的 evaluate 响应要等 resume 才回来（实测 3s 超时），
+   * 但副作用发生在脚本顶层执行之前，所以「先发后放行」不会漏。
+   */
+  async function injectWorkerTarget({ sessionId, type, url, waitingForDebugger }) {
+    const started = Date.now();
+    // 末行回显 __fpRealm：注入真跑过才等于 'worker'，这是「真值」而不是「发过就算」
+    const expression = buildWorkerInjectionSource(view, { debug: FP_DEBUG }) + '\n;(self.__fpRealm || null)';
+    const pending = client
+      .send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: false }, sessionId)
+      .then((r) => ({ ok: true, r }), (e) => ({ ok: false, error: e.message }));
+
+    resumeNow(sessionId, waitingForDebugger);
+
+    const res = await withTimeout(pending, WORKER_INJECT_TIMEOUT_MS, 'worker 注入超时（未收到 evaluate 结果）');
+    const ms = Date.now() - started;
+    const realm = res.ok ? res.r?.result?.value : null;
+    const exc = res.ok && res.r?.exceptionDetails
+      ? String(res.r.exceptionDetails.text || res.r.exceptionDetails.exception?.description || 'exception')
+      : null;
+
+    if (realm === 'worker') {
+      workerStats.injected += 1;
+      workerStats.last = { type, url: url.slice(0, 120), ms };
+      log(profileId, 'worker 注入', type, `${ms}ms`, url.slice(0, 80));
+    } else {
+      const reason = exc || (res.ok ? `realm 未标记（值=${JSON.stringify(realm)}）` : res.error);
+      workerStats.failed.push({ type, url: url.slice(0, 120), reason });
+      log(profileId, 'WARN worker 注入失败', type, url.slice(0, 80), reason);
+    }
+  }
+
   // 所有新页面（我们建的、用户 Ctrl+T 建的、页面自己 window.open 的）都在「暂停态」接住，
   // 装配完再放行 —— 否则运行中手动开新标签，指纹就裸奔了。
   client.on('Target.attachedToTarget', (params) => {
     const { sessionId, targetInfo, waitingForDebugger } = params;
     if (targetInfo.type !== 'page') {
-      if (waitingForDebugger) client.send('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => {});
+      handleNonPageTarget({ sessionId, targetInfo, waitingForDebugger });
       return;
     }
     // 新建标签（我们建的 / 用户 Ctrl+T / window.open）的**首个文档**在 attach 之前就存在，
@@ -458,6 +574,15 @@ async function waitFor(fn, timeoutMs = 5000, step = 60) {
   return null;
 }
 
+/** 给 Promise 套一层超时：超时返回失败对象而不是抛出，调用方统一记账 */
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve({ ok: false, error: label }), ms);
+    timer.unref?.();
+    promise.then((v) => { clearTimeout(timer); resolve(v); }, (e) => { clearTimeout(timer); resolve({ ok: false, error: e.message }); });
+  });
+}
+
 async function sessionForTarget(client, targetId) {
   try {
     const { sessionId } = await client.send('Target.attachToTarget', { targetId, flatten: true });
@@ -471,6 +596,10 @@ async function sessionForTarget(client, targetId) {
 async function applyToSession(client, sessionId, profile, view) {
   const s = sessionId;
   await client.send('Page.enable', {}, s);
+  // 页面会话层再挂一次 auto-attach：**专用 worker 只在页面层被接住**（浏览器层接不住，实测）。
+  // waitForDebuggerOnStart 让 worker 停在首行之前，注入完再放行 —— 宁可多几毫秒，不留裸窗口。
+  await client.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, s)
+    .catch((e) => log(instance_profile(profile), 'worker auto-attach 失败', e.message));
   await client.send('Page.addScriptToEvaluateOnNewDocument', { source: buildInjectionSource(view, { debug: FP_DEBUG }) }, s);
 
   if (view.ua) {

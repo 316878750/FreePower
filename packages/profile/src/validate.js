@@ -42,6 +42,22 @@ export const DOMAINS = {
 const err = (field, message) => ({ field, message });
 
 /**
+ * 这些 array<string> 字段额外接受「逗号分隔字符串」。
+ *
+ * 为什么：对手把 `DisabledFonts` 落盘成 csv 字符串（StaticConfig 是内核读的文件），
+ * 迁移过来的脚本会照着那个语义传 `"Arial,SimSun"`。我们自己的存储是 SQLite 的 JSON 数组
+ * （不落 StaticConfig，CDP 路线），所以**存储形状不变**，只在入参处把 csv 归一成数组 ——
+ * 老脚本不用改一行，我们也不用为了兼容去学对手的文件格式。
+ */
+export const CSV_ARRAY_FIELDS = new Set(['fonts', 'disabled_fonts', 'blacklist', 'whitelist']);
+
+/** csv → 数组：去空项、去首尾空格；空串是空数组 */
+export function csvToArray(value) {
+  if (typeof value !== 'string') return value;
+  return value.split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+/**
  * 一致性问题分两级：
  *   hard = 结构上自相矛盾（UA 说 Windows、platform 报 MacIntel），几乎必然被指纹库抓 → 默认阻断
  *   soft = 不像真机 / 业务上风险高，但不是硬矛盾（语言↔时区、核数↔内存、没绑代理…）→ 只告警
@@ -159,6 +175,8 @@ export function validateField(name, value) {
     case 'array<string>':
     case 'array<object>':
     case 'array<enum>': {
+      // csv 入参先归一，再按数组校验（迁移脚本按对手落盘语义传字符串）
+      if (CSV_ARRAY_FIELDS.has(name) && typeof value === 'string') value = csvToArray(value);
       if (!Array.isArray(value)) return [err(name, 'must be an array')];
       if (name === 'fonts' && value.length === 1 && value[0] === 'all') return [];
       if (f.type === 'array<string>' && value.some((v) => typeof v !== 'string')) return [err(name, 'array items must be strings')];
@@ -188,6 +206,8 @@ export function normalizeValue(name, value) {
   }
   if (name === 'timezone' && typeof value === 'string') return value.replace(/ /g, '_');
   if (name === 'allow_scan_ports' && Array.isArray(value)) return value.join(',');
+  // csv 入参统一落成 JSON 数组（存储形状不跟着对手的落盘格式走）
+  if (CSV_ARRAY_FIELDS.has(name) && typeof value === 'string') return csvToArray(value);
   if (['webgl', 'canvas', 'audio', 'webgl_image', 'client_rects', 'media_devices'].includes(name) && typeof value === 'number') return String(value);
   return value;
 }

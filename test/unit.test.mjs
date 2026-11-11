@@ -9,7 +9,7 @@ import { checkProxy, httpGetViaProxy, normalizeProxyConfig, hasProxy, parseExitI
 import { mergeLaunchArgs, parseLaunchArgs } from '../src/kernel/launch-args.js';
 import { alignProfileToKernel } from '../src/kernel/version.js';
 import { checkProfile } from '../src/store/profiles.js';
-import { checkEgress, validateField, isValidTimezone } from '../packages/profile/src/validate.js';
+import { checkEgress, validateField, isValidTimezone, normalizeValue, csvToArray } from '../packages/profile/src/validate.js';
 import { deriveNoiseSeeds, ensureNoiseSeeds, seedOf } from '../src/fingerprint/seeds.js';
 import { generateFingerprint } from '../src/fingerprint/generate.js';
 import { fingerprintView } from '../src/fingerprint/view.js';
@@ -21,6 +21,8 @@ import { ok, unsupported } from '../src/api/contract.js';
 import { clampConcurrency } from '../src/runtime/batch.js';
 import { cookieToStorage, cookieText } from '../src/store/profiles.js';
 import { startFakeProxy } from './fake-proxy.mjs';
+import vm from 'node:vm';
+import { buildInjectionSource, buildWorkerInjectionSource, sharedNoiseCoreSource } from '../src/kernel/inject.js';
 
 /** 找一个当前没人监听的端口（起一个 server 再关掉） */
 async function deadPort() {
@@ -502,4 +504,268 @@ test('时区校验：UTC / Etc 这类合法 ID 不能被 Intl 枚举表误杀', 
   assert.equal(validateField('timezone', 'Mars/Olympus')[0].message, 'not an IANA timezone: Mars/Olympus');
   assert.equal(isValidTimezone(''), false);
   assert.equal(isValidTimezone(null), false);
+});
+
+/* ---------------- P7 前置：DisabledFonts 落盘是 csv，入参要能收 ---------------- */
+
+test('字体字段：对手落盘是 csv 字符串，入参收 csv 但存储仍是 JSON 数组', () => {
+  // 对手 StaticConfig.DisabledFonts 是 "Arial,SimSun" 这种串；迁移脚本会照这个语义传
+  assert.deepEqual(csvToArray('Arial,SimSun'), ['Arial', 'SimSun']);
+  assert.deepEqual(csvToArray(' Arial , , SimSun '), ['Arial', 'SimSun']);
+  assert.deepEqual(csvToArray(''), []);
+  assert.deepEqual(csvToArray(['Arial']), ['Arial'], '已经是数组就原样返回');
+
+  // 校验放行
+  assert.deepEqual(validateField('disabled_fonts', 'Arial,SimSun'), []);
+  assert.deepEqual(validateField('fonts', 'all'), []);
+  assert.deepEqual(validateField('blacklist', 'a.com,b.com'), []);
+  // 归一成数组（存储形状不跟着对手的文件格式走）
+  assert.deepEqual(normalizeValue('disabled_fonts', 'Arial,SimSun'), ['Arial', 'SimSun']);
+  assert.deepEqual(normalizeValue('fonts', 'all'), ['all']);
+
+  // 非 csv 字段不许被误当成 csv 收下
+  assert.equal(validateField('tabAssistantFeatures', 'tabAssistant').length, 1);
+});
+
+test('字体视图：库里是 csv 串（手工改库/老数据）也要读成数组', () => {
+  const v1 = fingerprintView({ fonts: 'Arial,SimSun', fp_seed: 's1' });
+  assert.deepEqual(v1.fonts, ['Arial', 'SimSun']);
+  const v2 = fingerprintView({ fonts: ['all'], fp_seed: 's1' });
+  assert.deepEqual(v2.fonts, ['all']);
+  const v3 = fingerprintView({ fonts: null, fp_seed: 's1' });
+  assert.deepEqual(v3.fonts, ['all']);
+});
+
+/* ------------------- P7：注入分层（core/page/worker）与双 Realm 同源 ------------------- */
+
+const P7_W = 300;
+const P7_H = 150;
+
+/** 一张确定性的「原始画布」：每次调用都返回新副本，便于重复测量 */
+function basePixels() {
+  const data = new Uint8ClampedArray(P7_W * P7_H * 4);
+  for (let i = 0; i < data.length; i++) data[i] = (i * 37 + (i >> 3) * 11) & 0xff;
+  return data;
+}
+
+function hashBytes(bytes) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < bytes.length; i++) { h ^= bytes[i]; h = Math.imul(h, 16777619) >>> 0; }
+  return h.toString(16);
+}
+
+/**
+ * 造一个最小的 realm（page 或 worker），把注入源真跑一遍。
+ * 目的不是模拟浏览器，而是让**同一份注入代码**在两种全局环境下执行，
+ * 再比对它们产出的噪声结果 —— 这才是「同源同值」的实证，而不是读源码猜。
+ */
+function makeRealm(kind, view, navOverrides = {}) {
+  const sandbox = {};
+
+  // 2D 画布（page 用 HTMLCanvasElement，两边都有 OffscreenCanvas）
+  class OCR2D {
+    getImageData() { return { width: P7_W, height: P7_H, data: basePixels() }; }
+    putImageData() {}
+    drawImage() {}
+  }
+  class OffscreenCanvas {
+    constructor(w = P7_W, h = P7_H) { this.width = w; this.height = h; }
+    getContext() { return new OCR2D(); }
+    convertToBlob() { return Promise.resolve({ size: 1 }); }
+  }
+  sandbox.OffscreenCanvas = OffscreenCanvas;
+  sandbox.OffscreenCanvasRenderingContext2D = OCR2D;
+
+  class CanvasRenderingContext2D {
+    getImageData() { return { width: P7_W, height: P7_H, data: basePixels() }; }
+    putImageData() {}
+    drawImage() {}
+  }
+  class HTMLCanvasElement {
+    constructor() { this.width = P7_W; this.height = P7_H; }
+    getContext() { return new CanvasRenderingContext2D(); }
+    toDataURL() { return 'data:image/png;base64,ORIGINAL'; }
+    toBlob(cb) { if (cb) cb(null); }
+  }
+  sandbox.HTMLCanvasElement = HTMLCanvasElement;
+  sandbox.CanvasRenderingContext2D = CanvasRenderingContext2D;
+  sandbox.document = { createElement: () => new HTMLCanvasElement() };
+
+  class DOMRect {
+    constructor(x, y, w, h) { this.x = x; this.y = y; this.width = w; this.height = h; }
+  }
+  class Element {
+    getBoundingClientRect() { return { x: 10, y: 20, width: 100, height: 30 }; }
+    getAttribute() { return null; }
+  }
+  sandbox.DOMRect = DOMRect;
+  sandbox.Element = Element;
+
+  class AudioBuffer {
+    constructor(len = 2048) { this._d = new Float32Array(len); for (let i = 0; i < len; i++) this._d[i] = Math.sin(i / 7) * 0.5; }
+    getChannelData() { return this._d.slice(); }
+    copyFromChannel(dest) { dest.set(this._d.subarray(0, dest.length)); }
+  }
+  sandbox.AudioBuffer = AudioBuffer;
+
+  class MediaDevices { enumerateDevices() { return Promise.resolve([]); } }
+  sandbox.MediaDevices = MediaDevices;
+
+  // Navigator：值全挂在原型上，注入层改的也是原型 —— 与真实浏览器一致
+  const NavClass = kind === 'page' ? class Navigator {} : class WorkerNavigator {};
+  const navValues = {
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36',
+    appVersion: '5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36',
+    platform: 'Linux x86_64', // 故意给个错的，验证 page/worker 都会纠正
+    hardwareConcurrency: 4,
+    deviceMemory: 4,
+    language: 'en-US',
+    languages: ['en-US', 'en'],
+    webdriver: false,
+    vendor: 'Google Inc.',
+    mediaDevices: new MediaDevices(),
+    ...navOverrides,
+  };
+  for (const [k, v] of Object.entries(navValues)) {
+    Object.defineProperty(NavClass.prototype, k, { get() { return v; }, configurable: true, enumerable: true });
+  }
+  sandbox.Navigator = NavClass;
+  sandbox.WorkerNavigator = NavClass;
+  sandbox.navigator = new NavClass();
+
+  sandbox.window = sandbox;
+  sandbox.self = sandbox;
+
+  const context = vm.createContext(sandbox);
+  const source = kind === 'page' ? buildInjectionSource(view) : buildWorkerInjectionSource(view);
+  vm.runInContext(source, context, { filename: `${kind}.inject.js` });
+  return { sandbox, context };
+}
+
+/** 在某个 realm 里量 OffscreenCanvas 的 2D 像素哈希 */
+function offscreenHash(realm) {
+  const oc = new realm.sandbox.OffscreenCanvas(P7_W, P7_H);
+  const ctx = oc.getContext('2d');
+  const img = ctx.getImageData(0, 0, P7_W, P7_H);
+  return hashBytes(img.data);
+}
+
+const p7View = () => fingerprintView(generateFingerprint({ seed: 'p7-dual-realm', kernel: '156.0.8078.80' }));
+
+test('P7 分层：噪声实现只有一份，page 与 worker 内联的是同一段字节', () => {
+  const view = p7View();
+  const core = sharedNoiseCoreSource();
+  const page = buildInjectionSource(view);
+  const worker = buildWorkerInjectionSource(view);
+
+  assert.ok(core.includes('function noiseImageData'), '核心必须含 2D 噪声');
+  assert.ok(core.includes('function noiseChannel'), '核心必须含 audio 噪声');
+  assert.ok(core.includes('function noisePixels'), '核心必须含 webgl 像素噪声');
+  assert.ok(page.includes(core), 'page 层必须内联同一份核心');
+  assert.ok(worker.includes(core), 'worker 层必须内联同一份核心');
+
+  // 不许出现第二份定义：copy 一份就会漂移，这是「防根因」那条
+  for (const name of ['function noiseImageData', 'function noisePixels', 'function noiseChannel', 'function makeRng']) {
+    assert.equal(page.split(name).length - 1, 1, `page 层 ${name} 只能定义一次`);
+    assert.equal(worker.split(name).length - 1, 1, `worker 层 ${name} 只能定义一次`);
+  }
+
+  // 分层边界：page 层不碰 WorkerNavigator，worker 层不碰 document
+  assert.ok(!page.includes('WorkerNavigator'), 'page 层不该有 worker 补丁');
+  assert.ok(!worker.includes('document.createElement'), 'worker 层不该有 DOM 依赖');
+});
+
+test('P7 双 Realm：同一配置下主帧与 worker 的 OffscreenCanvas 噪声同源同值', () => {
+  const view = p7View();
+  const page = makeRealm('page', view);
+  const worker = makeRealm('worker', view);
+
+  const pageHash = offscreenHash(page);
+  const workerHash = offscreenHash(worker);
+  assert.equal(pageHash, workerHash, `主帧 ${pageHash} 与 worker ${workerHash} 必须同值`);
+
+  // 确实加过噪：不等于原图像素
+  assert.notEqual(pageHash, hashBytes(basePixels()), '噪声必须真的改动了像素');
+  // 同一个 realm 重复测量稳定（同种子跨次一致）
+  assert.equal(offscreenHash(page), pageHash);
+  assert.equal(offscreenHash(worker), workerHash);
+
+  // 诊断字段：realm 标识正确，四个种子快照一致
+  assert.equal(page.sandbox.__fpRealm, 'page');
+  assert.equal(worker.sandbox.__fpRealm, 'worker');
+  assert.equal(
+    JSON.stringify(page.sandbox.__fpSeeds),
+    JSON.stringify(worker.sandbox.__fpSeeds),
+    '四个噪点种子在两侧必须完全一致',
+  );
+  assert.deepEqual(JSON.parse(JSON.stringify(worker.sandbox.__fpSeeds)), {
+    canvas: view.canvas.seed,
+    webgl_image: view.webgl_image.seed,
+    audio: view.audio.seed,
+    client_rects: view.client_rects.seed,
+  });
+});
+
+test('P7 双 Realm：换种子必须换结果（噪声不是常量）', () => {
+  const a = makeRealm('page', p7View());
+  const b = makeRealm('page', fingerprintView(generateFingerprint({ seed: 'p7-other-seed', kernel: '156.0.8078.80' })));
+  assert.notEqual(offscreenHash(a), offscreenHash(b), '不同种子的画布哈希必须不同');
+});
+
+test('P7 双 Realm：core 的 audio 噪声在主帧与 worker 里逐字节相同', () => {
+  const view = p7View();
+  const core = sharedNoiseCoreSource()
+    + '\n;globalThis.__core = { noiseChannel, noisePixels };';
+  const page = makeRealm('page', view);
+  const worker = makeRealm('worker', view);
+  vm.runInContext(core, page.context);
+  vm.runInContext(core, worker.context);
+
+  const sample = () => { const a = new Float32Array(2048); for (let i = 0; i < a.length; i++) a[i] = Math.sin(i / 7) * 0.5; return a; };
+  const pa = page.sandbox.__core.noiseChannel(sample(), view.audio.seed, 0);
+  const wa = worker.sandbox.__core.noiseChannel(sample(), view.audio.seed, 0);
+  assert.equal(
+    hashBytes(new Uint8Array(pa.buffer)),
+    hashBytes(new Uint8Array(wa.buffer)),
+    '同一份 core 在两个 realm 里必须给出同一串采样值',
+  );
+
+  // noisePixels 是原地改、无返回值，别把返回值当结果用
+  const px = new Uint8Array(4096);
+  for (let i = 0; i < px.length; i++) px[i] = i & 0xff;
+  const ppx = px.slice();
+  const wpx = px.slice();
+  page.sandbox.__core.noisePixels(ppx, view.webgl_image.seed);
+  worker.sandbox.__core.noisePixels(wpx, view.webgl_image.seed);
+  assert.equal(hashBytes(ppx), hashBytes(wpx), 'webgl 像素噪声两侧同值');
+  assert.notEqual(hashBytes(ppx), hashBytes(px), '像素噪声必须真的改了数据');
+});
+
+test('P7 worker 层：UA 已被 CDP 给对就不重复覆盖，没给对才用 JS 补', () => {
+  const view = p7View();
+  // 专用 worker：CDP 已传播 UA → 不该再叠一层 JS 覆盖（少一层痕迹）
+  const good = makeRealm('worker', view, { userAgent: view.ua });
+  assert.ok(!JSON.stringify(good.sandbox.__fpApplied).includes('userAgent'), 'CDP 已给对时不该再 patch');
+
+  // SharedWorker / ServiceWorker：实测 CDP 不传播 UA → JS 必须补上
+  const bad = makeRealm('worker', view);
+  assert.equal(bad.sandbox.navigator.userAgent, view.ua);
+  assert.equal(bad.sandbox.navigator.appVersion, view.ua.replace(/^Mozilla\//, ''));
+  assert.equal(bad.sandbox.navigator.platform, view.platform);
+  assert.equal(bad.sandbox.navigator.hardwareConcurrency, view.hardware_concurrency);
+  assert.ok(JSON.stringify(bad.sandbox.__fpApplied).includes('userAgent'));
+});
+
+test('P7 page 层：注入后硬件/语言与声明一致，且只装一次（重复注入不叠 patch）', () => {
+  const view = p7View();
+  const realm = makeRealm('page', view);
+  assert.equal(realm.sandbox.navigator.platform, view.platform);
+  assert.equal(realm.sandbox.navigator.hardwareConcurrency, view.hardware_concurrency);
+  assert.equal(realm.sandbox.navigator.deviceMemory, view.device_memory);
+  assert.equal(realm.sandbox.navigator.language, view.language[0]);
+  assert.equal(realm.sandbox.__fpInstalled, true);
+
+  const before = offscreenHash(realm);
+  vm.runInContext(buildInjectionSource(view), realm.context); // 再来一遍
+  assert.equal(offscreenHash(realm), before, '重复注入不能改变噪声结果');
 });

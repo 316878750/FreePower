@@ -83,6 +83,19 @@ function mediaView(profile) {
 }
 
 /**
+ * fonts / disabled_fonts 的落库形状是 JSON 数组，但对手落盘是 csv 字符串，
+ * 手工改库或从老数据导入时可能是 `"Arial,SimSun"`。这里两种都收，统一成数组。
+ */
+function stringList(v, dflt) {
+  if (Array.isArray(v)) return v.filter((x) => typeof x === 'string');
+  if (typeof v === 'string') {
+    const arr = v.split(',').map((s) => s.trim()).filter(Boolean);
+    return arr.length ? arr : dflt;
+  }
+  return dflt;
+}
+
+/**
  * @param {object} profile 平铺记录
  * @returns {object} 注入层视图
  */
@@ -110,7 +123,7 @@ export function fingerprintView(profile) {
     device_scale_factor: typeof p.device_scale === 'number' ? p.device_scale : 1,
     webrtc: p.webrtc || 'disabled',
     media: mediaView(p),
-    fonts: Array.isArray(p.fonts) ? p.fonts : ['all'],
+    fonts: stringList(p.fonts, ['all']),
     kernel_version: p.kernel_version || null,
   };
 }
