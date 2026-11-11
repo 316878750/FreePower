@@ -18,7 +18,7 @@ import {
 } from '../store/profiles.js';
 import { listTags, createTags, updateTags, deleteTags, tagIdsOf } from '../store/tags.js';
 import {
-  createProxies, updateProxy, listProxies, deleteProxies, rememberProxyCheck,
+  createProxies, updateProxy, listProxies, deleteProxies, rememberProxyCheck, getProxy,
 } from '../store/proxies.js';
 import { startProfile, stopProfile, listRunning, getRunning, getInstance, userDataDirFor } from '../runtime/manager.js';
 import { batchStart, batchStop } from '../runtime/batch.js';
@@ -26,6 +26,7 @@ import { PROFILES_DIR } from '../config.js';
 import { profileFormSchema } from './schema.js';
 import { validateProfile } from '../../packages/profile/src/validate.js';
 import { checkProxy, hasProxy } from '../proxy/probe.js';
+import { checkMany, HEALTH_CONCURRENCY, HEALTH_TIMEOUT_MS } from '../proxy/health.js';
 import { pacInUse, pacMessage } from '../proxy/pac.js';
 import { runSelfCheck } from '../selfcheck/index.js';
 import { readReportFile, summarize } from '../selfcheck/store.js';
@@ -539,6 +540,52 @@ export function buildRoutes() {
     const proxyId = ctx.body.proxy_id || (ctx.body.proxy_config || {}).proxy_id;
     if (proxyId && r && r.ok) rememberProxyCheck(proxyId, r);
     return ok(r);
+  });
+
+  /* ---- 代理批量健康检查（限并发 3、单条 10s；成功才落「最近预检」缓存） ---- */
+  add(['POST'], ['/api/v1/proxy/check-batch', '/api/v2/proxy/check-batch'], async (ctx) => {
+    const v = versionOf(ctx.path);
+    const ids = idList(ctx.body.proxy_ids ?? ctx.body.proxy_id, v);
+    if (!ids.length) throw new ApiError(ERR.INVALID, v === 'v2' ? 'proxy_id is required' : 'proxy_ids is required');
+    if (ids.length > 100) throw new ApiError(ERR.INVALID, 'proxy_ids length must be less than 100');
+
+    // 只检查库里存在的代理；不存在的单独报「代理不存在」，别让一条脏 id 把整批打挂
+    const valid = [];
+    for (let i = 0; i < ids.length; i++) {
+      const p = getProxy(ids[i]);
+      if (!p) continue;
+      valid.push({
+        index: i,
+        proxy_id: p.proxy_id,
+        proxy: { proxy_type: p.type, host: p.host, port: p.port, username: p.user, password: p.password },
+      });
+    }
+    const batch = await checkMany(valid.map((x) => ({ proxy_id: x.proxy_id, proxy: x.proxy })));
+
+    const list = new Array(ids.length);
+    valid.forEach((x, k) => {
+      const r = batch.list[k] || {};
+      list[x.index] = { ...r, proxy_id: x.proxy_id };
+      if (r.ok) rememberProxyCheck(x.proxy_id, r);
+    });
+    const stamp = new Date().toISOString();
+    for (let i = 0; i < ids.length; i++) {
+      if (list[i]) continue;
+      list[i] = {
+        index: i, proxy_id: ids[i], ok: false, error_kind: 'not_found',
+        error_label: '代理不存在', error: 'proxy not found', latency_ms: 0, checked_at: stamp,
+      };
+    }
+    const okCount = list.filter((r) => r.ok).length;
+    return ok({
+      list,
+      total: list.length,
+      ok: okCount,
+      fail: list.length - okCount,
+      concurrency: batch.concurrency_limit || HEALTH_CONCURRENCY,
+      timeout_ms: batch.timeout_ms || HEALTH_TIMEOUT_MS,
+      elapsed_ms: batch.elapsed_ms,
+    });
   });
 
   /* ============================ 5. 占位：明确不支持 ============================ */

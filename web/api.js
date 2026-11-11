@@ -96,6 +96,8 @@ export const api = {
   proxyUpdate: (one) => call('/api/v2/proxy-list/update', { method: 'POST', body: one }),
   proxyDelete: (ids) => call('/api/v2/proxy-list/delete', { method: 'POST', body: { proxy_id: ids } }),
   proxyCheck: (cfg) => call('/api/v2/proxy/check', { method: 'POST', body: { proxy_config: cfg }, timeoutMs: 30000 }),
+  /** 批量健康检查：服务端限并发 3、单条 10s（超时记 fail，不拖住整批） */
+  proxyCheckBatch: (ids) => call('/api/v2/proxy/check-batch', { method: 'POST', body: { proxy_ids: ids }, timeoutMs: 120000 }),
 
   /* ---- 自检 ---- */
   selfcheck: (id, { rerun = false } = {}) => call('/api/v2/browser-profile/selfcheck', { query: { profile_id: id, rerun: rerun ? 1 : '' } }),

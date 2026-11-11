@@ -183,6 +183,23 @@ try {
   const pxDel = await api('POST', '/api/v2/proxy-list/delete', { proxy_id: [pxId] });
   check('代理列表：删除', pxDel.json.code === 0 && pxDel.json.data?.deleted?.includes(pxId));
 
+  /* -------------------- 代理批量健康检查（P8-B） -------------------- */
+  const hbNoId = await api('POST', '/api/v2/proxy/check-batch', {});
+  codes.add(hbNoId.json.code);
+  check('批量检测：缺 proxy_id 报 100002', hbNoId.json.code === 100002, hbNoId.json.msg);
+  // 指向一个没人监听的端口：这条必然失败，用来验「失败原因分类」与「不存在的 id 单独报」
+  const hbCreated = await api('POST', '/api/v2/proxy-list/create', [
+    { type: 'http', host: '127.0.0.1', port: 1, remark: '死端口' },
+  ]);
+  const hbId = hbCreated.json.data?.[0]?.proxy_id;
+  const hb = await api('POST', '/api/v2/proxy/check-batch', { proxy_ids: [hbId, 'ghost-proxy'] });
+  check('批量检测：code 0 且逐条返回', hb.json.code === 0 && hb.json.data?.list?.length === 2, JSON.stringify(hb.json.data && { total: hb.json.data.total }));
+  check('批量检测：死端口归「连接被拒」', hb.json.data?.list?.[0]?.ok === false && hb.json.data.list[0].error_kind === 'connect_refused', JSON.stringify(hb.json.data?.list?.[0]));
+  check('批量检测：不存在的代理单独报 not_found', hb.json.data?.list?.[1]?.error_kind === 'not_found' && hb.json.data.list[1].error_label === '代理不存在', JSON.stringify(hb.json.data?.list?.[1]));
+  check('批量检测：汇总带 ok/fail/并发/上限', hb.json.data?.ok === 0 && hb.json.data?.fail === 2 && hb.json.data?.concurrency === 3 && hb.json.data?.timeout_ms === 10000, JSON.stringify({ ok: hb.json.data?.ok, fail: hb.json.data?.fail, c: hb.json.data?.concurrency, t: hb.json.data?.timeout_ms }));
+  const hbDel = await api('POST', '/api/v2/proxy-list/delete', { proxy_id: [hbId] });
+  check('批量检测：删掉测试代理', hbDel.json.code === 0);
+
   /* -------------------- 批量启停：失败清单 / 中断 -------------------- */
   const bs = await api('POST', '/api/v1/browser/batch-start', { user_ids: ['ghost-1', 'ghost-2', 'ghost-3'], concurrency: 2 });
   check('批量启动：返回失败清单', bs.json.code === 0 && bs.json.data?.failed?.length >= 1, JSON.stringify(bs.json.data?.failed));

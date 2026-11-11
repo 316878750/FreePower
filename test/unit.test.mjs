@@ -6,6 +6,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import { checkProxy, httpGetViaProxy, normalizeProxyConfig, hasProxy, parseExitInfo } from '../src/proxy/probe.js';
+import { checkOne, checkMany, classifyProxyFailure } from '../src/proxy/health.js';
 import { mergeLaunchArgs, parseLaunchArgs } from '../src/kernel/launch-args.js';
 import { alignProfileToKernel } from '../src/kernel/version.js';
 import { checkProfile } from '../src/store/profiles.js';
@@ -870,4 +871,81 @@ test('P7 page 层：注入后硬件/语言与声明一致，且只装一次（�
   const before = offscreenHash(realm);
   vm.runInContext(buildInjectionSource(view), realm.context); // 再来一遍
   assert.equal(offscreenHash(realm), before, '重复注入不能改变噪声结果');
+});
+/* ============================================================================
+ * P8-B 代理健康检查：并发上限 / 单条超时 / 失败归类
+ * ==========================================================================*/
+
+test('代理健康检查：真连假代理拿到出口 IP；死端口报「连接被拒」', async () => {
+  const fake = await startFakeProxy({ ip: '203.0.113.9', countryCode: 'JP' });
+  try {
+    const r = await checkOne({ proxy_type: 'http', host: '127.0.0.1', port: fake.port });
+    assert.equal(r.ok, true);
+    assert.equal(r.ip, '203.0.113.9');
+    assert.equal(typeof r.latency_ms, 'number');
+    assert.ok(r.checked_at);
+  } finally { await fake.close(); }
+  const port = await deadPort();
+  const bad = await checkOne({ proxy_type: 'http', host: '127.0.0.1', port }, { timeoutMs: 3000 });
+  assert.equal(bad.ok, false);
+  assert.equal(bad.error_kind, 'connect_refused');
+  assert.match(bad.error_label, /连接被拒/);
+});
+
+test('代理健康检查：407 归类为认证失败', async () => {
+  const fake = await startFakeProxy({ requireAuth: ['u1', 'p1'] });
+  try {
+    const r = await checkOne({ proxy_type: 'http', host: '127.0.0.1', port: fake.port, username: 'u1', password: 'wrong' }, { timeoutMs: 3000 });
+    assert.equal(r.ok, false);
+    assert.equal(r.error_kind, 'auth');
+    assert.match(r.error_label, /认证失败/);
+  } finally { await fake.close(); }
+});
+
+test('代理健康检查：并发峰值不超过 3，且每条都跑到', async () => {
+  let active = 0, peak = 0, done = 0;
+  const probe = async () => {
+    active += 1; peak = Math.max(peak, active);
+    await new Promise((r) => setTimeout(r, 30));
+    active -= 1; done += 1;
+    return { ok: true, ip: '203.0.113.9', latency_ms: 1 };
+  };
+  const items = Array.from({ length: 9 }, (_, i) => ({ proxy_id: `p${i}`, proxy: { proxy_type: 'http', host: '127.0.0.1', port: 1 } }));
+  const r = await checkMany(items, { probe, concurrency: 3 });
+  assert.equal(peak, 3, `峰值并发应为 3，实测 ${peak}`);
+  assert.equal(done, 9);
+  assert.equal(r.ok, 9);
+  assert.equal(r.fail, 0);
+  assert.equal(r.concurrency, 3);
+});
+
+test('代理健康检查：并发传 0 / 超大都被夹在 1..条数', async () => {
+  const probe = async () => ({ ok: true, ip: 'x', latency_ms: 1 });
+  const one = [{ proxy: { proxy_type: 'http', host: '127.0.0.1', port: 1 } }];
+  assert.equal((await checkMany(one, { probe, concurrency: 0 })).concurrency, 1);
+  assert.equal((await checkMany(one, { probe, concurrency: 99 })).concurrency, 1);
+  const three = [1, 2, 3].map(() => ({ proxy: { proxy_type: 'http', host: '127.0.0.1', port: 1 } }));
+  assert.equal((await checkMany(three, { probe, concurrency: 99 })).concurrency, 3);
+});
+
+test('代理健康检查：单条卡死不拖住整批（超时记 fail，其余照跑）', async () => {
+  const probe = (cfg) => (cfg.port === 9 ? new Promise(() => {}) : Promise.resolve({ ok: true, ip: '203.0.113.9', latency_ms: 1 }));
+  const items = [
+    { proxy_id: 'slow', proxy: { proxy_type: 'http', host: '127.0.0.1', port: 9 } },
+    { proxy_id: 'fast', proxy: { proxy_type: 'http', host: '127.0.0.1', port: 1 } },
+  ];
+  const r = await checkMany(items, { probe, concurrency: 3, timeoutMs: 150 });
+  assert.equal(r.fail, 1);
+  assert.equal(r.ok, 1);
+  const slow = r.list.find((x) => x.proxy_id === 'slow');
+  assert.equal(slow.error_kind, 'timeout');
+  assert.match(slow.error_label, /超时/);
+  assert.ok(r.elapsed_ms < 3000, `整批应在超时上限附近结束，实测 ${r.elapsed_ms}ms`);
+});
+
+test('代理健康检查：错误归类（CONNECT 被拒 / DNS / 配置）', () => {
+  assert.equal(classifyProxyFailure('代理拒绝 CONNECT：HTTP/1.1 403 Forbidden'), 'connect_rejected');
+  assert.equal(classifyProxyFailure('连接 example.invalid:443 失败：ENOTFOUND'), 'dns');
+  assert.equal(classifyProxyFailure('代理配置不完整（host/port 为空）'), 'config');
+  assert.equal(classifyProxyFailure(''), 'other');
 });
