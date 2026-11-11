@@ -34,7 +34,9 @@
     "test:speech": "node --no-warnings test/speech.test.mjs",
     "test:media-speech": "node --no-warnings test/media-devices.test.mjs && node --no-warnings test/speech.test.mjs",
     "test:cmdline": "node --no-warnings test/cmdline-leak.test.mjs",
-    "test:fileio": "node --no-warnings test/fileio.test.mjs"
+    "test:fileio": "node --no-warnings test/fileio.test.mjs",
+    "test:native-tostring": "node --no-warnings test/native-tostring.test.mjs",
+    "test:p9c-judge": "node --no-warnings tools/p9c-judge.mjs"
   },
   "devDependencies": {
     "electron": "^45.2.3",
