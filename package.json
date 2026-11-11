@@ -36,6 +36,7 @@
     "test:cmdline": "node --no-warnings test/cmdline-leak.test.mjs",
     "test:fileio": "node --no-warnings test/fileio.test.mjs",
     "test:native-tostring": "node --no-warnings test/native-tostring.test.mjs",
+    "test:nav-race": "node --no-warnings test/nav-race.test.mjs",
     "test:p9c-judge": "node --no-warnings tools/p9c-judge.mjs"
   },
   "devDependencies": {

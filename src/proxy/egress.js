@@ -14,16 +14,22 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * @param {import('../kernel/cdp.js').CdpClient} client
+ * @param {{ url?: string, timeoutMs?: number, onTarget?: (targetId: string) => void }} [opt]
+ *   `onTarget` 在目标刚建好、导航之前同步调用：调用方用它给这张探测页登记「别被 blank-reload 碰」。
+ *   不传也能工作（只是会在 400ms 那一拍和 watcher 抢一下）。
  * @returns {Promise<{ok:boolean, ip?:string, country?:string, countryCode?:string, city?:string,
  *   timezone?:string, isp?:string, url:string, error?:string}>}
  */
 export async function probeEgressInBrowser(client, {
   url = EGRESS_PROBE_URL,
   timeoutMs = EGRESS_TIMEOUT_MS,
+  onTarget = null,
 } = {}) {
   let targetId = null;
   try {
     ({ targetId } = await client.send('Target.createTarget', { url: 'about:blank' }));
+    // 先登记豁免，再做任何可能被 watcher 抢的事（attach / enable / navigate）
+    try { if (typeof onTarget === 'function') onTarget(targetId); } catch { /* 登记失败不致命 */ }
     const { sessionId } = await client.send('Target.attachToTarget', { targetId, flatten: true });
     await client.send('Page.enable', {}, sessionId).catch(() => {});
     await client.send('Page.navigate', { url }, sessionId);
@@ -62,6 +68,10 @@ export async function probeEgressInBrowser(client, {
       // 那既不是被代理拦，也不是没加载完，而是探测目标（或它上游）不可达。
       // 另一种典型：探测 URL 在 HSTS 预载列表里（如 example.com），http 被升到 https → 需要 CONNECT，
       // 而代理不支持 CONNECT 就会落成 chrome-error://chromewebdata/ —— 这时 finalUrl 会直接显示它。
+      // ⚠️ 2026-11-11 复核推翻了上面这条作为「启动期读到空 body」的解释：真根因是我们自己的
+      // blank-reload watcher 把在飞的导航顶掉了（`net::ERR_ABORTED`，`readyState=complete` +
+      // `finalUrl=about:blank` 正是它的指纹）。HSTS/CONNECT 仍是**另一个独立可能**，但不再是主因；
+      // 修法与回归见 src/runtime/manager.js 的 scheduleBlankReload 与 README 已知限制 37。
       return {
         ok: false, url, error: '出口探测页没有内容（探测目标不可达或被拦截）',
         targetId, readyState: state || '(空)', finalUrl: href || '(空)',

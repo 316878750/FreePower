@@ -269,6 +269,9 @@ export async function startProfile(profile, { force = false } = {}) {
       const egress = await probeEgressInBrowser(client, {
         url: EGRESS_PROBE_URL,
         timeoutMs: EGRESS_TIMEOUT_MS,
+        // 探测页是它自己建、自己关的：显式告诉 injectAndOpen 的 blank-reload watcher 别碰它。
+        // 不加这一句就是「探测页刚 navigate，watcher 400ms 后 reload 把它顶成 ERR_ABORTED」。
+        onTarget: (targetId) => instance.exemptBlankReload(targetId),
       });
       instance.egress = egress;
       if (egress.ok) {
@@ -329,6 +332,105 @@ async function injectAndOpen(instance, profile, view) {
 
   /** targetId -> { prep, sessionId } */
   const pageReady = new Map();
+
+  /* ============================================================================
+   * 导航自掐（net::ERR_ABORTED）：空白页补 reload 时，不许顶掉**正在飞**的导航
+   * ============================================================================
+   *
+   * 真实现象（2026-11-11 A/B 实测，安装包 0.3.0）：CDP 新建空白目标后立刻 navigate
+   * 一个非 HTML 地址（JSON/API），结果 `net::ERR_ABORTED`、页面停在 about:blank；
+   * 同一个 URL 用环境自己那张既有页导航就正常，裸内核也正常 —— 是我们自己掐的。
+   *
+   * 机理：新建标签的首个文档早于 addScriptToEvaluateOnNewDocument，所以 attach 之后
+   * 要补一次 Page.reload（否则首帧是原始指纹）。原来的写法是「400ms 后读 location.href，
+   * 还是 about:blank 就 reload」——慢一点的导航在 400ms 时**还没 commit**，href 仍是
+   * about:blank，于是 reload 把在飞的导航顶掉。example.com 够快所以看起来「只有 JSON 打不开」。
+   *
+   * 修法：改用 CDP 事件判「这张页有人在导航」，不用定时器猜：
+   *   - `Page.frameRequestedNavigation` / `Page.frameStartedLoading` → 打「在飞」标记；
+   *   - `Page.frameNavigated` 落到非 about:blank → 清标记（说明导航真落地了）。
+   * 另外给「我们自己建、自己会关」的目标（出口探测页）一个**显式豁免**，
+   * 不靠「看起来是空白」去推断。
+   *
+   * 明确不做的事：这条路径上**永不用 `Page.stopLoading`** —— 那会把别人的导航掐死，
+   * 比 reload 更狠，而且拿不到任何可诊断的错误。
+   */
+  /** 有人正在导航的 session */
+  const navBusy = new Set();
+  /** 豁免 blank-reload 的 targetId（我们自己建的目标：出口探测页等） */
+  const blankReloadExempt = new Set();
+  /** 因为「有人在导航」而暂时跳过补注入的 session：等导航落地后再确认一次 */
+  const pendingInjectCheck = new Set();
+
+  /** 导航落地之后确认注入是否真跑过；没跑过才补一次 reload（此刻已经没有在飞的导航可顶） */
+  async function verifyInjectedAfterNav(sessionId) {
+    try {
+      const r = await client.send('Runtime.evaluate', {
+        expression: 'window.__fpInstalled === true',
+        returnByValue: true,
+      }, sessionId);
+      if (r?.result?.value === true) return true;
+      await reloadSession(client, sessionId).catch(() => {});
+      return false;
+    } catch { return false; }
+  }
+
+  client.on('Page.frameRequestedNavigation', (params, sid) => { if (sid) navBusy.add(sid); });
+  client.on('Page.frameStartedLoading', (params, sid) => { if (sid) navBusy.add(sid); });
+  client.on('Page.frameNavigated', (params, sid) => {
+    if (!sid) return;
+    const url = String(params?.frame?.url || '');
+    // 落到 about:blank 不算「落地」：reload 也会先报一次 about:blank，这时候清标记会让
+    // 后面那一下 reload 直接顶掉在飞的导航。只有真实 URL commit 才清。
+    if (!url || url === 'about:blank') return;
+    navBusy.delete(sid);
+    // 这一拍之前有张空白页因为「有人在导航」被放过了：现在导航落地，补一次注入确认。
+    // 不是无脑 reload —— 注入真跑过（脚本注册早于这次导航）就什么都不做。
+    if (pendingInjectCheck.has(sid)) {
+      pendingInjectCheck.delete(sid);
+      verifyInjectedAfterNav(sid).catch(() => {});
+    }
+  });
+
+  /**
+   * 空白页补一次 reload（见上面那段注释）。**只对「确实还停在空白页、且没人正在导航」的页生效。**
+   * 有人在导航时不 reload，改为登记一次「导航落地后再确认注入」，两头都不牺牲：
+   * 既不掐掉在飞的导航，也不让「脚本注册晚于导航」的页面裸着指纹。
+   * @param {{ targetId?: string, sessionId: string, delayMs?: number }} opt
+   */
+  function scheduleBlankReload({ targetId = null, sessionId, delayMs = 400 }) {
+    const timer = setTimeout(async () => {
+      try {
+        if (targetId && blankReloadExempt.has(targetId)) return;   // 我们自己建的目标：完全不碰
+        if (navBusy.has(sessionId)) {                              // 有人在导航：让开，落地后再确认
+          pendingInjectCheck.add(sessionId);
+          return;
+        }
+        const r = await client.send('Runtime.evaluate', {
+          expression: 'location.href',
+          returnByValue: true,
+        }, sessionId);
+        const href = String(r?.result?.value ?? '');
+        if (href !== '' && href !== 'about:blank' && href !== 'chrome://newtab/') return;
+        // 读 href 这一拍里也可能刚好有人开始导航 —— 再让一次，宁可这张空白页晚点补注入，
+        // 也不要把别人的导航掐掉（漏注入是可修的，ERR_ABORTED 是用户可见的故障）
+        if (navBusy.has(sessionId)) {
+          pendingInjectCheck.add(sessionId);
+          return;
+        }
+        await reloadSession(client, sessionId).catch(() => {});
+      } catch { /* 页面已关或会话已断 */ }
+    }, delayMs);
+    timer.unref?.();
+  }
+
+  /**
+   * 让某个 target 免于 blank-reload（出口探测页自己会导航、自己会关）。
+   * 必须在它导航之前调用；调用方是 probeEgressInBrowser 的 onTarget 回调。
+   */
+  instance.exemptBlankReload = (targetId) => {
+    if (targetId) blankReloadExempt.add(targetId);
+  };
 
   /**
    * worker 注入实况（自检与排障读它，也是「不许说理论上支持」的证据）。
@@ -501,7 +603,7 @@ async function injectAndOpen(instance, profile, view) {
           await client.send('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => {});
         }
       }
-      if (blank) scheduleBlankReload(client, sessionId);
+      if (blank) scheduleBlankReload({ targetId: targetInfo.targetId, sessionId });
       else await ensureInjectedOrReload(client, sessionId).catch(() => {});
     })();
     pageReady.set(targetInfo.targetId, { prep, sessionId });
@@ -605,27 +707,9 @@ async function ensureInjected(client, sessionId) {
   return false;
 }
 
-/**
- * 空白页补一次重载：addScriptToEvaluateOnNewDocument 只对「下一个文档」生效，
- * 而新建标签的首个文档在 attach 之前就存在。
- * 但不能无脑 reload —— 出口探测 / open_urls 可能正在这张页上导航，抢过去会把它们的导航顶掉。
- * 所以延迟一拍，确认它还停在空白页才重载。
- */
-function scheduleBlankReload(client, sessionId, delayMs = 400) {
-  const timer = setTimeout(async () => {
-    try {
-      const r = await client.send('Runtime.evaluate', {
-        expression: 'location.href',
-        returnByValue: true,
-      }, sessionId);
-      const href = String(r?.result?.value ?? '');
-      if (href === '' || href === 'about:blank' || href === 'chrome://newtab/') {
-        await reloadSession(client, sessionId).catch(() => {});
-      }
-    } catch { /* 页面已关或会话已断 */ }
-  }, delayMs);
-  timer.unref?.();
-}
+/* 注：blank-reload 的实现已挪进 injectAndOpen（`scheduleBlankReload`），
+ * 因为它要读「这张页有没有人在导航」的事件状态（navBusy）和豁免表（blankReloadExempt），
+ * 那两份状态都是每个实例/每条 CDP 连接自己的。模块级那份已删除，别再在别处补一份。 */
 
 /**
  * 重载一张页面并等 load：让 addScriptToEvaluateOnNewDocument 真正跑一遍。
