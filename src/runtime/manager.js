@@ -333,6 +333,8 @@ async function injectAndOpen(instance, profile, view) {
     total: 0,
     injected: 0,
     skipped_extension: 0,
+    /** Chrome 自己的 UI target（type='browser_ui'）：不属于页面，跳过并单独计数 */
+    browser_ui: 0,
     iframes: 0,
     /** AudioWorklet 也是独立 target（type='worklet'），但按设计不注入，单独记账 */
     worklets: 0,
@@ -362,6 +364,14 @@ async function injectAndOpen(instance, profile, view) {
     const type = String(targetInfo.type || '');
     const url = String(targetInfo.url || '');
     const targetId = String(targetInfo.targetId || '');
+    // Chrome 自己的 UI target（type='browser_ui'）不是页面起的 worker。
+    // 把它计进 total/other，刚启动的环境就会显示 total:1 other:1 —— 看着像
+    // 「接住了一个不知道是什么的 target」，实际什么都没漏。显式跳过、单独计数。
+    if (type === 'browser_ui') {
+      workerStats.browser_ui += 1;
+      resumeNow(sessionId, waitingForDebugger);
+      return;
+    }
     workerStats.total += 1;
     workerStats.by_type[type] = (workerStats.by_type[type] || 0) + 1;
 
