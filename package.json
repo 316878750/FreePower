@@ -33,7 +33,8 @@
     "test:cdp-page": "node --no-warnings test/cdp-target.test.mjs",
     "test:speech": "node --no-warnings test/speech.test.mjs",
     "test:media-speech": "node --no-warnings test/media-devices.test.mjs && node --no-warnings test/speech.test.mjs",
-    "test:cmdline": "node --no-warnings test/cmdline-leak.test.mjs"
+    "test:cmdline": "node --no-warnings test/cmdline-leak.test.mjs",
+    "test:fileio": "node --no-warnings test/fileio.test.mjs"
   },
   "devDependencies": {
     "electron": "^45.2.3",

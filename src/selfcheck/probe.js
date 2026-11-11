@@ -146,11 +146,14 @@ export function buildProbeSource() {
     const ch = buf.getChannelData(0);
     let sum = 0;
     const parts = [];
-    for (let i = 0; i < Math.min(ch.length, 2048); i++) {
+    // 整段 buffer 都进哈希。原来只取前 128 个采样，而噪声每 1000 个采样才落一次 ——
+    // 两个不同种子的「早期窗口」可能算出同一个哈希（P10 复制验收真撞到过）。
+    // 那是测量口径的坑，不是注入没生效：真实检测库哈希的是整段 buffer / 全样本和。
+    for (let i = 0; i < ch.length; i++) {
       sum += Math.abs(ch[i]);
-      if (i < 128) parts.push(ch[i].toFixed(8));
+      parts.push(ch[i].toFixed(8));
     }
-    return { supported: true, sum: sum.toFixed(10), hash: hashStr(parts.join(',')) };
+    return { supported: true, sum: sum.toFixed(10), hash: hashStr(parts.join(',') + '|sum:' + sum.toFixed(10)) };
   }
   try {
     const a = await audioSample();
