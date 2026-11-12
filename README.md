@@ -75,11 +75,25 @@ npm run dist:win       # 打 Windows 安装包 → release\FreePower-<ver>-setup
 
 鉴权：`api-key` 头（对齐对手）、`api_key` 查询参数 / 头、`Authorization: Bearer`。**本地校验，离线可用**（对手是远端校验，离线不可用，这是我们有意做的差异）。
 
-限流：`/status` 不限流；其余路由默认 1 次/秒，带 `x-freepower-client: mcp` 或 `x-adspower-client: mcp` 头走 30 次/秒。控制台自己带 `x-freepower-client: ui`，额度 60 次/秒（一次操作会连发几个请求，按 1/s 会把自己挡在门外；仍然是限量，不是「带某头就免限」）。超限报文与对手逐字一致（HTTP 200，脚本按这句判断要不要重试）：
+限流：三档阈值 **`1 / 30 / 60` 次每秒**（`src/config.js:21/22/28`，可用 `FREEPOWER_RATE_LIMIT` / `FREEPOWER_RATE_LIMIT_MCP` / `FREEPOWER_RATE_LIMIT_UI` 覆写）。令牌桶在 `src/api/server.js:15-23`，**桶键是 `apiKey|<std|mcp|ui>`**（`server.js:151-152`）—— 即「**一个 key × 一种客户端类 = 一个桶**」，**不是每端点一个桶**：同一个 key 下 `/user/list` 与 `/user/create` 共用一份配额。档位由头决定：默认 std 1/s；`x-freepower-client: mcp`（也认 `x-freepower-client: 1` 和 `x-adspower-client: mcp`，`server.js:147-150`）走 30/s；控制台自己带 `x-freepower-client: ui`，额度 60/s（一次操作会连发几个请求，按 1/s 会把自己挡在门外；仍然是限量，不是「带某头就免限」）。`/status` **完全不限流**：`src/api/routes.js:132` 把它标成 `{ auth: false }`，而 `server.js:139` 的 `if (route.auth !== false)` 把鉴权与限流整块跳过。
 
-```json
-{"code":-1,"msg":"Too many request per second, please check"}
+**超限不会返回 429**，一律 **HTTP 200 + `{"code":-1,"msg":"Too many request per second, please check"}`**（`server.js:155` 是 `send(res, 200, ...)`，报文逐字对齐对手，取自 `src/api/contract.js:41` 的 `TOO_MANY_MSG`）。所以调用方**必须看 `code` 字段**，只看 HTTP 状态会把「被限流」当成「成功」。
+
+实测（2026-11-12 13:14，对本机 `127.0.0.1:53380` 的**只读**端点 `GET /api/v1/group/list`，原始响应）：
+
 ```
+不带 mcp 头，1 秒内连发 3 次（三次共 22 ms）：
+  #1  t=3..18 ms   HTTP=200  {"code":0,"msg":"success","data":{"list":[{"group_id":"0","group_name":"Default","sort":0}]}}
+  #2  t=21..21 ms  HTTP=200  {"code":-1,"msg":"Too many request per second, please check"}
+  #3  t=21..22 ms  HTTP=200  {"code":-1,"msg":"Too many request per second, please check"}
+隔 2 秒再发 1 次：
+  #4  HTTP=200  code=0 / msg=success，data.list 1 条
+带 x-freepower-client: mcp，连发 10 次：成功 10 / 被限 0
+带 x-adspower-client: mcp，连发 5 次：成功 5 / 被限 0
+不带 key 连发 5 次 GET /status：5 次全 HTTP 200 {"code":0,"msg":"success"}（免鉴权 + 不限流）
+```
+
+**已知差异（backlog，本轮不改代码）**：`/api/v1/fbbird/user/list` 对手是 **10 次/秒**（对手侧读数，本文未实测），我们走默认档 **1 次/秒** —— 它和 `/api/v1/user/list` 共用同一条 `listHandler`，没有单独配额。要对齐就得给这条路由单开一档，属于改 `src/**`，已列 backlog。
 
 CORS：只放行 `127.0.0.1` / `localhost` 的 Origin，其他返回 `403` + 纯文本 `CORS ERROR`。
 
