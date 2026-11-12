@@ -81,6 +81,38 @@ check('disable_video：其它类型不受影响', block('https://a.com/a.js', 'S
 check('disable_video=0：不拦（默认关）',
   block('https://a.com/v.mp4', 'Media', compileNetRules({ disable_video: '0' })).block === false);
 
+/* 视频的「mime 分支」（逆向 21- §7，对手 `:1973-1988`）：Media 不只是 resourceType。
+   HLS 走 hls.js/MSE 时清单与分片以 XHR/Fetch 到达，resourceType 根本不是 Media；
+   只按 resourceType 判会**静默漏拦**。request 阶段没有 Content-Type，所以：
+   mime 那几条把 mime 直接喂给 decideRequest（= response 阶段的实际形状），
+   扩展名那条不喂 mime（= request 阶段的兜底路径）。 */
+check('HLS .m3u8 按 mime 命中 Media（伪装成 XHR，resourceType 不是 Media）',
+  decideRequest({ url: 'https://cdn.x.com/v.m3u8', resourceType: 'XHR', mimeType: 'application/vnd.apple.mpegurl' }, vid).reason === 'disable_video');
+check('video/* mime 命中 Media（连 resourceType 都是 Document）',
+  decideRequest({ url: 'https://x/v', resourceType: 'Document', mimeType: 'video/mp4' }, vid).block === true);
+check('Youtube UMP mime 命中 Media（application/vnd.yt-ump，URL 上没扩展名）',
+  decideRequest({ url: 'https://rr1---sn-x.googlevideo.com/videoplayback?id=1', resourceType: 'XHR', responseMimeType: 'application/vnd.yt-ump' }, vid).block === true);
+check('request 阶段没有 mime：.m3u8 清单 / .ts 分片按扩展名兜底',
+  decideRequest({ url: 'https://cdn.x.com/index.m3u8?token=1', resourceType: 'XHR' }, vid).block === true
+  && decideRequest({ url: 'https://cdn.x.com/seg-1.ts', resourceType: 'XHR' }, vid).block === true
+  && decideRequest({ url: 'https://cdn.x.com/seg-1.m4s', resourceType: 'XHR' }, vid).block === true);
+check('扩展名兜底不误伤：.tsx 与查询串里的 .m3u8 都不算',
+  decideRequest({ url: 'https://x/app.tsx', resourceType: 'Script' }, vid).block === false
+  && decideRequest({ url: 'https://x/v.js?f=.m3u8', resourceType: 'Script' }, vid).block === false);
+check('视频开关关着时 mime 也不拦（开关才是总闸，防「配了 mtime 就永远拦」）',
+  decideRequest({ url: 'https://x/v', resourceType: 'XHR', mimeType: 'video/mp4' }, compileNetRules({ disable_video: '0' })).block === false);
+
+/* 门 2（逆向 21- §1，对手 `main-v2.9.0.1.pretty.js:454`）：`url_list_user_role_active === "0"`
+   时白/黑名单三个字段一律当空串。这条以前是**字段空转**：schema 认字段、判定层不读。 */
+check('url_list_user_role_active="0"：compileNetRules 整条不生效（名单 + 视频一起关）',
+  compileNetRules({ blacklist: 'a.com', whitelist: 'b.com', disable_video: '1', url_list_user_role_active: '0' }).active === false);
+check('url_list_user_role_active 是数字 0 也按同一口径关',
+  compileNetRules({ blacklist: 'a.com', url_list_user_role_active: 0 }).active === false);
+check('url_list_user_role_active="1" 或不传：名单照旧生效（正例，防门写反成假绿）',
+  compileNetRules({ blacklist: 'a.com', url_list_user_role_active: '1' }).active === true
+  && compileNetRules({ blacklist: 'a.com' }).active === true
+  && block('https://a.com/x', 'Document', compileNetRules({ blacklist: 'a.com', url_list_user_role_active: '1' })).reason === 'blacklist');
+
 /* ---------------------------------- 空规则 ---------------------------------- */
 const none = compileNetRules({});
 check('无规则：active=false、任何请求都放行',

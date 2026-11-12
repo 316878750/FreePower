@@ -954,19 +954,42 @@ async function installRequestGating(client, sessionId, profile, proxy, { proxyAu
 
   await client.send('Fetch.enable', {
     handleAuthRequests: needAuth,
-    patterns: [{ urlPattern: '*' }],
+    // 视频开关要多挂一个 response 阶段：request 阶段拿不到 Content-Type，HLS/yt-ump 这类
+    // 伪装成 XHR 的媒体只能等响应头回来再判（见 net-rules.js 的 isMediaRequest）。
+    // 没有视频开关时不加这一阶段 —— 别给每一个响应都多一次暂停。
+    patterns: rules.blockMedia
+      ? [{ urlPattern: '*' }, { urlPattern: '*', requestStage: 'Response' }]
+      : [{ urlPattern: '*' }],
   }, sessionId);
 
   client.on('Fetch.requestPaused', (params, sid) => {
     if (sid !== sessionId) return;
-    // resourceType 在 params 顶层，不在 params.request 里（实测：request.resourceType 是 undefined，
+    // 两个阶段共用这一个事件：response 阶段才带 `responseStatusCode`（CDP 的约定），
+    // request 阶段没有 mime，只能按 resourceType + 扩展名兜底。
+    // `resourceType` 在 params 顶层，不在 params.request 里（实测：request.resourceType 是 undefined，
     // 只看它就永远判不出「这是不是 Media」——视频开关会静默不生效）。
-    const verdict = decideRequest({ ...(params.request || {}), resourceType: params.resourceType }, rules);
+    const atResponse = params.responseStatusCode !== undefined;
+    const contentType = atResponse
+      ? (params.responseHeaders || []).find((h) => String(h.name || '').toLowerCase() === 'content-type')?.value
+      : undefined;
+    const verdict = decideRequest(
+      atResponse
+        ? { url: params.request?.url, resourceType: params.resourceType, responseMimeType: contentType }
+        : { ...(params.request || {}), resourceType: params.resourceType },
+      rules,
+    );
     if (verdict.block) {
       client.send('Fetch.failRequest', { requestId: params.requestId, errorReason: 'BlockedByClient' }, sid).catch(() => {});
       return;
     }
-    client.send('Fetch.continueRequest', { requestId: params.requestId }, sid).catch(() => {});
+    // response 阶段要用 continueResponse（continueRequest 只对请求阶段有意义）；
+    // 老内核不认识 continueResponse 时退回 continueRequest，别把一个响应永久挂住。
+    if (atResponse) {
+      client.send('Fetch.continueResponse', { requestId: params.requestId }, sid)
+        .catch(() => client.send('Fetch.continueRequest', { requestId: params.requestId }, sid).catch(() => {}));
+    } else {
+      client.send('Fetch.continueRequest', { requestId: params.requestId }, sid).catch(() => {});
+    }
   });
 
   if (!needAuth) return;

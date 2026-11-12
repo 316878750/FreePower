@@ -370,10 +370,12 @@ export function toRecycleBinItem(profile) {
   };
 }
 
-/** 回收站列表：只给数据层结果，响应形状由路由层决定（`data = {list, page, limit}`） */
+/** 回收站列表：只给数据层结果，响应形状由路由层决定（`data = {list, page, limit}`）。
+ *  `total` **不往上传**（2026-11-12 巡检）：对手这条路由的回包里没有它，多一个键就是形状不符；
+ *  路由层另有一道显式枚举兜底，这里也从源头收掉，两处口径一致。 */
 export function listRecycleBin({ page = 1, page_size = 50 } = {}) {
   const r = dbListDeleted(getDb(), { page, page_size });
-  return { list: r.list.map(toRecycleBinItem), page: r.page, page_size: r.page_size, total: r.total };
+  return { list: r.list.map(toRecycleBinItem), page: r.page, page_size: r.page_size };
 }
 
 /**
