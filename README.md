@@ -401,9 +401,28 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
     一句话：**`7z-out` 解出来了、`$INSTDIR` 一个文件没进去、退出码还是 0** ⇒ 就是 Low IL 写 Medium 被拒这条路；再补一条 `icacls` 看安装器 exe 的低标签即可闭环。
     **处置（CEO 执行，降级路径）**：安装器两次失败后，把 `release\win-unpacked`（与安装包内 payload 逐字节相同）覆盖进 `C:\Users\1\AppData\Local\Programs\FreePower`，`app.asar` 复核 = `A9FEB33B…1157825`；随后手写卸载注册项（`HKCU\...\Uninstall\cfc06f39-cb32-5a00-9ce5-55cf1e15d011`：`DisplayName=FreePower 0.3.2`、`DisplayVersion=0.3.2`、`UninstallString="<appDir>\Uninstall FreePower.exe" /currentuser`、`EstimatedSize=366179`、`NoModify/NoRepair=1`），已读回核对（我复量：该键存在，值如上；HKLM 两个视图仍无项）。
     **代价如实标**：程序与功能里的卸载器**仍是 0.3.1 那份二进制**（`Uninstall FreePower.exe` 138,745 B、mtime 11-11 22:44:46，自报 0.3.1），只有文件层面是逐字节 0.3.2；下次走正常安装器时要重新生成卸载器。
+    **（2026-11-12 13:03 起，上面这段是历史；装机已被正常安装取代。）** 现在这份是**正常 NSIS 安装**、不是降级覆盖：卸载器重生成 **0.3.2**（138,746 B / `865F409F…DAC97`），我手写的 `EstimatedSize=366179` 已被 NSIS 写的 **366043** 取代，`UninstallString` 也由 NSIS 写成小写目录名 `…\Programs\freepower\…`。旧段落保留，不改。
     **还没验的事（别写成已验）**：去掉 exe 的低标签（例如 `icacls <exe> /setintegritylevel Medium`，或从没有低标签的位置复制一份再跑）之后安装器能否装成功 —— 本机没有 makensis，且本轮不许跑 `setup.exe`，所以这一条只有机制、没有实测。
-    **这不是一次性事故（重要）**：在这台机器上，**下一次构建（0.3.3 及以后）出的 `setup.exe` 照样是 Low**（写进 `release\` 就继承），装进 Medium 的 `%LOCALAPPDATA%\Programs\FreePower` 会以同样方式失败。安装前必须二选一：① `icacls '<setup.exe>' /setintegritylevel Medium` 再跑；② 把 exe 复制到 Medium 位置（如 `%TEMP%`）再跑。**「为什么副本有效」要写对**：不是复制动作洗掉了标签，而是**新文件继承目标目录的标签** —— `%TEMP%` 是 Medium，所以副本是 Medium；反过来从 `%TEMP%` 往工作区里复制没用（会重新继承 Low），这正是「复制了还是失败」的常见误判。
-    **证据保留**：`%TEMP%\Low` 下三个 `ns*.tmp`（09:45:48 / 09:49:18 / 09:52:43）是本次根因的现场证据，**留着别清** —— 等 0.3.3 安装成功后再一起删。
+    **（2026-11-12 13:03 实测推翻「未验」：能装成功。）** CEO 把 `release\FreePower-0.3.2-setup.exe` **复制到 `%TEMP%\fp-relabel\`（Medium 目录）**后跑 `/S` —— 副本 `icacls` **无 Low 标签**、sha256 与原件**逐字相同** `61FE401F…F224` —— 结果 **`exit 0 / 4.3 s`、payload 落盘、卸载器重生成 0.3.2、注册项由 NSIS 自己写**。所以「副本有效」也从机制变成实测：**不是复制动作洗掉了标签，而是新文件继承目标目录的标签**（`%TEMP%` 是 Medium）。
+      我只读复核（13:04，没重跑安装器，应用在跑）：
+      ```
+      appdir_files = 77
+      resources\app.asar   673,488 B   sha = A9FEB33B…1157825（= 验收过的 0.3.2 payload）
+      Uninstall FreePower.exe  138,746 B  mtime 2026/11/12 00:00:04
+                               FileVersion 0.3.2  ProductVersion 0.3.2  sha 865F409F…DAC97
+                               （降级路径留下的 0.3.1 那份 138,745 B 已被取代）
+      HKCU\…\Uninstall\cfc06f39-…  DisplayName=FreePower 0.3.2   DisplayVersion=0.3.2
+                                   EstimatedSize=366043（NSIS 写；手写的 366179 已不在）
+                                   UninstallString="C:\Users\1\AppData\Local\Programs\freepower\Uninstall FreePower.exe" /currentuser
+                                   InstallLocation=（空）
+      %APPDATA%\FreePower\install-dir.ini → [install] dir=C:\Users\1\AppData\Local\Programs\freepower
+      %APPDATA%\FreePower\data\profiles   1673 文件 / 334,999,431 B（与装前一字不差）
+      装机 77 vs release\win-unpacked 76 → SAME=76 / DIFF=0，唯一单边仍只有 Uninstall FreePower.exe
+      ```
+    **假成功与真成功的区别不在退出码**：失败那次 **`exit 0 / 7.2 s / 零文件`**；成功这次 **`exit 0 / 4.3 s / 77 文件`**。**判断安装器是否成功只看 payload（`resources\app.asar` 的 sha256 + 文件数），不看退出码** —— 两次退出码都是 0。
+    **NSIS 不写卸载项的 `InstallLocation`**：装后该值为空，卸载器靠 `desktop/build/installer.nsh` 写下的 `%APPDATA%\FreePower\install-dir.ini` 兜底（本次内容是 `dir=C:\Users\1\AppData\Local\Programs\freepower`，小写；Windows 大小写不敏感，与 `…\Programs\FreePower` 是同一目录）。别混淆：`HKCU\Software\cfc06f39-cb32-5a00-9ce5-55cf1e15d011`（同一 GUID 的**应用键**，不是 Uninstall 键）里另有 `InstallLocation`/`KeepShortcuts`/`ShortcutName`，那是快捷方式记录，不是卸载用的那个值。
+    **这不是一次性事故（重要）**：在这台机器上，**下一次构建（0.3.3 及以后）出的 `setup.exe` 照样是 Low**（写进 `release\` 就继承），装进 Medium 的 `%LOCALAPPDATA%\Programs\FreePower` 会以同样方式失败。安装前必须二选一：① `icacls '<setup.exe>' /setintegritylevel Medium` 再跑；② 把 exe 复制到 Medium 位置（如 `%TEMP%`）再跑。**「为什么副本有效」要写对**：不是复制动作洗掉了标签，而是**新文件继承目标目录的标签** —— `%TEMP%` 是 Medium，所以副本是 Medium；反过来从 `%TEMP%` 往工作区里复制没用（会重新继承 Low），这正是「复制了还是失败」的常见误判。**现状：② 已被 2026-11-12 13:03 实测证实（复制到 `%TEMP%\fp-relabel\` 后 `/S` 装成功）；① `setintegritylevel Medium` 仍未实测**，别把两条写成同等证据。
+    **证据保留**：`%TEMP%\Low` 下三个 `ns*.tmp`（09:45:48 / 09:49:18 / 09:52:43）是本次根因的现场证据，**留着别清** —— 等 0.3.3 安装成功后再一起删。（那里另有一个 `~nsu.tmp`，`2026/11/10 18:10:52`，是更早一次卸载留下的，不属于本次证据。）
 
 
 ## 八、验证
