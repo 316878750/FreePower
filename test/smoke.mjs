@@ -587,7 +587,7 @@ async function main() {
       await api('POST', '/api/v2/proxy-list/delete', { proxy_id: [pxId] });
       if (tagId) await api('POST', '/api/v2/browser-tags/delete', { ids: [tagId] });
 
-      // 占位：明确不支持
+      // 回收站：形状对齐对手（2026-11-12 真实现）
       const ph = await api('POST', '/api/v2/browser-profile/recycle-bin/list', { page: 1 });
       check('回收站路由：真实现（code 0 + list 数组 + data 键全等 limit,list,page + 无 total）', ph.json.code === 0 && Array.isArray(ph.json.data?.list) && Object.keys(ph.json.data).sort().join(',') === 'limit,list,page' && ph.json.data.total === undefined);
     }
