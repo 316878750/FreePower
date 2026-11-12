@@ -12,6 +12,10 @@
  * 没有系统代理 → **塌成单跳、正常启动**（不是失败）。所以「打开了开关也只是一条链」，
  * 只有在用户本机确实配了系统代理时才多出这一跳 —— README 必须照实写，不许包装成「已实现多级代理」。
  *
+ * 关于 `20-` §5 的 A/B 两版证据：B 版（`mutli_level_proxy` 是运行时对象）描述的是**对手客户端的
+ * 运行时构造**，不是 API 入参；我们没有那一层客户端实现，所以 API 层两种写法都只当开关认 ——
+ * 这是**没有可复刻的层**，不是漏实现。两版各写各的层，不互相矛盾。
+ *
  * 结构：
  *   浏览器 --(--proxy-server=http://127.0.0.1:<relayPort>)--> 本模块的本地 HTTP 代理
  *          --> hop0（系统代理） --> hop1（环境代理） --> 目标
@@ -120,6 +124,7 @@ function parseBypass(raw = '') {
  *   pacUrl:string|null, hop:object|null, entries:Array, source:'registry'|'override'}}
  */
 export function readSystemProxy(overrides = null) {
+  // `!== null` 必须写在 `typeof` 前面：JS 里 `typeof null === 'object'`，顺序反了会把 `null` 当注入。
   const injected = overrides !== null && typeof overrides === 'object' && !Array.isArray(overrides);
   const raw = injected ? overrides : readRegistryValues();
   const proxyEnable = dwordOn(raw.ProxyEnable ?? raw.proxyEnable);

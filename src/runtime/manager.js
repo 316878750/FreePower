@@ -949,6 +949,14 @@ async function installRequestGating(client, sessionId, profile, proxy, { proxyAu
   // 链式环境：Chrome 连的是**无认证的本地中继**，认证由链逐跳完成；这时候再开 `handleAuthRequests`
   // 只会让 authRequired 去应答一个根本不存在的挑战（而且环境代理的账密不该出现在这一层）。
   // 单跳仍走原来的 Fetch.authRequired 路径 —— 那条是老坑，别一刀切关掉。
+  //
+  // 「双重保险」的两道防线，各防一种改动（巡检 S2，2026-11-12）：
+  //   第一道 —— 调用方 `applyToSession` 调用点（本文件 :685）在链式环境显式传
+  //              `proxyAuth: instance.chain_mode !== 'chain'`，认证路径根本不进来；
+  //   第二道 —— 下一行的 `!!(proxy.username && proxy.host)` 短路，兜「将来有人加了新调用点
+  //              却忘了传 `proxyAuth:false`」：链式环境的 `effectiveProxy.username` 恒为空串
+  //              （本文件 :181 组装本地中继时写死）。
+  // 两道**不是**冗余：拆掉任何一道，另一道的默认前提都会破（链上会冒出一个不存在的认证挑战）。
   const needAuth = proxyAuth && !!(proxy.username && proxy.host);
   if (!rules.active && !needAuth) return;
 
