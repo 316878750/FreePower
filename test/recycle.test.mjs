@@ -162,10 +162,12 @@ try {
   check('list：data 里**没有** total / total_count / total_pages（对手零出现）',
     bin.data?.total === undefined && bin.data?.total_count === undefined && bin.data?.total_pages === undefined,
     Object.keys(bin.data || {}).join(','));
-  check('list：入参回显 page/limit（locally 改写成 page_size）', bin.data?.page === 1 && bin.data?.limit === 50, JSON.stringify({ page: bin.data?.page, limit: bin.data?.limit }));
-  check('list：不传的键不出现（透传语义）',
-    JSON.stringify(Object.keys((await binList({})).data || {}).sort()) === JSON.stringify(['list']),
-    Object.keys((await binList({})).data || {}).join(','));
+  check('list：入参回显 page/limit（本地改写成 page_size）', bin.data?.page === 1 && bin.data?.limit === 50, JSON.stringify({ page: bin.data?.page, limit: bin.data?.limit }));
+  const binEmpty = await binList({});
+  check('list：data 是**恒定三键**（不传参数也是 list,page,limit=1/50；对手整形函数里这两个字段永远存在）',
+    JSON.stringify(Object.keys(binEmpty.data || {}).sort()) === JSON.stringify(['limit', 'list', 'page'])
+    && binEmpty.data?.page === 1 && binEmpty.data?.limit === 50,
+    `${Object.keys(binEmpty.data || {}).sort().join(',')} page=${binEmpty.data?.page} limit=${binEmpty.data?.limit}`);
   check('list：item 严格 6 字段（多一个算失败）',
     JSON.stringify(Object.keys(item).sort()) === JSON.stringify(BIN_KEYS), Object.keys(item).sort().join(','));
   check('list：item 值对上（id/no/name/group_name/remark）',

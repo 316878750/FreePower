@@ -620,9 +620,11 @@ export function buildRoutes() {
 
   /**
    * recycle-bin/list：入参只认 `page`（≥1）与 `limit`（1–100），本地改写成 `page_size`。
-   * 出参 `data = {list, page, limit}` —— **没有** `total` / `total_count` / `total_pages`
-   * （对手的整形函数里这三个词零出现；普通 `/browser-profile/list` 才有 total）。
-   * item 是严格 6 字段子集（store 里的 toRecycleBinItem），未传的键不出现（"透传"语义）。
+   * 出参 `data` 是**恒定三键** `{list, page, limit}` —— 对手的整形函数里这两个字段永远存在
+   * （`l(e&&e.page)` / `l(e&&e.page_size)`），不是"传了才给"。**没有** `total` / `total_count`
+   * / `total_pages`（对手整形函数里这三个词零出现；普通 `/browser-profile/list` 才有 total）。
+   * 不传时的 `page=1` / `limit=50` 是**我们**的取值，对手云端默认值无证据（README 已标）。
+   * item 是严格 6 字段子集（store 里的 toRecycleBinItem）。
    */
   add(['POST'], ['/api/v2/browser-profile/recycle-bin/list'], (ctx) => {
     const src = ctx.body || {};
@@ -636,11 +638,10 @@ export function buildRoutes() {
     if (page !== undefined && page < 1) throw new ApiError(ERR.INVALID, 'page must be greater than or equal to 1');
     const limit = asNumber('limit', src.limit);
     if (limit !== undefined && (limit < 1 || limit > 100)) throw new ApiError(ERR.INVALID, 'limit must be between 1 and 100');
-    const r = listRecycleBin({ page: page ?? 1, page_size: limit ?? 50 });
-    const data = { list: r.list };
-    if (page !== undefined) data.page = page;
-    if (limit !== undefined) data.limit = limit;
-    return ok(data);
+    const effPage = page ?? 1;
+    const effLimit = limit ?? 50;
+    const r = listRecycleBin({ page: effPage, page_size: effLimit });
+    return ok({ list: r.list, page: effPage, limit: effLimit });
   });
 
   /**

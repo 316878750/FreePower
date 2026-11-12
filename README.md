@@ -629,6 +629,10 @@ npm run test:switches    # 真机开/关对照，19 项，需要真实 Chrome（
 
 **语义**：`browser-profile/delete` 从「停内核 + 删盘 + 删记录」改成**软删除** —— 只写 `deleted_at`，**user-data 目录原样留在盘上**。理由一句话：回收站里的环境恢复后必须是**能直接启动的原环境**，删了盘就恢复出一个空壳，「回收站」三个字也就成了骗人。彻底清理是另一套语义（`purge`），**本轮不实现、也不出现在这两条路由里**。
 
+> **两件最容易误导用户的事，写在这最前面（2026-11-12）**
+> 1. **`delete` 不释放磁盘**：它只是把环境挪进回收站，user-data 目录原样留着。想省空间的彻底清理（`purge`）**还没有入口**，已列 backlog、本轮不做。
+> 2. **从回收站恢复必须选分组**：`recycle-bin/restore` 的 `group_id` **必填**（数字或数字串），不能"回原分组就不传"。控制台页面本轮没做，脚本/第三方接入时这是必填项，不是可选优化。
+
 `delete` 的响应形状没变：`data = {deleted:[…], userdata_removed: 0}`。`userdata_removed` 恒为 0 是**实话**（这次一条都没删盘），保留这个键只是为了不动 54 条路由的契约形状。
 
 **数据层**
@@ -654,7 +658,7 @@ npm run test:switches    # 真机开/关对照，19 项，需要真实 Chrome（
 
 **`recycle-bin/list`**（形状照逆向 `22-回收站响应形状.md`）
 
-- 入参只认 `page`（≥1）、`limit`（1–100），本地改写成 `page_size`；**不传的键不出现在 `data` 里**（透传语义）。内部默认 `page=1 / limit=50` —— **默认值是我们的选择，不是证据**。
+- 入参只认 `page`（≥1）、`limit`（1–100），本地改写成 `page_size`。出参 `data` 是**恒定三键** `{list, page, limit}` —— 对手的整形函数里这两个字段永远存在（`l(e&&e.page)` / `l(e&&e.page_size)`），不是「传了才给」。不传时取 `page=1` / `limit=50`：**这两个默认值是我们取的，对手云端默认值无证据**。
 - 出参 `data = {list, page, limit}` —— **没有** `total` / `total_count` / `total_pages`（对手整形函数里这三个词零出现；普通 `/browser-profile/list` 才有 `total`）。
 - **item 严格 6 字段**：`profile_id`、`profile_no`、`name`、`group_name`、`remark`、`delete_time`。代理、指纹、标签、状态一个都不带（对手是新建对象，不是 merge）。
 - `delete_time` 口径（照抄）：空 → `""`；数字 → `String(Math.trunc)`（**毫秒不除 1000**）；纯数字串 → 原样；`YYYY-MM-DD HH:mm:ss`（严格、写死 Asia/Shanghai）→ **秒级 unix 时间戳字符串**；其它 → 原串。我们库里存的就是第 4 种格式（`repo.js` 的 `deleteStamp`），所以正常读数是 10 位数字串，例如 `1794463738`。
@@ -672,17 +676,27 @@ npm run test:switches    # 真机开/关对照，19 项，需要真实 Chrome（
 
 1. **迁移**：用**改造前的 DDL**（把 `deleted_at` 两行摘掉）造一个 0.3.2 形状的库 + 3 条环境 → 跑真迁移后列补上、3 条一条不少、`profile_no` 没重排、全部算在用；再开一次验幂等。
 2. **删除**：`userdata_removed=0` 且目录与文件都还在；v1/v2 两个 list 都不出现；`detail`/`start`/`update` 都是 `100001`；重复删除不重复计数。
-3. **`recycle-bin/list`**：`data` 里没有 total 三兄弟、item **键集合全等那 6 个**（多一个就算失败）、`delete_time` 是 10 位秒级时间戳、三条校验文案逐字。
+3. **`recycle-bin/list`**：`data` 是**恒定三键** `list,page,limit`（不传参数也一样，且没有 total 三兄弟）、item **键集合全等那 6 个**（多一个就算失败）、`delete_time` 是 10 位秒级时间戳、三条校验文案逐字。
 4. **`recycle-bin/restore`**：五条校验文案逐字、不在回收站报 `100001`、成功后 `data` 不出现、id/no/指纹不变、user-data 还在、**重启（真起一个新进程读库）**删除态与恢复态都保持。
 
-**判据现状（如实报）**：`test/smoke.mjs:591` 那条「占位路由：明确不支持」还把 `recycle-bin/list` 钉成 `code:-1 + supported:false`，所以现在 `node --no-warnings test/smoke.mjs` 是 **151/152**，唯一红项就是它。`smoke.mjs` 属于「不许改的判据文件」，我没动 —— 要么把那条改成断言新形状（更严、不削弱），要么先把路由退回占位，等 CEO 拍。
+**判据现状**：这条原本是红的 —— `test/smoke.mjs` 里那条断言把 `recycle-bin/list` 钉成「占位：明确不支持」（`code:-1` + `data.supported:false`）。功能真做出来之后，**是判据过期、不是产品坏了**；我按「冻结判据不许动」先报不动手，等 CEO 拍。
+
+**2026-11-12 授权改动（`df10446`）**：只改那一行，`git show --stat` = **1 file / 1 insertion / 1 deletion**。
+
+| | 期望值 |
+|---|---|
+| 改前 | `ph.json.code === -1 && ph.json.data?.supported === false`（验"占位明确不支持"） |
+| 改后 | `code === 0` + `list` 是数组 + `data` 键**全等** `limit,list,page`（多一个键就红）+ `total === undefined` |
+| 后续收窄 | 三键改成**恒定**后（本轮），断言里的键集合从 `list,page` 变成 `limit,list,page` —— 同样是改严 |
+
+**这条规矩写在这里，防止以后有人拿它当先例**：冻结判据（`test/smoke.mjs`、`tools/p9c-judge.mjs`、`test/nav-type.test.mjs`、`test/media-label.test.mjs`）**正常一律不动**；只有「功能真做出来了、旧断言确实过期」时，由 CEO **明确授权**，**且只能改严、不许改松**，并在提交说明里写明授权与行数。`node --no-warnings test/smoke.mjs` 现为 **152/152**。
 
 **两条「不是从对手代码里读来的」要标清**：
 
 - 「软删除**保留 userdata**」是我们的语义。对手是否也保留**没有证据**，只有【推断】：同表有成对的 recycle/recovery 接口、`restore` 还要 `group_id`，看起来像软删。
-- `purge`（彻底清理）**没实现**，也不在这两条路由里。
+- **backlog：`purge`（彻底清理）没有入口**。现在 `delete` = 进回收站、**不释放磁盘** —— 用户预期的「删了就省空间」目前落空，这是已知的产品缺口，不是 bug。做的时候要另立语义（单环境清理 / 回收站清空 / 保留天数），并且**只允许删 `PROFILES_DIR` 之下的目录**（原来那套防越界逻辑在 `0cd3270` 里删掉了，`git log -S removeProfileDataDir` 能找到）。
 
-冒烟覆盖（152 项，双 Realm 的 24 项在 `test/workers.test.mjs` 里单独列；**其中「占位路由」那 1 项目前红，原因见上面「判据现状」**）：
+冒烟覆盖（152 项，双 Realm 的 24 项在 `test/workers.test.mjs` 里单独列）：
 
 - `/status` 形状、鉴权、跨站 Origin 403 纯文本、限流报文
 - 建环境 → 起真 Chrome → 探针读回 UA / UA-CH / 时区 / 语言 / platform / hardwareConcurrency / WebGL / `navigator.webdriver`
@@ -691,7 +705,7 @@ npm run test:switches    # 真机开/关对照，19 项，需要真实 Chrome（
 - **自检**：启动后自动跑 19 项、覆盖度 7/10/2、四个哈希齐全、`rerun=1` 重跑、HTML 页可读且无外链
 - **双 Realm**（`test/workers.test.mjs`，已进 `npm run smoke`）：同一张页里起专用 worker / SharedWorker / ServiceWorker（**页面直接创建的**，嵌套 worker 另有三条断言，见已知限制第 6 条），断言三者的脚本首行已注入（`atTop === 'worker'`）、五处 canvas 哈希完全一致、硬件/语言/时区/UA 与主帧同值、`workerStats.injected === 3`；另断言 AudioWorklet 未被注入且可测表面只有 `sampleRate`/`currentTime`
 - **嵌套 worker**（同文件）：页面里起的 worker 再 `new Worker`，断言外层与嵌套层首行都已注入、主帧/外层/嵌套三者的 `hardwareConcurrency` 一致、两层都进注入计数 —— 防的是「同一台机器同时暴露伪装值与真实核数」
-- **本地 API 完整化**：`active` 的 Active/Inactive 形状、`local-active`、`cookies`、`kernels`、标签/代理列表 CRUD、占位接口明确不支持
+- **本地 API 完整化**：`active` 的 Active/Inactive 形状、`local-active`、`cookies`、`kernels`、标签/代理列表 CRUD、占位接口明确不支持（`share` 之类）；**回收站两条已从占位变成真实现**，断言改成验「`code:0` + `data` 键全等 `limit,list,page` + 无 `total`」
 - **批量启停**：一次起 3 个、批量停、失败清单带 code/message、中途失败即中断、并发上限生效
 - **cloud-active 明确报错**（`-1` + `supported:false`，不假成功）
 - 停环境后进程树回收干净、重复 start 幂等、重复 stop 800002
