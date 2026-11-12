@@ -368,7 +368,19 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
       ```
       即「**工作区目录带低标签、产物继承**」，不是这个 exe 偶然带的（连本仓这份 README 也是 Low）。**带低标签的 exe 起进程，进程就是 Low IL**；装机目录里那份 `FreePower.exe` 则没有低标签（它是 Medium 进程写进去的）。
     - 于是 `$PLUGINSDIR` 落在 `%TEMP%\Low\nsXXXX.tmp`（`icacls` 同一个低标签）。**`Nsis7z::Extract` 在那里是成功的**：09:52:43 那次留下的 `%LOCALAPPDATA%\Temp\Low\nsm5F6D.tmp\7z-out` 里有 **82 个文件 / 490,216,832 B**，`FreePower.exe` 249,831,936 B 整个都在。也就是说**解包没问题，问题全在「往装机目录复制」这一步**。
-    - 目标 `%LOCALAPPDATA%\Programs\FreePower` 是 Medium（ACL 三行 `SYSTEM/Administrators/用户` 全控，`icacls` 无低标签）。**Low IL 写 Medium 被完整性策略拒绝**。我的复现（拷一份 `cmd.exe` → `icacls /setintegritylevel Low` → 用它操作）：写装机目录 → `Access is denied.`、**exit 1**、文件不存在；同一个低完整性进程写 `%TEMP%\Low` → **成功、exit 0**；对装机目录里的文件做 `ren` → `Access is denied.`、**exit 1**（这就是 `un.atomicRMDir` 那一步）；读装机目录里的文件 → **exit 0**（只读不被拦）。
+    - 目标 `%LOCALAPPDATA%\Programs\FreePower` 是 Medium（ACL 三行 `SYSTEM/Administrators/用户` 全控，`icacls` 无低标签）。**低完整性进程对任何 Medium 对象（`%LOCALAPPDATA%\Programs\FreePower`、`%TEMP%` 根）的写/重命名一律 `Access is denied.`，只有低标签目录（`%TEMP%\Low`）可写；NSIS 的 `$PLUGINSDIR` 恰好落在 `%TEMP%\Low`，所以解包成功、复制失败。** 这是 Mandatory Integrity Control 的 **no-write-up** 一般行为，**不是装机目录的特例**。
+      我的复现（拷一份 `cmd.exe` 到 `%TEMP%` → `icacls /setintegritylevel Low`，原始输出）：
+      ```
+      icacls → Mandatory Label\Low Mandatory Level:(NW)
+      & ilprobe-fp.exe /c "whoami /groups | findstr /i Mandatory"
+        → Mandatory Label\Low Mandatory Level Label  S-1-16-4096     ← 进程 token 自报 Low，不是推断
+      写 %LOCALAPPDATA%\Programs\FreePower → Access is denied.  exit 1  exists=False
+      写 %TEMP% 根（Medium）              → Access is denied.  exit 1  exists=False
+      写 %TEMP%\Low（低标签）             → exit 0  exists=True       ← 唯一可写处
+      对装机目录里的文件 ren（= un.atomicRMDir）→ Access is denied.  exit 1
+      读装机目录里的文件                   → exit 0（只读不被拦）
+      ```
+      三条结论因此自动连起来：① `7z-out` 82 个文件全在（解包写的是 `%TEMP%\Low`，那里可写）；② `CopyFiles` 必然连败 5 次（目标 Medium）；③ 装前 `icacls <exe> /setintegritylevel Medium` 是正解（exe 变 Medium ⇒ 进程不再受 no-write-up 约束）。
     - 所以 `CopyFiles "$PLUGINSDIR\7z-out\*" $OUTDIR` 连败 5 次 → `:116`：**交互模式**弹「应用无法关闭」等人点（我们那次 180 秒不动）；**静默模式**按 `/SD IDRETRY` 顺落到兜底，安装继续 → **退出码 0、零文件**。**「退出码 0」在这种场景下完全不可信，这是本次最该记住的一条。**
     - 旧卸载器退出码 2 是同一条链：它被拷成 `$PLUGINSDIR\old-uninstaller.exe`（同样在 `%TEMP%\Low` 里）运行，`--updated` 走 `un.atomicRMDir` → `Rename` 被拒（上面那条实测）→ `un.restoreFiles` → `uninstaller.nsh:167` `Abort`。**「`Abort` ⇒ 进程退出码 2」这半步我没能复现**（本机没有 makensis，且不许再跑安装器/卸载器），标**推断**；能证的只有：对话框里的 `2` 是旧卸载器的退出码，而模板里**没有任何一处**给卸载器 `SetErrorLevel 2`（grep `SetErrorLevel` 全部命中：`installUtil.nsh:131` 安装器、`common.nsh:80` 成功=0、`assistedInstaller.nsh:91`）。
     - 残留旁证（`%TEMP%\Low` 下今天三个目录）：`nszAA4.tmp`（09:45:48）与 `nsm3EB5.tmp`（09:49:18）里只有 `old-uninstaller.exe` 138,745 B + `nsExec/StdUtils/System.dll` —— 那两次停在「跑旧卸载器」；`nsm5F6D.tmp`（09:52:43）里是完整 `7z-out` —— 那一次已经过了卸载，卡/落在「复制进装机目录」。
