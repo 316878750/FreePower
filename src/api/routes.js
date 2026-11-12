@@ -230,7 +230,8 @@ export function buildRoutes() {
   };
   add(['GET'], ['/api/v1/user/list'], listHandler);
   add(['POST', 'GET'], ['/api/v2/browser-profile/list'], listHandler);
-  add(['GET'], ['/api/v1/fbbird/user/list'], listHandler);
+  // 唯一 10/s 的桶（对手的分桶表：其余全 1/s，只有这条 10/s），档位由 server.js 的 rateTier 读
+  add(['GET'], ['/api/v1/fbbird/user/list'], listHandler, { rateTier: 'fbbird' });
 
   /* ============================ 2. 本地 CRUD ============================ */
 

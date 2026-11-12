@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { API_HOST, RATE_LIMIT_DEFAULT, RATE_LIMIT_MCP, RATE_LIMIT_UI, API_PORT } from '../config.js';
+import { API_HOST, RATE_LIMIT_DEFAULT, RATE_LIMIT_MCP, RATE_LIMIT_UI, RATE_LIMIT_FBBIRD, API_PORT } from '../config.js';
 import { ensureApiKey } from '../store/db.js';
 import { stopAll } from '../runtime/manager.js';
 import { ApiError, ERR, TOO_MANY_MSG } from './contract.js';
@@ -148,8 +148,14 @@ export function createApiServer({ port } = {}) {
         const isMcp = ['mcp', '1'].includes(client)
           || String(req.headers['x-adspower-client'] || '').toLowerCase() === 'mcp';
         const isUi = client === 'ui';
-        const limit = isMcp ? RATE_LIMIT_MCP : isUi ? RATE_LIMIT_UI : RATE_LIMIT_DEFAULT;
-        const bucket = `${key}|${isMcp ? 'mcp' : isUi ? 'ui' : 'std'}`;
+        // 档位：mcp / ui 头照旧升档；否则看路由自己声明的档位（目前只有 fbbird 列表是 10/s），默认 1/s。
+        // 桶键里带上档位名，所以 fbbird 那 10 发不会占掉同一把 key 的 std 配额（对手也是分开的两个桶）。
+        const tier = isMcp ? 'mcp' : isUi ? 'ui' : (route.rateTier || 'std');
+        const limit = tier === 'mcp' ? RATE_LIMIT_MCP
+          : tier === 'ui' ? RATE_LIMIT_UI
+          : tier === 'fbbird' ? RATE_LIMIT_FBBIRD
+          : RATE_LIMIT_DEFAULT;
+        const bucket = `${key}|${tier}`;
         if (!rateLimit(bucket, limit)) {
           // 超限报文逐字对齐对手（脚本按这句判断要不要重试）
           return send(res, 200, { code: ERR.GENERIC, msg: TOO_MANY_MSG }, corsHeaders);

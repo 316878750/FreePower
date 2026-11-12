@@ -64,6 +64,17 @@ try {
   const r2 = await api('GET', '/api/v1/user/list', undefined, { mcp: false });
   check('限流触发且报文逐字一致', r2.json.code === -1 && r2.json.msg === 'Too many request per second, please check', `${r1.json.code}/${r2.json.code} ${r2.json.msg}`);
 
+  // 对手的分桶表里唯一例外：`/api/v1/fbbird/user/list` 是**单独的 10/s 桶**，其余全 1/s。
+  // 同一把 key、同样的请求头，一次性打 10 发全过、第 11 发才限 —— 额度真是 10 而不是 ∞；
+  // 下面再打两发 std 路由，第二发必须被限，证明 fbbird 的 10 发没占掉 std 的桶（两条对照缺一就是假绿）。
+  const birdBurst = await Promise.all(Array.from({ length: 10 }, () => api('GET', '/api/v1/fbbird/user/list', undefined, { mcp: false })));
+  check('fbbird 列表：默认 10/s，连打 10 发不被限（对手唯一的 10/s 桶）', birdBurst.every((r) => r.json.code === 0), birdBurst.map((r) => r.json.code).join(','));
+  const bird11 = await api('GET', '/api/v1/fbbird/user/list', undefined, { mcp: false });
+  check('fbbird 第 11 发被限（不是免限）', bird11.json.code === -1, String(bird11.json.code));
+  const s1 = await api('GET', '/api/v1/user/list', undefined, { mcp: false });
+  const s2 = await api('GET', '/api/v1/user/list', undefined, { mcp: false });
+  check('std 桶仍是 1/s：fbbird 那 10 发没给它充值', s2.json.code === -1, `${s1.json.code}/${s2.json.code}`);
+
   // CORS：非白名单 Origin → 403 + 纯文本 CORS ERROR
   const cors = await fetch(base + '/status', { headers: { origin: 'https://evil.example' } });
   const corsText = await cors.text();

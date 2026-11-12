@@ -22,6 +22,13 @@ export const RATE_LIMIT_DEFAULT = Number(process.env.FREEPOWER_RATE_LIMIT || 1);
 export const RATE_LIMIT_MCP = Number(process.env.FREEPOWER_RATE_LIMIT_MCP || 30);
 
 /**
+ * 对手的分桶不是「所有路由一个额度」：54 条里除 `/status` 外都是 **1/s**，**只有
+ * `/api/v1/fbbird/user/list` 单独一个桶、10/s**（`docs/reverse/07-LocalAPI路由全量清单.md` 的限流分桶那一行）。
+ * 这个桶只属于那一条路由，别把默认档一起抬上去 —— 默认还是 1/s。
+ */
+export const RATE_LIMIT_FBBIRD = Number(process.env.FREEPOWER_RATE_LIMIT_FBBIRD || 10);
+
+/**
  * Web 控制台的额度：界面一次操作会连发几个请求（列表 + 运行态 + 自检），
  * 按 1/s 限会自己把自己挡在门外。给 60/s，仍然限量，不做成「带某头的就免限」。
  */

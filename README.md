@@ -77,7 +77,7 @@ npm run dist:win       # 打 Windows 安装包 → release\FreePower-<ver>-setup
 
 鉴权：`api-key` 头（对齐对手）、`api_key` 查询参数 / 头、`Authorization: Bearer`。**本地校验，离线可用**（对手是远端校验，离线不可用，这是我们有意做的差异）。
 
-限流：三档阈值 **`1 / 30 / 60` 次每秒**（`src/config.js:21/22/28`，可用 `FREEPOWER_RATE_LIMIT` / `FREEPOWER_RATE_LIMIT_MCP` / `FREEPOWER_RATE_LIMIT_UI` 覆写）。令牌桶在 `src/api/server.js:15-23`，**桶键是 `apiKey|<std|mcp|ui>`**（`server.js:151-152`）—— 即「**一个 key × 一种客户端类 = 一个桶**」，**不是每端点一个桶**：同一个 key 下 `/user/list` 与 `/user/create` 共用一份配额。档位由头决定：默认 std 1/s；`x-freepower-client: mcp`（也认 `x-freepower-client: 1` 和 `x-adspower-client: mcp`，`server.js:147-150`）走 30/s；控制台自己带 `x-freepower-client: ui`，额度 60/s（一次操作会连发几个请求，按 1/s 会把自己挡在门外；仍然是限量，不是「带某头就免限」）。`/status` **完全不限流**：`src/api/routes.js:132` 把它标成 `{ auth: false }`，而 `server.js:139` 的 `if (route.auth !== false)` 把鉴权与限流整块跳过。
+限流：**四档**阈值 —— 默认 **1/s**、`x-freepower-client: mcp` **30/s**、控制台 `ui` **60/s**、`/api/v1/fbbird/user/list` 单独一桶 **10/s**（`src/config.js:21` DEFAULT / `:22` MCP / `:29` FBBIRD / `:35` UI，分别可用 `FREEPOWER_RATE_LIMIT` / `FREEPOWER_RATE_LIMIT_MCP` / `FREEPOWER_RATE_LIMIT_FBBIRD` / `FREEPOWER_RATE_LIMIT_UI` 覆写）。令牌桶在 `src/api/server.js:14-25`，**桶键是 `apiKey|<std|mcp|ui|fbbird>`**（`server.js:152-158`）—— 即「**一个 key × 一种档位 = 一个桶**」，**不是每端点一个桶**：同一把 key 下 `/user/list` 与 `/user/create` 共用 std 那份配额；`fbbird` 那条路由自己一桶（打 10 发不占 std 的额度，对手也是分开的两个桶）。档位判定：`mcp` / `ui` 头优先（升档照旧生效，带 mcp 头打 fbbird 走 30/s），否则看路由自己声明的 `rateTier`（`src/api/routes.js:234` 那条 fbbird 标了 `fbbird`），再否则 std。`/status` **完全不限流**：`src/api/routes.js:132` 把它标成 `{ auth: false }`，而 `server.js:139` 的 `if (route.auth !== false)` 把鉴权与限流整块跳过。
 
 **超限不会返回 429**，一律 **HTTP 200 + `{"code":-1,"msg":"Too many request per second, please check"}`**（`server.js:155` 是 `send(res, 200, ...)`，报文逐字对齐对手，取自 `src/api/contract.js:41` 的 `TOO_MANY_MSG`）。所以调用方**必须看 `code` 字段**，只看 HTTP 状态会把「被限流」当成「成功」。
 
@@ -95,7 +95,7 @@ npm run dist:win       # 打 Windows 安装包 → release\FreePower-<ver>-setup
 不带 key 连发 5 次 GET /status：5 次全 HTTP 200 {"code":0,"msg":"success"}（免鉴权 + 不限流）
 ```
 
-**已知差异（backlog，本轮不改代码）**：`/api/v1/fbbird/user/list` 对手是 **10 次/秒**（对手侧读数，本文未实测），我们走默认档 **1 次/秒** —— 它和 `/api/v1/user/list` 共用同一条 `listHandler`，没有单独配额。要对齐就得给这条路由单开一档，属于改 `src/**`，已列 backlog。
+**已对齐（2026-11-12，原先列在这里的 backlog 已做掉）**：`/api/v1/fbbird/user/list` 对手是 **10 次/秒**（对手侧读数，见 `docs/reverse/07-LocalAPI路由全量清单.md` 的限流分桶：54 条路由除 `/status` 外全 1/s，只有这一条 10/s）。我们原来走默认档 1/s，现在给它**单独一桶 10/s**（`RATE_LIMIT_FBBIRD`，桶键 `apiKey|fbbird`），**默认档仍是 1/s**，没有顺手把全局限流抬上去。判据（`test/api.test.mjs`）：同一把 key 一次性打 10 发全过、第 11 发被限，紧接两发 std 路由第二发必被限 —— 两条对照缺一就是假绿。
 
 CORS：只放行 `127.0.0.1` / `localhost` 的 Origin，其他返回 `403` + 纯文本 `CORS ERROR`。
 
@@ -451,7 +451,7 @@ npm run test
 npm run smoke
 ```
 
-当前实测：`npm run test` = schema **10** + net-rules **29** + chain-rules **31** + recycle **44** + unit **71** + api **96** + ui **29** + desktop **54**（`package.json` 里那条脚本就是这八组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`），真 Chrome `157.0.8103.40`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的八组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测：`npm run test` = schema **10** + net-rules **29** + chain-rules **31** + recycle **44** + unit **71** + api **100** + ui **29** + desktop **54**（`package.json` 里那条脚本就是这八组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`），真 Chrome `157.0.8103.40`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的八组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 > 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：
