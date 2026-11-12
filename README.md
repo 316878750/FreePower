@@ -803,6 +803,10 @@ src/
   selfcheck/           自检：页面探针 / 报告 / 落盘 / 本地安全上下文服务 / HTML 渲染
   runtime/manager.js   启停、校验/预检/跟版、自动 attach 新标签页、自检、代理认证
   runtime/batch.js     批量启停：并发池、失败清单、中断
+  agent/task.js        browser_task DSL：7 个动作的解析/校验、任务 digest（审批用）
+  agent/workflow.js    工作流容器：状态机、每步审批、对外形状（骨架版执行器未接）
+  agent/cli.js         adspower_cli 调用层：只走本地 API + CDP，不调对手云
+  agent/llm.js         LLM 接入骨架：OpenAI 兼容配置解析与请求构造（暂不发送）
 desktop/
   main.js              Electron 主进程：起服务、开窗、托盘、单实例、自启、退出收尾
   residue.js           退出前的残留 chrome 检查（WMI 查命令行 → taskkill → 再查）
@@ -820,7 +824,7 @@ web/
   pages/selfcheck.js   自检报告
 test/smoke.mjs         端到端冒烟（152 项，需真实 Chrome）
 test/unit.test.mjs     零 Chrome 单元测试（71 项）
-test/api.test.mjs      本地 API 契约测试（96 项，不需要 Chrome）
+test/api.test.mjs      本地 API 契约测试（100 项，不需要 Chrome）
 test/net-rules.test.mjs  网络规则匹配逻辑单测（38 项，不需要 Chrome）
 test/recycle.test.mjs  回收站数据层 + 两条路由（44 项，含重启读库）
 test/chain-rules.test.mjs  多级代理链纯逻辑（31 项：hop 解析、塌单跳、PAC、协议限制）
@@ -839,3 +843,52 @@ tools/run-desktop.mjs  开发态起桌面壳（会剥掉 ELECTRON_RUN_AS_NODE �
 electron-builder.yml   打包配置（win-unpacked + NSIS）
 docs/                  技术方案、阶段交付、curl 实测、截图（docs/shots/）
 ```
+
+## 十、AI Agent（0.4.0 骨架）
+
+**先把这一节的性质说清楚**：这是 **骨架**，不是能用的 Agent —— DSL 解析、HITL 审批、状态查询是**真实现**，但**执行器与模型调用都还没接**（`runBrowserTask()` / `chat()` 抛 `NotImplementedError`，工作流会停在 `approved`，不会假装跑完）。写这一节是为了先把路由契约、DSL 子集与「默认拒」的口径定下来。
+
+### 范围（拍过板，不再扩）
+
+- **1 会话 + 1 环境**：一次只操作一个浏览器环境，不做并发池、不做 `browser-worker` 编排；
+- **`browser_task`**：第一版只做 7 个动作 —— `open` / `click` / `fill` / `wait` / `text` / `screenshot` / `cookie`；不在表里的动作报 `100002`，**不静默忽略**；
+- **`adspower_cli`**（`src/agent/cli.js`）：只走我们自己的本地 API（`/api/v2/browser-profile/start|stop|active|list`）+ CDP，**不调对手云**；
+- **HITL**：每一步默认 `pending_approval`、默认拒；没有 `approve` 一步都不执行（执行器接上之后也一样走这个门）；
+- **自带 LLM**：OpenAI 兼容 endpoint + 用户自己的 key（`AGENT_LLM_*`，只存本地），**不走对手云端 token**。
+
+### 与对手的有意差异（最要紧的一条）
+
+对手的形态是「宿主窗口（`AI Pet`，加载云端页面）+ 5.3 MB Agent Core 子进程 + 自家模型网关 `https://ai.adspower.com/api`，Bearer 就是你的**登录 token**」（逆向 `24-` §2 / §3.3 / §5.2）。我们**没有云端**：模型 endpoint 与 key 都由用户自己填，请求直连那个 endpoint、不经过任何 adspower 域名；用户看得见自己花的是谁的钱。Agent 的浏览器动作走已有的 Local API + CDP（等价对手 §6.1 那条路），但少掉「自家网关」这一跳。**这条差异是有意的，不是还没做。**
+
+### 路由（三条，都是我们自己的契约）
+
+对手没有可抄的本地 REST —— 它是 Agent Core 的 4 条 WebSocket 指令（`24-` §3.2）；所以这三条的形状按「脚本能编排、人能审批」定：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/v1/agent/workflow/run` | 建工作流：校验 DSL、给每步算 `digest`、状态 `created`；**不启动浏览器** |
+| GET | `/api/v1/agent/workflow/:id/status` | 读状态与每步审批状态；不存在 → `100001` |
+| POST | `/api/v1/agent/workflow/:id/approve` | HITL：`{step_id?, decision:'approve'\|'reject', digest?}`；**不给 `decision` 就是拒** |
+
+动态段 `:id` 是本地路由表里**唯一**支持参数的一段（`src/api/server.js` 的 `matchRoute`），老 54 条静态路由的匹配行为一个字节没变。错误码沿用已有的：DSL/参数错 `100002`（带 `data.field` 指出哪个字段）、工作流不存在 `100001`、环境不存在 `100001`。
+
+### HITL 的三条硬规矩
+
+1. **默认拒**：`decision` 缺省、写成别的值、或没带 → 一律按 reject 处理，工作流直接进 `rejected`；
+2. **digest 绑定**：`digest = sha256(规范化任务 JSON)`，64 位十六进制；审批时给了 `digest` 就必须与那一步一致，否则 `100002`（防「批的是 A、跑的是 B」）。**算法与覆盖内容是我们自己的** —— 对手那个只知长度 64、算法【无证据】（`24-` §4.5），别写成「对齐了对手」；
+3. **执行器没接也不许绕**：`runWorkflow()` 抛 `NotImplementedError`，工作流停在 `approved`；不存在「批了就直接跑」的旁路。
+
+### 配置
+
+```
+FREEPOWER_AGENT_LLM_ENDPOINT   OpenAI 兼容 base（例如 https://api.deepseek.com/v1）
+FREEPOWER_AGENT_LLM_KEY        用户自己的 key（只存本地；日志里只出现前 4 + 后 4 位）
+FREEPOWER_AGENT_LLM_MODEL      模型名（三样缺一 = 没配，不做默认模型猜测）
+FREEPOWER_AGENT_LLM_TIMEOUT    单次请求超时（默认 60000 ms）
+FREEPOWER_AGENT_HITL           写 `approve` 才放行，其余（含写错、空串）一律 `deny`
+```
+
+### 现在做到哪 / 下一步
+
+- **已做**：7 个动作的解析与字段白名单（含 http(s)、CSS 选择器、`wait` 三选一、cookie get/set）、任务 `digest`、工作流状态机与审批、三条路由、`cli.js` 的 list/start/stop/active 与 `cdpUrl()`、`llm.js` 的配置解析与请求构造（**不发请求**）、`x-freepower-agent: 1` 来源标记；
+- **未做（下一轮）**：`runBrowserTask()` 的 CDP 执行、`chat()` 真调用、控制台审批弹窗（现在只有 API）、工作流持久化（目前是进程内 `Map`，重启即丢）。

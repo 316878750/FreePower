@@ -8,7 +8,8 @@
  *        环境 CRUD、分组、标签、代理列表。
  *   其余：**明确报「不支持」，不假成功**，错误码用已知的 -1，脚本不会拿到未知码。
  *
- * FreePower 扩展（对手没有）：batch-start / batch-stop / selfcheck / detail / proxy-check。
+ * FreePower 扩展（对手没有）：batch-start / batch-stop / selfcheck / detail / proxy-check，
+ * 以及 0.4.0 的 agent/*（工作流 / 审批，见第十节）。
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -36,6 +37,7 @@ import { readReportFile, summarize } from '../selfcheck/store.js';
 import { renderHtml } from '../selfcheck/html.js';
 import { issueTicket } from './tickets.js';
 import { listKernels } from '../kernel/chrome.js';
+import { createWorkflow, getWorkflow, approveStep, presentWorkflow } from '../agent/workflow.js';
 import { toCanonical, toV2 } from '../../packages/profile/src/aliases.js';
 import {
   ApiError, ERR, ok, unsupported, normalizeLaunchArgs, serializeLaunchArgs, normalizePasswordFilling, serializePasswordFilling,
@@ -674,6 +676,49 @@ export function buildRoutes() {
     const r = restoreProfiles([target.id], g)[0];
     if (!r.restored) throw new ApiError(ERR.GENERIC, 'restore failed');
     return ok(null);
+  });
+
+  /* ==================== 6. AI Agent（0.4.0 骨架；对手那套在云端，见 docs/reverse 24-） ====================
+   *
+   * 三条路由都是**我们自己的契约**（对手没有可抄的本地 REST：它是 5.3 MB Agent Core 子进程
+   * + `ws://127.0.0.1:<port>/agent/socket` 的 4 条 WS 指令，逆向 `24-` §3.2）。
+   * 所以这里的形状不定"对齐对手"，定"脚本能编排 + 人能在控制台批"：
+   *   POST run      建工作流（解析 DSL、算每步审批 digest），**不启动浏览器**
+   *   GET  status   读状态（骨架版永远到不了 completed，因为执行器未接）
+   *   POST approve  HITL 批/拒一步；**不给 decision 就是拒**（默认拒）
+   */
+
+  /** 把 agent 层的错误（带数字 code / field）统一转成 ApiError，不发明新码 */
+  const agentCall = (fn) => {
+    try {
+      return fn();
+    } catch (e) {
+      if (e instanceof ApiError) throw e;
+      const code = Number.isFinite(e?.code) ? e.code : ERR.GENERIC;
+      throw new ApiError(code, e?.message || 'agent error', 200, e?.field ? { field: e.field } : {});
+    }
+  };
+
+  add(['POST'], ['/api/v1/agent/workflow/run'], (ctx) => {
+    const b = ctx.body || {};
+    const pid = String(b.profile_id ?? b.user_id ?? '').trim();
+    if (!pid) throw new ApiError(ERR.INVALID, 'profile_id is required');
+    // 环境存在性先查：别让工作流建出来挂在一个不存在的环境上（执行器接上后才发现就晚了）
+    if (!getProfile(pid)) throw new ApiError(ERR.NOT_FOUND, 'Profile does not exist');
+    const wf = agentCall(() => createWorkflow({ profile_id: pid, goal: b.goal, tasks: b.tasks }));
+    return ok(presentWorkflow(wf));
+  });
+
+  add(['GET'], ['/api/v1/agent/workflow/:id/status'], (ctx) => {
+    const wf = getWorkflow(ctx.params?.id);
+    if (!wf) throw new ApiError(ERR.NOT_FOUND, 'Workflow does not exist');
+    return ok(presentWorkflow(wf));
+  });
+
+  add(['POST'], ['/api/v1/agent/workflow/:id/approve'], (ctx) => {
+    const b = ctx.body || {};
+    const wf = agentCall(() => approveStep(ctx.params?.id, { step_id: b.step_id, decision: b.decision, digest: b.digest }));
+    return ok(presentWorkflow(wf));
   });
 
   /* ============================ 5. 占位：明确不支持 ============================ */

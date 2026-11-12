@@ -11,7 +11,7 @@ const MAX_BODY = 2 * 1024 * 1024;
 const VERSION = '0.3.2';
 
 /* ------------------------------- 限流 ------------------------------- */
-const buckets = new Map();
+const buckets = new Map();;
 function rateLimit(key, limit) {
   const now = Date.now();
   const b = buckets.get(key) || { tokens: limit, ts: now };
@@ -22,6 +22,44 @@ function rateLimit(key, limit) {
   b.tokens -= 1;
   buckets.set(key, b);
   return true;
+}
+
+/* ------------------------------ 路由匹配 ------------------------------ */
+/**
+ * 路径匹配：静态路径仍然全等（54 条老路由的行为一个字节不变）；
+ * 带 `:name` 的段按「一段非空」匹配，取出来的值进 `ctx.params`。
+ * 目前只有 AI Agent 的三条动态路由（`/agent/workflow/:id/...`）用到。
+ * 编译结果按路径字符串缓存 —— 路由表只建一次，不必每请求重编译。
+ */
+const pathMatchers = new Map();
+function matcherFor(pattern) {
+  const hit = pathMatchers.get(pattern);
+  if (hit) return hit;
+  const names = [];
+  const src = pattern.split('/').map((seg) => {
+    if (seg.startsWith(':')) { names.push(seg.slice(1)); return '([^/]+)'; }
+    return seg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }).join('/');
+  const out = { re: new RegExp(`^${src}$`), names };
+  pathMatchers.set(pattern, out);
+  return out;
+}
+
+function matchRoute(routes, method, pathname) {
+  for (const r of routes) {
+    if (!r.methods.includes(method)) continue;
+    if (r.path === pathname) return { route: r, params: {} };
+    if (!r.path.includes(':')) continue;
+    const { re, names } = matcherFor(r.path);
+    const m = re.exec(pathname);
+    if (!m) continue;
+    const params = {};
+    for (let i = 0; i < names.length; i++) {
+      try { params[names[i]] = decodeURIComponent(m[i + 1]); } catch { params[names[i]] = m[i + 1]; }
+    }
+    return { route: r, params };
+  }
+  return null;
 }
 
 /* ------------------------------- 鉴权 ------------------------------- */
@@ -133,7 +171,9 @@ export function createApiServer({ port } = {}) {
       return sendStatic(res, file, corsHeaders);
     }
 
-    const route = routes.find((r) => r.methods.includes(req.method) && r.path === url.pathname);
+    const matched = matchRoute(routes, req.method, url.pathname);
+    const route = matched?.route;
+    const routeParams = matched?.params || {};
     if (!route) return send(res, 404, { code: ERR.GENERIC, msg: `no route ${req.method} ${url.pathname}`, data: { supported: false, path: url.pathname } }, corsHeaders);
 
     if (route.auth !== false) {
@@ -172,6 +212,8 @@ export function createApiServer({ port } = {}) {
         path: url.pathname,
         query: Object.fromEntries(url.searchParams.entries()),
         body,
+        // 动态段参数（静态路由恒为 {}），只有 `/agent/workflow/:id/...` 这组用
+        params: routeParams,
       };
       const out = await route.handler(ctx);
       if (out && typeof out.__html === 'string') sendHtml(res, out.__html, corsHeaders);

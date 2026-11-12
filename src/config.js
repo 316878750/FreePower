@@ -71,3 +71,24 @@ export const FP_DEBUG = process.env.FREEPOWER_FP_DEBUG === '1';
  * 也容易把代理预检压出超时（10 个环境 × 每个 3 条连接）。
  */
 export const BATCH_CONCURRENCY = Math.max(1, Number(process.env.FREEPOWER_BATCH_CONCURRENCY || 3));
+
+/* --------------------------- 0.4.0 AI Agent（骨架） --------------------------- */
+
+/**
+ * 模型接入：**用户自己的 endpoint / key / model**，OpenAI 兼容协议
+ * （`POST <endpoint>/chat/completions`）。对手走自家网关 `https://ai.adspower.com/api`、
+ * Bearer 是登录 token（逆向 `24-` §5.2）—— 我们不碰那条路，也不默认填任何厂商地址。
+ * 三样缺一就算"没配"，不做默认模型猜测。
+ */
+export const AGENT_LLM_ENDPOINT = String(process.env.FREEPOWER_AGENT_LLM_ENDPOINT || '').trim();
+export const AGENT_LLM_KEY = String(process.env.FREEPOWER_AGENT_LLM_KEY || '').trim();
+export const AGENT_LLM_MODEL = String(process.env.FREEPOWER_AGENT_LLM_MODEL || '').trim();
+export const AGENT_LLM_TIMEOUT_MS = Number(process.env.FREEPOWER_AGENT_LLM_TIMEOUT || 60000);
+
+/**
+ * HITL 缺省裁决。**只认 `approve` 才放行，其余（含没配、写错、空串）一律 `deny`** ——
+ * 这条是 Agent 在本地跑自动化时的安全底线，别做成"配错就默认同意"。
+ */
+export const AGENT_HITL_DEFAULT = String(process.env.FREEPOWER_AGENT_HITL || 'deny').trim().toLowerCase() === 'approve'
+  ? 'approve'
+  : 'deny';
