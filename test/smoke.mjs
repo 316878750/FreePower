@@ -589,7 +589,7 @@ async function main() {
 
       // 占位：明确不支持
       const ph = await api('POST', '/api/v2/browser-profile/recycle-bin/list', { page: 1 });
-      check('占位路由：明确不支持', ph.json.code === -1 && ph.json.data?.supported === false);
+      check('回收站路由：真实现（code 0 + list 数组 + data 键全等 list,page + 无 total）', ph.json.code === 0 && Array.isArray(ph.json.data?.list) && Object.keys(ph.json.data).sort().join(',') === 'list,page' && ph.json.data.total === undefined);
     }
 
     /* ================= 契约基础 ================= */
