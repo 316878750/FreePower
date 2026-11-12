@@ -12,6 +12,12 @@
 ; 表现为「退出码 0、一个文件都没删」，用户完全看不出失败。
 ; 实测本包：装到自定义路径后注册表 9 个值里**没有 InstallLocation**，
 ; 所以下面这条兜底不是预防性代码，是每次卸载都要走的必经路径。
+; 2026-11-12 13:03 复核：上面这句只对「装到自定义路径」那次成立。同一台机器上
+; 一次正常 NSIS 安装（默认路径）后，HKCU\Software\<APP_GUID> 的 InstallLocation
+; **有值**（C:\Users\1\AppData\Local\Programs\freepower），`customUnInit` 第一条就
+; 读到了它 ⇒ 这次 INI 兜底**没有触发**。INI 仍要写：它只在注册表读不到时兜。
+; 另：Uninstall 键（…\Uninstall\<APP_GUID>）的 InstallLocation 一直是空的，别和
+; 应用键那个值混为一谈。
 ;
 ; 做法：安装时把 $INSTDIR 另存一份到 %APPDATA%\FreePower\install-dir.ini；
 ; 卸载时注册表读不到就用这份标记，并且必须确认该目录里确实有 FreePower.exe 才认。
