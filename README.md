@@ -337,11 +337,49 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
     - 结论：**`.txt` 只适合「人看 + 对方能吃」的搬运，不是保真备份**；要保真用 JSON（JSON 侧不编码，密码里的 `:` 原样保留）。这一条与已知限制 33 里「txt 不是环境全量备份」是同一件事的两面。
 39. **`/S` 装包不会弹「应用正在运行」的对话框 —— 它会直接杀掉应用（2026-11-12 复核，推翻旧判断）**：旧判断是「静默装会挂在隐藏的『应用正在运行』对话框上，所以必须先停应用」，当时标的是**推断、未实测**。**今天复核推翻了它**，依据是装这个包的那套 NSIS 模板源码（`node_modules\app-builder-lib@26.0.12\templates\nsis\`，仓库 `devDependencies` 是 `^26.0.12`、装的就是 26.0.12）：
     - `include\allowOnlyOneInstallerInstance.nsh:65` 是 `MessageBox MB_OKCANCEL|MB_ICONEXCLAMATION "$(appRunning)" /SD IDOK IDOK doStopProcess`。NSIS 的 `/SD` 就是「静默模式下取这个默认值、**且不显示窗口**」，所以 `/S` 下**根本不会有 `#32770`** —— 那次「枚举窗口没看到对话框」不是这次没抓到，而是**方法上永远抓不到**。
+      **（2026-11-12 12:47 复核：这句只在 `:65` 这一条 MessageBox 上成立，推广到整个安装器是错的 —— 推翻。）** `/SD` 只对**自己写了 `/SD` 的那几条**生效：实测在 `/S` 下抓到过两个 `#32770`（见第 40 条），其中 `installUtil.nsh:129` 的 `MessageBox MB_OK|MB_ICONEXCLAMATION "$(uninstallFailed): $R0"` **没有 `/SD`**，所以静默模式照样弹出来等人点。**「`/S` 下方法上永远抓不到对话框」这个结论作废**；旧判断保留在上面，不改。
     - 静默默认 `IDOK` 会跳到 `doStopProcess`，即 `taskkill /im "FreePower.exe" /fi "PID ne $pid" /fi "USERNAME eq %USERNAME%"`（`:76` 先软、`:94` 加 `/f`）。**结论：`/S` 装包会把用户正在跑的 FreePower.exe 直接硬杀，不弹窗、不问。**「装包必须先停应用」因此仍然成立，但理由换了：不是「有对话框在等」，而是「不停就被 `taskkill`」。
     - `installSection.nsh:33`（oneClick 分支）先 `CHECK_APP_RUNNING` 再 `uninstallOldVersion`，顺序与上面两条对得上。
     - 「无窗口、永不返回」的真实机制在 `include\extractAppPackage.nsh:116`：`MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION ... /SD IDRETRY IDCANCEL AbortExtract7za` —— 静默默认 `IDRETRY` ⇒ `CopyFiles` 连败 5 次后**无限重试**。所以判「卡住」的判据只能是 **pid + 看门狗**，**用窗口枚举判这个问题在方法上无效**（静默模式下安装器没有窗口可看）。对照：`installUtil.nsh:219` 是 `/SD IDCANCEL`，会返回，不是死循环。
+      **（2026-11-12 12:47 复核：上面「静默下无限重试」这句也错了 —— 修正。）** `/SD IDRETRY` 是「静默时取 IDRETRY 这个按钮、且不显示窗口」，而 `IDRETRY` 在这条 `MessageBox` 上**没有对应标签**，于是**顺落**到 `:125-128` 的兜底：`RMDir /r "$PLUGINSDIR\7z-out"` → 直接 `Nsis7z::Extract` → `Goto DoneExtract7za`，安装**继续往下走并正常退出**。实测：一次 `/S` **7.2 秒、退出码 0、零文件写入**（详见第 40 条）。真正会「一直等」的是**交互模式**下没人点（我们那次 180 秒不动）。**「pid + 看门狗」这条判据不变，但理由要换成「静默下它会『成功』退出，靠退出码根本发现不了失败」。**
     - 证据等级如实标：这是**模板源码事实 + 版本一致**，**不是二进制里验过** —— 115,330,938 B 的 `setup.exe` 全读一遍，utf8/utf16 搜 `appRunning` 风格串 **0 命中**，负载是压缩的。
     - 另记一条当天实测（与上面分开，不混进「对话框」那个结论）：本机用 `Start-Process -FilePath setup.exe -ArgumentList '/S' -PassThru` 起安装器，**6 分钟没返回**，20 秒的窗口枚举循环一次都没跑到；同一 exe 用 `CreateProcessW(CREATE_SUSPENDED)` 直接起是 **ok、532 ms**，收尾安装目录一字未变。即进程创建本身通得过，差别在 ShellExecute 那条路。**本地安装脚本因此改用 `Process.Start(UseShellExecute=$false)` + 180 s 看门狗 + 按 pid 收尾**（`.tmp\install-032.ps1`，gitignored，不进版本库）。
+40. **本机装不上 0.3.2 的真根因：安装器进程被降到低完整性（Low IL），不是它误判「应用正在运行」（2026-11-12，实测）**。这一条替换掉「安装器以为应用还在跑」的旧说法，并推翻第 39 条里那句推广过头的「`/S` 下永远没有 `#32770`」。
+    **两张对话框原文（CEO 12:47 一手记录）**：
+    - 静默那次：标题 `FreePower 安装`，正文 `Failed to uninstall old application files. Please try running the installer again.: 2`，按钮「确定」。对应 `installUtil.nsh:128-133` 的 `MessageBox MB_OK|MB_ICONEXCLAMATION "$(uninstallFailed): $R0"` —— **这一条没有 `/SD`**；`$(uninstallFailed)` 的 en 串（`messages.yml:206`）与正文前缀逐字相同，`: 2` 是 `$R0`，即**旧卸载器的退出码**。
+    - 非静默那次：`FreePower 无法关闭。请手动关闭它，然后单击重试以继续。` = `$(appCannotBeClosed)` 的 zh_CN 译文（`messages.yml:83`）。用到它的分支全模板只有三处：`allowOnlyOneInstallerInstance.nsh:110`（`/SD IDCANCEL`）、`extractAppPackage.nsh:116`（`/SD IDRETRY`）、`installUtil.nsh:219`（`/SD IDCANCEL`）。
+    **分支定位（排除法，逐条带读数）**：
+    | 候选 | 需要的条件 | 读数 / 结论 |
+    |---|---|---|
+    | `allowOnlyOneInstallerInstance.nsh:65`（`$(appRunning)`，确定/取消） | — | **不是它**：那个文案（「…正在运行。点击“确定”关闭」）全程没出现过 |
+    | `installUtil.nsh:219`（`$(appCannotBeClosed)`） | `UninstallString` 非空 | **排除**：`:156-164` 读不到 `UninstallString` 就直接 `Return`；12:47 时 `UninstallString` 为空（四个注册表视图无 FreePower 项，CEO 12:47 量），所以这一条根本走不到 |
+    | `allowOnlyOneInstallerInstance.nsh:110`（`$(appCannotBeClosed)`） | `FIND_PROCESS` 报「应用在跑」两轮 | **排除**：那条原命令单独跑 **exit 1**（无输出）；现在应用在跑时同一条命令 **exit 0 + 4 行 CSV**，反向 `NoSuchApp.exe` **exit 1** —— 命令本身没坏，exit 1 就是「真没在跑」 |
+    | `extractAppPackage.nsh:116`（`$(appCannotBeClosed)`） | `CopyFiles` 连败 5 次 | **落在这一条**（三条排除后唯一剩下的，且与「文件一个都进不去」的现象吻合） |
+    **根因（实测，不是猜）**：
+    - `icacls release\FreePower-0.3.2-setup.exe` → `Mandatory Label\Low Mandatory Level:(I)(NW)`。**带低标签的 exe 起进程，进程就是 Low IL**（本机 `release\win-unpacked\FreePower.exe` 同样是低标签；装机目录里那份则没有低标签）。
+    - 于是 `$PLUGINSDIR` 落在 `%TEMP%\Low\nsXXXX.tmp`（`icacls` 同一个低标签）。**`Nsis7z::Extract` 在那里是成功的**：09:52:43 那次留下的 `%LOCALAPPDATA%\Temp\Low\nsm5F6D.tmp\7z-out` 里有 **82 个文件 / 490,216,832 B**，`FreePower.exe` 249,831,936 B 整个都在。也就是说**解包没问题，问题全在「往装机目录复制」这一步**。
+    - 目标 `%LOCALAPPDATA%\Programs\FreePower` 是 Medium（ACL 三行 `SYSTEM/Administrators/用户` 全控，`icacls` 无低标签）。**Low IL 写 Medium 被完整性策略拒绝**。我的复现（拷一份 `cmd.exe` → `icacls /setintegritylevel Low` → 用它操作）：写装机目录 → `Access is denied.`、**exit 1**、文件不存在；同一个低完整性进程写 `%TEMP%\Low` → **成功、exit 0**；对装机目录里的文件做 `ren` → `Access is denied.`、**exit 1**（这就是 `un.atomicRMDir` 那一步）；读装机目录里的文件 → **exit 0**（只读不被拦）。
+    - 所以 `CopyFiles "$PLUGINSDIR\7z-out\*" $OUTDIR` 连败 5 次 → `:116`：**交互模式**弹「应用无法关闭」等人点（我们那次 180 秒不动）；**静默模式**按 `/SD IDRETRY` 顺落到兜底，安装继续 → **退出码 0、零文件**。**「退出码 0」在这种场景下完全不可信，这是本次最该记住的一条。**
+    - 旧卸载器退出码 2 是同一条链：它被拷成 `$PLUGINSDIR\old-uninstaller.exe`（同样在 `%TEMP%\Low` 里）运行，`--updated` 走 `un.atomicRMDir` → `Rename` 被拒（上面那条实测）→ `un.restoreFiles` → `uninstaller.nsh:167` `Abort`。**「`Abort` ⇒ 进程退出码 2」这半步我没能复现**（本机没有 makensis，且不许再跑安装器/卸载器），标**推断**；能证的只有：对话框里的 `2` 是旧卸载器的退出码，而模板里**没有任何一处**给卸载器 `SetErrorLevel 2`（grep `SetErrorLevel` 全部命中：`installUtil.nsh:131` 安装器、`common.nsh:80` 成功=0、`assistedInstaller.nsh:91`）。
+    - 残留旁证（`%TEMP%\Low` 下今天三个目录）：`nszAA4.tmp`（09:45:48）与 `nsm3EB5.tmp`（09:49:18）里只有 `old-uninstaller.exe` 138,745 B + `nsExec/StdUtils/System.dll` —— 那两次停在「跑旧卸载器」；`nsm5F6D.tmp`（09:52:43）里是完整 `7z-out` —— 那一次已经过了卸载，卡/落在「复制进装机目录」。
+    **已排除项（每条带我自己的读数）**：
+    - 磁盘不足：`C:` 剩 **506.25 GB**。
+    - `%TEMP%` 不可写：Medium 进程写 20 MB **成功**（20,971,520 B，已删）。
+    - 安装包损坏：`7za t release\FreePower-0.3.2-setup.exe` → **exit 0**，76 文件 / 374,828,265 B，无 CRC 错。
+    - 杀软拦截：Defender 操作日志近 6 小时**无 1116/1117**（检出/拦截）；只有 09:45:59 的 8 条 2010（云保护查询，正常）与 08:30 的扫描事件。**没有证据支持「被杀软拦」，别这么写。**
+    - ACL 权限：装机目录 ACL 正常（`SYSTEM`/`Administrators`/用户 全控）。**拦它的是完整性级别，不是 ACL** —— 这两件事必须分开说，否则会去改 ACL 而白改。
+    - 应用没关：`FIND_PROCESS` 原命令 exit 1（上面）。
+    - 旧卸载器自身坏了：单独跑 `Uninstall FreePower.exe /S /KEEP_APP_DATA /currentuser --updated _?=<appDir>` → **exit 0 / 0.6 s**，`appDir` 77→1 文件、数据目录 1673 文件不变（**CEO 12:47 的读数；我没跑** —— 跑它会删注册表项）。
+    **只读判据（下次复现不用装）**：
+    ```powershell
+    icacls 'release\FreePower-0.3.2-setup.exe'            # 期望看到 Mandatory Label\Low Mandatory Level
+    icacls "$env:LOCALAPPDATA\Temp\Low"                   # 同一个低标签，(OI)(CI)(NW)
+    Get-ChildItem "$env:LOCALAPPDATA\Temp\Low" -Directory  # 装失败会留下 ns*.tmp；里面有 7z-out 的那次已过卸载
+    ```
+    一句话：**`7z-out` 解出来了、`$INSTDIR` 一个文件没进去、退出码还是 0** ⇒ 就是 Low IL 写 Medium 被拒这条路；再补一条 `icacls` 看安装器 exe 的低标签即可闭环。
+    **处置（CEO 执行，降级路径）**：安装器两次失败后，把 `release\win-unpacked`（与安装包内 payload 逐字节相同）覆盖进 `C:\Users\1\AppData\Local\Programs\FreePower`，`app.asar` 复核 = `A9FEB33B…1157825`；随后手写卸载注册项（`HKCU\...\Uninstall\cfc06f39-cb32-5a00-9ce5-55cf1e15d011`：`DisplayName=FreePower 0.3.2`、`DisplayVersion=0.3.2`、`UninstallString="<appDir>\Uninstall FreePower.exe" /currentuser`、`EstimatedSize=366179`、`NoModify/NoRepair=1`），已读回核对（我复量：该键存在，值如上；HKLM 两个视图仍无项）。
+    **代价如实标**：程序与功能里的卸载器**仍是 0.3.1 那份二进制**（`Uninstall FreePower.exe` 138,745 B、mtime 11-11 22:44:46，自报 0.3.1），只有文件层面是逐字节 0.3.2；下次走正常安装器时要重新生成卸载器。
+    **还没验的事（别写成已验）**：去掉 exe 的低标签（例如 `icacls <exe> /setintegritylevel Medium`，或从没有低标签的位置复制一份再跑）之后安装器能否装成功 —— 本机没有 makensis，且本轮不许跑 `setup.exe`，所以这一条只有机制、没有实测。
 
 
 ## 八、验证
