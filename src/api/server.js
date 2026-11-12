@@ -209,6 +209,8 @@ export function createApiServer({ port } = {}) {
       const body = hasBody ? await readBody(req) : {};
       const ctx = {
         req,
+        // 服务自己的 key：agent 执行器要拿它回调本地 API（同一进程，不经网络再查库）
+        apiKey,
         path: url.pathname,
         query: Object.fromEntries(url.searchParams.entries()),
         body,

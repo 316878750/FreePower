@@ -1,21 +1,22 @@
 /**
- * 工作流容器（0.4.0 AI Agent 骨架）。
+ * 工作流容器（0.4.0 AI Agent）。
  *
  * 一次工作流 = **1 个环境 + N 条 `browser_task` + 每步一次人工审批**。
  * 范围按 CEO 拍的口径：不做并发池、不做 `browser-worker` 编排、不做技能市场。
  *
- * 状态机（第一版只有前三个会真的出现，执行器未接）：
+ * 状态机：
  *
- *   created ──approve──▶ approved ──(执行器)──▶ running ──▶ completed
- *      │                     │                     │
- *      └──reject──▶ rejected └─────────────┘        └──▶ failed / aborted
+ *   created ──approve──▶ approved ──runWorkflow──▶ running ──▶ completed
+ *      │                     │                        │
+ *      └──reject──▶ rejected └──────────────────┘     └──▶ failed / aborted
  *
  * **HITL 是硬约束**：每一步默认 `pending_approval`，`AGENT_HITL_DEFAULT` 默认 `deny`；
  * 没有 `approve` 的步一步都不许执行。审批单带 `digest`（`task.js` 的 `digestTask`），
- * 防"批的是 A、跑的是 B"。
+ * 防"批的是 A、跑的是 B"——**执行每一步之前还会从盘上再核一次**（批完到真跑之间，
+ * 文件是可能被外部改的）。
  *
- * 这一版把**解析 + 审批 + 状态查询**做真，`runStep` 抛 `NotImplementedError` ——
- * 所以工作流会停在 `approved`，不会假装跑完。
+ * 执行（`runWorkflow`）：环境没起来就调 `cli.startBrowser` 拉起来；**跑完不关浏览器**
+ * （用户可能还要看页面，关是用户的事）。单步失败/超时不重试、不跳过，整条工作流落 `failed`。
  *
  * 存储：`DATA_DIR/agent/workflows/<id>.json`，一个工作流一个文件，**每次状态转移都落盘**
  * （`<id>.json.tmp` → `rename`，半写崩进程只留 `.tmp`，读侧跳过），与对手的
@@ -27,6 +28,9 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseTaskList, digestTask, runBrowserTask, TaskError, NotImplementedError } from './task.js';
+import { createCli } from './cli.js';
+import { getMeta } from '../store/db.js';
+import { CdpClient } from '../kernel/cdp.js';
 import { AGENT_HITL_DEFAULT, AGENT_WORKFLOW_DIR } from '../config.js';
 
 export const WORKFLOW_STATES = ['created', 'approved', 'running', 'completed', 'failed', 'rejected', 'aborted'];
@@ -136,7 +140,7 @@ export function createWorkflow({ profile_id: profileId, goal = '', tasks } = {})
     state: 'created',
     created_at: now,
     updated_at: now,
-    /** 每一步：审批状态 + digest；执行结果留到执行器接上再填 */
+    /** 每一步：审批状态 + digest + 执行结果（结果形状见 presentWorkflow / README） */
     steps: parsed.map((task, i) => ({
       step_id: `step-${i + 1}`,
       index: i,
@@ -145,9 +149,15 @@ export function createWorkflow({ profile_id: profileId, goal = '', tasks } = {})
       state: 'pending_approval',
       approved_at: null,
       decision: null,
+      result: null,
+      reason: null,
+      started_at: null,
+      finished_at: null,
     })),
-    /** 执行器未接：这个字段让调用方一眼看出"批了也不会跑" */
-    executor: 'skeleton',
+    /** 执行器：`cdp` = 本地 CDP 真执行（对手那是云端 Agent Core，见 24- 契约） */
+    executor: 'cdp',
+    started_at: null,
+    finished_at: null,
     error: null,
   };
   workflows.set(id, wf);
@@ -183,6 +193,11 @@ export function presentWorkflow(wf) {
       digest: s.digest,
       decision: s.decision,
       approved_at: s.approved_at,
+      // 结果只回「动作的产物」：不回 task 原文（fill 的值、cookie set 的值可能是密码/token）
+      result: s.result ?? null,
+      reason: s.reason ?? null,
+      started_at: s.started_at ?? null,
+      finished_at: s.finished_at ?? null,
     })),
     hitl: { default_decision: AGENT_HITL_DEFAULT, required: true },
     error: wf.error,
@@ -248,12 +263,149 @@ function rejectStep(wf, input, reason) {
 }
 
 /**
- * 跑工作流 —— **骨架版未接执行器**。
- * 真实现时：只跑 `approved` 的步、按顺序、每步前后发事件；任何一步抛错 → `failed` 并停。
- * 这里刻意抛 NotImplementedError，让调用方看到「approved 但不执行」，而不是假 completed。
+ * 只有「全部步都批过、且盘上任务没被改过」的 `approved` 工作流才许跑。
+ * 同步函数：路由层可以在返回前就拿到参数错（100002 带 `data.field`），不必等异步任务。
  */
-export async function runWorkflow() {
-  throw new NotImplementedError('工作流执行器未接（0.4.0 骨架版）：审批与状态机已就绪，执行留到下一轮');
+export function assertWorkflowRunnable(wf) {
+  if (!wf) throw new WorkflowError(100001, 'Workflow does not exist');
+  if (wf.state === 'running') throw new WorkflowError(100002, 'workflow is already running', { field: 'status' });
+  if (wf.state !== 'approved') {
+    throw new WorkflowError(100002, `workflow is ${wf.state}（要全部步批完的 approved 才能跑）`, { field: 'status' });
+  }
+  for (const step of wf.steps) {
+    if (step.state !== 'approved') throw new WorkflowError(100002, `step ${step.step_id} is ${step.state}`, { field: 'step_id' });
+    assertStepDigestOnDisk(wf.id, step);
+  }
+}
+
+function readWorkflowFile(id) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(AGENT_WORKFLOW_DIR, `${id}.json`), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 执行前再核 digest（**读盘上的版本**）：`approveStep` 时核过一次，但持久化之后
+ * 文件是可能被外部改的 —— 内存里那份改不到，盘上那份能改。不一致就拒绝执行。
+ */
+function assertStepDigestOnDisk(id, step) {
+  const onDisk = readWorkflowFile(id);
+  if (!onDisk) throw new WorkflowError(100001, 'workflow file is missing on disk（持久化文件没了，拒绝执行）', { field: 'workflow_id' });
+  const filed = Array.isArray(onDisk.steps) ? onDisk.steps.find((s) => s.step_id === step.step_id) : null;
+  if (!filed) throw new WorkflowError(100002, `step ${step.step_id} is missing on disk（文件被改过）`, { field: 'step_id' });
+  if (digestTask(filed.task) !== step.digest || filed.digest !== step.digest) {
+    throw new WorkflowError(100002, `step ${step.step_id}: digest does not match（审批后任务被改过）`, { field: 'digest' });
+  }
+}
+
+/** 环境已在跑就直接用；没起来才拉起。**不负责关** —— 关浏览器是用户的事 */
+async function ensureBrowser(cli, profileId) {
+  const active = await cli.getBrowser(profileId);
+  if (active && active.status === 'Active') return cli.cdpUrl(active);
+  const started = await cli.startBrowser(profileId);
+  return cli.cdpUrl(started);
+}
+
+/** 挑一个普通页面目标 attach；一个都没有就新建一张 about:blank */
+async function openPageSession(client) {
+  const { targetInfos = [] } = await client.send('Target.getTargets');
+  const page = targetInfos.find((t) => t.type === 'page' && !/^(devtools|chrome-extension):/i.test(String(t.url || '')));
+  const targetId = page?.targetId || (await client.send('Target.createTarget', { url: 'about:blank' })).targetId;
+  const { sessionId } = await client.send('Target.attachToTarget', { targetId, flatten: true });
+  return sessionId;
+}
+
+/**
+ * 跑工作流：按顺序执行**已审批**的步；任何一步失败/超时 → `failed` 并停（不重试、不跳过）。
+ *
+ * @param {string} id 工作流 id
+ * @param {{cli?: object}} [opts] `cli` 是 `cli.js` 的本地 API 调用层；不给就按默认端口 +
+ *        库里的 api_key 建一个（路由会显式传，避免端口猜错）
+ * @returns {Promise<object>} 内部记录（对外形状用 `presentWorkflow`）
+ */
+export async function runWorkflow(id, { cli = null } = {}) {
+  const wf = getWorkflow(id);
+  assertWorkflowRunnable(wf); // 状态 + 每步审批 + 盘上 digest，错了同步抛
+
+  // 先置 running 再 await：并发进来的第二个请求会被上面那条挡掉
+  wf.state = 'running';
+  wf.started_at = new Date().toISOString();
+  wf.error = null;
+  touch(wf);
+
+  const tool = cli || createCli({ apiKey: getMeta('api_key') || '' });
+  let client = null;
+  try {
+    const wsUrl = await ensureBrowser(tool, wf.profile_id);
+    client = await CdpClient.connect(wsUrl, { timeoutMs: 15000 });
+    const sessionId = await openPageSession(client);
+    const send = (method, params = {}) => client.send(method, params, sessionId);
+
+    for (const step of wf.steps) {
+      // 执行前再核一次（读盘）：防「批完到真跑之间任务被改」
+      try {
+        assertStepDigestOnDisk(wf.id, step);
+      } catch (e) {
+        return failWorkflow(wf, step, e);
+      }
+
+      step.state = 'running';
+      step.started_at = new Date().toISOString();
+      touch(wf);
+
+      try {
+        step.result = await runBrowserTask(step.task, { send, screenshotName: `${wf.id}-${step.step_id}.png` });
+      } catch (e) {
+        return failWorkflow(wf, step, e);
+      }
+      step.state = 'completed';
+      step.finished_at = new Date().toISOString();
+      touch(wf);
+    }
+
+    wf.state = 'completed';
+    wf.finished_at = new Date().toISOString();
+    touch(wf);
+    return wf;
+  } catch (e) {
+    // 起浏览器 / 连 CDP / 开页面失败：整条工作流 failed，不猜是哪一步
+    wf.state = 'failed';
+    wf.finished_at = new Date().toISOString();
+    wf.error = {
+      code: Number.isFinite(e?.code) ? e.code : -1,
+      msg: e?.message || 'executor failed',
+      step_id: runningStepId(wf),
+      reason: e?.reason || 'browser_unavailable',
+    };
+    touch(wf);
+    return wf;
+  } finally {
+    try { if (client) client.close(); } catch { /* 只关 CDP 连接，浏览器不动 */ }
+  }
+}
+
+function runningStepId(wf) {
+  const s = wf.steps.find((x) => x.state === 'running');
+  return s ? s.step_id : null;
+}
+
+/** 单步失败：落 step + 整条工作流 `failed`（不重试、不跳过），返回工作流供调用方读状态 */
+function failWorkflow(wf, step, e) {
+  step.state = 'failed';
+  step.finished_at = new Date().toISOString();
+  step.reason = e?.reason || 'execution_failed';
+  wf.state = 'failed';
+  wf.finished_at = step.finished_at;
+  wf.error = {
+    code: Number.isFinite(e?.code) ? e.code : -1,
+    msg: e?.message || 'step failed',
+    step_id: step.step_id,
+    reason: step.reason,
+  };
+  touch(wf);
+  return wf;
 }
 
 export { TaskError, NotImplementedError };

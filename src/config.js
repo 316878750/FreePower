@@ -93,6 +93,18 @@ export const AGENT_LLM_TIMEOUT_MS = Number(process.env.FREEPOWER_AGENT_LLM_TIMEO
 export const AGENT_WORKFLOW_DIR = path.join(DATA_DIR, 'agent', 'workflows');
 
 /**
+ * 单步执行超时（`wait.ms` 另算：`wait({ms})` 按 ms + 5s 放宽，ms 本身已在 DSL 里封顶 120000）。
+ * 超时 → 工作流 `failed`、`error.reason='step_timeout'`，**不自动重试**。
+ */
+export const AGENT_STEP_TIMEOUT_MS = Number(process.env.FREEPOWER_AGENT_STEP_TIMEOUT || 30000);
+
+/**
+ * 截图目录。工作流的 `screenshot` 出参只回**相对这里**的路径（DSL 里的 `path` 也必须是
+ * 相对路径、不许 `..`）—— 不让模型把文件写到 `C:\Windows\...`。
+ */
+export const AGENT_SCREENSHOT_DIR = path.join(DATA_DIR, 'agent', 'screenshots');
+
+/**
  * HITL 缺省裁决。**只认 `approve` 才放行，其余（含没配、写错、空串）一律 `deny`** ——
  * 这条是 Agent 在本地跑自动化时的安全底线，别做成"配错就默认同意"。
  */

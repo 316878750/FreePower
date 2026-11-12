@@ -37,7 +37,9 @@ import { readReportFile, summarize } from '../selfcheck/store.js';
 import { renderHtml } from '../selfcheck/html.js';
 import { issueTicket } from './tickets.js';
 import { listKernels } from '../kernel/chrome.js';
-import { createWorkflow, getWorkflow, approveStep, presentWorkflow } from '../agent/workflow.js';
+import { createWorkflow, getWorkflow, approveStep, presentWorkflow, runWorkflow, assertWorkflowRunnable } from '../agent/workflow.js';
+import { createCli } from '../agent/cli.js';
+import { API_PORT } from '../config.js';
 import { toCanonical, toV2 } from '../../packages/profile/src/aliases.js';
 import {
   ApiError, ERR, ok, unsupported, normalizeLaunchArgs, serializeLaunchArgs, normalizePasswordFilling, serializePasswordFilling,
@@ -718,6 +720,28 @@ export function buildRoutes() {
   add(['POST'], ['/api/v1/agent/workflow/:id/approve'], (ctx) => {
     const b = ctx.body || {};
     const wf = agentCall(() => approveStep(ctx.params?.id, { step_id: b.step_id, decision: b.decision, digest: b.digest }));
+    return ok(presentWorkflow(wf));
+  });
+
+  /**
+   * 真跑：只接受「全部步都批完」的 approved 工作流。接口**立刻回 `running`**，
+   * 执行在后台推进（单步可能几十秒，不能挂在请求上）；进度走 `GET …/:id/status` 轮询。
+   *
+   * 状态 / 每步审批 / 盘上 digest 都在返回前**同步**核一遍：参数错必须当面回 100002，
+   * 不能等后台跑起来才发现（那时调用方已经拿到 200 了）。
+   */
+  add(['POST'], ['/api/v1/agent/workflow/:id/run'], (ctx) => {
+    const wf = getWorkflow(ctx.params?.id);
+    if (!wf) throw new ApiError(ERR.NOT_FOUND, 'Workflow does not exist');
+    const port = ctx.req?.socket?.localPort || API_PORT;
+    const cli = createCli({ base: `http://127.0.0.1:${port}`, apiKey: ctx.apiKey || '' });
+    agentCall(() => assertWorkflowRunnable(wf));
+    agentCall(() => {
+      runWorkflow(wf.id, { cli }).catch((e) => {
+        // runWorkflow 内部已把失败落到 wf.error；这里只兜「连状态转移都没走到」的意外
+        try { console.warn(`[agent] 工作流执行异常 ${wf.id}：${e?.message || e}`); } catch { /* ignore */ }
+      });
+    });
     return ok(presentWorkflow(wf));
   });
 

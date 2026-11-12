@@ -71,9 +71,13 @@ export class AgentCli {
     return this.request('POST', '/api/v2/browser-profile/list', { page, limit });
   }
 
-  /** 起环境，回 `{pid, ws:{puppeteer,selenium}, debug_port, ...}` */
+  /**
+   * 起环境，回 `{pid, ws:{puppeteer,selenium}, debug_port, ...}`。
+   * **必须是 GET**：我们自己的 `/api/v2/browser-profile/start` 只注册了 GET（对齐对手），
+   * 骨架版这里写成 POST，真接执行器时才发现会 404 —— 2026-11-12 修。
+   */
   async startBrowser(profileId) {
-    return this.request('POST', '/api/v2/browser-profile/start', { profile_id: profileId });
+    return this.request('GET', `/api/v2/browser-profile/start?profile_id=${encodeURIComponent(profileId)}`);
   }
 
   /** 停环境 */
