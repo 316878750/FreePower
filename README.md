@@ -14,6 +14,7 @@
 - 环境（profile）增删改查、分组、指纹重生成；**运行中改配置可一键重启**（`POST /api/v1/browser/restart`，stop → 落库 → start 一个请求内完成，控制台里运行态保存按钮变「保存并重启」）
 - 启动/关闭浏览器实例：独立 `--user-data-dir`、独立进程、随机 CDP 端口、进程树回收
 - 指纹：UA / UA-CH / 语言 / 时区 / 屏幕与 DPR / WebGL vendor+renderer / Canvas 种子化噪声 / Audio 噪声 / WebGL 图像噪声 / client rects 噪声 / hardwareConcurrency / deviceMemory / media devices（**真实枚举 + 只改名字**）/ 语音（按环境语言投影 `getVoices()`）/ platform / 字体声明（只声明，不注入）/ WebRTC 策略
+- **隐私开关四项有真行为**（2026-11-12 第一批）：`disable_image` 内核层不请求图片、`disable_video` 按 `Media` 资源类型拦截、`blacklist` / `whitelist` 按域名（含子域、URL 通配、host:port）拦放行 —— 都有开/关对照判据，见第八节「隐私开关」
 - 自检：每个环境启动后自动跑一次真实页面探针，输出 19 项可读报告（覆盖度对齐字段表 full/partial/none），含「页面直接创建的三类 worker + 嵌套 worker」双 Realm 断言与 AudioWorklet 明确 `none`，支持 API 与本地 HTML 页。**worker 不是全覆盖**（OOPIF 子帧、启动前已在跑的 SW 仍是盲区），边界见已知限制第 6 条
 - 代理：HTTP/HTTPS/SOCKS5 绑定、账号密码认证（HTTP 代理）、**fail-closed**；PAC 明确拒绝（不支持就报错，不静默降级）；代理管理页**单条 / 批量健康检查**（出口 IP / 国家 / 延迟 / 时间，失败区分超时、认证失败、代理拒绝 CONNECT、连接被拒、DNS、TLS；批量限并发 3、单条 10s 上限，超 24h 的结果标「结果过期」）
 - 本地 API：`/status`、环境 CRUD、分组、标签、代理列表、浏览器启停、**批量启停（并发上限 + 失败清单 + 可中断）**、自检报告；返回值形状对齐 AdsPower（`ws.puppeteer` / `ws.selenium` / `debug_port` / `status: Active|Inactive` / `cookies` / `kernels`）
@@ -564,6 +565,44 @@ foreach ($f in $files) {
 
 **为什么不给测试加 `--app-root=<dir>` 参数**：上面这套「解包 + 原样拷两个文件」已经做到两个前提同时成立 —— **判据零修改**、**代码来自包内**，读数就能当产物级证据用。给测试加参数等于动判据本身：一旦这条路径和源码路径行为不一致，红/绿到底是产品的问题还是参数的问题就分不清了。真要改，得配「同一份判据跑源码能绿、跑 asar 也能绿」的双向证明，那是另一个活。**顺手提醒**：比产物别用 `git archive` 导出再比 —— 本仓库 `core.autocrlf=true`，导出的 `src/**/*.js` 会变 CRLF，凭空造出「仅换行」的假差异（`src/api/routes.js` 工作区与 asar 都是 45,123 B 纯 LF）。
 
+
+### 隐私开关：四个字段的真行为（2026-11-12 第一批）
+
+`disable_image` / `disable_video` / `blacklist` / `whitelist` 之前只有 schema 里的名字、**没有任何生效路径**（配了什么都不会发生）。现在四个都有真行为，字段名与取值一个没改：
+
+| 字段 | 取值 | 生效方式 | 落地位置 |
+|---|---|---|---|
+| `disable_image` | `'0'` / `'1'` | 内核开关 `--blink-settings=imagesEnabled=false`：**Blink 不请求图片**，服务器侧零请求，`img.complete` 恒为 `false` | `src/kernel/chrome.js`（`buildArgs`） |
+| `disable_video` | `'0'` / `'1'` | CDP `Fetch` 拦截 `resourceType === 'Media'` 的请求（`failRequest` + `BlockedByClient`） | `src/kernel/net-rules.js` + `src/runtime/manager.js`（`installRequestGating`） |
+| `blacklist` | `array<string>`（CSV 串也收） | 命中即拦；支持 `example.com`（含子域）、`*.example.com`（仅子域）、`http://a.com/p*`（URL 通配）、`host:8080`（精确端口） | 同上 |
+| `whitelist` | 同上 | **只放行语义**：非空时不在名单里的一律拦（含顶层文档），名单内再受黑名单约束 | 同上 |
+
+两条命令跑完就有结论（都不碰真数据目录，自己起一次性 `FREEPOWER_DATA` 与本机 http server）：
+
+```powershell
+npm run test:net-rules   # 纯判定逻辑单测，26 项，不需要 Chrome
+npm run test:switches    # 真机开/关对照，19 项，需要真实 Chrome（本机 157.0.8103.78）
+```
+
+`test:switches` 的读数（2026-11-12，同一台机、同一个自起 http server；页面在 `127.0.0.1`，「被拦目标」故意用 `localhost` 以便只拦一个）：
+
+| 环境 | img 请求命中 | img.complete | 媒体命中 | video readyState / networkState | allowed(=127.0.0.1) | blocked(=localhost) |
+|---|---|---|---|---|---|---|
+| 对照（全关） | **1** | true（naturalWidth 1） | **1** | **4 / 1** | ok | ok |
+| `disable_image=1` | **0** | **false**（naturalWidth 0） | 1 | 4 / 1 | ok | ok |
+| `disable_video=1` | 1 | true | **0** | **0 / 3**（NO_SOURCE） | ok | ok |
+| `blacklist=localhost` | 1 | true | 1 | 4 / 1 | ok | **error:TypeError**（命中 0） |
+| `whitelist=127.0.0.1` | 1 | true | 1 | 4 / 1 | ok（命中 1） | **error:TypeError**（命中 0） |
+
+每组都有「同机对照」，所以**不会出现「页面根本没起来 → 全 0 → 误判通过」**：对照那行自己就是断言。
+
+边界与代价，如实写：
+
+- `disable_image` 是 Blink 级的「图片不请求」，所以 **CSS 背景图、favicon 也一起不加载**；它**不是** `launch_args` 白名单项（字段驱动，用户不能再用启动参数绕回去）。
+- `disable_video` 按 `resourceType === 'Media'` 拦，**音频也属于 Media**，所以 `<audio>` 一并被拦。这是「按资源类型」的直接后果，不是漏判。
+- 黑白名单只判 `http:` / `https:`；`about:` / `data:` / `blob:` / `chrome:` 不参与判定，否则会把内核自己的内部页拦死。
+- 请求拦截是**有规则或绑定了代理认证时才开**（`Fetch.enable`），没规则时完全不开 —— 默认路径不额外加每请求一跳。
+- **实测坑（我第一版就栽在这）**：`resourceType` 在 `Fetch.requestPaused` 的 **params 顶层**，不在 `params.request` 里；按 `request.resourceType` 读永远是 `undefined`，视频开关会**静默不生效**（图片和黑白名单都正常，只有视频这一条绿不了）。判据 `test:switches` 就是把这个坑抓出来的那条。
 
 冒烟覆盖（152 项，双 Realm 的 24 项在 `test/workers.test.mjs` 里单独列）：
 

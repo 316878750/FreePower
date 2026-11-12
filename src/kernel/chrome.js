@@ -227,6 +227,15 @@ export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, use
     });
   }
 
+  /**
+   * 禁用图片：Blink 层直接不请求图片（`img.complete` 恒为 false，服务器侧零请求）。
+   * 视频/域名黑白名单是请求级规则，走 CDP Fetch 拦截（见 src/kernel/net-rules.js 与
+   * manager.js 的 installRequestGating）—— 内核没有「不加载视频」的等价开关。
+   */
+  if (String(profile.disable_image) === '1') {
+    args.push('--blink-settings=imagesEnabled=false');
+  }
+
   // PAC 明确拒绝（调用方已先拦，这里是纵深防御）：PAC 的 DIRECT 回退无法 fail-closed
   if (profile.full_pac_url) {
     throw Object.assign(new Error('不支持 PAC：请改用固定 HTTP / SOCKS5 代理'), { code: 800003, reason: 'pac_unsupported' });

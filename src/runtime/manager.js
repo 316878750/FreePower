@@ -7,6 +7,7 @@ import {
 import { findChrome, buildArgs, launchChrome, waitForDevToolsPort, killProcessTree, rememberVersion } from '../kernel/chrome.js';
 import { CdpClient, fetchJson } from '../kernel/cdp.js';
 import { buildInjectionSource, buildWorkerInjectionSource } from '../kernel/inject.js';
+import { compileNetRules, decideRequest } from '../kernel/net-rules.js';
 import { alignProfileToKernel } from '../kernel/version.js';
 import { fingerprintView } from '../fingerprint/view.js';
 import { ensureNoiseSeeds } from '../fingerprint/seeds.js';
@@ -861,21 +862,45 @@ async function applyToSession(client, sessionId, profile, view) {
   // 与预检 / --proxy-server 同源：AdsPower 形状（proxy_user / proxy_password）也要认，
   // 否则账号密码挂不上，内核收到 407 后页面直接空白。
   const proxy = normalizeProxyConfig(profile.user_proxy_config || profile.proxy_config || {});
-  if (proxy.username && proxy.host) {
-    await setupProxyAuth(client, s, proxy).catch((e) => log(profile.id, 'proxy auth 挂载失败', e.message));
-  }
+  await installRequestGating(client, s, profile, proxy).catch((e) => log(profile.id, '请求闸门挂载失败', e.message));
 }
 
 function instance_profile(p) {
   return p?.id || p?.profile_id;
 }
 
-async function setupProxyAuth(client, sessionId, proxy) {
-  await client.send('Fetch.enable', { handleAuthRequests: true, patterns: [{ urlPattern: '*' }] }, sessionId);
+/**
+ * 请求级闸门：代理认证 + 环境级网络开关（`disable_video` / `blacklist` / `whitelist`）。
+ *
+ * 两件事都必须走 CDP 的 `Fetch` 域，所以**合成一次 enable、一个处理点**：分两次
+ * `Fetch.enable` 会互相覆盖 patterns，两个 `requestPaused` 处理器还会争抢同一个请求
+ * （一个 continue、一个 fail，最后谁先谁算）。判定逻辑本身在 kernel/net-rules.js，纯函数、可单测。
+ *
+ * 没有规则也没有代理认证时**完全不开 Fetch** —— 默认路径零额外开销（拦截会加每请求一跳）。
+ */
+async function installRequestGating(client, sessionId, profile, proxy) {
+  const rules = compileNetRules(profile);
+  const needAuth = !!(proxy.username && proxy.host);
+  if (!rules.active && !needAuth) return;
+
+  await client.send('Fetch.enable', {
+    handleAuthRequests: needAuth,
+    patterns: [{ urlPattern: '*' }],
+  }, sessionId);
+
   client.on('Fetch.requestPaused', (params, sid) => {
     if (sid !== sessionId) return;
+    // resourceType 在 params 顶层，不在 params.request 里（实测：request.resourceType 是 undefined，
+    // 只看它就永远判不出「这是不是 Media」——视频开关会静默不生效）。
+    const verdict = decideRequest({ ...(params.request || {}), resourceType: params.resourceType }, rules);
+    if (verdict.block) {
+      client.send('Fetch.failRequest', { requestId: params.requestId, errorReason: 'BlockedByClient' }, sid).catch(() => {});
+      return;
+    }
     client.send('Fetch.continueRequest', { requestId: params.requestId }, sid).catch(() => {});
   });
+
+  if (!needAuth) return;
   client.on('Fetch.authRequired', (params, sid) => {
     if (sid !== sessionId) return;
     client.send('Fetch.continueWithAuth', {
