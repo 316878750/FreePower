@@ -444,14 +444,14 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 ## 八、验证
 
 ```powershell
-# 不需要 Chrome：schema + 单元 + 本地 API 契约 + 控制台契约 + 桌面壳契约
+# 不需要 Chrome：schema + 单元 + 本地 API 契约 + 控制台契约 + 桌面壳契约 + 代理链纯逻辑
 npm run test
 
-# 需要真实 Chrome + 完整权限（沙箱挡命名管道和进程查询）
+# 需要真实 Chrome + 完整权限（沙箱挡命名管道和进程查询）；含两跳代理链判据
 npm run smoke
 ```
 
-当前实测：`npm run test` = schema **10** + net-rules **29** + recycle **44** + unit **71** + api **96** + ui **29** + desktop **54**（`package.json` 里那条脚本就是这七组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **24/24**（`test/workers.test.mjs`），真 Chrome `157.0.8103.40`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**多级代理链的两套判据不在 `npm test` 里**（要起 5 次内核，单独跑）：`npm run test:chain-rules` **31/31**、`npm run test:proxy-chain` **37/37**。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测：`npm run test` = schema **10** + net-rules **29** + chain-rules **31** + recycle **44** + unit **71** + api **96** + ui **29** + desktop **54**（`package.json` 里那条脚本就是这八组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`），真 Chrome `157.0.8103.40`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的八组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 > 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：
@@ -665,12 +665,15 @@ npm run test:switches    # 真机开/关对照，19 项，需要真实 Chrome（
 3. **两个远端代理串起来不做**：对手靠「系统代理 + 环境代理」凑出来的那两跳我们做了；再叠第三跳/任意跳是我们的扩展、**非对手口径**，等真需要时再单独设计（不预留 API 字段）。
 4. **两跳必须都是 http**：https 跳要在隧道里再套 TLS、socks5 跳要在隧道里再握手，本轮都没做，所以明确拒绝（`proxy_chain_invalid`），不出现「配了 socks 跳却静默只走一跳」。
 
-**判据**（两个文件，都要单独跑，**没并进 `npm test` 的七组**）：
+**判据**（两个文件，都在入口里，不用单独跑）：
 
 ```
-node --no-warnings test/chain-rules.test.mjs   → 31 passed, 0 failed   （纯逻辑：hop 解析、门控 '1'、塌单跳、PAC、协议限制、ProxyOverride 不旁路）
-node --no-warnings test/proxy-chain.test.mjs   → 37 passed, 0 failed   （真内核：两个记录型代理 + 目标 server，每条「0 命中」都成对给正例）
+npm test                       → chain-rules 31 passed, 0 failed   （八组之一；纯逻辑：hop 解析、门控 '1'、塌单跳、PAC、协议限制、ProxyOverride 不旁路）
+npm run smoke                  → proxy-chain 37 passed, 0 failed   （跑完 smoke.mjs 接着跑；真内核：两个记录型代理 + 目标 server，每条「0 命中」都成对给正例）
+node --no-warnings test/proxy-chain.test.mjs   → 也行，单独跑同一套（调试用）
 ```
+
+两个都在门里（2026-11-12 CEO 拍板）：`chain-rules` 进 `npm test`，`proxy-chain` 进 `npm run smoke`（和 `workers.test.mjs` 邻居）。理由不是「跑得动」，而是**判据脱门就会烂** —— `test/api.test.mjs:363` 那次就是这么静默过期的：不在被改的那几组里，谁也不跑。
 
 `test/proxy-chain.test.mjs` 覆盖：两跳都有命中且「hop0 的上游 = hop1、hop1 的 client 源端口 = hop0 出站 socket 本地端口」；无系统代理时 hop0 命中 0 而 hop1 有命中；hop1 不可达 / 系统代理要认证时 fail-closed + 零内核（按 `--user-data-dir` 归类数进程）+ 目标命中 0；运行中关掉 hop0 后目标命中**不增加**（防回落直连）；凭据不串层；argv 只有本地中继；`stop` 后端口查不到 LISTEN；单跳认证回归。测试**不读也不写用户注册表**（`readSystemProxy(overrides)` 注入）。
 
