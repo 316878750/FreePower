@@ -87,6 +87,43 @@ const CLOUD_ONLY = new Set([
   'sync_history', 'not_sync_cache_not_open', 'fb_cloud_password_manager', 'is_fb_network_acceleration',
 ]);
 
+/**
+ * 空转字段：**字段表照对手收了、这一版代码不消费**（0.3.3 巡检扫出来的那批）。
+ * 不删字段 —— 字段表是照着对手的，脚本/导入导出按名字读写，删了会撞空；
+ * 但要如实标出来：schema 出参带 `idle: true` + `idle_reason`，表单灰显并浮层说明。
+ *
+ * 键 = 字段名，值 = 为什么没生效（写给用户和下一个改代码的人看，不写「暂不支持」这种废话）。
+ * 判定在 `test/unit.test.mjs`：BASIC 里 `coverage === 'none'` 必须标、每个 idle 必须有原因、
+ * BASIC 里没标的字段必须出现在「已生效」白名单里（新加字段忘标就红）。
+ */
+const IDLE = new Map([
+  ['fonts', '注入层只把它挂成 window.__fpFontsDeclared（诊断用），没有禁用过滤；改它不影响渲染'],
+  ['disabled_fonts', '全 src 零读取（只在校验与详情视图里出现）'],
+  ['do_not_track', '零读取（指纹生成里只写默认值，没有消费点）'],
+  ['scan_port_type', '零读取；端口扫描是内核级特性，我们走 CDP/启动参数做不了'],
+  ['allow_scan_ports', '零读取；同上'],
+  ['disable_console', '零读取；禁用控制台是内核级特性，我们走 CDP/启动参数做不了'],
+  ['device_name', 'device_name_switch 有默认值，但 device_name 本身没有被消费'],
+  ['device_name_switch', '字段表登记但 src 零消费，连开关本身都没搭生效路径'],
+  ['hidden_notification', '基线不带 --enable-automation，本来就没有「受自动化控制」横幅可消（基线已覆盖）'],
+  ['disable_save_password', 'overrides.mjs 原标 full 系误标，src 零读取；P2 批次会接 --disable-features=PasswordManager,AutofillServerCommunication'],
+  ['disable_password_filling', 'API 边界有归一与落库，chrome.js 零消费'],
+  ['gyroscope', '零读取'],
+  ['virtual_camera', '零读取'],
+  ['network_information_type', '零读取'],
+  ['mac_address_config', '零读取（storage=fp，只存不注入）'],
+  ['open_google_api', '零读取'],
+  ['translate_webpages', '零读取'],
+  ['domain_https', '零读取'],
+  ['storage_strategy', '零读取'],
+  ['new_mobile_mode', '零读取'],
+  ['browser_head', '零读取'],
+  ['tls', '零读取（同名 tls 在代理代码里是协议名，不是这个字段）'],
+  ['tls_switch', '零读取'],
+  ['whitelist_open', '零读取（白名单本体走 whitelist + net-rules）'],
+  ['image_size', '零读取'],
+]);
+
 /** 基础区（其余进「高级」折叠） */
 const BASIC = new Set([
   'name', 'group_id', 'profile_tag_ids', 'remark', 'domain_name', 'open_urls', 'cookie',
@@ -145,6 +182,9 @@ export function profileFormSchema() {
       storage: f.storage,
       basic: BASIC.has(f.name),
       cloudOnly: CLOUD_ONLY.has(f.name),
+      // 空转字段：填了能存、但不影响内核。表单按它灰显 + 浮层，别让用户以为「配了就有用」
+      idle: IDLE.has(f.name),
+      idle_reason: IDLE.get(f.name) || null,
       apiV2Alias: f.apiV2Alias || null,
     };
   });

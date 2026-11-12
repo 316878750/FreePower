@@ -440,6 +440,8 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
     **这不是一次性事故（重要）**：在这台机器上，**下一次构建（0.3.3 及以后）出的 `setup.exe` 照样是 Low**（写进 `release\` 就继承），装进 Medium 的 `%LOCALAPPDATA%\Programs\FreePower` 会以同样方式失败。安装前必须二选一：① `icacls '<setup.exe>' /setintegritylevel Medium` 再跑；② 把 exe 复制到 Medium 位置（如 `%TEMP%`）再跑。**「为什么副本有效」要写对**：不是复制动作洗掉了标签，而是**新文件继承目标目录的标签** —— `%TEMP%` 是 Medium，所以副本是 Medium；反过来从 `%TEMP%` 往工作区里复制没用（会重新继承 Low），这正是「复制了还是失败」的常见误判。**现状：② 已被 2026-11-12 13:03 实测证实（复制到 `%TEMP%\fp-relabel\` 后 `/S` 装成功）；① `setintegritylevel Medium` 仍未实测**，别把两条写成同等证据。
     **证据保留**：`%TEMP%\Low` 下三个 `ns*.tmp`（09:45:48 / 09:49:18 / 09:52:43）是本次根因的现场证据，**留着别清** —— 等 0.3.3 安装成功后再一起删。（那里另有一个 `~nsu.tmp`，`2026/11/10 18:10:52`，是更早一次卸载留下的，不属于本次证据。）
 
+41. **字段表里有 25 个字段是「声明了、这一版不生效」**（`idle`）：`fonts` / `disabled_fonts` / `do_not_track` / `scan_port_type` / `allow_scan_ports` / `disable_console` / `device_name` / `device_name_switch` / `hidden_notification` / `disable_save_password` / `disable_password_filling` / `gyroscope` / `virtual_camera` / `network_information_type` / `mac_address_config` / `open_google_api` / `translate_webpages` / `domain_https` / `storage_strategy` / `new_mobile_mode` / `browser_head` / `tls` / `tls_switch` / `whitelist_open` / `image_size`。`GET /api/v2/browser-profile/schema` 里这些字段带 `idle: true` + `idle_reason`，控制台表单把它们灰显、浮层写明「字段表声明，当前版本未生效」。**能填、能存，但不影响内核**。为什么不直接删字段：字段表是照对手的，脚本与导入导出按名字读写，删了会撞空 —— 标出来才是实话。`hidden_notification` 单独说：基线不带 `--enable-automation`，本来就没有「受自动化控制」横幅可消（`idle_reason` 写的是「基线已覆盖」，不是「还没做」）。**判据**：`test/unit.test.mjs` 的一条断言 —— BASIC 区 `coverage === 'none'` 的字段必须 `idle`、每个 `idle` 必须写原因、不许标 `coverage=full` 的字段、BASIC 里没标 `idle` 的必须在「已登记」清单里（新加字段忘标就红）、`overrides.mjs` 的 `coverage` 不许和 `idle` 矛盾（idle 字段不许在 overrides 里标 `full`）。**`disable_save_password` / `disable_password_filling` 是「假 full」纠错**：`overrides.mjs` 原来把这两个标成 `full`，而 `src/` 里没有任何启动参数/注入点消费它们（只有 API 边界归一 + 落库）—— 假 `full` 比不标更坏，UI 会说「CDP 能做到且不留痕迹」。这次把 overrides 的 coverage 改成 `none`（`fields.generated.json` 由 `tools/gen-schema.mjs` 重新生成，只动这两行）、同时标 `idle`。P2 批次真要接：`--disable-features=PasswordManager,AutofillServerCommunication`。`device_name_switch` 是同一批扫出来的第三个：`src/` 零消费，连开关本身都没搭生效路径。
+
 
 ## 八、验证
 
@@ -451,7 +453,7 @@ npm run test
 npm run smoke
 ```
 
-当前实测：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **71** + api **100** + ui **29** + desktop **54**（`package.json` 里那条脚本就是这八组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`），真 Chrome `157.0.8103.40`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的八组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **72** + api **100** + ui **29** + desktop **54**（`package.json` 里那条脚本就是这八组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`），真 Chrome `157.0.8103.40`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的八组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 > 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：
@@ -823,7 +825,7 @@ web/
   pages/proxies.js     代理管理
   pages/selfcheck.js   自检报告
 test/smoke.mjs         端到端冒烟（152 项，需真实 Chrome）
-test/unit.test.mjs     零 Chrome 单元测试（71 项）
+test/unit.test.mjs     零 Chrome 单元测试（72 项）
 test/api.test.mjs      本地 API 契约测试（100 项，不需要 Chrome）
 test/net-rules.test.mjs  网络规则匹配逻辑单测（38 项，不需要 Chrome）
 test/recycle.test.mjs  回收站数据层 + 两条路由（44 项，含重启读库）

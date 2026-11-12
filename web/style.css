@@ -98,6 +98,10 @@ label.field > span.hint { font-size: 11px; color: var(--ink-3); }
 .req { color: var(--bad); }
 .field-error { font-size: 11px; color: var(--bad); }
 label.field.has-error input, label.field.has-error select, label.field.has-error textarea { border-color: var(--bad); background: #fffafa; }
+/* 空转字段：字段表收了但这一版不生效 —— 灰显 + 禁用，浮层（title）说明原因 */
+label.field.idle { opacity: .55; }
+label.field.idle input, label.field.idle select, label.field.idle textarea { cursor: not-allowed; background: var(--line-2); }
+label.field.idle > span.lbl::after { content: '未生效'; margin-left: 6px; font-size: 10px; padding: 0 4px; border-radius: 3px; background: var(--line-2); color: var(--ink-3); }
 
 /* ---------------- 卡片 / 表格 ---------------- */
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }

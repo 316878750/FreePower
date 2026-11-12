@@ -137,8 +137,11 @@ export const COVERAGE = {
   disable_video: 'partial',
   image_size: 'n/a',
   disable_console: 'partial',
-  disable_save_password: 'full',
-  disable_password_filling: 'full',
+  // 这两个原标 full 是误标：src 里没有任何启动参数/注入点消费它们（只有 API 边界归一 + 落库）。
+  // 标 full 会让 UI 显示「能做」，比标 none 更坏。P2 批次真要接：
+  // --disable-features=PasswordManager,AutofillServerCommunication。
+  disable_save_password: 'none',
+  disable_password_filling: 'none',
   sync_password: 'n/a',
   fb_cloud_password_manager: 'n/a',
   open_google_api: 'partial',

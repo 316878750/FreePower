@@ -25,6 +25,8 @@ import { publicCookie, cdpCookieParam } from '../src/kernel/cookies.js';
 import { normalizeImportItem } from '../src/store/transfer.js';
 import { parseAdspowerTxt, formatAdspowerTxt, proxyLineOf } from '../src/store/adspower-txt.js';
 import { startFakeProxy } from './fake-proxy.mjs';
+import { profileFormSchema } from '../src/api/schema.js';
+import { COVERAGE as OVERRIDES_COVERAGE } from '../packages/profile/reference/overrides.mjs';
 import vm from 'node:vm';
 import { buildInjectionSource, buildWorkerInjectionSource, sharedNoiseCoreSource } from '../src/kernel/inject.js';
 
@@ -1303,4 +1305,69 @@ test('txt 对齐：group 写空串、countrycode 写小写（JSON 侧各自保�
   assert.equal(back.ip_country, 'us');
   assert.equal(back.group_id, undefined, 'group 空串不产生 group_id（normalize 时会补默认 0）');
   assert.equal(normalizeImportItem(back).input.group_id, '0');
+});
+
+/* ============================================================================
+ * 空转字段（0.4.0 追加）：字段表照对手收了、这一版代码不消费的那批
+ * ==========================================================================*/
+
+/**
+ * BASIC 区里**没标 idle**的字段清单。两个作用：
+ *  1. 新加一个 BASIC 字段时，必须在这里登记（或者标 idle），否则本条红 —— 防「加了字段忘标」；
+ *  2. 登记 ≠ 全都验证过生效。0.4.0 之前有三个字段只做到「存下来 + 边界别名归一」（`device_name_switch` /
+ *     `disable_save_password` / `disable_password_filling`），当时登记在这里；现在它们已改标 `idle`，
+ *     从清单里去掉 —— 清单只留「有消费点、或者根本不是指纹维度」的字段。
+ */
+const BASIC_NOT_IDLE = new Set([
+  'name', 'group_id', 'profile_tag_ids', 'remark', 'domain_name', 'open_urls', 'cookie',
+  'browser', 'platform', 'gpu', 'device_scale', 'ua', 'language', 'language_switch',
+  'timezone', 'automatic_timezone',
+  'canvas', 'webgl_image', 'webgl', 'audio', 'client_rects',
+  'screen_resolution', 'hardware_concurrency', 'device_memory',
+  'media_devices', 'media_devices_num', 'speech_switch', 'speech_voices',
+  'webrtc', 'bypass_proxy_check',
+  'location', 'location_switch', 'longitude', 'latitude', 'accuracy',
+  'automation_controlled', 'disable_image', 'disable_video',
+  'blacklist', 'whitelist',
+  'launch_args', 'headless', 'new_startup_page', 'window_position', 'win_x', 'win_y',
+  'clear_cache_after_closing',
+]);
+
+test('空转字段：标了必须说清原因，BASIC 里一个都不许漏标', () => {
+  const { fields } = profileFormSchema();
+  const idle = fields.filter((f) => f.idle);
+
+  // ① 每个 idle 都要有原因（不许只打个标记糊弄；最短的合法写法是「零读取」三个字）
+  assert.deepEqual(idle.filter((f) => !f.idle_reason || f.idle_reason.trim().length < 3).map((f) => f.name), [],
+    '这些字段标了 idle 却没写原因');
+
+  // ② 不许把 coverage=full 的字段标成空转
+  assert.deepEqual(idle.filter((f) => f.coverage === 'full').map((f) => f.name), [],
+    'coverage=full 的字段不该标 idle');
+
+  // ③ BASIC 区里 coverage='none'（字段表收了、代码一次没读）的字段必须标 idle
+  assert.deepEqual(fields.filter((f) => f.basic && f.coverage === 'none' && !f.idle).map((f) => f.name), [],
+    '这些 BASIC 字段 coverage=none 却没标 idle');
+
+  // ④ 防「以后加字段忘标」：BASIC 里没标 idle 的必须在上面的清单里
+  assert.deepEqual(fields.filter((f) => f.basic && !f.idle && !BASIC_NOT_IDLE.has(f.name)).map((f) => f.name), [],
+    '新 BASIC 字段既没标 idle、也没登记 —— 先判断它是真生效还是空转');
+
+  // ⑤ 清单里不许留着已经不存在的字段（删字段时要同步，别让白名单变成化石）
+  const names = new Set(fields.map((f) => f.name));
+  assert.deepEqual([...BASIC_NOT_IDLE].filter((n) => !names.has(n)), [], '清单里有字段表已经不存在的字段');
+
+  // ⑥ 数量对得上（0.3.3 巡检那批 22 个 + 0.4.0 追加 `device_name_switch` / `disable_save_password` /
+  //    `disable_password_filling` 三个零消费字段 = 25），少一个或多一个都要先问清楚
+  assert.equal(idle.length, 25, `idle 字段 ${idle.length} 个：${idle.map((f) => f.name).join(',')}`);
+  // ⑦ 单独钉一条：hidden_notification 的原因是「基线已覆盖」，不是「还没做」
+  const hn = idle.find((f) => f.name === 'hidden_notification');
+  assert.match(hn.idle_reason, /基线/, 'hidden_notification 的原因是「基线已覆盖」，不是「还没做」');
+  // ⑧ overrides.mjs（coverage 的事实源）与这里的 idle 不许互相矛盾：idle 的字段不许标 full。
+  //    假 full 比不标更坏 —— UI 会说「CDP 能做到且不留痕迹」，而 src 一次都没读。
+  //    判据是「不是 full」而不是「必须是 none|partial」：overrides 里还有 n/a（不是指纹维度），
+  //    现有 idle 里 hidden_notification / whitelist_open / image_size / device_name_switch 就是 n/a，
+  //    它们该留 n/a，不该为了过判据把标签改成 none。
+  assert.deepEqual(idle.filter((f) => OVERRIDES_COVERAGE[f.name] === 'full').map((f) => f.name), [],
+    '这些字段 schema 标了 idle，overrides 却标 coverage=full —— 假 full 标签');
 });

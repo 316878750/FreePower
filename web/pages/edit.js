@@ -297,6 +297,8 @@ export default async function renderEdit({ head, page, params }) {
     if (f.range) bits.push(`范围 ${f.range}`);
     if (f.max) bits.push(`最长 ${f.max}`);
     if (f.cloudOnly) bits.push('云端字段：FreePower 本地不生效，改了也只是存着');
+    // 空转字段：字段表收着（脚本能按名字读写），但这一版代码不消费 —— 说清原因，不装能配
+    if (f.idle) bits.push(`字段表声明，当前版本未生效${f.idle_reason ? `：${f.idle_reason}` : ''}`);
     return bits.join(' · ');
   }
 
@@ -365,9 +367,15 @@ export default async function renderEdit({ head, page, params }) {
       input = h('input', { type: 'text', value: val === undefined || val === null ? '' : String(val), onInput: (e) => onChange(e.target.value) });
     }
     if (f.cloudOnly) input.disabled = true;
+    if (f.idle) input.disabled = true;
 
     const errEl = h('div', { class: 'field-error', style: { display: 'none' } });
-    const wrap = h('label', { class: `field ${wide ? 'wide' : ''}`, dataset: { field: f.name } },
+    const wrap = h('label', {
+      class: `field ${wide ? 'wide' : ''}${f.idle ? ' idle' : ''}`,
+      dataset: { field: f.name },
+      // 灰显之外再给一个浮层：鼠标停在整格上就能看到「为什么未生效」
+      title: f.idle ? `字段表声明，当前版本未生效${f.idle_reason ? `：${f.idle_reason}` : ''}` : null,
+    },
       h('span', { class: 'lbl' },
         f.label,
         f.required ? h('span', { class: 'req' }, '*') : null,
