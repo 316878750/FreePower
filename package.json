@@ -23,7 +23,7 @@
     "test:ui": "node --no-warnings test/ui.test.mjs",
     "test:desktop": "node --no-warnings test/desktop.test.mjs",
     "test:profile": "node --no-warnings packages/profile/test/schema.test.mjs",
-    "test": "node --no-warnings packages/profile/test/schema.test.mjs && node --no-warnings test/net-rules.test.mjs && node --no-warnings test/unit.test.mjs && node --no-warnings test/api.test.mjs && node --no-warnings test/ui.test.mjs && node --no-warnings test/desktop.test.mjs",
+    "test": "node --no-warnings packages/profile/test/schema.test.mjs && node --no-warnings test/net-rules.test.mjs && node --no-warnings test/recycle.test.mjs && node --no-warnings test/unit.test.mjs && node --no-warnings test/api.test.mjs && node --no-warnings test/ui.test.mjs && node --no-warnings test/desktop.test.mjs",
     "gen": "node tools/gen-schema.mjs",
     "test:workers": "node --no-warnings test/workers.test.mjs",
     "test:all": "npm run test && npm run test:workers",
@@ -40,6 +40,7 @@
     "test:nav-race": "node --no-warnings test/nav-race.test.mjs",
     "test:nav-type": "node --no-warnings test/nav-type.test.mjs",
     "test:net-rules": "node --no-warnings test/net-rules.test.mjs",
+    "test:recycle": "node --no-warnings test/recycle.test.mjs",
     "test:switches": "node --no-warnings test/switches.test.mjs",
     "test:p9c-judge": "node --no-warnings tools/p9c-judge.mjs"
   },

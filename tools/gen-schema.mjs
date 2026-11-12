@@ -65,6 +65,10 @@ const EXT = [
   { name: 'created_at', sqlType: 'TEXT', note: '' },
   { name: 'updated_at', sqlType: 'TEXT', note: '' },
   { name: 'last_launch_at', sqlType: 'TEXT', note: '' },
+  // 软删除（回收站）：NULL = 正常环境；有值 = 已进回收站，值为删除时刻的 ISO 时间。
+  // 不对外暴露成字段（不在 repo.js 的 EXT_COLS 里）：它是存储状态，不是环境属性，
+  // 出现在 v1/v2 响应里会凭空多一个键、破坏 54 条路由契约。
+  { name: 'deleted_at', sqlType: 'TEXT', note: 'NULL=在用；有值=回收站（软删除时刻 ISO）' },
 ];
 
 // ---- DDL ----
@@ -156,6 +160,7 @@ ${colLines.join(',\n')},
 
 CREATE INDEX IF NOT EXISTS idx_profiles_group ON profiles("group_id");
 CREATE INDEX IF NOT EXISTS idx_profiles_status ON profiles("status");
+CREATE INDEX IF NOT EXISTS idx_profiles_deleted ON profiles("deleted_at");
 CREATE INDEX IF NOT EXISTS idx_launches_profile ON launches(profile_id);
 `;
 

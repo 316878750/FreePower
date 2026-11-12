@@ -59,8 +59,20 @@ check('白名单：名单外被拦', block('https://other.com/a', 'Document', wl
 check('白名单：子域算名单内', block('https://cdn.only.com/a.js', 'Script', wl).block === false);
 check('白名单：与黑名单同时存在时，白名单外先被拦',
   block('https://other.com/a', 'Document', compileNetRules({ whitelist: 'only.com', blacklist: 'other.com' })).reason === 'not_in_whitelist');
-check('白名单：名单内但命中黑名单 → 拦',
-  block('https://only.com/a', 'Document', compileNetRules({ whitelist: 'only.com', blacklist: 'only.com' })).reason === 'blacklist');
+
+/* 白名单模式**忽略**黑名单 —— 这条 2026-11-12 按逆向 21- §3 改了期望值（原来是"拦"）。
+   对手的实现里，白名单开关为真时只走白名单分支，环境黑名单的项根本不会进 `NetFilters`；
+   两个模式互斥、白名单优先。所以「名单内且同时命中黑名单」在对手那边是放行。
+   我们原来"先判白名单、再判黑名单"会拦，那不是更严，是语义不同：按对手行为写的规则
+   （比如黑名单压着历史域名、临时开白名单放行）在我们这儿会静默失效。 */
+check('白名单：名单内且同时命中黑名单 → 放行（互斥、白名单优先）',
+  block('https://only.com/a', 'Document', compileNetRules({ whitelist: 'only.com', blacklist: 'only.com' })).block === false);
+check('白名单：黑名单整体不参与（子域也放行）',
+  block('https://cdn.only.com/a.js', 'Script', compileNetRules({ whitelist: 'only.com', blacklist: '*.only.com' })).block === false);
+check('白名单：名单外即使不在黑名单里也拦',
+  block('https://other.com/a', 'Document', compileNetRules({ whitelist: 'only.com', blacklist: '' })).reason === 'not_in_whitelist');
+check('白名单 + disable_video：视频仍按 Media 拦（互斥只针对两张名单，不是针对视频开关）',
+  block('https://only.com/v.mp4', 'Media', compileNetRules({ whitelist: 'only.com', disable_video: '1' })).reason === 'disable_video');
 
 /* ---------------------------------- 视频 ---------------------------------- */
 const vid = compileNetRules({ disable_video: '1' });

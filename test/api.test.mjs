@@ -356,11 +356,14 @@ try {
   const tBadFmt = await api('POST', '/api/v2/browser-profile/export', { profile_id: [tId], format: 'yaml' });
   check('txt 导出：非法 format → 100002', tBadFmt.json.code === 100002, tBadFmt.json.msg);
 
-  /* -------------------- 占位：明确不支持，不假成功 -------------------- */
+  /* -------------------- 回收站：占位已换成真实现（2026-11-12），形状见 test/recycle.test.mjs -------------------- */
   const ph = await api('POST', '/api/v2/browser-profile/recycle-bin/list', { page: 1 });
-  check('占位路由：明确不支持（code -1 + supported:false）', ph.json.code === -1 && ph.json.data?.supported === false && /不支持/.test(ph.json.msg), ph.json.msg);
+  check('回收站 list：code 0 + data={list,page,limit}（无 total；原断言是 -1 + supported:false）',
+    ph.json.code === 0 && Array.isArray(ph.json.data?.list) && ph.json.data?.total === undefined
+    && ph.json.data?.page === 1 && ph.json.data?.limit === undefined,
+    JSON.stringify(ph.json.data));
   const ph2 = await api('POST', '/api/v2/browser-profile/share', {});
-  check('占位路由：share 也是明确报错', ph2.json.code === -1 && ph2.json.data?.supported === false);
+  check('占位路由：share 仍是明确报错', ph2.json.code === -1 && ph2.json.data?.supported === false);
   const unknown = await api('POST', '/api/v9/nope', {});
   check('未知路由：404 且带 supported:false', unknown.status === 404 && unknown.json?.data?.supported === false);
 
@@ -398,12 +401,16 @@ try {
   const uiId = uiCreate.json.data?.profile_id;
   const uiNo = uiCreate.json.data?.profile_no;
 
-  // 硬删要连 user-data 一起删，否则磁盘上留垃圾
+  // 删除已改成软删除（进回收站）：**不删盘**，恢复后必须能直接启动，
+  // 所以 userdata_removed 恒为 0、目录必须还在。回收站行为的完整判据在 test/recycle.test.mjs。
   const envDir = path.join(dataDir, 'profiles', `${uiNo}_${String(uiId).slice(0, 8)}`);
   fs.mkdirSync(path.join(envDir, 'userdata', 'Default'), { recursive: true });
   fs.writeFileSync(path.join(envDir, 'userdata', 'Default', 'Cookies'), 'x');
   const uiDel = await api('POST', '/api/v2/browser-profile/delete', { profile_id: [uiId] });
-  check('删除：返回 userdata_removed 且目录真的没了', uiDel.json.data?.userdata_removed === 1 && !fs.existsSync(envDir), JSON.stringify(uiDel.json.data));
+  check('删除：软删除（userdata_removed=0 且目录留着）（2026-11-12 语义变更，原断言是 1 + 目录没了）',
+    uiDel.json.data?.userdata_removed === 0 && uiDel.json.data?.deleted?.length === 1 && fs.existsSync(envDir), JSON.stringify(uiDel.json.data));
+  const uiGone = await api('POST', '/api/v2/browser-profile/list', { page: 1, limit: 200 });
+  check('删除后 list 里不再出现', !(uiGone.json.data?.list || []).some((p) => p.profile_id === uiId));
 
   const indexRes = await fetch(base + '/');
   const indexHtml = await indexRes.text();

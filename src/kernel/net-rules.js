@@ -19,6 +19,11 @@
  *
  * 白名单非空时是**只放行**语义：不在名单里的请求一律拦（含顶层文档），这与「白名单」
  * 三个字的直觉一致。非 http(s) 的 scheme（about: / data: / blob: / chrome:）不参与判定。
+ *
+ * 白名单与黑名单**互斥、白名单优先**（2026-11-12 按逆向 `21-` §3 改的）：
+ * 对手在白名单开关为真时只走白名单分支，环境黑名单的项根本不会进它的 `NetFilters`；
+ * 所以「白名单内的域名同时命中黑名单」在对手那边是**放行**。我们之前是「先判白名单、
+ * 再判黑名单」，会拦 —— 那不是更严，是**语义不同**，脚本按对手行为写的规则会失效。
  */
 
 /** 字段可能来自 CSV 串、JSON 数组或逗号串 —— 统一成去空、去重的小写数组 */
@@ -108,8 +113,9 @@ export function decideRequest(request, rules) {
     return { block: true, reason: 'disable_video' };
   }
   const hit = (list) => list.some((fn) => fn(t.href, t.host, t.port));
-  if (rules.matchers.whitelist.length && !hit(rules.matchers.whitelist)) {
-    return { block: true, reason: 'not_in_whitelist' };
+  // 白名单模式下**完全不看黑名单**：与对手互斥（见文件头），不要"两个都判、取更严"
+  if (rules.matchers.whitelist.length) {
+    return hit(rules.matchers.whitelist) ? { block: false } : { block: true, reason: 'not_in_whitelist' };
   }
   if (hit(rules.matchers.blacklist)) return { block: true, reason: 'blacklist' };
   return { block: false };

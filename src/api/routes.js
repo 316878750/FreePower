@@ -15,6 +15,7 @@ import path from 'node:path';
 import {
   createProfile, getProfile, getProfileByNo, listProfiles, updateProfile, deleteProfiles, regroupProfiles,
   newFingerprintFor, listGroups, createGroup, getGroup, updateGroup, deleteGroup, cookieText, cookieToStorage,
+  listRecycleBin, restoreProfiles, getRecycledProfile,
 } from '../store/profiles.js';
 import { listTags, createTags, updateTags, deleteTags, tagIdsOf } from '../store/tags.js';
 import { importProfiles, copyProfile } from '../store/transfer.js';
@@ -25,7 +26,6 @@ import {
 } from '../store/proxies.js';
 import { startProfile, stopProfile, listRunning, getRunning, getInstance, userDataDirFor } from '../runtime/manager.js';
 import { batchStart, batchStop } from '../runtime/batch.js';
-import { PROFILES_DIR } from '../config.js';
 import { profileFormSchema } from './schema.js';
 import { validateProfile } from '../../packages/profile/src/validate.js';
 import { checkProxy, hasProxy } from '../proxy/probe.js';
@@ -264,15 +264,13 @@ export function buildRoutes() {
     if (v === 'v2' && !Array.isArray(raw)) throw new ApiError(ERR.INVALID, 'profile_id must be an array');
     if (v === 'v1' && !Array.isArray(raw)) throw new ApiError(ERR.INVALID, '[user_ids] Incorrect format');
     const ids = idList(raw, v);
-    // 先停再删：留着运行中的内核被删了记录，就是孤儿进程，谁也回收不了
+    // 先停再删：留着运行中的内核被软删除，就是孤儿进程，谁也回收不了
     for (const id of ids) if (getRunning(id)) await stopProfile(id);
-    const dirs = [];
-    for (const id of ids) {
-      const p = getProfile(id);
-      if (p) dirs.push(removeProfileDataDir(p));
-    }
+    // 软删除（进回收站）：只置删除标记，**user-data 目录原样留在盘上** ——
+    // 回收站里的环境恢复后必须能直接启动，删了盘就恢复出一个空壳。
+    // 所以 userdata_removed 恒为 0；这个键保留，是为了不动 54 条路由契约的形状。
     const deleted = deleteProfiles(ids);
-    return ok({ deleted, userdata_removed: dirs.filter(Boolean).length });
+    return ok({ deleted, userdata_removed: 0 });
   });
 
   add(['POST'], ['/api/v1/user/regroup', '/api/v2/browser-profile/regroup'], (ctx) => {
@@ -618,11 +616,68 @@ export function buildRoutes() {
   add(['GET'], ['/api/v1/browser-profile/cookie/export', '/api/v2/browser-profile/cookie/export', '/api/v1/user/cookie/export'], cookieExportHandler);
   add(['POST'], ['/api/v1/browser-profile/cookie/import', '/api/v2/browser-profile/cookie/import', '/api/v1/user/cookie/import'], cookieImportHandler);
 
+  /* ==================== 4.7 回收站（软删除；形状按逆向 22- 号文） ==================== */
+
+  /**
+   * recycle-bin/list：入参只认 `page`（≥1）与 `limit`（1–100），本地改写成 `page_size`。
+   * 出参 `data = {list, page, limit}` —— **没有** `total` / `total_count` / `total_pages`
+   * （对手的整形函数里这三个词零出现；普通 `/browser-profile/list` 才有 total）。
+   * item 是严格 6 字段子集（store 里的 toRecycleBinItem），未传的键不出现（"透传"语义）。
+   */
+  add(['POST'], ['/api/v2/browser-profile/recycle-bin/list'], (ctx) => {
+    const src = ctx.body || {};
+    const asNumber = (name, raw) => {
+      if (raw === undefined || raw === null || raw === '') return undefined;
+      const n = Number(raw);
+      if (!Number.isFinite(n)) throw new ApiError(ERR.INVALID, `${name} must be a number`);
+      return n;
+    };
+    const page = asNumber('page', src.page);
+    if (page !== undefined && page < 1) throw new ApiError(ERR.INVALID, 'page must be greater than or equal to 1');
+    const limit = asNumber('limit', src.limit);
+    if (limit !== undefined && (limit < 1 || limit > 100)) throw new ApiError(ERR.INVALID, 'limit must be between 1 and 100');
+    const r = listRecycleBin({ page: page ?? 1, page_size: limit ?? 50 });
+    const data = { list: r.list };
+    if (page !== undefined) data.page = page;
+    if (limit !== undefined) data.limit = limit;
+    return ok(data);
+  });
+
+  /**
+   * recycle-bin/restore：**单个** `profile_id`（或 `profile_no`），不是 `user_ids` 数组。
+   * `group_id` **必填**（对手要求恢复时显式选分组）—— 不能"回原分组就不传"。
+   * 五条错误文案逐字照抄对手（docs/reverse/07 的错误串表）。
+   * 成功响应体**无对手证据**（它是原样透传、客户端零整形），所以取最小形状：`data` 不出现。
+   */
+  add(['POST'], ['/api/v2/browser-profile/recycle-bin/restore'], (ctx) => {
+    const src = ctx.body || {};
+    const given = (v) => v !== undefined && v !== null && String(v).trim() !== '';
+    if (given(src.profile_id) && typeof src.profile_id !== 'string' && typeof src.profile_id !== 'number') {
+      throw new ApiError(ERR.INVALID, 'profile_id must be a string');
+    }
+    if (given(src.profile_no) && typeof src.profile_no !== 'string' && typeof src.profile_no !== 'number') {
+      throw new ApiError(ERR.INVALID, 'profile_no must be a string');
+    }
+    if (!given(src.profile_id) && !given(src.profile_no)) throw new ApiError(ERR.INVALID, 'profile_id or profile_no is required');
+    if (!given(src.group_id)) throw new ApiError(ERR.INVALID, 'group_id is required');
+    const g = src.group_id;
+    if (typeof g !== 'number' && !(typeof g === 'string' && /^\d+$/.test(g))) {
+      throw new ApiError(ERR.INVALID, 'group_id must be a number');
+    }
+
+    const byId = given(src.profile_id) ? String(src.profile_id) : null;
+    const target = getRecycledProfile({ profile_id: byId, profile_no: byId ? null : src.profile_no });
+    // 不在回收站里（含"根本没这个环境"）一律 100001：不要给"恢复成功"的假象
+    if (!target) throw new ApiError(ERR.NOT_FOUND, 'Profile does not exist');
+    const r = restoreProfiles([target.id], g)[0];
+    if (!r.restored) throw new ApiError(ERR.GENERIC, 'restore failed');
+    return ok(null);
+  });
+
   /* ============================ 5. 占位：明确不支持 ============================ */
   const placeholders = [
     '/api/v1/application/list', '/api/v2/category/list',
     '/api/v1/fb/list', '/api/v1/fb/page', '/api/v1/fb/bm',
-    '/api/v2/browser-profile/recycle-bin/list', '/api/v2/browser-profile/recycle-bin/restore',
     '/api/v2/browser-profile/share', '/api/v2/browser-profile/download-kernel',
     '/api/v2/browser-profile/update-patch',
     '/api/v2/user/create', '/api/v2/user/update', '/api/v2/user/reset_password',
@@ -928,26 +983,6 @@ async function cookieImportHandler(ctx) {
     verified,
     data: { imported: r.written.length, failed: allFailed, warnings, verified },
   };
-}
-
-/**
- * 硬删环境时把它的 user-data-dir 一起删掉。
- * 「删了记录、留几个 G 的 userdata」是最常见的脏数据来源；
- * 但这里只允许删 PROFILES_DIR 下的目录，路径算不对就不删（宁留数据不越界）。
- */
-function removeProfileDataDir(profile) {
-  try {
-    const base = path.resolve(PROFILES_DIR) + path.sep;
-    // userDataDirFor 给的是 <profiles>/<no>_<id8>/userdata，往上退一层才是这个环境的根
-    const dir = path.resolve(path.dirname(userDataDirFor(profile)));
-    if (!dir.startsWith(base)) return null;
-    if (!fs.existsSync(dir)) return null;
-    fs.rmSync(dir, { recursive: true, force: true });
-    return dir;
-  } catch {
-    // 文件被占用（刚停完的内核还没退干净）不能把删除整体搞失败：记录已经删了，下次启动会重建目录
-    return null;
-  }
 }
 
 /** 每种缓存类型 → user-data-dir 下的相对路径（只删白名单里的，绝不递归删整个目录） */

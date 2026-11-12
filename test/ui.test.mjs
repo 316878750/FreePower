@@ -130,7 +130,7 @@ try {
   })).text);
   check('validate：合法输入 ok', good.data.ok === true && good.data.errors.length === 0);
 
-  /* ---------------- 创建 → 删除（含 user-data） ---------------- */
+  /* ---------------- 创建 → 删除（软删除：进回收站，user-data 留着） ---------------- */
   const created = JSON.parse((await raw('POST', '/api/v2/browser-profile/create', {
     headers: h,
     body: JSON.stringify({ name: 'ui-env', group_id: '0', country: 'JP' }),
@@ -139,7 +139,7 @@ try {
   const pid = created.data.profile_id;
   const pno = created.data.profile_no;
 
-  // 手动造一个 user-data 目录，验证删除时会被带走
+  // 手动造一个 user-data 目录，验证删除时**不**被带走（恢复后要能直接启动）
   const envDir = path.join(DATA, 'profiles', `${pno}_${String(pid).slice(0, 8)}`);
   fs.mkdirSync(path.join(envDir, 'userdata', 'Default'), { recursive: true });
   fs.writeFileSync(path.join(envDir, 'userdata', 'Default', 'Cookies'), 'x');
@@ -148,8 +148,9 @@ try {
     headers: h,
     body: JSON.stringify({ profile_id: [pid] }),
   })).text);
-  check('删除返回 deleted + userdata_removed', del.code === 0 && del.data.deleted.length === 1 && del.data.userdata_removed === 1, JSON.stringify(del.data));
-  check('user-data 目录已删除', !fs.existsSync(envDir));
+  // 2026-11-12 语义变更：delete 从硬删改成软删除（进回收站），原断言是 userdata_removed===1 + 目录没了
+  check('删除返回 deleted + userdata_removed=0（软删除）', del.code === 0 && del.data.deleted.length === 1 && del.data.userdata_removed === 0, JSON.stringify(del.data));
+  check('user-data 目录仍在（恢复后能直接启动）', fs.existsSync(envDir));
   const gone = JSON.parse((await raw('GET', `/api/v2/browser-profile/detail?profile_id=${pid}`, { headers: h })).text);
   check('删完再查报 100001', gone.code === 100001, `${gone.code}`);
 

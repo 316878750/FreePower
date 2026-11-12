@@ -8,6 +8,8 @@ import {
   listProfiles as dbList,
   updateProfile as dbUpdate,
   deleteProfile as dbDelete,
+  restoreProfile as dbRestore,
+  listDeletedProfiles as dbListDeleted,
   setStatus,
 } from '../../packages/profile/src/repo.js';
 import { validateProfile, validateField } from '../../packages/profile/src/validate.js';
@@ -193,21 +195,22 @@ function groupName(groupId) {
   return row ? row.name : 'Default';
 }
 
-export function getProfile(profileId) {
-  return toApi(dbGet(getDb(), profileId));
+export function getProfile(profileId, opts) {
+  return toApi(dbGet(getDb(), profileId, opts));
 }
 
-/** serial_number / profile_no 是同一个数字编号，脚本里两种写法都有 */
+/** serial_number / profile_no 是同一个数字编号，脚本里两种写法都有（回收站里的不算） */
 export function getProfileByNo(no) {
   const n = Number(no);
   if (!Number.isFinite(n)) return null;
-  const row = getDb().prepare('SELECT id FROM profiles WHERE profile_no = ?').get(n);
+  const row = getDb().prepare('SELECT id FROM profiles WHERE profile_no = ? AND deleted_at IS NULL').get(n);
   return row ? toApi(dbGet(getDb(), row.id)) : null;
 }
 
-export function listProfiles({ page = 1, page_size = 50, group_id = null, name = null, ids = null, profile_nos = null, tag_ids = null, sort_field = null, sort_order = null } = {}) {
+export function listProfiles({ page = 1, page_size = 50, group_id = null, name = null, ids = null, profile_nos = null, tag_ids = null, sort_field = null, sort_order = null, include_deleted = false } = {}) {
   const db = getDb();
-  const where = [];
+  // 回收站里的环境一律不出现在 list 里（软删除语义，见 deleteProfiles）
+  const where = include_deleted ? [] : ['deleted_at IS NULL'];
   const args = [];
   if (group_id !== null && group_id !== undefined && group_id !== '') {
     where.push('group_id = ?');
@@ -314,6 +317,12 @@ export function updateProfile(profileId, patch = {}) {
   return toApi(res.profile);
 }
 
+/**
+ * 删除 = 进回收站（软删除）：只置删除标记，**不删 user-data 目录**。
+ * 回收站里的环境必须是「恢复后能直接启动的原环境」，删盘就等于恢复出一个空壳，
+ * 「回收站」三个字也就成了骗人。彻底清理是另一套语义（purge），这里不做。
+ * @returns {string[]} 真的进了回收站的 id（已经在里面或不存在的不算）
+ */
 export function deleteProfiles(ids = []) {
   const db = getDb();
   const deleted = [];
@@ -323,11 +332,83 @@ export function deleteProfiles(ids = []) {
   return deleted;
 }
 
+/**
+ * 回收站 item 的时间口径（照抄对手的可观测行为，2026-11-12 逆向 `22-回收站响应形状.md`）：
+ *   - 空 → `""`
+ *   - 数字 → `String(Math.trunc(n))`（**上游给毫秒不除 1000**，这里同样不动它）
+ *   - 纯数字串 → 原样
+ *   - `YYYY-MM-DD HH:mm:ss`（严格、写死 Asia/Shanghai）→ **秒级 unix 时间戳字符串**
+ *   - 其它 → 原串
+ * 我们库里存的就是第 4 种（见 repo.js 的 deleteStamp），所以正常的 delete_time 是 10 位数字串。
+ */
+export function deleteTimeOf(value) {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'number') return String(Math.trunc(value));
+  const s = String(value).trim();
+  if (!s) return '';
+  if (/^\d+$/.test(s)) return s;
+  const m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/.exec(s);
+  if (m) {
+    const ms = Date.parse(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}+08:00`);
+    if (Number.isFinite(ms)) return String(Math.trunc(ms / 1000));
+  }
+  return String(value);
+}
+
+/**
+ * 回收站 item：**严格 6 字段子集**，对手是新建对象而不是 merge ——
+ * 所以这里逐字段挑，绝不 `...profile` 展开（代理、指纹、标签、状态一个都不能带出来）。
+ */
+export function toRecycleBinItem(profile) {
+  return {
+    profile_id: profile.id,
+    profile_no: profile.profile_no,
+    name: profile.name ?? '',
+    group_name: groupName(profile.group_id),
+    remark: profile.remark ?? '',
+    delete_time: deleteTimeOf(profile.deleted_at),
+  };
+}
+
+/** 回收站列表：只给数据层结果，响应形状由路由层决定（`data = {list, page, limit}`） */
+export function listRecycleBin({ page = 1, page_size = 50 } = {}) {
+  const r = dbListDeleted(getDb(), { page, page_size });
+  return { list: r.list.map(toRecycleBinItem), page: r.page, page_size: r.page_size, total: r.total };
+}
+
+/**
+ * 在回收站里按 id 或 profile_no 找一个（恢复用）。
+ * 注意不能拿 getProfile/getProfileByNo 顶替：那两个**故意**把已删项过滤掉了。
+ */
+export function getRecycledProfile({ profile_id: profileId = null, profile_no: profileNo = null } = {}) {
+  const db = getDb();
+  let row = null;
+  if (profileId !== null && profileId !== undefined && String(profileId) !== '') {
+    row = db.prepare('SELECT id FROM profiles WHERE id = ? AND deleted_at IS NOT NULL').get(String(profileId));
+  } else {
+    const n = Number(profileNo);
+    if (Number.isFinite(n)) row = db.prepare('SELECT id FROM profiles WHERE profile_no = ? AND deleted_at IS NOT NULL').get(n);
+  }
+  return row ? dbGet(db, row.id, { includeDeleted: true }) : null;
+}
+
+/**
+ * 从回收站恢复。id / profile_no 原样保留 —— 恢复出来的必须是同一个环境，
+ * 否则脚本里存着的 profile_id、user-data 目录、绑过的代理对不上。
+ * `groupId` 是上层契约的必填项（对手的 restore 要求显式选分组），路由层一定会传。
+ * @returns {{id:string, restored:boolean}[]} 每个 id 的恢复结果（不在回收站里的 restored=false）
+ */
+export function restoreProfiles(ids = [], groupId) {
+  const db = getDb();
+  return ids.map((id) => ({ id, restored: dbRestore(db, id, groupId) }));
+}
+
 export function regroupProfiles(ids = [], groupId = '0') {
   const db = getDb();
   let changed = 0;
   for (const id of ids) {
-    if (!db.prepare('SELECT 1 FROM profiles WHERE id = ?').get(id)) continue;
+    // 回收站里的环境不改分组：它现在不在任何列表里，改它等于给用户看一个「改成功了」的假象
+    if (!db.prepare('SELECT 1 FROM profiles WHERE id = ? AND deleted_at IS NULL').get(id)) continue;
     db.prepare('UPDATE profiles SET group_id = ?, updated_at = ? WHERE id = ?')
       .run(String(groupId), new Date().toISOString(), id);
     changed++;
@@ -383,9 +464,12 @@ export function deleteGroup(groupId) {
   if (id === '0') return { ok: false, reason: 'default_group_protected' };
   const cur = getGroup(id);
   if (!cur) return { ok: false, reason: 'not_found' };
-  const moved = db.prepare('UPDATE profiles SET group_id = ? WHERE group_id = ?').run('0', id).changes;
+  // 回收站里的也算上一并挪走（否则恢复出来会挂在一个已经不存在的分组上）；
+  // 但只把「在用」的那些计入 moved，返回值说的必须是人能看见的环境数。
+  const alive = db.prepare('SELECT COUNT(*) AS n FROM profiles WHERE group_id = ? AND deleted_at IS NULL').get(id).n;
+  db.prepare('UPDATE profiles SET group_id = ? WHERE group_id = ?').run('0', id);
   db.prepare('DELETE FROM groups WHERE id = ?').run(id);
-  return { ok: true, moved };
+  return { ok: true, moved: alive };
 }
 
 export function markStatus(profileId, status) {

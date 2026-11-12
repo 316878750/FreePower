@@ -15,11 +15,12 @@
 - 启动/关闭浏览器实例：独立 `--user-data-dir`、独立进程、随机 CDP 端口、进程树回收
 - 指纹：UA / UA-CH / 语言 / 时区 / 屏幕与 DPR / WebGL vendor+renderer / Canvas 种子化噪声 / Audio 噪声 / WebGL 图像噪声 / client rects 噪声 / hardwareConcurrency / deviceMemory / media devices（**真实枚举 + 只改名字**）/ 语音（按环境语言投影 `getVoices()`）/ platform / 字体声明（只声明，不注入）/ WebRTC 策略
 - **隐私开关四项有真行为**（2026-11-12 第一批）：`disable_image` 内核层不请求图片、`disable_video` 按 `Media` 资源类型拦截、`blacklist` / `whitelist` 按域名（含子域、URL 通配、host:port）拦放行 —— 都有开/关对照判据，见第八节「隐私开关」
+- **回收站**（2026-11-12 第一批 ②）：删除改成**软删除**（只置 `deleted_at`、**不删 user-data**），`list`/`detail`/`start`/`update` 一律看不到已删项；`recycle-bin/list`、`recycle-bin/restore` 两条路由按逆向切片的形状落地（item 严格 6 字段、恢复要显式选 `group_id`），见第八节「回收站」
 - 自检：每个环境启动后自动跑一次真实页面探针，输出 19 项可读报告（覆盖度对齐字段表 full/partial/none），含「页面直接创建的三类 worker + 嵌套 worker」双 Realm 断言与 AudioWorklet 明确 `none`，支持 API 与本地 HTML 页。**worker 不是全覆盖**（OOPIF 子帧、启动前已在跑的 SW 仍是盲区），边界见已知限制第 6 条
 - 代理：HTTP/HTTPS/SOCKS5 绑定、账号密码认证（HTTP 代理）、**fail-closed**；PAC 明确拒绝（不支持就报错，不静默降级）；代理管理页**单条 / 批量健康检查**（出口 IP / 国家 / 延迟 / 时间，失败区分超时、认证失败、代理拒绝 CONNECT、连接被拒、DNS、TLS；批量限并发 3、单条 10s 上限，超 24h 的结果标「结果过期」）
 - 本地 API：`/status`、环境 CRUD、分组、标签、代理列表、浏览器启停、**批量启停（并发上限 + 失败清单 + 可中断）**、自检报告；返回值形状对齐 AdsPower（`ws.puppeteer` / `ws.selenium` / `debug_port` / `status: Active|Inactive` / `cookies` / `kernels`）
 - **Web 管理控制台**（`node:http` 直接托管，浏览器打开 `127.0.0.1:<端口>/` 即用）：环境列表（启动/停止/自检状态/批量操作）、环境编辑（11 组分栏表单，值域与必填来自后端注册表）、代理管理、自检报告。四个页面全部只调自己的 Local API，没有私有通道
-- 未实现的 46 条云端透传接口（回收站、分享、成员、内核下载…）**明确报「不支持」**（`code:-1` + `data.supported:false`），不假成功、不留未知码
+- 未实现的云端透传接口（分享、成员、内核下载…）**明确报「不支持」**（`code:-1` + `data.supported:false`），不假成功、不留未知码。原来这类有 46 条，**2026-11-12 回收站两条已本地实现 → 剩 44 条**（回收站从这条清单里移出去，不是改成假成功）
 - **桌面版**：Electron 壳（单实例 / 托盘 / 关窗不退出 / 开机自启开关 / 退出前必清残留内核）+ NSIS 安装包，不需要 VS 编译链
 
 ### 不做（已和 CEO 确认，写进范围外）
@@ -142,7 +143,7 @@ CORS：只放行 `127.0.0.1` / `localhost` 的 Origin，其他返回 `403` + 纯
 | GET | `/` | **Web 管理控制台**（静态页，注入本地 api_key；外站 Origin 403） |
 | GET | `/ui/*` | 控制台资源（`app.js` / `style.css` / `pages/*.js`），越权路径一律 404 |
 
-未实现的云端透传接口（回收站、分享、成员体系、内核下载、fb/*…）统一返回：
+未实现的云端透传接口（分享、成员体系、内核下载、fb/*…）统一返回（**回收站两条已于 2026-11-12 本地实现，不在这个清单里**，见第八节「回收站」）：
 
 ```json
 {"code":-1,"msg":"FreePower 不支持该接口（AdsPower 依赖其云端，本地没有对应能力）：/api/v2/browser-profile/share","data":{"supported":false,"path":"..."}}
@@ -285,7 +286,7 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 10. **2D canvas 固定软件光栅化**（`--disable-accelerated-2d-canvas`）。GPU 2D 路径跨进程会产生不同像素，导致 canvas 哈希跨重启漂移；固定软件光栅化后四轮实测一致。代价：`chrome://gpu` 显示 Software only，canvas 密集页面略慢。
 11. **远程代理下的自检有盲区**：自检页走 `http://127.0.0.1` 安全上下文；若代理强制 loopback 也走代理（非 `--proxy-bypass-list=<-loopback>` 的配置），会回落到 `about:blank`，此时报告里 UA-CH / 媒体设备明确标「本次未验证」，不标通过。
 12. **轮换代理会把「出口 IP 与预检不一致」判为告警**（正常业务形态，只提示不阻断）；运行中没有代理健康检查，掉线时请求失败但不会回退直连。
-13. **云端依赖的接口一律不支持**：`cloud-active`、回收站、分享、成员体系、内核下载、`fb/*`、应用/分类等 17 条（对手 54 条路由里剩下的云端透传）返回 `-1` + `data.supported:false`，**不假成功**。`cloud-active` 尤其明确：脚本若以为"环境已开"会直接下错单。
+13. **云端依赖的接口一律不支持**：`cloud-active`、分享、成员体系、内核下载、`fb/*`、应用/分类等 17 条（对手 54 条路由里剩下的云端透传）返回 `-1` + `data.supported:false`，**不假成功**。`cloud-active` 尤其明确：脚本若以为"环境已开"会直接下错单。**2026-11-12 更正**：原清单里的**回收站两条已本地实现**（`recycle-bin/list`、`recycle-bin/restore`，见第八节），所以这条实际剩 15 条；数字保留原文只为对得上旧回执。
 14. **批量启停的并发默认 3**（`FREEPOWER_BATCH_CONCURRENCY` 可调，请求里 `concurrency` 覆盖，夹在 1..10）。批量启动**中途失败即中断**：已经起来的保留，剩下的不硬起，返回 `failed` + `skipped`。
 15. **`kernels` 的版本号区分「实测」与「猜」**：系统 Chrome 的 `Application\` 下可能同时有几个版本目录（本机实测有 156/157），而启动器实际跑哪个由注册表决定。启动过就报 `Browser.getVersion` 的真值（`probed:true`），没启动过则按目录名猜。**不要拿目录名当真实版本用。**
 16. **桌面壳没有代码签名、没有自动更新**：安装包和 exe 都未签名，SmartScreen 会提示「未知发布者」；要对外发版必须补证书。壳只做窗口/托盘/单实例/自启，不做增量更新与崩溃上报。
@@ -575,12 +576,12 @@ foreach ($f in $files) {
 | `disable_image` | `'0'` / `'1'` | 内核开关 `--blink-settings=imagesEnabled=false`：**Blink 不请求图片**，服务器侧零请求，`img.complete` 恒为 `false` | `src/kernel/chrome.js`（`buildArgs`） |
 | `disable_video` | `'0'` / `'1'` | CDP `Fetch` 拦截 `resourceType === 'Media'` 的请求（`failRequest` + `BlockedByClient`） | `src/kernel/net-rules.js` + `src/runtime/manager.js`（`installRequestGating`） |
 | `blacklist` | `array<string>`（CSV 串也收） | 命中即拦；支持 `example.com`（含子域）、`*.example.com`（仅子域）、`http://a.com/p*`（URL 通配）、`host:8080`（精确端口） | 同上 |
-| `whitelist` | 同上 | **只放行语义**：非空时不在名单里的一律拦（含顶层文档），名单内再受黑名单约束 | 同上 |
+| `whitelist` | 同上 | **只放行语义**：非空时不在名单里的一律拦（含顶层文档）；**此时完全忽略黑名单**（见下面「白名单为什么忽略黑名单」） | 同上 |
 
 两条命令跑完就有结论（都不碰真数据目录，自己起一次性 `FREEPOWER_DATA` 与本机 http server）：
 
 ```powershell
-npm run test:net-rules   # 纯判定逻辑单测，26 项，不需要 Chrome
+npm run test:net-rules   # 纯判定逻辑单测，29 项，不需要 Chrome
 npm run test:switches    # 真机开/关对照，19 项，需要真实 Chrome（本机 157.0.8103.78）
 ```
 
@@ -604,7 +605,84 @@ npm run test:switches    # 真机开/关对照，19 项，需要真实 Chrome（
 - 请求拦截是**有规则或绑定了代理认证时才开**（`Fetch.enable`），没规则时完全不开 —— 默认路径不额外加每请求一跳。
 - **实测坑（我第一版就栽在这）**：`resourceType` 在 `Fetch.requestPaused` 的 **params 顶层**，不在 `params.request` 里；按 `request.resourceType` 读永远是 `undefined`，视频开关会**静默不生效**（图片和黑白名单都正常，只有视频这一条绿不了）。判据 `test:switches` 就是把这个坑抓出来的那条。
 
-冒烟覆盖（152 项，双 Realm 的 24 项在 `test/workers.test.mjs` 里单独列）：
+#### 白名单为什么忽略黑名单（2026-11-12 按逆向 `21-` §3 改的）
+
+对手的实现里，白名单开关为真时**只走白名单分支**，环境黑名单的项根本不会进它的 `NetFilters` —— 两个模式**互斥、白名单优先**。我第一版是「先判白名单、再判黑名单」，于是「白名单内的域名同时命中黑名单 → 拦」，**与对手相反**；而且 `test/net-rules.test.mjs` 里正好有一条把这个错语义钉成了 PASS。
+
+改动只有 `src/kernel/net-rules.js` 的 `decideRequest` 里那三行，语义对照：
+
+| 场景 | 改前（错） | 改后（与对手同构） |
+|---|---|---|
+| 白名单非空、名单外 | 拦 `not_in_whitelist` | 拦 `not_in_whitelist` |
+| 白名单非空、名单内 **且同时命中黑名单** | **拦 `blacklist`** | **放行** |
+| 白名单非空 + `disable_video=1`、Media 请求 | 拦 `disable_video` | 拦 `disable_video`（互斥只针对两张名单，不针对视频开关） |
+| 白名单为空 | 按黑名单判 | 按黑名单判（不变） |
+
+判据同步改：`白名单：名单内但命中黑名单 → 拦` 改成 `白名单：名单内且同时命中黑名单 → 放行（互斥、白名单优先）`，并在测试文件里写清**为什么**改（不是只改断言让它变绿）；另加两条「黑名单整体不参与（子域也放行）」「白名单 + `disable_video` 时视频仍拦」。`node --no-warnings test/net-rules.test.mjs` → **29 passed / 0 failed**（原 26 项）。
+
+#### 与对手的两处「有意差异」（不是复刻，别当一样）
+
+1. **拦截的呈现不同**：对手命中后返回**它自己的拦截页 HTML**（`StaticConfig.BlockPage` 是 base64 的整页，页面脚本还用 `window.blockUrl` 再判一次子域）；我们走 `Fetch.failRequest` → 浏览器报 `net::ERR_BLOCKED_BY_CLIENT`。用户看到的东西不一样。**拦截页列 backlog，本轮不做。**
+2. **关图的机制不同**：对手**新内核**（`>20220901`）是在内核网络层按 MIME `image/` + 尺寸上限拦（`StaticConfig.NetFilters` 里 `{mimeType:"image/", maxSize:…}`），**请求已经发出、服务器能看到**；`--blink-settings=imagesEnabled=false` 在对手那边只是**老内核兜底**。我们用的是 `blink-settings`，所以「服务器侧零请求」—— 这条差异**对我们更彻底**，但它仍是差异：别以为我们复刻了对手的新内核路径（`test:switches` 里「img 命中 0」正是这条差异的读数）。
+
+### 回收站：软删除 + 两条路由（2026-11-12 第一批 ②）
+
+**语义**：`browser-profile/delete` 从「停内核 + 删盘 + 删记录」改成**软删除** —— 只写 `deleted_at`，**user-data 目录原样留在盘上**。理由一句话：回收站里的环境恢复后必须是**能直接启动的原环境**，删了盘就恢复出一个空壳，「回收站」三个字也就成了骗人。彻底清理是另一套语义（`purge`），**本轮不实现、也不出现在这两条路由里**。
+
+`delete` 的响应形状没变：`data = {deleted:[…], userdata_removed: 0}`。`userdata_removed` 恒为 0 是**实话**（这次一条都没删盘），保留这个键只是为了不动 54 条路由的契约形状。
+
+**数据层**
+
+| 位置 | 改了什么 |
+|---|---|
+| `packages/profile/src/schema.sql`（由 `tools/gen-schema.mjs` 生成） | profiles 表加 `"deleted_at" TEXT`（NULL = 在用）+ `idx_profiles_deleted` |
+| `src/store/db.js` `migrate()` | 老库用 `ensureColumns` 补列。**顺序有坑**：DDL 里有 `CREATE INDEX … ON profiles("deleted_at")`，必须先补列再 `d.exec(DDL)`，否则老库直接 `no such column: deleted_at` |
+| `packages/profile/src/repo.js` | `deleteProfile` 改 `UPDATE … SET deleted_at`（已删的不重复计数）；新增 `restoreProfile` / `listDeletedProfiles`；`getProfile` / `listProfiles` 默认带 `deleted_at IS NULL` |
+| `src/store/profiles.js` | `listRecycleBin` / `restoreProfiles` / `getRecycledProfile` / `toRecycleBinItem` / `deleteTimeOf`；`listProfiles` 加 `include_deleted`；`regroupProfiles` 跳过已删；`deleteGroup` 把回收站里的也挪回 Default（否则恢复出来挂在不存在的分组上），但 `moved` 只数在用的 |
+
+`deleted_at` **刻意不进** `repo.js` 的 `EXT_COLS`：它是存储状态、不是环境属性，进了 `fromRow` 就会顺着 `toV2` / `toApi` 的展开漏进每条响应，凭空给 54 条路由多一个键。回收站 item 由 `toRecycleBinItem` **逐字段挑**，不 `...profile`。
+
+**已删项的行为（一律一致，不许半死不活）**
+
+| 入口 | 行为 |
+|---|---|
+| `list`（v1 `user/list`、v2 `browser-profile/list`） | 不出现 |
+| `detail` / `start` / `update` / 按 `profile_no` 解析 | 一律 `100001 Profile does not exist` |
+| `regroup` | 跳过，`changed: 0` |
+| `delete` 已删项 | `deleted: []`（不重复计数） |
+| `recycle-bin/list` | 出现 |
+
+**`recycle-bin/list`**（形状照逆向 `22-回收站响应形状.md`）
+
+- 入参只认 `page`（≥1）、`limit`（1–100），本地改写成 `page_size`；**不传的键不出现在 `data` 里**（透传语义）。内部默认 `page=1 / limit=50` —— **默认值是我们的选择，不是证据**。
+- 出参 `data = {list, page, limit}` —— **没有** `total` / `total_count` / `total_pages`（对手整形函数里这三个词零出现；普通 `/browser-profile/list` 才有 `total`）。
+- **item 严格 6 字段**：`profile_id`、`profile_no`、`name`、`group_name`、`remark`、`delete_time`。代理、指纹、标签、状态一个都不带（对手是新建对象，不是 merge）。
+- `delete_time` 口径（照抄）：空 → `""`；数字 → `String(Math.trunc)`（**毫秒不除 1000**）；纯数字串 → 原样；`YYYY-MM-DD HH:mm:ss`（严格、写死 Asia/Shanghai）→ **秒级 unix 时间戳字符串**；其它 → 原串。我们库里存的就是第 4 种格式（`repo.js` 的 `deleteStamp`），所以正常读数是 10 位数字串，例如 `1794463738`。
+- 校验文案逐字：`page must be greater than or equal to 1`、`limit must be between 1 and 100`、`page must be a number` / `limit must be a number`。
+
+**`recycle-bin/restore`**
+
+- 参数是**单个** `profile_id`（或 `profile_no`），**不是** `user_ids` 数组；两个都给就按 `profile_id` 走。
+- **`group_id` 必填**（数字或数字串 `/^\d+$/`）—— 不能"回原分组就不传"。**控制台/脚本恢复时必须选分组**，这条改变了原来「删了再恢复」的用法。
+- 五条文案逐字：`profile_id or profile_no is required`、`profile_id must be a string`、`profile_no must be a string`、`group_id is required`、`group_id must be a number`（文案说 string，实现也收 number，与对手同）。
+- 恢复后 **id / profile_no / 指纹身份逐字不变**（判据里跟删除前的快照逐字段比过），user-data 目录一直在，所以恢复即可启动（启动路径本身由冒烟覆盖，这里不重复起内核）。
+- **成功响应体没有对手证据**（它是原样透传、客户端零整形；`toRecycleBinProfile` 是死代码，不能当证据），所以我们返回**没有 `data`**（取最小形状）。目标不在回收站里 → `100001`，这个选择也没有证据。
+
+**判据**：`node --no-warnings test/recycle.test.mjs` → **44 passed / 0 failed**，已并入 `npm test`。四段：
+
+1. **迁移**：用**改造前的 DDL**（把 `deleted_at` 两行摘掉）造一个 0.3.2 形状的库 + 3 条环境 → 跑真迁移后列补上、3 条一条不少、`profile_no` 没重排、全部算在用；再开一次验幂等。
+2. **删除**：`userdata_removed=0` 且目录与文件都还在；v1/v2 两个 list 都不出现；`detail`/`start`/`update` 都是 `100001`；重复删除不重复计数。
+3. **`recycle-bin/list`**：`data` 里没有 total 三兄弟、item **键集合全等那 6 个**（多一个就算失败）、`delete_time` 是 10 位秒级时间戳、三条校验文案逐字。
+4. **`recycle-bin/restore`**：五条校验文案逐字、不在回收站报 `100001`、成功后 `data` 不出现、id/no/指纹不变、user-data 还在、**重启（真起一个新进程读库）**删除态与恢复态都保持。
+
+**判据现状（如实报）**：`test/smoke.mjs:591` 那条「占位路由：明确不支持」还把 `recycle-bin/list` 钉成 `code:-1 + supported:false`，所以现在 `node --no-warnings test/smoke.mjs` 是 **151/152**，唯一红项就是它。`smoke.mjs` 属于「不许改的判据文件」，我没动 —— 要么把那条改成断言新形状（更严、不削弱），要么先把路由退回占位，等 CEO 拍。
+
+**两条「不是从对手代码里读来的」要标清**：
+
+- 「软删除**保留 userdata**」是我们的语义。对手是否也保留**没有证据**，只有【推断】：同表有成对的 recycle/recovery 接口、`restore` 还要 `group_id`，看起来像软删。
+- `purge`（彻底清理）**没实现**，也不在这两条路由里。
+
+冒烟覆盖（152 项，双 Realm 的 24 项在 `test/workers.test.mjs` 里单独列；**其中「占位路由」那 1 项目前红，原因见上面「判据现状」**）：
 
 - `/status` 形状、鉴权、跨站 Origin 403 纯文本、限流报文
 - 建环境 → 起真 Chrome → 探针读回 UA / UA-CH / 时区 / 语言 / platform / hardwareConcurrency / WebGL / `navigator.webdriver`

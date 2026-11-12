@@ -47,6 +47,11 @@
         "name": "last_launch_at",
         "sqlType": "TEXT",
         "note": ""
+      },
+      {
+        "name": "deleted_at",
+        "sqlType": "TEXT",
+        "note": "NULL=在用；有值=回收站（软删除时刻 ISO）"
       }
     ]
   },
