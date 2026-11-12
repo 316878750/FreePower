@@ -42,6 +42,8 @@
     "test:net-rules": "node --no-warnings test/net-rules.test.mjs",
     "test:recycle": "node --no-warnings test/recycle.test.mjs",
     "test:switches": "node --no-warnings test/switches.test.mjs",
+    "test:chain-rules": "node --no-warnings test/chain-rules.test.mjs",
+    "test:proxy-chain": "node --no-warnings test/proxy-chain.test.mjs",
     "test:p9c-judge": "node --no-warnings tools/p9c-judge.mjs"
   },
   "devDependencies": {

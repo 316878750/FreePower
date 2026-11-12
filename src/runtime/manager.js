@@ -13,6 +13,7 @@ import { fingerprintView } from '../fingerprint/view.js';
 import { ensureNoiseSeeds } from '../fingerprint/seeds.js';
 import { checkProfile, markStatus, applyProfileFields, persistEgress } from '../store/profiles.js';
 import { checkProxy, hasProxy, normalizeProxyConfig } from '../proxy/probe.js';
+import { resolveChain, startChain } from '../proxy/chain.js';
 import { pacInUse, pacMessage } from '../proxy/pac.js';
 import { probeEgressInBrowser } from '../proxy/egress.js';
 import { runSelfCheck } from '../selfcheck/index.js';
@@ -100,9 +101,10 @@ function log(profileId, ...parts) {
  *   页面在暂停态接住并装配 → 浏览器内出口探测 → 地理/时区一致性告警
  *
  * @param {object} profile
- * @param {{force?:boolean}} opts force=1 时允许越过硬冲突（软冲突本来就只告警）
+ * @param {{force?:boolean, systemProxy?:object}} opts force=1 时允许越过硬冲突（软冲突本来就只告警）；
+ *   `systemProxy` 只给测试用：显式注入本机系统代理的注册表值（**测试不改用户注册表**）
  */
-export async function startProfile(profile, { force = false } = {}) {
+export async function startProfile(profile, { force = false, systemProxy = null } = {}) {
   const id = profile.id || profile.profile_id;
 
   const inst = running.get(id);
@@ -154,20 +156,63 @@ export async function startProfile(profile, { force = false } = {}) {
 
     // 2) 代理 fail-closed：先证明代理活着、能出网，再决定要不要起内核
     const proxy = profile.user_proxy_config || profile.proxy_config || null;
-    const proxyBound = hasProxy(proxy);
+    let proxyBound = hasProxy(proxy);
+    /** 真正交给内核的代理：单跳就是它本身，多级链则换成本地链监听（127.0.0.1:<port>） */
+    let effectiveProxy = proxy;
+    /** 多级链的本地监听；失败/停止时必须 close，否则反复起停会漏端口 */
+    let chainServer = null;
     let proxyCheck = null;
+
+    // 2.1) 多级代理链：hop0 = 本机 **Windows 系统代理**，hop1 = 环境自己的代理（对手也是这样两跳拼出来的）
+    //      - 本机没配系统代理 → **塌成单跳、正常启动**（不算失败，误报 800003 才是错）
+    //      - 确实是两跳 → 浏览器只看到本地回环监听，链在浏览器外由我们逐跳转发
+    const chain = resolveChain(profile, { systemProxy });
+    if (chain.active && !chain.ok) {
+      // PAC / 组不成链 → 拒绝启动，**绝不静默降级成单跳或直连**
+      const err = new Error(chain.reason === 'pac_unsupported'
+        ? chain.message
+        : `多级代理链不可用，拒绝启动（fail-closed）：${chain.message}`);
+      err.code = 800003;
+      err.reason = chain.reason;
+      throw err;
+    }
+    if (chain.mode === 'chain') {
+      chainServer = await startChain(chain.hops);
+      effectiveProxy = { type: 'http', host: '127.0.0.1', port: chainServer.port, username: '', password: '' };
+      proxyBound = true;
+      warnings.push(soft('is_multi_level_proxy',
+        `多级代理链：hop0=系统代理 ${chain.hops[0].host}:${chain.hops[0].port}，hop1=环境代理 ${chain.hops[1].host}:${chain.hops[1].port}；`
+        + `内核只看到 127.0.0.1:${chainServer.port}（链由 FreePower 在浏览器外转发，内核没有 --protected-staticconfig 通道）`));
+      log(id, '代理链', `hops=${chain.hops.length} local_port=${chainServer.port}`);
+    } else if (chain.mode === 'single') {
+      // 只找到一跳：直接用那条代理（与单代理完全等价 —— 认证仍走 Fetch.authRequired 老路径）
+      effectiveProxy = chain.hops[0];
+      proxyBound = true;
+      warnings.push(soft('is_multi_level_proxy',
+        `多级代理链：只找到 1 跳（${chain.hops[0].source === 'system' ? '只有系统代理，环境未配代理' : '只有环境代理，本机未启用系统代理'}）→ 与单跳等价`));
+      log(id, '代理链', `collapsed hops=1 source=${chain.hops[0].source}`);
+    } else if (chain.active) {
+      warnings.push(soft('is_multi_level_proxy', '多级代理链：本机未启用系统代理、环境也没有代理 → 与不设代理等价'));
+    }
+
     if (proxyBound) {
       if (String(profile.bypass_proxy_check) === '1') {
         warnings.push(soft('bypass_proxy_check', '已跳过代理预检（bypass_proxy_check=1）：代理若失效就不会有兜底，请自行确认'));
         log(id, 'WARN 跳过代理预检（bypass_proxy_check=1）');
       } else {
-        proxyCheck = await checkProxy(proxy, { url: EGRESS_PROBE_URL, timeoutMs: PROXY_PROBE_TIMEOUT_MS });
+        // 链式环境下这就是「整条链 + 目标」的端到端探测：探通即每一跳都通
+        proxyCheck = await checkProxy(effectiveProxy, { url: EGRESS_PROBE_URL, timeoutMs: PROXY_PROBE_TIMEOUT_MS });
         if (!proxyCheck.ok) {
+          const hop = chainServer && chainServer.lastError ? chainServer.lastError.hop : undefined;
+          if (chainServer) { await chainServer.close().catch(() => {}); chainServer = null; }
           log(id, '代理预检失败，拒绝启动', proxyCheck.error);
           const err = new Error(`代理不可用，已阻止启动（fail-closed）：${proxyCheck.error}`);
           err.code = 800003;
-          err.reason = 'proxy_unreachable';
+          // 链式：那一跳是「连不上 / 认证失败」→ proxy_chain_hop_failed（带 hop 下标）；
+          // 单代理：保持原来的 proxy_unreachable
+          err.reason = chain.mode === 'chain' ? 'proxy_chain_hop_failed' : 'proxy_unreachable';
           err.proxy_check = proxyCheck;
+          if (Number.isInteger(hop)) err.failed_hop = hop;
           throw err;
         }
         log(id, '代理预检通过', `${proxyCheck.ip} ${proxyCheck.countryCode || ''} ${proxyCheck.latency_ms}ms`);
@@ -182,25 +227,35 @@ export async function startProfile(profile, { force = false } = {}) {
     let view = fingerprintView(effective);
     let uaAligned = null;
     const udd = userDataDirFor(effective);
-    fs.mkdirSync(udd, { recursive: true });
-    // 上一次运行留下的 DevToolsActivePort 会让本轮读到旧端口 → 连到一个已经死掉的端口。
-    // 必须在新内核写文件之前删掉（重启同一环境的常见坑）。
-    try { fs.rmSync(path.join(udd, 'DevToolsActivePort'), { force: true }); } catch { /* ignore */ }
+    let built;
+    let child;
+    let pid;
+    // 链监听已经起来了：下面这段任何一步抛错都要把它关掉，否则漏端口
+    try {
+      fs.mkdirSync(udd, { recursive: true });
+      // 上一次运行留下的 DevToolsActivePort 会让本轮读到旧端口 → 连到一个已经死掉的端口。
+      // 必须在新内核写文件之前删掉（重启同一环境的常见坑）。
+      try { fs.rmSync(path.join(udd, 'DevToolsActivePort'), { force: true }); } catch { /* ignore */ }
 
-    const built = buildArgs(effective, {
-      userDataDir: udd,
-      proxy,
-      proxyBound,
-      userArgs: effective.launch_args,
-    });
-    warnings.push(...built.warnings);
-    for (const r of built.rejected) {
-      warnings.push(soft('launch_args', `参数被拒绝：${r.arg} —— ${r.reason}`));
+      built = buildArgs(effective, {
+        userDataDir: udd,
+        // 多级链在这里已经换成本地回环监听：内核只认 --proxy-server=http://127.0.0.1:<port>
+        proxy: effectiveProxy,
+        proxyBound,
+        userArgs: effective.launch_args,
+      });
+      warnings.push(...built.warnings);
+      for (const r of built.rejected) {
+        warnings.push(soft('launch_args', `参数被拒绝：${r.arg} —— ${r.reason}`));
+      }
+      log(id, 'launch', chrome.path, chrome.version, built.args.join(' '));
+
+      child = launchChrome(chrome.path, built.args);
+      pid = child.pid;
+    } catch (e) {
+      if (chainServer) { await chainServer.close().catch(() => {}); chainServer = null; }
+      throw e;
     }
-    log(id, 'launch', chrome.path, chrome.version, built.args.join(' '));
-
-    const child = launchChrome(chrome.path, built.args);
-    const pid = child.pid;
     let client = null;
 
     try {
@@ -244,6 +299,10 @@ export async function startProfile(profile, { force = false } = {}) {
         real_version: realVersion,
         user_data_dir: udd,
         proxy: proxyCheck,
+        // 多级链的本地监听：`stop` 与「内核自己退出」两条路径都要 close（见 stopProfile / exit 回调）
+        chain: chainServer,
+        // 'off' | 'none' | 'single' | 'chain'：只有 'chain' 才关掉 Fetch 的代理认证路径（见 applyToSession）
+        chain_mode: chain.mode,
         egress: null,
         ua_aligned: uaAligned,
         launch_args: { applied: built.applied, rejected: built.rejected },
@@ -261,6 +320,7 @@ export async function startProfile(profile, { force = false } = {}) {
           running.delete(id);
           markStatus(id, 'idle');
         }
+        if (chainServer) { chainServer.close().catch(() => {}); chainServer = null; }
         try { if (client) client.close(); } catch { /* ignore */ }
       });
 
@@ -318,6 +378,8 @@ export async function startProfile(profile, { force = false } = {}) {
       running.delete(id);
       markStatus(id, 'idle');
       killProcessTree(pid);
+      // 链监听一定要关：失败路径漏端口，几轮反复起停之后才会炸，最难查
+      if (chainServer) { await chainServer.close().catch(() => {}); chainServer = null; }
       if (!err.code) err.code = 800003;
       throw err;
     }
@@ -620,7 +682,7 @@ async function injectAndOpen(instance, profile, view) {
     const blank = !targetInfo.url || targetInfo.url === 'about:blank' || targetInfo.url.startsWith('chrome://newtab');
     const prep = (async () => {
       try {
-        await applyToSession(client, sessionId, profile, view);
+        await applyToSession(client, sessionId, profile, view, { proxyAuth: instance.chain_mode !== 'chain' });
       } catch (e) {
         log(profileId, 'session 装配失败', targetInfo.targetId, e.message);
       } finally {
@@ -810,8 +872,12 @@ async function sessionForTarget(client, targetId) {
   }
 }
 
-/** 单个页面会话的指纹装配：先注入脚本，再打浏览器原生覆盖 */
-async function applyToSession(client, sessionId, profile, view) {
+/**
+ * 单个页面会话的指纹装配：先注入脚本，再打浏览器原生覆盖
+ * @param {{proxyAuth?:boolean}} gate `proxyAuth=false` 时**不挂** Fetch 的代理认证路径（多级链专用：
+ *   链式环境的认证由本地中继逐跳完成，Chrome 看到的是一个不需要认证的回环代理）
+ */
+async function applyToSession(client, sessionId, profile, view, { proxyAuth = true } = {}) {
   const s = sessionId;
   await client.send('Page.enable', {}, s);
   // 页面会话层再挂一次 auto-attach：**专用 worker 只在页面层被接住**（浏览器层接不住，实测）。
@@ -862,7 +928,7 @@ async function applyToSession(client, sessionId, profile, view) {
   // 与预检 / --proxy-server 同源：AdsPower 形状（proxy_user / proxy_password）也要认，
   // 否则账号密码挂不上，内核收到 407 后页面直接空白。
   const proxy = normalizeProxyConfig(profile.user_proxy_config || profile.proxy_config || {});
-  await installRequestGating(client, s, profile, proxy).catch((e) => log(profile.id, '请求闸门挂载失败', e.message));
+  await installRequestGating(client, s, profile, proxy, { proxyAuth }).catch((e) => log(profile.id, '请求闸门挂载失败', e.message));
 }
 
 function instance_profile(p) {
@@ -878,9 +944,12 @@ function instance_profile(p) {
  *
  * 没有规则也没有代理认证时**完全不开 Fetch** —— 默认路径零额外开销（拦截会加每请求一跳）。
  */
-async function installRequestGating(client, sessionId, profile, proxy) {
+async function installRequestGating(client, sessionId, profile, proxy, { proxyAuth = true } = {}) {
   const rules = compileNetRules(profile);
-  const needAuth = !!(proxy.username && proxy.host);
+  // 链式环境：Chrome 连的是**无认证的本地中继**，认证由链逐跳完成；这时候再开 `handleAuthRequests`
+  // 只会让 authRequired 去应答一个根本不存在的挑战（而且环境代理的账密不该出现在这一层）。
+  // 单跳仍走原来的 Fetch.authRequired 路径 —— 那条是老坑，别一刀切关掉。
+  const needAuth = proxyAuth && !!(proxy.username && proxy.host);
   if (!rules.active && !needAuth) return;
 
   await client.send('Fetch.enable', {
@@ -921,6 +990,8 @@ export async function stopProfile(profileId) {
   await new Promise((r) => setTimeout(r, 400));
   killProcessTree(inst.pid);
   try { inst.client.close(); } catch { /* ignore */ }
+  // 链监听跟实例同生命周期：不关它，反复起停会一直漏端口
+  if (inst.chain) { await inst.chain.close().catch(() => {}); inst.chain = null; }
   running.delete(profileId);
   markStatus(profileId, 'idle');
   return { profile_id: profileId, stopped: true };

@@ -625,6 +625,55 @@ npm run test:switches    # 真机开/关对照，19 项，需要真实 Chrome（
 1. **拦截的呈现不同**：对手命中后返回**它自己的拦截页 HTML**（`StaticConfig.BlockPage` 是 base64 的整页，页面脚本还用 `window.blockUrl` 再判一次子域）；我们走 `Fetch.failRequest` → 浏览器报 `net::ERR_BLOCKED_BY_CLIENT`。用户看到的东西不一样。**拦截页列 backlog，本轮不做。**
 2. **关图的机制不同**：对手**新内核**（`>20220901`）是在内核网络层按 MIME `image/` + 尺寸上限拦（`StaticConfig.NetFilters` 里 `{mimeType:"image/", maxSize:…}`），**请求已经发出、服务器能看到**；`--blink-settings=imagesEnabled=false` 在对手那边只是**老内核兜底**。我们用的是 `blink-settings`，所以「服务器侧零请求」—— 这条差异**对我们更彻底**，但它仍是差异：别以为我们复刻了对手的新内核路径（`test:switches` 里「img 命中 0」正是这条差异的读数）。
 
+### 多级代理链（2026-11-12 第二批）
+
+**它是什么（先说实话）**：对手的「多级」不是我们能配一串代理，而是**两跳拼出来的产物** —— `hop0 = 本机 Windows 系统代理`（`HKCU\...\Internet Settings`）+ `hop1 = 环境自己的代理`。我们复刻的就是这个两跳产物：开关 `is_multi_level_proxy='1'`（对手拼写 `mutli_level_proxy` 同样当开关认，两个字段的类型一个字节没改，都是 enum `'0'|'1'`）。
+
+> **这条必须直白写在最前面**：本功能**只有当用户本机确实配了系统代理时才产生额外一跳**。用户没配系统代理时，`is_multi_level_proxy=1` 与单跳**完全等价**（链塌成 1 跳，正常启动）。别把它读成「已实现多级代理」——字段打开后行为与 `0` 一致的经典空转，正是这轮要避免的东西。
+
+**怎么实现的（与对手的差异）**：对手走内核 `--protected-staticconfig` 把整包配置交内核，我们用的是**系统 Chrome，没有这条通道**，所以链在浏览器外面搭：
+
+```
+内核 --(--proxy-server=http://127.0.0.1:<relayPort>)--> 本地一次性中继（只 bind 127.0.0.1，端口系统分配）
+     --嵌套 CONNECT--> hop0（系统代理） --> hop1（环境代理） --> 目标
+```
+
+- 中继和实例同生命周期：`start` 前起、`stop` 与**任何启动失败路径**都 close（判据里有一条就是「`stop` 后 relayPort 查不到 LISTEN」，漏端口这种问题几轮之后才炸）。
+- 嵌套 CONNECT：向当前跳发「CONNECT 下一跳」，到最深一跳再在它的隧道里发「CONNECT 目标」；**每一跳只带自己的 `Proxy-Authorization`**。系统代理在注册表里没有凭据，所以 hop0 那一段**不带任何凭据**，hop1 的账密不会漏到 hop0（判据里逐条查这个）。
+- 明文 `http://` 目标也走同一条链（绝对 URI 改写成 origin-form 再从隧道发出），**转发层没有直连分支**。
+- 只有**两跳**：对手代码里也只有两次 push。不做 N 跳。
+- 因为 Chrome 看到的是一个**不需要认证的回环代理**，链式环境下 `Fetch.authRequired` 那条 CDP 认证路径**不启用**；黑/白名单与 `disable_video` 仍走 `Fetch`（互不影响）。**单跳照旧走 `Fetch.authRequired`** —— 别把老路径一起关掉（`test/proxy-chain.test.mjs` 的 E 组就是这条回归）。
+
+**判据口径（这条是我们自己的，不是对手口径）**：`--proxy-server` 只指向 `127.0.0.1:<relayPort>`，**上游 host/port 与凭据都不进 argv**。我们没有 `--protected-staticconfig`，只能靠回环中继做到这一点 —— 它比对手**更严**（对手把第二跳写进内核配置），但它是我们的口径，不要拿它当「对手也这样」。
+
+**hop 顺序**：下标 `0` = **离浏览器最近**的第一跳，最后一跳直连目标。这是**我们的语义**（数组即执行顺序，读代码不用在脑子里反转）；**对手的顺序无证据**，若日后取证相反，只在解析层改一次，不动转发层。
+
+**三种显式行为（不是一刀切）**：
+
+| 情形 | 行为 | 为什么 |
+|---|---|---|
+| 本机**没有**系统代理（`ProxyEnable=0`） | 链**塌成单跳**（只有环境代理），正常启动 | 报 800003 是误伤；对手的 `noProxy` 分支也是单跳 |
+| 有系统代理但**连不上 / 认证失败 / 系统代理是 socks=** | `800003` + `reason=proxy_chain_hop_failed` + `failed_hop`（下标）+ **零内核进程** | fail-closed 的本义：不静默降级、不裸奔直连 |
+| 系统代理是 **PAC**（`AutoConfigURL` 非空） | 拒绝：`800003` + `pac_unsupported` | 与既有 PAC 政策一致；PAC 可能含 `DIRECT`，无法保证 fail-closed |
+
+`ProxyServer` 的两种写法都解：`host:port` 与 `http=host:port;https=host:port`（有 `http=` 优先用它）。
+
+**已知边界（都列 backlog，不假装有）**：
+
+1. **系统代理需要认证本轮不支持**：`Internet Settings` 里没有凭据可读，链会在 hop0 拿 407 → fail-closed 报 `proxy_chain_hop_failed`、`failed_hop=0`。要支持得先有「系统代理账密」的配置入口，本轮不造字段。
+2. **`ProxyOverride` 只读不用**：它被解出来备查，但**不做逐请求旁路** —— 旁路的终点就是直连，与 fail-closed 冲突（`<local>` 尤其常见，照它办等于把本机流量放出链外）。
+3. **两个远端代理串起来不做**：对手靠「系统代理 + 环境代理」凑出来的那两跳我们做了；再叠第三跳/任意跳是我们的扩展、**非对手口径**，等真需要时再单独设计（不预留 API 字段）。
+4. **两跳必须都是 http**：https 跳要在隧道里再套 TLS、socks5 跳要在隧道里再握手，本轮都没做，所以明确拒绝（`proxy_chain_invalid`），不出现「配了 socks 跳却静默只走一跳」。
+
+**判据**（两个文件，都要单独跑，**没并进 `npm test` 的七组**）：
+
+```
+node --no-warnings test/chain-rules.test.mjs   → 31 passed, 0 failed   （纯逻辑：hop 解析、门控 '1'、塌单跳、PAC、协议限制、ProxyOverride 不旁路）
+node --no-warnings test/proxy-chain.test.mjs   → 37 passed, 0 failed   （真内核：两个记录型代理 + 目标 server，每条「0 命中」都成对给正例）
+```
+
+`test/proxy-chain.test.mjs` 覆盖：两跳都有命中且「hop0 的上游 = hop1、hop1 的 client 源端口 = hop0 出站 socket 本地端口」；无系统代理时 hop0 命中 0 而 hop1 有命中；hop1 不可达 / 系统代理要认证时 fail-closed + 零内核（按 `--user-data-dir` 归类数进程）+ 目标命中 0；运行中关掉 hop0 后目标命中**不增加**（防回落直连）；凭据不串层；argv 只有本地中继；`stop` 后端口查不到 LISTEN；单跳认证回归。测试**不读也不写用户注册表**（`readSystemProxy(overrides)` 注入）。
+
 ### 回收站：软删除 + 两条路由（2026-11-12 第一批 ②）
 
 **语义**：`browser-profile/delete` 从「停内核 + 删盘 + 删记录」改成**软删除** —— 只写 `deleted_at`，**user-data 目录原样留在盘上**。理由一句话：回收站里的环境恢复后必须是**能直接启动的原环境**，删了盘就恢复出一个空壳，「回收站」三个字也就成了骗人。彻底清理是另一套语义（`purge`），**本轮不实现、也不出现在这两条路由里**。

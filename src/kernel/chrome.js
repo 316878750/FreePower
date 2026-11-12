@@ -260,13 +260,10 @@ export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, use
     args.push(`--proxy-server=${scheme}://${px.host}:${px.port}`);
   }
 
-  if (String(profile.is_multi_level_proxy) === '1' || String(profile.mutli_level_proxy) === '1') {
-    warnings.push({
-      field: 'is_multi_level_proxy',
-      message: '多级代理（链式）暂未实现：只对第一跳做预检与注入，链路中间跳不可见',
-      severity: 'soft',
-    });
-  }
+  // 多级代理链在这里没有额外参数：链由 FreePower 在浏览器外搭好（src/proxy/chain.js），
+  // 内核只看到 `--proxy-server=http://127.0.0.1:<本地链端口>`。链路是「本机系统代理 + 环境代理」
+  // 两跳拼出来的（对手也是这么拼的，没有可配置的 hop 列表），解析全在 chain.js 里，这里刻意不重复判，
+  // 免得两处口径不一致（旧实现这里会推一条「多级代理暂未实现」的告警，0.3.3 起已不成立）。
 
   const merged = mergeLaunchArgs(args, userArgs, {
     proxyBound,
