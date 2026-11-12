@@ -122,10 +122,10 @@ try {
 
   const kn = await api('GET', '/api/v2/browser-profile/kernels?kernel_type=chrome');
   check('kernels：返回 {list:[{kernel_type,kernel,is_downloaded}]}', kn.json.code === 0 && Array.isArray(kn.json.data?.list) && kn.json.data.list.every((k) => k.kernel_type === 'chrome' && typeof k.kernel === 'string' && k.is_downloaded === true), JSON.stringify(kn.json.data?.list?.slice(0, 2)));
-  // 形状对齐对手：对手只有三个键；`path` / `source` 是我们的内部信息，序列化出去就是「API 形状不符」。
-  // 允许的额外键只有我们自己的诊断位（in_use / guessed_kernel / probed），别的键一律算红。
-  const kAllowed = new Set(['kernel_type', 'kernel', 'is_downloaded', 'in_use', 'guessed_kernel', 'probed']);
-  check('kernels：没有 path/source 这类内部键（字段白名单）', kn.json.data.list.every((k) => Object.keys(k).every((x) => kAllowed.has(x))), JSON.stringify(Object.keys(kn.json.data.list[0] || {})));
+  // 形状对齐对手：对手只有三个键；`path` / `source` / `in_use` 都是内部信息，序列化出去就是「API 形状不符」。
+  // 允许的额外键只有 `guessed_kernel` / `probed`（已知限制 15 的判据在用），别的键一律算红。
+  const kAllowed = new Set(['kernel_type', 'kernel', 'is_downloaded', 'guessed_kernel', 'probed']);
+  check('kernels：没有 path/source/in_use 这类内部键（字段白名单）', kn.json.data.list.every((k) => Object.keys(k).every((x) => kAllowed.has(x))), JSON.stringify(Object.keys(kn.json.data.list[0] || {})));
   check('kernels：至少有一个可用内核', (kn.json.data?.list || []).length > 0);
   const knBad = await api('GET', '/api/v2/browser-profile/kernels?kernel_type=opera');
   check('kernels：非法类型报 100002', knBad.json.code === 100002 && knBad.json.msg === 'Kernel type must be Chrome or Firefox.', knBad.json.msg);
