@@ -358,9 +358,9 @@ try {
 
   /* -------------------- 回收站：占位已换成真实现（2026-11-12），形状见 test/recycle.test.mjs -------------------- */
   const ph = await api('POST', '/api/v2/browser-profile/recycle-bin/list', { page: 1 });
-  check('回收站 list：code 0 + data={list,page,limit}（无 total；原断言是 -1 + supported:false）',
+  check('回收站 list：code 0 + data 键全等 limit,list,page（limit 取默认 50）+ 无 total',
     ph.json.code === 0 && Array.isArray(ph.json.data?.list) && ph.json.data?.total === undefined
-    && ph.json.data?.page === 1 && ph.json.data?.limit === undefined,
+    && ph.json.data?.limit === 50 && Object.keys(ph.json.data).sort().join(',') === 'limit,list,page',
     JSON.stringify(ph.json.data));
   const ph2 = await api('POST', '/api/v2/browser-profile/share', {});
   check('占位路由：share 仍是明确报错', ph2.json.code === -1 && ph2.json.data?.supported === false);
