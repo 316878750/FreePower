@@ -17,12 +17,17 @@
  * 这一版把**解析 + 审批 + 状态查询**做真，`runStep` 抛 `NotImplementedError` ——
  * 所以工作流会停在 `approved`，不会假装跑完。
  *
- * 存储：进程内 `Map`（骨架版）。真做持久化时落 `DATA_DIR/agent/workflows/<id>.json`，
- * 与对手的 `RUNTIME_PATH=<data>\ai_agent` + `/conversation_history/` 同构（逆向 `24-` §4.4）。
+ * 存储：`DATA_DIR/agent/workflows/<id>.json`，一个工作流一个文件，**每次状态转移都落盘**
+ * （`<id>.json.tmp` → `rename`，半写崩进程只留 `.tmp`，读侧跳过），与对手的
+ * `RUNTIME_PATH=<data>\ai_agent` + `/conversation_history/` 同构（逆向 `24-` §4.4）。
+ * 重启时扫目录恢复；**`running` 一律落成 `aborted`** —— 重启意味着那次执行已经没了
+ * （浏览器那边早没了），不能留在 `running` 上假装还在跑。终态就地保留、不进归档目录。
  */
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { parseTaskList, digestTask, runBrowserTask, TaskError, NotImplementedError } from './task.js';
-import { AGENT_HITL_DEFAULT } from '../config.js';
+import { AGENT_HITL_DEFAULT, AGENT_WORKFLOW_DIR } from '../config.js';
 
 export const WORKFLOW_STATES = ['created', 'approved', 'running', 'completed', 'failed', 'rejected', 'aborted'];
 const TERMINAL = new Set(['completed', 'failed', 'rejected', 'aborted']);
@@ -36,11 +41,77 @@ export class WorkflowError extends Error {
   }
 }
 
-/** 进程内注册表（骨架版；重启即丢，别在这上面做长任务） */
+/**
+ * 进程内热副本。**盘上那份才是权威**：`Map` 只做读加速，状态转移一律先落盘
+ * （反过来就会出现「内存 approved、重启丢审批」）。
+ */
 const workflows = new Map();
+let loaded = false;
 
 export function isTerminal(state) {
   return TERMINAL.has(state);
+}
+
+function warn(msg) {
+  try { console.warn(`[agent] ${msg}`); } catch { /* ignore */ }
+}
+
+/**
+ * 原子写：先写 `<id>.json.tmp` 再 `rename` —— 崩在写一半只留 `.tmp`，
+ * 正式文件要么是上一版、要么是新版，不可能是半截 JSON。
+ * 落盘失败不改内存里的结论，但必须留痕（否则调用方以为重启还读得到）。
+ */
+function saveWorkflow(wf) {
+  const file = path.join(AGENT_WORKFLOW_DIR, `${wf.id}.json`);
+  const tmp = `${file}.tmp`;
+  try {
+    fs.mkdirSync(AGENT_WORKFLOW_DIR, { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(wf, null, 2));
+    fs.renameSync(tmp, file);
+    return true;
+  } catch (e) {
+    warn(`工作流落盘失败 ${wf.id}：${e.message}`);
+    return false;
+  }
+}
+
+/**
+ * 扫 `DATA_DIR/agent/workflows/` 把工作流收进内存（幂等）。
+ * 启动时调一次；`getWorkflow` / `listWorkflows` 再兜一次（模块被单独 import 时也能读到盘）。
+ * 坏文件只跳过并告警：一个半写的 JSON 不该让整个 Agent 起不来。
+ *
+ * **不做跨进程同步**：扫一次就置 `loaded`，之后以本进程内存为准。同一个 DATA_DIR 上
+ * 起第二个 API 进程读不到对方后写的工作流 —— 一个数据目录只该有一个 API 进程
+ * （发现文件 `data/local_api` 也只指向一个端口），多进程互斥不在本轮范围。
+ */
+export function loadWorkflows() {
+  if (loaded) return [...workflows.values()];
+  loaded = true;
+  let names = [];
+  try { names = fs.readdirSync(AGENT_WORKFLOW_DIR); } catch { return []; } // 第一次跑：目录还不存在
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue; // `.json.tmp` 是没写完的残骸，别当正式记录
+    const file = path.join(AGENT_WORKFLOW_DIR, name);
+    let wf;
+    try { wf = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) {
+      warn(`工作流文件读不了，跳过 ${name}：${e.message}`);
+      continue;
+    }
+    if (!wf || typeof wf.id !== 'string' || !Array.isArray(wf.steps)) {
+      warn(`工作流文件形状不对，跳过 ${name}`);
+      continue;
+    }
+    if (wf.state === 'running') {
+      // 重启 = 那次执行已经中断（浏览器那边早没了）。落 aborted，别留在 running 上骗人。
+      // 错误码用 -1（通用失败）：码表里没有「中断」这一项，不为它新造一个码。
+      wf.state = 'aborted';
+      wf.error = { code: -1, msg: 'process restarted while running' };
+      wf.updated_at = new Date().toISOString();
+      saveWorkflow(wf);
+    }
+    workflows.set(wf.id, wf);
+  }
+  return [...workflows.values()];
 }
 
 /**
@@ -80,16 +151,18 @@ export function createWorkflow({ profile_id: profileId, goal = '', tasks } = {})
     error: null,
   };
   workflows.set(id, wf);
+  saveWorkflow(wf);
   return wf;
 }
 
 export function getWorkflow(id) {
+  loadWorkflows();
   return workflows.get(String(id)) || null;
 }
 
-/** 只给测试/诊断用：别借它做业务逻辑（骨架版内存表） */
+/** 只给测试/诊断用：别借它做业务逻辑（返回内存热副本，顺序不保证） */
 export function listWorkflows() {
-  return [...workflows.values()];
+  return loadWorkflows();
 }
 
 /** 对外形状：不把内部 task 全量回吐（模型看到的 DSL 可能含敏感值），只回动作与摘要 */
@@ -143,10 +216,10 @@ export function approveStep(id, input = {}) {
   step.state = 'approved';
   step.decision = 'approve';
   step.approved_at = new Date().toISOString();
-  touch(wf);
 
   // 所有步都批完了 → 工作流进 approved；单步批完仍是 created（还有别的步待审）
   if (wf.steps.every((s) => s.state === 'approved')) wf.state = 'approved';
+  touch(wf); // 状态定稿后再落盘，别把「created + 一步已批」的中间态写出去
   return wf;
 }
 
@@ -187,4 +260,5 @@ export { TaskError, NotImplementedError };
 
 function touch(wf) {
   wf.updated_at = new Date().toISOString();
+  saveWorkflow(wf); // 每次状态转移都落盘：create / approve / reject / 执行器推进的每一跳
 }

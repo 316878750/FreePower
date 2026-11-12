@@ -878,6 +878,15 @@ docs/                  技术方案、阶段交付、curl 实测、截图（docs
 2. **digest 绑定**：`digest = sha256(规范化任务 JSON)`，64 位十六进制；审批时给了 `digest` 就必须与那一步一致，否则 `100002`（防「批的是 A、跑的是 B」）。**算法与覆盖内容是我们自己的** —— 对手那个只知长度 64、算法【无证据】（`24-` §4.5），别写成「对齐了对手」；
 3. **执行器没接也不许绕**：`runWorkflow()` 抛 `NotImplementedError`，工作流停在 `approved`；不存在「批了就直接跑」的旁路。
 
+### 工作流落盘（HITL 批完不能丢）
+
+位置 `DATA_DIR/agent/workflows/<id>.json`，一个工作流一个文件，**每次状态转移都落盘**（`created`、每步 `approved`、`rejected`、执行器推进的每一跳），启动时扫目录恢复：
+
+- **原子写**：先写 `<id>.json.tmp` 再 `rename`。崩在写一半只会留下 `.tmp`，正式文件要么是上一版、要么是新版，不会出现半截 JSON；读侧跳过一切非 `.json`（`.tmp` 是残骸）。
+- **重启 = 中断**：恢复时 `running` 一律落成 `aborted`（`error.msg = process restarted while running`）—— 进程重启意味着那次执行已经没了，浏览器那边也早没了，留在 `running` 上是骗人。
+- **终态就地保留**：`completed` / `failed` / `rejected` / `aborted` 不移位置、不进归档目录（列表要能看到全部历史）；清理另开 `agent/workflow/purge`，思路同回收站 purge，现在只是 backlog。
+- **落盘失败不改内存结论**：只 `console.warn`、接口照常回。代价说清楚：重启后可能回退到上一版（比如审批丢了要重批），但不会静默变成「成功了」。
+
 ### 配置
 
 ```
@@ -888,7 +897,9 @@ FREEPOWER_AGENT_LLM_TIMEOUT    单次请求超时（默认 60000 ms）
 FREEPOWER_AGENT_HITL           写 `approve` 才放行，其余（含写错、空串）一律 `deny`
 ```
 
+> **骨架版 LLM 层不发请求**：`AGENT_LLM_*` 现在只做「读配置 + 校验三样齐」（`resolveLlmConfig`）与请求构造（`buildChatRequest`），**设了 `FREEPOWER_AGENT_LLM_KEY` 也不会调模型** —— 真正的 `POST <endpoint>/chat/completions` 等执行器接上才发。别拿「设了 key」当「Agent 能跑了」。
+
 ### 现在做到哪 / 下一步
 
-- **已做**：7 个动作的解析与字段白名单（含 http(s)、CSS 选择器、`wait` 三选一、cookie get/set）、任务 `digest`、工作流状态机与审批、三条路由、`cli.js` 的 list/start/stop/active 与 `cdpUrl()`、`llm.js` 的配置解析与请求构造（**不发请求**）、`x-freepower-agent: 1` 来源标记；
-- **未做（下一轮）**：`runBrowserTask()` 的 CDP 执行、`chat()` 真调用、控制台审批弹窗（现在只有 API）、工作流持久化（目前是进程内 `Map`，重启即丢）。
+- **已做**：7 个动作的解析与字段白名单（含 http(s)、CSS 选择器、`wait` 三选一、cookie get/set）、任务 `digest`、工作流状态机与审批、**工作流落盘**（`DATA_DIR/agent/workflows/<id>.json`，原子写、重启 `running → aborted`）、三条路由、`cli.js` 的 list/start/stop/active 与 `cdpUrl()`、`llm.js` 的配置解析与请求构造（**不发请求**）、`x-freepower-agent: 1` 来源标记；
+- **未做（下一轮）**：`runBrowserTask()` 的 CDP 执行、`chat()` 真调用、控制台审批弹窗（现在只有 API）、`steps[].result`（结果形状见待落规格）、`agent/workflow/purge`（清理历史）。

@@ -86,6 +86,13 @@ export const AGENT_LLM_MODEL = String(process.env.FREEPOWER_AGENT_LLM_MODEL || '
 export const AGENT_LLM_TIMEOUT_MS = Number(process.env.FREEPOWER_AGENT_LLM_TIMEOUT || 60000);
 
 /**
+ * 工作流落盘目录：`DATA_DIR/agent/workflows/<id>.json`，一个工作流一个文件。
+ * HITL 批完到真跑之间可能隔着几分钟：进程一崩就丢审批 = 用户得重批，所以**必须落盘**。
+ * 终态就地保留、不进归档目录（列表接口要能看到全部历史）；清理另开 `agent/workflow/purge`。
+ */
+export const AGENT_WORKFLOW_DIR = path.join(DATA_DIR, 'agent', 'workflows');
+
+/**
  * HITL 缺省裁决。**只认 `approve` 才放行，其余（含没配、写错、空串）一律 `deny`** ——
  * 这条是 Agent 在本地跑自动化时的安全底线，别做成"配错就默认同意"。
  */

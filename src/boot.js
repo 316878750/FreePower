@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { API_HOST, API_PORT, DATA_DIR } from './config.js';
 import { createApiServer } from './api/server.js';
+import { loadWorkflows } from './agent/workflow.js';
 import { stopAll, listRunning } from './runtime/manager.js';
 import { findChrome } from './kernel/chrome.js';
 
@@ -37,6 +38,9 @@ function listen(server, port) {
  */
 export async function startApiServer({ port = API_PORT, tries = PORT_TRIES, writeDiscovery = true } = {}) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
+  // 先把盘上的工作流收进来再对外服务：重启时这一步会把残留的 running 落成 aborted，
+  // 别让调用方在 status 里看到「还在跑」而浏览器其实早没了。
+  loadWorkflows();
   const { server, apiKey } = createApiServer({ port });
 
   let actualPort = null;
