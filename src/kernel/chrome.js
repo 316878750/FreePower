@@ -59,6 +59,12 @@ export function findChrome() {
 /**
  * 本机可用的内核清单（kernels 路由用）。
  * 只报「磁盘上真的有可执行文件」的版本：系统 Chrome 的版本子目录 + 我们的内核矩阵目录。
+ *
+ * 出参形状照对手的 `/browser-profile/kernels`：**核心只有 `kernel_type` / `kernel` / `is_downloaded` 三个键**
+ * （另加我们自己的诊断位 `in_use` / `guessed_kernel` / `probed`）。可执行文件路径与来源只在函数内部
+ * 用 `_path` / `_source` 传（判 `in_use`、比对探测缓存都要它），**不出现在返回的对象里** ——
+ * 最后是按白名单显式建对象，不是把内部记录展开，所以内部再加字段也不会漏到 API。
+ * 理由：巡检比形状时多一个 `path` 就是「API 形状不符」，而路径属于本机内部信息，对方也没有。
  */
 export function listKernels({ type = 'chrome' } = {}) {
   const t = String(type).toLowerCase();
@@ -68,7 +74,7 @@ export function listKernels({ type = 'chrome' } = {}) {
   const push = (version, exePath, source) => {
     if (!version || seen.has(`${version}|${exePath}`)) return;
     seen.add(`${version}|${exePath}`);
-    out.push({ kernel_type: 'chrome', kernel: version, is_downloaded: true, path: exePath, source });
+    out.push({ kernel_type: 'chrome', kernel: version, is_downloaded: true, _path: exePath, _source: source });
   };
 
   if (CHROME_BIN && fs.existsSync(CHROME_BIN)) {
@@ -96,10 +102,11 @@ export function listKernels({ type = 'chrome' } = {}) {
   const known = readKnownVersion();
   return out
     .map((k) => {
-      const item = { ...k, in_use: !!current && current.path === k.path };
+      // 白名单出参：`_path` / `_source` 留在这里就不往下传了（多一个键就是形状不符）
+      const item = { kernel_type: 'chrome', kernel: k.kernel, is_downloaded: k.is_downloaded, in_use: !!current && current.path === k._path };
       // 目录名只是猜：同一个 chrome.exe 的版本子目录可能有多个（实测有 156/157，跑的是 156）。
       // 启动探测过就报真值，把目录猜测留在 guessed_kernel 里，别让调用方按错版本号挑内核。
-      if (known && known.path === k.path && known.version !== k.kernel) {
+      if (known && known.path === k._path && known.version !== k.kernel) {
         return { ...item, kernel: known.version, guessed_kernel: k.kernel, probed: true };
       }
       return item;
