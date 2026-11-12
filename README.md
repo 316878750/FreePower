@@ -356,7 +356,17 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
     | `allowOnlyOneInstallerInstance.nsh:110`（`$(appCannotBeClosed)`） | `FIND_PROCESS` 报「应用在跑」两轮 | **排除**：那条原命令单独跑 **exit 1**（无输出）；现在应用在跑时同一条命令 **exit 0 + 4 行 CSV**，反向 `NoSuchApp.exe` **exit 1** —— 命令本身没坏，exit 1 就是「真没在跑」 |
     | `extractAppPackage.nsh:116`（`$(appCannotBeClosed)`） | `CopyFiles` 连败 5 次 | **落在这一条**（三条排除后唯一剩下的，且与「文件一个都进不去」的现象吻合） |
     **根因（实测，不是猜）**：
-    - `icacls release\FreePower-0.3.2-setup.exe` → `Mandatory Label\Low Mandatory Level:(I)(NW)`。**带低标签的 exe 起进程，进程就是 Low IL**（本机 `release\win-unpacked\FreePower.exe` 同样是低标签；装机目录里那份则没有低标签）。
+    - **根因不在单个 exe 上，在工作区目录本身**：`C:\Users\1\.dsh\bot\workspace` 就挂着 `Mandatory Label\Low Mandatory Level:(OI)(CI)(NW)`（`OI`/`CI` = 容器与对象都继承，`NW` = 禁止向上写），于是一路继承下来。我自己量的六行（`icacls`，12:56:56）：
+      ```
+      ...\.dsh\bot\workspace                              Mandatory Label\Low Mandatory Level:(OI)(CI)(NW)
+      ...\workspace\freepower                             Mandatory Label\Low Mandatory Level:(I)(OI)(CI)(NW)
+      ...\freepower\release                               Mandatory Label\Low Mandatory Level:(I)(OI)(CI)(NW)
+      ...\freepower\release\win-unpacked                  Mandatory Label\Low Mandatory Level:(I)(OI)(CI)(NW)
+      ...\freepower\README.md                             Mandatory Label\Low Mandatory Level:(I)(NW)
+      ...\freepower\release\FreePower-0.3.2-setup.exe     Mandatory Label\Low Mandatory Level:(I)(NW)
+      对照（Medium）：%LOCALAPPDATA%\Programs\FreePower 与 %TEMP% 都**没有** Mandatory Label 行
+      ```
+      即「**工作区目录带低标签、产物继承**」，不是这个 exe 偶然带的（连本仓这份 README 也是 Low）。**带低标签的 exe 起进程，进程就是 Low IL**；装机目录里那份 `FreePower.exe` 则没有低标签（它是 Medium 进程写进去的）。
     - 于是 `$PLUGINSDIR` 落在 `%TEMP%\Low\nsXXXX.tmp`（`icacls` 同一个低标签）。**`Nsis7z::Extract` 在那里是成功的**：09:52:43 那次留下的 `%LOCALAPPDATA%\Temp\Low\nsm5F6D.tmp\7z-out` 里有 **82 个文件 / 490,216,832 B**，`FreePower.exe` 249,831,936 B 整个都在。也就是说**解包没问题，问题全在「往装机目录复制」这一步**。
     - 目标 `%LOCALAPPDATA%\Programs\FreePower` 是 Medium（ACL 三行 `SYSTEM/Administrators/用户` 全控，`icacls` 无低标签）。**Low IL 写 Medium 被完整性策略拒绝**。我的复现（拷一份 `cmd.exe` → `icacls /setintegritylevel Low` → 用它操作）：写装机目录 → `Access is denied.`、**exit 1**、文件不存在；同一个低完整性进程写 `%TEMP%\Low` → **成功、exit 0**；对装机目录里的文件做 `ren` → `Access is denied.`、**exit 1**（这就是 `un.atomicRMDir` 那一步）；读装机目录里的文件 → **exit 0**（只读不被拦）。
     - 所以 `CopyFiles "$PLUGINSDIR\7z-out\*" $OUTDIR` 连败 5 次 → `:116`：**交互模式**弹「应用无法关闭」等人点（我们那次 180 秒不动）；**静默模式**按 `/SD IDRETRY` 顺落到兜底，安装继续 → **退出码 0、零文件**。**「退出码 0」在这种场景下完全不可信，这是本次最该记住的一条。**
@@ -380,6 +390,8 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
     **处置（CEO 执行，降级路径）**：安装器两次失败后，把 `release\win-unpacked`（与安装包内 payload 逐字节相同）覆盖进 `C:\Users\1\AppData\Local\Programs\FreePower`，`app.asar` 复核 = `A9FEB33B…1157825`；随后手写卸载注册项（`HKCU\...\Uninstall\cfc06f39-cb32-5a00-9ce5-55cf1e15d011`：`DisplayName=FreePower 0.3.2`、`DisplayVersion=0.3.2`、`UninstallString="<appDir>\Uninstall FreePower.exe" /currentuser`、`EstimatedSize=366179`、`NoModify/NoRepair=1`），已读回核对（我复量：该键存在，值如上；HKLM 两个视图仍无项）。
     **代价如实标**：程序与功能里的卸载器**仍是 0.3.1 那份二进制**（`Uninstall FreePower.exe` 138,745 B、mtime 11-11 22:44:46，自报 0.3.1），只有文件层面是逐字节 0.3.2；下次走正常安装器时要重新生成卸载器。
     **还没验的事（别写成已验）**：去掉 exe 的低标签（例如 `icacls <exe> /setintegritylevel Medium`，或从没有低标签的位置复制一份再跑）之后安装器能否装成功 —— 本机没有 makensis，且本轮不许跑 `setup.exe`，所以这一条只有机制、没有实测。
+    **这不是一次性事故（重要）**：在这台机器上，**下一次构建（0.3.3 及以后）出的 `setup.exe` 照样是 Low**（写进 `release\` 就继承），装进 Medium 的 `%LOCALAPPDATA%\Programs\FreePower` 会以同样方式失败。安装前必须二选一：① `icacls '<setup.exe>' /setintegritylevel Medium` 再跑；② 把 exe 复制到 Medium 位置（如 `%TEMP%`）再跑。**「为什么副本有效」要写对**：不是复制动作洗掉了标签，而是**新文件继承目标目录的标签** —— `%TEMP%` 是 Medium，所以副本是 Medium；反过来从 `%TEMP%` 往工作区里复制没用（会重新继承 Low），这正是「复制了还是失败」的常见误判。
+    **证据保留**：`%TEMP%\Low` 下三个 `ns*.tmp`（09:45:48 / 09:49:18 / 09:52:43）是本次根因的现场证据，**留着别清** —— 等 0.3.3 安装成功后再一起删。
 
 
 ## 八、验证
