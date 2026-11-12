@@ -28,6 +28,8 @@ import { startFakeProxy } from './fake-proxy.mjs';
 import { profileFormSchema } from '../src/api/schema.js';
 import { COVERAGE as OVERRIDES_COVERAGE } from '../packages/profile/reference/overrides.mjs';
 import vm from 'node:vm';
+import fs from 'node:fs';
+import { buildArtifacts } from '../tools/gen-schema.mjs';
 import { buildInjectionSource, buildWorkerInjectionSource, sharedNoiseCoreSource } from '../src/kernel/inject.js';
 
 /** 找一个当前没人监听的端口（起一个 server 再关掉） */
@@ -1370,4 +1372,32 @@ test('空转字段：标了必须说清原因，BASIC 里一个都不许漏标',
   //    它们该留 n/a，不该为了过判据把标签改成 none。
   assert.deepEqual(idle.filter((f) => OVERRIDES_COVERAGE[f.name] === 'full').map((f) => f.name), [],
     '这些字段 schema 标了 idle，overrides 却标 coverage=full —— 假 full 标签');
+});
+
+/* ============================================================================
+ * 判据⑨：字段表产物必须是最新生成的结果
+ * ==========================================================================*/
+
+/** 首个不同字节的下标；完全相同 → -1（用来把「哪儿不一样」写进断言信息） */
+function firstDiffByte(a, b) {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) if (a[i] !== b[i]) return i;
+  return a.length === b.length ? -1 : n;
+}
+
+test('字段表产物是最新的：重新生成必须与仓库里那份逐字节相同', () => {
+  const { fieldsJson, ddl } = buildArtifacts();
+  const pairs = [
+    ['fields.generated.json', fieldsJson],
+    ['schema.sql', ddl],
+  ];
+
+  for (const [name, generated] of pairs) {
+    // 读原始字节比对：连 CRLF / BOM / 末尾换行都算差异（这三样以前真出过）
+    const onDisk = fs.readFileSync(new URL(`../packages/profile/src/${name}`, import.meta.url));
+    const want = Buffer.from(generated, 'utf8');
+    const at = firstDiffByte(onDisk, want);
+    assert.equal(at, -1, at === -1 ? '' : `${name} 与 tools/gen-schema.mjs 的生成结果不一致：第一处差异在第 ${at} 字节`
+      + `（仓库里 ${onDisk.length} B，生成器 ${want.length} B）—— 跑 \`node tools/gen-schema.mjs\` 再提交`);
+  }
 });

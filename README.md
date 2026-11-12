@@ -453,7 +453,7 @@ npm run test
 npm run smoke
 ```
 
-当前实测：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **72** + api **100** + ui **29** + desktop **54**（`package.json` 里那条脚本就是这八组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`），真 Chrome `157.0.8103.40`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的八组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **73** + api **100** + ui **29** + desktop **54**（`package.json` 里那条脚本就是这八组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`），真 Chrome `157.0.8103.40`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的八组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 > 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：
@@ -825,7 +825,7 @@ web/
   pages/proxies.js     代理管理
   pages/selfcheck.js   自检报告
 test/smoke.mjs         端到端冒烟（152 项，需真实 Chrome）
-test/unit.test.mjs     零 Chrome 单元测试（72 项）
+test/unit.test.mjs     零 Chrome 单元测试（73 项）
 test/api.test.mjs      本地 API 契约测试（100 项，不需要 Chrome）
 test/net-rules.test.mjs  网络规则匹配逻辑单测（38 项，不需要 Chrome）
 test/recycle.test.mjs  回收站数据层 + 两条路由（44 项，含重启读库）

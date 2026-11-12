@@ -164,14 +164,38 @@ CREATE INDEX IF NOT EXISTS idx_profiles_deleted ON profiles("deleted_at");
 CREATE INDEX IF NOT EXISTS idx_launches_profile ON launches(profile_id);
 `;
 
-const outDir = path.join(root, 'packages/profile/src');
-fs.mkdirSync(outDir, { recursive: true });
-fs.writeFileSync(path.join(outDir, 'fields.generated.json'), JSON.stringify({ meta: { generatedFrom: 'ads-8.9.23-fields.json', count: fields.length, ext: EXT }, fields }, null, 2) + '\n');
-fs.writeFileSync(path.join(outDir, 'schema.sql'), ddl);
+/**
+ * 生成产物（纯函数、不写盘）。
+ *
+ * 为什么单独抽出来：`test/unit.test.mjs` 要拿「重新生成的结果」和仓库里那份**逐字节**比对
+ * （判据⑨：overrides.mjs 改了却忘了重跑生成器，得红）。测试不该为此真写盘 —— 那会改工作区；
+ * 也不该去 spawn 子进程 —— 受限环境里管道 stdio 会被拦。所以「算」和「写」分开：
+ * 测试只调这个函数，一个字节都不落盘。
+ */
+export function buildArtifacts() {
+  return {
+    fieldsJson: JSON.stringify({ meta: { generatedFrom: 'ads-8.9.23-fields.json', count: fields.length, ext: EXT }, fields }, null, 2) + '\n',
+    ddl,
+  };
+}
 
-const byGroup = fields.reduce((a, f) => ((a[f.group] = (a[f.group] ?? 0) + 1), a), {});
-const byCov = fields.reduce((a, f) => ((a[f.coverage] = (a[f.coverage] ?? 0) + 1), a), {});
-console.log('fields:', fields.length, 'ext:', EXT.length);
-console.log('by group:', byGroup);
-console.log('by coverage:', byCov);
-console.log('written: packages/profile/src/{fields.generated.json,schema.sql}');
+// 只在「被当脚本跑」时写盘；被 import 时不动任何文件。
+const scriptPath = process.argv[1] ? path.resolve(process.argv[1]) : '';
+const selfPath = path.resolve(fileURLToPath(import.meta.url));
+const invokedAsScript = scriptPath === selfPath
+  || (process.platform === 'win32' && scriptPath.toLowerCase() === selfPath.toLowerCase());
+
+if (invokedAsScript) {
+  const outDir = path.join(root, 'packages/profile/src');
+  fs.mkdirSync(outDir, { recursive: true });
+  const { fieldsJson, ddl: ddlText } = buildArtifacts();
+  fs.writeFileSync(path.join(outDir, 'fields.generated.json'), fieldsJson);
+  fs.writeFileSync(path.join(outDir, 'schema.sql'), ddlText);
+
+  const byGroup = fields.reduce((a, f) => ((a[f.group] = (a[f.group] ?? 0) + 1), a), {});
+  const byCov = fields.reduce((a, f) => ((a[f.coverage] = (a[f.coverage] ?? 0) + 1), a), {});
+  console.log('fields:', fields.length, 'ext:', EXT.length);
+  console.log('by group:', byGroup);
+  console.log('by coverage:', byCov);
+  console.log('written: packages/profile/src/{fields.generated.json,schema.sql}');
+}
