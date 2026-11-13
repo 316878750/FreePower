@@ -1082,7 +1082,7 @@ FREEPOWER_AGENT_STEP_TIMEOUT   单步执行超时（默认 30000 ms；`wait({ms}
 
 **为什么不转发对手的包**：那是它自己分发、自己签名的 SunBrowser 二进制（`SunBrowser.exe.sig` 是它私钥签的 PKCS#7），转发等于替它做分发，也违背「独立实现、不用对方二进制」这条。CfT 是 Google 给自动化测试发的官方构建，公开可下。
 
-**下多少**：一次 `chrome-win64.zip` 实测 **209,854,321 B**（约 200 MB；解压后 400 MB 上下），装完的目录就是几百 MB —— 用户点一次就是真下这么大，不是「下个几 KB 的配置」。**慢网要几十分钟**：本机实测到 `storage.googleapis.com` 只有 50–160 KB/s（同一时刻 Cloudflare 有 860 KB/s），所以默认整体预算 **60 分钟**（`FREEPOWER_KERNEL_DOWNLOAD_TIMEOUT`，默认 `3600000` ms），并且下载层做**停顿检测 + 断点续传**（见「重试与断点续传」）。这不等于请求会挂 60 分钟：接口立刻回 `pending`，下载在后台跑。
+**下多少**：一次 `chrome-win64.zip` 实测 **209,854,321 B**（约 200 MB；解压后 400 MB 上下），装完的目录就是几百 MB —— 用户点一次就是真下这么大，不是「下个几 KB 的配置」。**慢网要一两个小时**：本机实测到 `storage.googleapis.com` 只有 30–160 KB/s（同一时刻 Cloudflare 有 860 KB/s），按 34 KB/s 算 200 MB 要 90 分钟以上，所以默认整体预算 **2 小时**（`FREEPOWER_KERNEL_DOWNLOAD_TIMEOUT`，默认 `7200000` ms），并且下载层做**停顿检测 + 断点续传**（见「重试与断点续传」）。这不等于请求会挂 2 小时：接口立刻回 `pending`，下载在后台跑。
 
 ### 接口形状（照 `23-内核下载契约.md`）
 
@@ -1148,7 +1148,8 @@ POST /api/v2/browser-profile/download-kernel
 | 事实（本机实测） | 数值 |
 |---|---|
 | `chrome-win64.zip` 实际大小 | **209,854,321 B**（约 200 MB） |
-| 到 `storage.googleapis.com` 的带宽 | **50–160 KB/s**（同一时刻 `speed.cloudflare.com` 有 860 KB/s） |
+| 到 `storage.googleapis.com` 的带宽 | **30–160 KB/s**（同一时刻 `speed.cloudflare.com` 有 860 KB/s） |
+| 干净单连接 3 分钟均值 | **34 KB/s** → 200 MB 约 90 分钟以上 |
 | 单条连接的衰减 | 前 15 s 138 KB/s → 60 s 60 KB/s → 120 s 47 KB/s |
 | 另开一条连接的速率 | 又回到 100 KB/s 以上 |
 
@@ -1159,7 +1160,7 @@ POST /api/v2/browser-profile/download-kernel
 
 可重试：408 / 429 / 5xx / 网络中断 / 卡死。**不可重试**：404 这类 4xx 立刻失败（重试一万次还是 404）。重连上限 `FREEPOWER_KERNEL_DOWNLOAD_ATTEMPTS`（默认 **12**），用尽仍不完整 → 明确失败，`.tmp-*` 删掉。
 
-总预算 `FREEPOWER_KERNEL_DOWNLOAD_TIMEOUT` 默认 **60 分钟**（原来是 10 分钟，在这条链路上必然超时）。**注意这不等于请求会挂 60 分钟**：`download-kernel` 立刻回 `pending`，下载在后台跑，用户/脚本轮询同一个端点即可。
+总预算 `FREEPOWER_KERNEL_DOWNLOAD_TIMEOUT` 默认 **2 小时**（原来 10 分钟 → 60 分钟 → 2 小时，都是被实测数字推着改的：34 KB/s × 200 MB ≈ 90 分钟以上）。**注意这不等于请求会挂 2 小时**：`download-kernel` 立刻回 `pending`，下载在后台跑，用户/脚本轮询同一个端点即可；真正卡死由停顿检测兜。
 
 ### 与对手的有意差异（写清楚，不当 bug）
 
@@ -1175,7 +1176,7 @@ POST /api/v2/browser-profile/download-kernel
 FREEPOWER_CFT_META_URL      CfT 元数据（默认 googlechromelabs.github.io/.../last-known-good-versions-with-downloads.json）
 FREEPOWER_CFT_VERSIONS_URL  历史版本目录（默认 .../known-good-versions-with-downloads.json）
 FREEPOWER_CFT_ZIP_BASE      包体基地址（默认 https://storage.googleapis.com/chrome-for-testing-public）
-FREEPOWER_KERNEL_DOWNLOAD_TIMEOUT    下载+安装整体预算（默认 3600000 ms = 60 分钟）
+FREEPOWER_KERNEL_DOWNLOAD_TIMEOUT    下载+安装整体预算（默认 7200000 ms = 2 小时）
 FREEPOWER_KERNEL_DOWNLOAD_STALL      单条连接多久没字节就断开重连（默认 120000 ms）
 FREEPOWER_KERNEL_DOWNLOAD_ATTEMPTS   续传最多重连几次（默认 12）
 ```

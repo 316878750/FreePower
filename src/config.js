@@ -56,14 +56,17 @@ export const CFT_ZIP_BASE = String(
 ).trim().replace(/\/+$/, '');
 
 /**
- * 下载+安装的整体预算（默认 **60 分钟**）。
+ * 下载+安装的整体预算（默认 **2 小时**）。
  *
- * 为什么这么长：本机实测到 `storage.googleapis.com` 只有 **50–160 KB/s**（同一时刻
- * Cloudflare 有 860 KB/s），一个 `chrome-win64.zip` 是 **209,854,321 B**，慢网要几十分钟。
- * 而且这不是「挂住请求」——`download-kernel` 立刻回 `pending`，下载在后台跑，用户/脚本轮询。
- * 原来默认 10 分钟，在这条链路上必然超时（实测 10 分钟只下到 85 MB 左右）。
+ * 为什么这么长：本机实测到 `storage.googleapis.com` 只有 **30–160 KB/s**（同一时刻
+ * Cloudflare 有 860 KB/s），一个 `chrome-win64.zip` 是 **209,854,321 B**；
+ * 按 34 KB/s 算要 **90 分钟以上**。原来默认 10 分钟必然超时（实测 10 分钟只下到 85 MB），
+ * 60 分钟也还差一截。
+ *
+ * 这不是「挂住请求」：`download-kernel` 立刻回 `pending`，下载在后台跑，用户/脚本轮询。
+ * 真正卡死由 `KERNEL_DOWNLOAD_STALL_MS` 兜（120 s 没字节就断），所以总预算长一点是安全的。
  */
-export const KERNEL_DOWNLOAD_TIMEOUT_MS = Number(process.env.FREEPOWER_KERNEL_DOWNLOAD_TIMEOUT || 3600000);
+export const KERNEL_DOWNLOAD_TIMEOUT_MS = Number(process.env.FREEPOWER_KERNEL_DOWNLOAD_TIMEOUT || 7200000);
 
 /**
  * 单次连接「多久没收到字节」就判定卡死并重连续传（默认 120 s）。
