@@ -211,7 +211,7 @@ export function normalizeValue(name, value) {
   if (['webgl', 'canvas', 'audio', 'webgl_image', 'client_rects', 'media_devices'].includes(name) && typeof value === 'number') return String(value);
   // 开关型字段统一落成字符串：对手在自家客户端里是 `"1" === value` 的严格比较，
   // 数字 1 进了库再读出来会被当成「关」。落库前归一，执行侧才不用猜类型。
-  if (name === 'disable_save_password' && (value === 0 || value === 1)) return String(value);
+  if ((name === 'disable_save_password' || name === 'automation_controlled') && (value === 0 || value === 1)) return String(value);
   return value;
 }
 

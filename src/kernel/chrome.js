@@ -217,8 +217,6 @@ export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, use
     '--no-first-run',
     '--no-default-browser-check',
     '--no-service-autorun',
-    // 不加 --enable-automation，并从 Blink 特性里摘掉 AutomationControlled（navigator.webdriver 的来源）
-    '--disable-blink-features=AutomationControlled',
     `--lang=${view.locale || 'en-US'}`,
     `--accept-lang=${(view.language || ['en-US']).join(',')}`,
     `--window-size=${profile.window_size || `${win.width},${win.height}`}`,
@@ -233,6 +231,21 @@ export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, use
 
   // P2 · 禁用保存密码：与上面 disableFeatures 里那条配套，不走系统钥匙串后端
   if (String(profile.disable_save_password) === '1') args.push('--password-store=basic');
+
+  /**
+   * P2 · 自动化受控标记（`navigator.webdriver`）。**对手机制不同**：对手是自家内核的
+   * `staticConfig.AutomationControlled` 布尔键（没有 `--protected-*` 开关，内核怎么读这个键
+   * 逆向无证据）。我们不自编译内核，用**行为等价的 Chrome flag 方案**：不是复刻。
+   *
+   * 基线：不加 `--enable-automation`，并从 Blink 特性里摘掉 `AutomationControlled`
+   * （`navigator.webdriver` 的来源）→ `navigator.webdriver === false`，与对手基线行为一致。
+   * `"1"` 时**不放**这个 flag，内核原生就是 `true`（实测 157.0.8103.78）；`"0"` / 缺省维持基线。
+   *
+   * 配套（不配套就是静默空转）：注入层那句「webdriver 兜底」也跟着这个字段走 —— 见
+   * `src/kernel/inject.js` 的 `CFG.automationControlled`。否则 `"1"` 会被自家兜底改回 false。
+   */
+  const automationControlled = String(profile.automation_controlled) === '1';
+  if (!automationControlled) args.push('--disable-blink-features=AutomationControlled');
 
   // WebRTC：只放浏览器真实支持的策略位
   if (view.webrtc === 'disabled') {

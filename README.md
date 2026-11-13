@@ -632,7 +632,27 @@ npm run test:switches    # 真机开/关对照，19 项，需要真实 Chrome（
 1. **拦截的呈现不同**：对手命中后返回**它自己的拦截页 HTML**（`StaticConfig.BlockPage` 是 base64 的整页，页面脚本还用 `window.blockUrl` 再判一次子域）；我们走 `Fetch.failRequest` → 浏览器报 `net::ERR_BLOCKED_BY_CLIENT`。用户看到的东西不一样。**拦截页列 backlog，本轮不做。**
 2. **关图的机制不同**：对手**新内核**（`>20220901`）是在内核网络层按 MIME `image/` + 尺寸上限拦（`StaticConfig.NetFilters` 里 `{mimeType:"image/", maxSize:…}`），**请求已经发出、服务器能看到**；`--blink-settings=imagesEnabled=false` 在对手那边只是**老内核兜底**。我们用的是 `blink-settings`，所以「服务器侧零请求」—— 这条差异**对我们更彻底**，但它仍是差异：别以为我们复刻了对手的新内核路径（`test:switches` 里「img 命中 0」正是这条差异的读数）。
 
-### 多级代理链（2026-11-12 第二批）
+### 隐私开关：P2 四条（逐条接真行为，2026-11-13 起）
+
+P2 这批是「字段表里有名字、`src/` 里零消费」的第二轮补漏，**一个字段一个提交**，四条落完再一起推。顺序：① `disable_save_password` ② `automation_controlled` ③ `location` ④ `do_not_track`。
+
+| 字段 | 取值 | 生效方式 | coverage | 落地位置 |
+|---|---|---|---|---|
+| `disable_save_password` | `'1'` | `--password-store=basic` + `--disable-features` 里加 `EnablePasswordsAccountStorage`；`'0'` / 缺省不加。对手是自编译内核的 `--protected-disablesavepassword=1`，那条路我们没有 | partial（参数进了命令行，「保存条不再出现」无本机证据，见已知限制第 41 条） | `src/kernel/chrome.js`（`buildArgs`） |
+| `automation_controlled` | `'1'` | **不放** `--disable-blink-features=AutomationControlled` → 内核原生 `navigator.webdriver === true`；`'0'` / 缺省照旧摘掉该特性 → `false`。注入层那句「webdriver 兜底」也跟着字段走 | full | `src/kernel/chrome.js`（启动参数）+ `src/kernel/inject.js`（`CFG.automationControlled`）+ `src/fingerprint/view.js` |
+
+**`automation_controlled` 的口径必须说清（不是复刻）**：对手是自家内核的 `staticConfig.AutomationControlled` 布尔键，**没有** `--protected-*` 开关，内核怎么读这个键逆向无证据；它老的「删 navigator.webdriver」注入在生产环境是关的。我们做的是**行为等价的 Chrome flag 方案**：纯启动参数、无 JS 层痕迹，基线（`false`）与对手基线一致。
+
+**实测（2026-11-13，内核 `157.0.8103.78`，真内核、走 API 起环境、`headless=1`）**：
+
+| 配置 | 命令行里的 `AutomationControlled` 特性 | 页面 `navigator.webdriver` | 专用 Worker |
+|---|---|---|---|
+| `automation_controlled=1` | **无** | **true** | `undefined`（`WorkerNavigator` 本来就没有这个属性） |
+| 缺省（`'0'`） | 有（`--disable-blink-features=AutomationControlled`） | **false** | `undefined` |
+
+两处都要记住：① 注入层那句 `if (navigator.webdriver) defGetter(...false)` 原来是无条件的 —— **只改启动参数的话 `'1'` 会被我们自己的兜底改回 false**（字段接了却空转），所以它现在受 `CFG.automationControlled` 控制；② `navigator.webdriver` 只在主帧有，worker realm 两边都是 `undefined`，别拿 worker 的读数当判据。
+
+
 
 **它是什么（先说实话）**：对手的「多级」不是我们能配一串代理，而是**两跳拼出来的产物** —— `hop0 = 本机 Windows 系统代理`（`HKCU\...\Internet Settings`）+ `hop1 = 环境自己的代理`。我们复刻的就是这个两跳产物：开关 `is_multi_level_proxy='1'`（对手拼写 `mutli_level_proxy` 同样当开关认，两个字段的类型一个字节没改，都是 enum `'0'|'1'`）。
 

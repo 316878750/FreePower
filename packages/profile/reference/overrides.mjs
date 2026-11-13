@@ -132,6 +132,12 @@ export const COVERAGE = {
   tls: 'partial',
   tls_switch: 'partial',
   flash: 'n/a',
+  // automation_controlled：P2 起两条极性都真生效 —— "1" 不放
+  // `--disable-blink-features=AutomationControlled`（内核原生 `navigator.webdriver === true`），
+  // "0" / 缺省摘掉它（false）；纯启动参数、注入层的 webdriver 兜底也跟着让路，没有 JS 层痕迹。
+  // 这一档 full 从 P2 起才名副其实：此前它是**假 full**（字段零消费，行为恒等于 "0"）。
+  // 注意口径：对手是自家内核的 `staticConfig.AutomationControlled`，我们是行为等价的 Chrome
+  // flag 方案，不是复刻（见 README §8「P2 隐私开关」）。
   automation_controlled: 'full',
   disable_image: 'partial',
   disable_video: 'partial',

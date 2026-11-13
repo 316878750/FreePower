@@ -153,6 +153,38 @@ test('P2 disable_save_password：只有 "1" 才加两个参数，且不冲掉基
   assert.equal(normalizeValue('disable_save_password', '1'), '1');
 });
 
+test('P2 automation_controlled：只有 "1" 才放开 navigator.webdriver，注入兜底跟着让路', () => {
+  const FLAG = '--disable-blink-features=AutomationControlled';
+  const built = (v) => buildArgs({ webgl_config: {}, automation_controlled: v }, { userDataDir: 'C:\\fp\\udd' });
+  const has = (r) => r.args.includes(FLAG);
+
+  // "1"：不放这个 flag（内核原生 navigator.webdriver=true），其余写法维持基线（false）
+  assert.equal(has(built('1')), false, 'automation_controlled=1 时不该再摘 AutomationControlled');
+  for (const v of ['0', '', undefined, 'false', '2']) assert.equal(has(built(v)), true, `"${v}" 应维持基线`);
+  // 基线其它参数不受影响：同一个环境只是少了这一条
+  const off = built('0').args;
+  assert.ok(off.includes('--disable-features=Translate,OptimizationHints,MediaRouter,CalculateNativeWinOcclusion'), off.join(' '));
+
+  // 数字 1 归一成 "1"（对手是 `"1" === value` 的严格比较，数字落库会被当成「关」）
+  assert.equal(normalizeValue('automation_controlled', 1), '1');
+  assert.equal(normalizeValue('automation_controlled', 0), '0');
+  assert.equal(normalizeValue('automation_controlled', '1'), '1');
+
+  // 注入层那句「webdriver 本该 false 却不是才补」必须受 CFG.automationControlled 控制：
+  // 否则 "1" 会被我们自己的兜底改回 false —— 字段看起来接了、其实空转。
+  const pageOn = buildInjectionSource({ seed: 'x', automationControlled: true });
+  const pageOff = buildInjectionSource({ seed: 'x', automationControlled: false });
+  const workerOn = buildWorkerInjectionSource({ seed: 'x', automationControlled: true });
+  const workerOff = buildWorkerInjectionSource({ seed: 'x', automationControlled: false });
+  assert.match(pageOn, /"automationControlled":true/);
+  assert.match(pageOff, /"automationControlled":false/);
+  assert.match(workerOn, /"automationControlled":true/);
+  assert.match(workerOff, /"automationControlled":false/);
+  for (const src of [pageOn, pageOff, workerOn, workerOff]) {
+    assert.match(src, /if \(!CFG\.automationControlled\)/, 'webdriver 兜底没有被 CFG.automationControlled 控住');
+  }
+});
+
 test('httpGetViaProxy：非 200 也完整返回，交给上层判断', async () => {
   const fake = await startFakeProxy();
   try {

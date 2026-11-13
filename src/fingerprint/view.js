@@ -165,6 +165,9 @@ export function fingerprintView(profile) {
     window: windowSize,
     device_scale_factor: typeof p.device_scale === 'number' ? p.device_scale : 1,
     webrtc: p.webrtc || 'disabled',
+    // P2 `automation_controlled`：'1' = 保留原生 navigator.webdriver=true（启动层不放
+    // --disable-blink-features=AutomationControlled，注入层的 webdriver 兜底也让路）
+    automationControlled: String(p.automation_controlled ?? '0') === '1',
     media: mediaView(p),
     speech: speechView(p),
     fonts: stringList(p.fonts, ['all']),

@@ -40,6 +40,11 @@ function injectionConfig(fp) {
     speech: fp.speech || null,
     fonts: Array.isArray(fp.fonts) ? fp.fonts.slice() : null,
     /**
+     * 自动化受控标记（P2）：`automation_controlled === '1'` 时 `navigator.webdriver` 保持原生 true。
+     * 下面那句「本该 false 却不是才补」的兜底必须让路，否则字段会被自己的兜底吃掉（静默空转）。
+     */
+    automationControlled: fp.automationControlled === true,
+    /**
      * 屏幕尺寸 + 可用区（avail*）。CDP 的 setDeviceMetricsOverride 只能设 screen 尺寸，
      * availWidth/availHeight 会被撑成和它一样 —— 而「没有任务栏」正是 headless 的特征。
      */
@@ -305,7 +310,8 @@ const PAGE_BODY = `
     }
   }
   // --disable-blink-features=AutomationControlled 已让原生 webdriver=false；只有兜底失败才改，别主动造痕迹
-  try { if (navigator.webdriver) defGetter(Navigator.prototype, 'webdriver', false); } catch (e) {}
+  // automation_controlled="1" 时相反：原生就是 true，这里一个字都不碰（碰了才是痕迹）
+  if (!CFG.automationControlled) { try { if (navigator.webdriver) defGetter(Navigator.prototype, 'webdriver', false); } catch (e) {} }
   try { if (navigator.vendor !== 'Google Inc.') defGetter(Navigator.prototype, 'vendor', 'Google Inc.'); } catch (e) {}
 
   /* ---------- Screen：avail* 必须留出任务栏 ---------- */
@@ -839,7 +845,8 @@ const WORKER_BODY = `
     const nativeLangs = self.navigator.languages ? Array.prototype.join.call(self.navigator.languages, ',') : '';
     if (nativeLangs !== CFG.language.join(',')) defGetter(NAV_PROTO, 'languages', langs);
   }
-  try { if (self.navigator && self.navigator.webdriver) defGetter(NAV_PROTO, 'webdriver', false); } catch (e) {}
+  // automation_controlled="1"：原生就是 true，worker 这边同样不碰（与主帧口径一致）
+  if (!CFG.automationControlled) { try { if (self.navigator && self.navigator.webdriver) defGetter(NAV_PROTO, 'webdriver', false); } catch (e) {} }
 
   /* ---------- OffscreenCanvas：和主帧共用 core 里那份噪声实现 ---------- */
   patchOffscreenCanvasNoise();
