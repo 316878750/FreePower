@@ -100,11 +100,17 @@ function safeRel(name) {
 /**
  * 取一个条目的解压数据。
  *
- * `maxOutputLength`（**解压时**的输出上限）不是可选项：没有它，一个 200 MB 的零字节炸弹
- * 会先老老实实在内存里长到 200 MB，再被尺寸/CRC 判据抓到 —— 判据对了，进程已经炸了。
- * 传进 `zlib.inflateRawSync` 后，超限在**灌数据的过程中**就抛 `ERR_BUFFER_TOO_LARGE`。
+ * `maxOutputLength`（**解压时**的输出上限）不是可选项：没有它，一个零字节炸弹会先在内存里
+ * 长到它的真实大小，再被尺寸判据抓到 —— 判据对了，进程已经炸了。传进 `zlib.inflateRawSync`
+ * 后，超限在**灌数据的过程中**就抛 `ERR_BUFFER_TOO_LARGE`。
+ *
+ * 上限从哪来决定报什么错（`capSource`）：
+ *   - `'declared'`：上限 = 中央目录声明的长度 + 1。诚实条目解压后必然正好等于 `usize`，
+ *     所以**超过 `usize` 本身就证明声明撒谎**（实际长度超过声明）→ `zip_size_mismatch`；
+ *     多给的那 1 字节是留给「刚刚好多 1 字节」的，让下面的等值校验去报，文案才对得上。
+ *   - `'budget'`：剩余预算比声明值还小，是**预算**先拦住它 → `zip_too_large`。
  */
-function entryData(buf, e, { maxOutputLength } = {}) {
+function entryData(buf, e, { maxOutputLength, capSource = 'budget' } = {}) {
   if (e.flags & 0x1) throw new ZipError(`ZIP 条目被加密：${e.name}`, { reason: 'zip_encrypted' });
   const p = e.localOffset;
   if (p + 30 > buf.length || buf.readUInt32LE(p) !== LFH_SIG) {
@@ -123,8 +129,14 @@ function entryData(buf, e, { maxOutputLength } = {}) {
     } catch (err) {
       // 超上限在**解压时**就抛（不是解完再比长度）
       if (err?.code === 'ERR_BUFFER_TOO_LARGE' || /larger than|maxOutputLength/i.test(String(err?.message))) {
+        if (capSource === 'declared') {
+          throw new ZipError(
+            `条目实际长度超过中央目录声明（声明 ${e.usize} 字节，解压到 ${maxOutputLength} 字节仍未结束）：${e.name}`,
+            { reason: 'zip_size_mismatch' },
+          );
+        }
         throw new ZipError(
-          `条目解压后超过上限（上限 ${maxOutputLength} 字节）：${e.name}`,
+          `条目解压后超过剩余预算（剩余 ${maxOutputLength} 字节，中央目录声明 ${e.usize} 字节）：${e.name}`,
           { reason: 'zip_too_large' },
         );
       }
@@ -196,8 +208,14 @@ export function extractZipBuffer(buf, destDir, { flatten = true, maxBytes = ZIP_
       if (out !== root && !out.startsWith(root + path.sep)) {
         throw new ZipError(`ZIP 条目越出解压目录：${rel}`, { reason: 'zip_unsafe_path' });
       }
-      // 单条目解压上限 = 剩余预算；压缩炸弹在 inflate 过程中就被掐断，不会先长到 GB 级再判
-      const data = entryData(buf, entry, { maxOutputLength: Math.max(1, maxBytes - actualBytes) });
+      // 单条目解压上限 = min(剩余预算, 声明长度 + 1)。**不能只用剩余预算**：`maxBytes` 默认 2 GB，
+      // 那等于「单条目没有上限」，炸弹会先长到真实大小再被判据抓到（判据绿、进程已经吃了 200 MB）。
+      // 上限从**数据本身**推：诚实条目解压后必然正好等于 `usize`，所以超过 `usize` 就是声明撒谎。
+      const budgetLeft = Math.max(1, maxBytes - actualBytes);
+      const declaredCap = entry.usize + 1;
+      const cap = Math.min(budgetLeft, declaredCap);
+      const capSource = cap === declaredCap ? 'declared' : 'budget';
+      const data = entryData(buf, entry, { maxOutputLength: cap, capSource });
       // **无条件比对**（巡检 2026-11-13 ①）：原来的 `entry.usize !== 0 &&` 等于「声明 0 就豁免」，
       // 一个声明 `usize=0`、实际 1 MB 的条目能整条跳过长度校验 —— 典型的 fail-open。
       if (data.length !== entry.usize) {
@@ -216,7 +234,15 @@ export function extractZipBuffer(buf, destDir, { flatten = true, maxBytes = ZIP_
       written.push(outRel);
     }
   } catch (e) {
-    // 失败时把这一次已经写出去的清掉：**盘上不留半个包**（内核安装本来就该「要么整份，要么没有」）
+    // 失败时把这一次已经写出去的清掉：**盘上不留半个包**（内核安装本来就该「要么整份，要么没有」）。
+    //
+    // 清场的边界（如实写清，别当成「什么都没动」）：
+    //   - **调用方传进来的已有目录本身不动**（`existedBefore` 为真时不删根目录），
+    //     但**里面与包内同名的文件会被覆盖**，然后在这里按 `written` 一起删掉 ——
+    //     也就是说「覆盖 + 失败」对调用方的同名文件是破坏性的。生产路径不可达：
+    //     `download.js` 每次都新建 `.tmp-*` 当 `xDir`，不会指向用户已有目录。
+    //   - `dest` 已存在时失败，**我们建出来的空子目录会残留**（只删 `written` 里记的文件，
+    //     不回溯删父目录）；下一次解包会覆盖同名文件，不影响正确性。
     for (const rel of written) {
       try { fs.rmSync(path.resolve(root, ...rel.split('/')), { force: true }); } catch { /* 清不掉就留给调用方 */ }
     }
