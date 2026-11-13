@@ -1576,7 +1576,11 @@ const KERNEL_LAYERS = [
 const DERIVE_LAYERS = ['src/fingerprint/view.js'];
 
 /**
- * 「登记 `none`，但派生层确实会读到它」的**例外表**（只有一条，且必须能被证伪）。
+ * **只喂自检的读取（`SELFCHECK_ONLY_READS`）** —— 只许有这一个含义：
+ * 「只喂自检的『声明值 vs 真实枚举』比对，**永不改变浏览器行为**」。
+ *
+ * 名字即口径（CEO 2026-11-13 裁决，原来是 `INERT_READ_EXCEPTIONS`，那名字读起来像
+ * 「我们容忍的例外」，看不出它为什么安全）。以后有人想往里塞第二个字段，得先反驳上面这句话。
  *
  * 为什么需要它：判据 ④ 改成「内核层 + 派生层一起扫」之后，唯一一条 `none` 字段被抓了出来 ——
  * `media_devices_num` 在 `src/fingerprint/view.js:98` 被读，算成 `CFG.media.counts`。
@@ -1584,14 +1588,17 @@ const DERIVE_LAYERS = ['src/fingerprint/view.js'];
  * 与 `CFG.media.devices`），`counts` 只走到 `selfcheck/report.js` 与 `declaredSnapshot`，
  * 是「拿声明值跟真实枚举比一比」的输入。所以登记 `none` 是对的，红的是判据的粗粒度。
  *
- * 例外不是橡皮章，下面 ④ 里钉三条：
- *   1. 例外字段必须仍然是 `none`（改成生效层了，例外表就过期）；
- *   2. 例外字段必须仍然有人读（读点没了，例外表也过期）；
- *   3. 读点不许跑出登记的那个文件之外；
- * 另外单独钉一条**可证伪**的：`inject.js` 一旦开始读 `counts`，这条先红 —— 因为那时
- * `media_devices_num` 就真的生效了，`none` 不成立。
+ * **不改数据、不挪读取**（CEO 裁决）：改成 `inject` 是撒谎（它真的不改变行为）；把 `view.js`
+ * 那行读取挪走会让自检失去「声明值」输入，等于为了判据好看拆功能。
+ *
+ * 这张表靠 ④ 里的断言活着，四条都是可证伪的：
+ *   1. 字段必须仍然是 `effect:'none'`；
+ *   2. `inert` 非空，且文字里写明「只喂自检」（口径写在 inert 上，不只写在这张表里）；
+ *   3. 读取点只许在 `src/fingerprint/view.js`（内核层零读取）；
+ *   4. `inject.js` 一旦开始读 `counts`，这条先红 —— 那时它就不是「只喂自检」了。
+ * 另外**数量钉死**（`Object.keys` 全等），加第二个必须改那条断言。
  */
-const INERT_READ_EXCEPTIONS = {
+const SELFCHECK_ONLY_READS = {
   media_devices_num: {
     file: 'src/fingerprint/view.js',
     why: 'view.js 把它算成 CFG.media.counts；注入层从不读 counts，只有自检页拿它比「声明值」',
@@ -1709,7 +1716,7 @@ test('effect 注册表：每个字段说清在哪一层生效，登记与代码�
   for (const [n, e] of Object.entries(OVERRIDES_EFFECT)) {
     const sites = readSites(n, EFFECT_LAYERS);
     if (e.effect === 'none') {
-      if (sites.length && !INERT_READ_EXCEPTIONS[n]) noneWithReads.push(`${n}（${sites.slice(0, 3).join(' ')}）`);
+      if (sites.length && !SELFCHECK_ONLY_READS[n]) noneWithReads.push(`${n}（${sites.slice(0, 3).join(' ')}）`);
     } else if (!sites.length) {
       effectWithoutReads.push(n);
     }
@@ -1717,18 +1724,31 @@ test('effect 注册表：每个字段说清在哪一层生效，登记与代码�
   assert.deepEqual(noneWithReads, [], '登记 none，内核层/派生层却读到了它 —— 要么改登记，要么把那行代码删掉');
   assert.deepEqual(effectWithoutReads, [], '登记了生效层，但内核层与派生层一次都没读 —— 空转的另一种写法');
 
-  // ④' 例外表不许变成橡皮章：每条都得仍然「登记 none + 仍有人读 + 读点没跑出登记的文件」
-  for (const [n, exc] of Object.entries(INERT_READ_EXCEPTIONS)) {
-    assert.equal(OVERRIDES_EFFECT[n]?.effect, 'none', `${n} 已经不是 none 了，例外表过期`);
+  // ④' 「只喂自检的读取」不许变成橡皮章：**数量钉死** + 每条四个可证伪断言
+  //
+  //    数量钉死和「各档数量钉死」一个套路：往里加第二个字段，必须来改这条断言 ——
+  //    改的时候就得先反驳 `SELFCHECK_ONLY_READS` 头上那句「永不改变浏览器行为」。
+  assert.deepEqual(Object.keys(SELFCHECK_ONLY_READS), ['media_devices_num'],
+    '「只喂自检的读取」只许有 media_devices_num 一条；要加第二个，先证明它也「永不改变浏览器行为」');
+
+  for (const [n, exc] of Object.entries(SELFCHECK_ONLY_READS)) {
+    // ① 必须仍然是 none（改成生效层了，这条就不该在这里）
+    assert.equal(OVERRIDES_EFFECT[n]?.effect, 'none', `${n} 已经不是 none 了，这条不该留在表里`);
+    // ② `inert` 非空，且文字里写明「只喂自检」—— 口径要落在注册表上，不能只写在这张表里
+    const inert = String(OVERRIDES_EFFECT[n]?.inert || '');
+    assert.ok(inert.trim().length >= 4, `${n}: 登记 none 却没写 inert 理由`);
+    assert.match(inert, /只喂自检|只有自检页|拿它比「声明值」/, `${n}: inert 里没写明「只喂自检」`);
+    // ③ 读取点必须仍存在，且只许在登记的那个文件（内核层零读取）
     const sites = readSites(n, EFFECT_LAYERS);
-    assert.ok(sites.length > 0, `${n} 已经没人读了，例外表过期（可以删掉这条例外）`);
+    assert.ok(sites.length > 0, `${n} 已经没人读了，这条可以删了`);
     assert.deepEqual(sites.filter((s) => !s.startsWith(exc.file)), [],
-      `${n} 的读取跑到了例外登记的文件之外（只登记了 ${exc.file}）`);
+      `${n} 的读取跑到了 ${exc.file} 之外（内核层读到它就不是「只喂自检」了）`);
+    assert.deepEqual(readSites(n, KERNEL_LAYERS), [], `${n} 在内核层被读了 —— 那就真生效了`);
   }
-  // 唯一那条例外的可证伪部分：注入层从不读 counts。一旦有人让注入层按 counts 造设备，
-  // media_devices_num 就真的生效了，这条先红，逼着把登记从 none 改掉。
+  // ④ 唯一那条例外的可证伪部分：注入层从不读 counts。一旦有人让注入层按 counts 造设备，
+  //    media_devices_num 就真的改变行为了，这条先红，逼着把登记从 none 改掉、把表撤掉。
   assert.equal(readSites('counts', ['src/kernel/inject.js']).length, 0,
-    'inject.js 开始读 counts 了：media_devices_num 不再成立 none，例外表要撤');
+    'inject.js 开始读 counts 了：media_devices_num 不再是「只喂自检」，这条口径要撤');
 
   // ⑤ inert 与 idle 必须一致（schema.js 的 idle 就是从 inert 派生的，这里钉死这条派生关系）
   const visible = new Set(fields.map((f) => f.name));
