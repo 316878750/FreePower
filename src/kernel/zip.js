@@ -6,6 +6,7 @@
  *   中央目录 → 本地头 → `store`(0) / `deflate`(8) 两种方法 + CRC32 校验。
  *
  * **明确不做（遇到就红，别静默糊过去）**：
+ *   - 运行时没有 `zlib.crc32`（Node < 22.5）→ `zip_crc_unavailable`（**不跳过校验**）；
  *   - ZIP64（条目数 / 偏移 / 尺寸溢出 0xFFFF / 0xFFFFFFFF）→ `zip_zip64_unsupported`；
  *   - 加密条目（flag bit 0）→ `zip_encrypted`；
  *   - 其它压缩方法（bzip2 / lzma…）→ `zip_unsupported_method`；
@@ -143,6 +144,21 @@ export function extractZipBuffer(buf, destDir, { flatten = true, maxBytes = ZIP_
   }
   if (!files.length) throw new ZipError('ZIP 里没有文件', { reason: 'zip_empty' });
 
+  // CRC32 是**必校验项**，不是「有就校验」：
+  //   - 运行时没有 `zlib.crc32`（Node < 22.5 / 老 Electron）就**直接拒解**，不许静默跳过。
+  //     跳过等于把「包体被动过」的检测整个丢掉 —— 和这轮在抓的 fail-open 是同一类问题。
+  //     `package.json` 的 `engines` 写了 node >= 22.5、Electron ^45，正常机器一定有。
+  //   - CRC 恒有值：`readZipEntries` 用 `readUInt32LE` 读它，**不存在「没有 CRC」的条目**；
+  //     所以这里只判两件事 —— 运行时有没有 `zlib.crc32`（没有就拒）、算出来的等不等。
+  //     曾经写成 `&& entry.crc` 是拿真假值判有无，`0` 是完全合法的 CRC32（有 1/2^32 的文件
+  //     正好算出 0），那样会把这类条目**静默跳过校验**。
+  if (typeof zlib.crc32 !== 'function') {
+    throw new ZipError(
+      '运行时没有 zlib.crc32（需要 Node >= 22.5 / Electron 45+），拒绝在无 CRC 校验的情况下解包',
+      { reason: 'zip_crc_unavailable' },
+    );
+  }
+
   let stripped = '';
   if (flatten) {
     const tops = new Set(files.map((f) => f.rel.split('/')[0]));
@@ -162,11 +178,9 @@ export function extractZipBuffer(buf, destDir, { flatten = true, maxBytes = ZIP_
     if (entry.usize !== 0 && data.length !== entry.usize) {
       throw new ZipError(`条目长度不符：${rel}（头写 ${entry.usize}，实际 ${data.length}）`, { reason: 'zip_size_mismatch' });
     }
-    // CRC32：Node 20.15+ 有 zlib.crc32；没有就跳过（仍然有长度校验 + 版本校验兜底）
-    if (typeof zlib.crc32 === 'function' && entry.crc) {
-      const got = zlib.crc32(data) >>> 0;
-      if (got !== (entry.crc >>> 0)) throw new ZipError(`CRC 不符：${rel}`, { reason: 'zip_crc_mismatch' });
-    }
+    // CRC32：**每个条目都校验**（可用性在上面统一把过关，这里不再静默跳过）
+    const got = zlib.crc32(data) >>> 0;
+    if (got !== (entry.crc >>> 0)) throw new ZipError(`CRC 不符：${rel}`, { reason: 'zip_crc_mismatch' });
     fs.mkdirSync(path.dirname(out), { recursive: true });
     fs.writeFileSync(out, data);
     written.push(outRel);

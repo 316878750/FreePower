@@ -86,6 +86,26 @@ const zipFor = (version) => makeZip({
   'chrome-win64/locales/en-US.pak': 'pak',
 });
 
+// 在**第一条 store 条目的数据区**翻一个字节（不是头）——长度不变，只有 CRC 能抓
+function flipDataByte(buf) {
+  const nameLen = buf.readUInt16LE(26);
+  const extraLen = buf.readUInt16LE(28);
+  const at = 30 + nameLen + extraLen;
+  const out = Buffer.from(buf);
+  out[at] ^= 0xff;
+  return out;
+}
+
+/** 把中央目录里第一条的 CRC 字段写成 0（数据不动）——`0` 是合法 CRC32，不许当成「没有 CRC」 */
+function zeroCdCrc(buf) {
+  const out = Buffer.from(buf);
+  let i = out.length - 22;
+  for (; i >= 0; i -= 1) if (out.readUInt32LE(i) === 0x06054b50) break;
+  const cdOffset = out.readUInt32LE(i + 16);
+  out.writeUInt32LE(0, cdOffset + 16);
+  return out;
+}
+
 /* ------------------------------ 假源 ------------------------------ */
 
 const zips = new Map();
@@ -248,6 +268,17 @@ const server = http.createServer((req, res) => {
     }
     res.writeHead(200, { 'content-type': 'application/zip', 'content-length': real.length });
     res.end(real);
+    return;
+  }
+
+  /* ---------- CRC 三种坏法：单字节翻转 / CRC 写成 0 / 运行时没有 zlib.crc32 ---------- */
+  const crcMode = /^\/(crcbad|crczero)\/([\d.]+)\/win64\/chrome-win64\.zip$/.exec(p);
+  if (crcMode) {
+    const [, kind, version] = crcMode;
+    const base = zipFor(version);
+    const zip = kind === 'crcbad' ? flipDataByte(base) : zeroCdCrc(base);
+    res.writeHead(200, { 'content-type': 'application/zip', 'content-length': zip.length });
+    res.end(zip);
     return;
   }
 
@@ -739,6 +770,51 @@ try {
       && head16 === 3 && probe16 === 3
       && !fs.existsSync(path.join(KERNELS_DIR, V16)) && tmpLeftovers().length === 0,
     `${f16?.reason} head=${head16} probe=${probe16} 镜像请求 ${mh16.length} 次 / ${(f16?.message || '').slice(0, 90)}`);
+
+  /* ---------------------------------------------------------------------------
+   * CRC 三条 fail-closed（0.4.1 补）：`src/kernel/zip.js` 原先写着
+   *   `if (typeof zlib.crc32 === 'function' && entry.crc)`
+   * 两个洞：① 运行时没有 `zlib.crc32` 就**静默跳过**校验（fail-open）；
+   *         ② 用真假值判 `entry.crc`，把合法 CRC32 `0` 当成「没有 CRC」。
+   * 这三条是互补关系的另一半：**CRC 抓意外损坏（全量逐字节），抽段抓镜像替换（0.3% 抽样）**。
+   * ------------------------------------------------------------------------- */
+  const V17 = '157.0.9018.18';
+  const r17 = await runKernelDownload(
+    { kernel_type: 'Chrome', kernel_version: V17 },
+    { zipBase: `${BASE}/crcbad`, mirrorBase: 'off', stallMs: 700, maxAttempts: 2 },
+  );
+  const f17 = await waitFailure(V17, 25000);
+  check('CRC：store 条目数据区翻 1 个字节（长度完全不变）→ zip_crc_mismatch，不留目录、不留 .tmp-*',
+    r17.code === 0 && f17?.reason === 'zip_crc_mismatch'
+      && !fs.existsSync(path.join(KERNELS_DIR, V17)) && tmpLeftovers().length === 0,
+    `${f17?.reason} ${(f17?.message || '').slice(0, 90)}`);
+
+  const V18 = '157.0.9019.19';
+  const r18 = await runKernelDownload(
+    { kernel_type: 'Chrome', kernel_version: V18 },
+    { zipBase: `${BASE}/crczero`, mirrorBase: 'off', stallMs: 700, maxAttempts: 2 },
+  );
+  const f18 = await waitFailure(V18, 25000);
+  check('CRC：中央目录 CRC 字段写 0（数据没动）→ 仍必须 zip_crc_mismatch（`0` 是合法 CRC，不是「没有 CRC」）',
+    r18.code === 0 && f18?.reason === 'zip_crc_mismatch' && !fs.existsSync(path.join(KERNELS_DIR, V18)),
+    `${f18?.reason} ${(f18?.message || '').slice(0, 90)}`);
+
+  // 运行时缺 `zlib.crc32`（Node < 22.5 / 老 Electron）：必须**拒解**，不许静默跳过
+  const zlibMod = (await import('node:zlib')).default;
+  const savedCrc32 = zlibMod.crc32;
+  let noCrc = null;
+  try {
+    Object.defineProperty(zlibMod, 'crc32', { value: undefined, configurable: true, writable: true });
+    const { extractZipBuffer: exNoCrc } = await import('../src/kernel/zip.js');
+    try {
+      exNoCrc(zipFor('157.0.9998.8'), path.join(dataDir, 'nocrc'), { flatten: true });
+    } catch (e) { noCrc = e; }
+  } finally {
+    Object.defineProperty(zlibMod, 'crc32', { value: savedCrc32, configurable: true, writable: true });
+  }
+  check('CRC：运行时没有 zlib.crc32 → 直接拒解（zip_crc_unavailable），不静默跳过',
+    noCrc?.reason === 'zip_crc_unavailable' && typeof zlib.crc32 === 'function',
+    `${noCrc?.reason || '没抛'} / 恢复后 crc32=${typeof zlib.crc32}`);
 
   /* -------------------- 收尾：目录里只剩合法版本 -------------------- */
   const dirs = fs.readdirSync(KERNELS_DIR).sort();
