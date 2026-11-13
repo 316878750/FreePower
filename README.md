@@ -19,7 +19,8 @@
 - 自检：每个环境启动后自动跑一次真实页面探针，输出 19 项可读报告（覆盖度对齐字段表 full/partial/none），含「页面直接创建的三类 worker + 嵌套 worker」双 Realm 断言与 AudioWorklet 明确 `none`，支持 API 与本地 HTML 页。**worker 不是全覆盖**（OOPIF 子帧、启动前已在跑的 SW 仍是盲区），边界见已知限制第 6 条
 - 代理：HTTP/HTTPS/SOCKS5 绑定、账号密码认证（HTTP 代理）、**fail-closed**；PAC 明确拒绝（不支持就报错，不静默降级）；代理管理页**单条 / 批量健康检查**（出口 IP / 国家 / 延迟 / 时间，失败区分超时、认证失败、代理拒绝 CONNECT、连接被拒、DNS、TLS；批量限并发 3、单条 10s 上限，超 24h 的结果标「结果过期」）
 - 本地 API：`/status`、环境 CRUD、分组、标签、代理列表、浏览器启停、**批量启停（并发上限 + 失败清单 + 可中断）**、自检报告；返回值形状对齐 AdsPower（`ws.puppeteer` / `ws.selenium` / `debug_port` / `status: Active|Inactive` / `cookies` / `kernels`）
-- **Web 管理控制台**（`node:http` 直接托管，浏览器打开 `127.0.0.1:<端口>/` 即用）：环境列表（启动/停止/自检状态/批量操作）、环境编辑（11 组分栏表单，值域与必填来自后端注册表）、代理管理、自检报告。四个页面全部只调自己的 Local API，没有私有通道
+- **Web 管理控制台**（`node:http` 直接托管，浏览器打开 `127.0.0.1:<端口>/` 即用）：环境列表（启动/停止/自检状态/批量操作）、环境编辑（11 组分栏表单，值域与必填来自后端注册表）、代理管理、自检报告、**AI Agent 面板**（一句话目标 → 动作清单 → 逐条批准 → 运行 → 每步结果）。五个页面全部只调自己的 Local API，没有私有通道
+- **AI Agent（0.4.0）**：`browser_task` 7 个动作、HITL 每步审批 + digest 绑定、工作流落盘与本地 CDP 执行、**模型真调用**（OpenAI 兼容，key 用户自填、不带内置 key）、控制台面板与截图票据取图 —— 细节见第十节
 - 未实现的云端透传接口（分享、成员、内核下载…）**明确报「不支持」**（`code:-1` + `data.supported:false`），不假成功、不留未知码。**现在这条清单实际是 15 条**（`src/api/routes.js` 的 `placeholders` 数组，2026-11-12 逐个数过）：原来这类有 46 条，回收站两条已本地实现，其余云端依赖的同类项合并后剩 15 条 —— 数字按实际数组算，不按历史回执抄（旧回执里写过的 44 / 17 都不再作为当前值）。
 - **桌面版**：Electron 壳（单实例 / 托盘 / 关窗不退出 / 开机自启开关 / 退出前必清残留内核）+ NSIS 安装包，不需要 VS 编译链
 
@@ -204,7 +205,7 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 
 `npm start` 之后浏览器直接打开 `http://127.0.0.1:<端口>/`（端口看 `data/local_api`）。不用装任何东西，也没有第二套进程。
 
-四个页面，范围就这些（CEO 定的，不扩）：
+五个页面，范围就这些（CEO 定的，不扩）：
 
 | 页面 | 做什么 |
 |---|---|
@@ -212,6 +213,7 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 | 环境编辑 | 11 组分栏表单（基本信息 / 浏览器与内核 / UA 与语言 / 噪声四维 / 字体 / 屏幕与硬件 / 媒体设备 / 网络与代理 / 地理定位 / 隐私开关 / 启动与缓存），保存前实时校验；Cookie 一栏带「导出 cookie（JSON / netscape）」「导入 cookie 文件」（**需要环境运行中**：cookie 在内核里，和这一栏的登录 cookie 文本不是一份数据） |
 | 代理管理 | 代理列表增删改、按 `proxy/check` 预检出口、显示最近一次出口 IP 与国家 |
 | 自检报告 | 评分、通过/告警/失败、覆盖度、四个噪声维度哈希与跨重启一致性、19 项逐条「声明值 vs 实测值」（含双 Realm 与 AudioWorklet） |
+| AI Agent（0.4.0） | 选环境 → 填目标 → 生成动作清单 → 逐步看动作/参数/digest 前 8 位 → 逐条批准或拒绝 → 运行 → 每步结果（`text` 结果、截图相对路径与图片、cookie 条数）；fill / cookie set 的值显示 `••••`，截图走 120 秒票据链接（master key 不进 URL） |
 
 三条设计约束（都不是口号，代码里能对得上）：
 
@@ -282,7 +284,8 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
    注：自检的 19 项里**不含**嵌套 worker 一项（自检只验证页面直接创建的三类），嵌套这条由 `test/workers.test.mjs` 的三条断言钉住。
 7. **沙箱内起不了 Chrome**：Windows 沙箱禁止命名管道，Chrome 的 Mojo IPC 会以 `platform_channel.cc:112 Check failed: 0x5` 自终止。这不是产品缺陷，但**跑冒烟必须用普通终端（非沙箱）**。
 8. **`https` 代理 + `https` 目标**（TLS in TLS）预检不支持，会明确报错，不静默降级。
-9. **PAC 明确不支持（不是静默降级）**：`full_pac_url` 或 `proxy_type=pac` 直接报错 `100002`（建环境）/ `800003`（老数据启动，`reason=pac_unsupported`），**一个内核进程都不会起**。原因是 PAC 可能含 `DIRECT` 回退，无法保证 fail-closed。多级代理（`is_multi_level_proxy`）未实现，只对第一跳做预检。
+9. **PAC 明确不支持（不是静默降级）**：`full_pac_url` 或 `proxy_type=pac` 直接报错 `100002`（建环境）/ `800003`（老数据启动，`reason=pac_unsupported`），**一个内核进程都不会起**。原因是 PAC 可能含 `DIRECT` 回退，无法保证 fail-closed。
+   **2026-11-13 更正（只改事实，历史判断保留）**：这条原先还写「多级代理（`is_multi_level_proxy`）未实现，只对第一跳做预检」——那是当时的事实，现已过期。多级代理链自 2026-11-12 第二批起已实现（`is_multi_level_proxy=1` 时**只有本机配了系统代理才多一跳**，没配就塌成单跳），判据见 `test/chain-rules.test.mjs`（31 项）+ `test/proxy-chain.test.mjs`（37 项），设计见下面「### 多级代理链（2026-11-12 第二批）」。**仍然成立的一半**：PAC 本身不支持（本条前半句），代理预检也只覆盖第一跳的出口。
 10. **2D canvas 固定软件光栅化**（`--disable-accelerated-2d-canvas`）。GPU 2D 路径跨进程会产生不同像素，导致 canvas 哈希跨重启漂移；固定软件光栅化后四轮实测一致。代价：`chrome://gpu` 显示 Software only，canvas 密集页面略慢。
 11. **远程代理下的自检有盲区**：自检页走 `http://127.0.0.1` 安全上下文；若代理强制 loopback 也走代理（非 `--proxy-bypass-list=<-loopback>` 的配置），会回落到 `about:blank`，此时报告里 UA-CH / 媒体设备明确标「本次未验证」，不标通过。
 12. **轮换代理会把「出口 IP 与预检不一致」判为告警**（正常业务形态，只提示不阻断）；运行中没有代理健康检查，掉线时请求失败但不会回退直连。
@@ -455,7 +458,7 @@ npm run test
 npm run smoke
 ```
 
-当前实测：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **78** + agent **6** + api **100** + ui **29** + desktop **54**（`package.json` 里那条脚本就是这九组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **23/23**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核），真 Chrome `157.0.8103.40`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的九组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测（2026-11-13，本机）：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **78** + agent **12** + api **100** + ui **46** + desktop **54**（`package.json` 里那条脚本就是这九组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **30/30**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的九组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 > 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：
@@ -887,7 +890,8 @@ src/
   agent/task.js        browser_task DSL：7 个动作的解析/校验、任务 digest、CDP 执行（runBrowserTask）
   agent/workflow.js    工作流容器：状态机、每步审批、落盘、执行器（runWorkflow）
   agent/cli.js         adspower_cli 调用层：只走本地 API + CDP，不调对手云
-  agent/llm.js         LLM 接入骨架：OpenAI 兼容配置解析与请求构造（暂不发送）
+  agent/llm.js         LLM 接入：OpenAI 兼容 `POST <endpoint>/chat/completions`（内置 fetch、不新增依赖），
+                       提示词由 task.js 的 TASK_SPECS 生成，围栏 JSON 容错 + canonicalTask 校验 + 错误分档
 desktop/
   main.js              Electron 主进程：起服务、开窗、托盘、单实例、自启、退出收尾
   residue.js           退出前的残留 chrome 检查（WMI 查命令行 → taskkill → 再查）
@@ -903,18 +907,19 @@ web/
   pages/edit.js        环境编辑：11 组分栏、实时校验（文案来自后端）
   pages/proxies.js     代理管理
   pages/selfcheck.js   自检报告
+  pages/agent.js       AI Agent 面板：选环境 → 目标 → 生成 → 逐条批准 → 运行 → 每步结果（含截图票据链接）
 test/smoke.mjs         端到端冒烟（152 项，需真实 Chrome）
-test/unit.test.mjs     零 Chrome 单元测试（73 项）
+test/unit.test.mjs     零 Chrome 单元测试（78 项）
 test/api.test.mjs      本地 API 契约测试（100 项，不需要 Chrome）
 test/net-rules.test.mjs  网络规则匹配逻辑单测（38 项，不需要 Chrome）
 test/recycle.test.mjs  回收站数据层 + 两条路由（44 项，含重启读库）
 test/chain-rules.test.mjs  多级代理链纯逻辑（31 项：hop 解析、塌单跳、PAC、协议限制）
 test/proxy-chain.test.mjs  多级代理链真机判据（37 项：两跳、断链 fail-closed、凭据不串层、端口回收）
-test/ui.test.mjs       控制台契约测试（29 项：静态托管、schema、校验、删除清目录、限流额度）
+test/ui.test.mjs       控制台契约测试（46 项：静态托管、schema、校验、删除清目录、限流额度、Agent 面板纯函数与截图取图）
 test/desktop.test.mjs  桌面壳契约测试（54 项：启动引导、票据、残留检查、安全姿势、打包配置）
 test/workers.test.mjs  双 Realm 真机验证（24 项：三类 worker + 嵌套 + AudioWorklet）
-test/agent.test.mjs    AI Agent 判定门 A 层（6 项，假 CDP / 纯函数，不启内核）
-test/agent-smoke.test.mjs  AI Agent 判定门 B 层（23 项，真内核：七动作 / 失败即停 / 超时 / 跑完不关浏览器）
+test/agent.test.mjs    AI Agent 判定门 A 层（12 项，假 CDP / 纯函数 / 本地 mock LLM，不启内核、不联网）
+test/agent-smoke.test.mjs  AI Agent 判定门 B 层（30 项，真内核：七动作 / 失败即停 / 超时 / 跑完不关浏览器 / 目标→工作流 e2e）
 test/proxy-health.test.mjs  代理健康检查真机验证（15 项：四态 / 批量 / 只读 / 控制台）
 test/media-devices.test.mjs 媒体设备真机验证（P9-C，12 项：真实枚举 + 只改 label + toJSON + 按 kind 授权）
 test/speech.test.mjs   语音投影真机验证（P9-A，8 项）
@@ -929,7 +934,7 @@ docs/                  技术方案、阶段交付、curl 实测、截图（docs
 
 ## 十、AI Agent（0.4.0）
 
-**这一节的状态**：DSL 解析、HITL 审批、状态机、工作流落盘、**CDP 执行器**都是真实现 —— 现在可以「脚本建工作流 → 人工逐步批 → 执行器真跑」。**模型调用还没接**（`chat()` 仍抛 `NotImplementedError`，设了 `AGENT_LLM_KEY` 也不会调模型），所以还不会「让模型自己规划任务」。
+**这一节的状态（0.4.0 收尾后）**：DSL 解析、HITL 审批、状态机、工作流落盘、**CDP 执行器**、**模型调用**、**控制台面板**都是真实现 —— 现在可以「说一句话 → 模型拆成动作 → 逐步看参数与 digest → 人逐条批 → 执行器真跑 → 看每步结果与截图」。控制台侧栏有「AI Agent」页；API 侧新增 `POST /agent/workflow/create-from-goal`。**仍然不做**：多轮对话修改、自动批准、并发池、技能市场。
 
 ### 范围（拍过板，不再扩）
 
@@ -943,16 +948,47 @@ docs/                  技术方案、阶段交付、curl 实测、截图（docs
 
 对手的形态是「宿主窗口（`AI Pet`，加载云端页面）+ 5.3 MB Agent Core 子进程 + 自家模型网关 `https://ai.adspower.com/api`，Bearer 就是你的**登录 token**」（逆向 `24-` §2 / §3.3 / §5.2）。我们**没有云端**：模型 endpoint 与 key 都由用户自己填，请求直连那个 endpoint、不经过任何 adspower 域名；用户看得见自己花的是谁的钱。Agent 的浏览器动作走已有的 Local API + CDP（等价对手 §6.1 那条路），但少掉「自家网关」这一跳。**这条差异是有意的，不是还没做。**
 
-### 路由（四条，都是我们自己的契约）
+### LLM 接入（2026-11-13，0.4.0）
 
-对手没有可抄的本地 REST —— 它是 Agent Core 的 4 条 WebSocket 指令（`24-` §3.2）；所以这四条的形状按「脚本能编排、人能审批」定：
+**我们不带任何内置 key，也没有默认厂商地址。** endpoint / key / model 三样都由用户自己填（`AGENT_LLM_*` 环境变量，或直接放在请求体 `llm` 里——显式参数优先）；三样缺一就明确报「没配」，不做默认模型猜测。
+
+- **协议**：OpenAI 兼容 `POST <endpoint>/chat/completions`（DeepSeek / OpenAI / 各类兼容网关都是这套）。用 Node 内置 `fetch`，**不新增 npm 依赖**；只做非流式，本版不偷偷转协议。
+- **提示词**：system 里放动作与字段白名单（**从 `src/agent/task.js` 的 `TASK_SPECS` 生成**，不另抄一份，避免两处漂移），user 里**只有目标原文**。profile 的 cookies / UA / 代理账密**一律不进 prompt**；key 只出现在 `Authorization: Bearer` 头里，不进 body。
+- **解析**：要求模型只回 JSON 数组；容忍 Markdown 代码围栏、前后空白、前后夹说明（取第一对方括号）。解析后**必须**过 `parseTaskList`（未知动作/字段一律拒）+ `canonicalTask` 重建（键序稳定，模型把字段顺序写反也不影响 digest）。
+- **步数上限**：模型一次最多 **20 步**（`LLM_TASK_LIMIT`）；超了让用户拆目标，别拿 `parseTaskList` 的 200 硬上限当模型额度。
+- **超时**：`AGENT_LLM_TIMEOUT_MS`（环境变量 `FREEPOWER_AGENT_LLM_TIMEOUT`，默认 60000 ms）。
+- **失败分档**（每档文案不同、都带 endpoint + model，便于定位；**code 不新造**）：
+
+  | 情况 | `code` | `data.reason` |
+  |---|---|---|
+  | 没配（三样缺一）/ goal 空 / goal 超 4000 字符 | `100002`（带 `field`） | `llm_not_configured` / `goal_required` / `goal_too_long` |
+  | 未知动作 / 未知字段（模型产出不合法） | `100002`（`field=tasks[i].x`） | `llm_invalid_task` |
+  | 空数组 / 超 20 步 | `100002`（`field=tasks`） | `llm_empty_tasks` / `llm_too_many_tasks` |
+  | HTTP 401（key 无效/无权） | `-1` | `llm_unauthorized` |
+  | HTTP 403（拒绝访问） | `-1` | `llm_forbidden` |
+  | HTTP 404（endpoint 路径/模型名不对） | `-1` | `llm_not_found` |
+  | HTTP 429（限流/额度） | `-1` | `llm_rate_limited` |
+  | HTTP 5xx（上游故障） | `-1` | `llm_upstream_error` |
+  | 连不上 endpoint | `-1` | `llm_unreachable` |
+  | 超时 | `-1` | `llm_timeout` |
+  | 返回不是 JSON / 形状不对 / 内容空 | `-1` | `llm_bad_json` / `llm_bad_shape` / `llm_empty_content` / `llm_not_array` |
+
+- **key 不外泄**：错误文案、日志、响应体里都不出现 key（上游把 key 回显在 body 里也会被打码成 `sk-a…cdef`）；详情见 `src/agent/llm.js` 的 `redactAll`。
+- **不自动重试**：429/5xx 由调用方决定要不要再来一次；重试藏在模型层会让人以为「没花钱」。流式（`stream=true`）本版不接。
+
+### 路由（七条，都是我们自己的契约）
+
+对手没有可抄的本地 REST —— 它是 Agent Core 的 4 条 WebSocket 指令（`24-` §3.2）；所以这七条的形状按「脚本能编排、人能审批」定：
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
+| POST | `/api/v1/agent/workflow/create-from-goal` | **一句话目标 → 工作流**：`{profile_id, goal, llm?}`；调用户自己的模型拆动作，返回与 `run` 同形（全 `pending_approval` + 每步 `digest`）。**不启动浏览器**；模型产出不合法当场 `100002` |
 | POST | `/api/v1/agent/workflow/run` | 建工作流：校验 DSL、给每步算 `digest`、状态 `created`；**不启动浏览器** |
-| GET | `/api/v1/agent/workflow/:id/status` | 读状态、每步审批状态与 `result`；不存在 → `100001` |
+| GET | `/api/v1/agent/workflow/:id/status` | 读状态、每步审批状态、`params`（敏感值打码）与 `result`；不存在 → `100001` |
 | POST | `/api/v1/agent/workflow/:id/approve` | HITL：`{step_id?, decision:'approve'\|'reject', digest?}`；**不给 `decision` 就是拒** |
 | POST | `/api/v1/agent/workflow/:id/run` | 真跑（只接受全部步批过的 `approved`）；**立刻回 `running`**，进度查 `status` |
+| POST | `/api/v1/agent/workflow/:id/screenshot-ticket` | 截图取图的**短期票据**（120 秒、绑环境）：控制台 `<img>` 带不了 api-key 头，master key 绝不进 URL（同自检报告那套） |
+| GET | `/api/v1/agent/workflow/:id/screenshot` | 取一张 PNG：`?path=<相对路径>`；复用 DSL 的 `normalizeShotPath` + `resolveShotPath`，越界 `100002` |
 
 动态段 `:id` 是本地路由表里**唯一**支持参数的一段（`src/api/server.js` 的 `matchRoute`），老 54 条静态路由的匹配行为一个字节没变。错误码沿用已有的：DSL/参数错 `100002`（带 `data.field` 指出哪个字段）、工作流不存在 `100001`、环境不存在 `100001`。
 
@@ -999,9 +1035,12 @@ docs/                  技术方案、阶段交付、curl 实测、截图（docs
 
 ### 判定门（断言清单由巡检出，分两层）
 
-**A 层 `test/agent.test.mjs`（6 项，进 `npm test`，不启内核）**：批完再改盘上任务 → `run` 当场 `100002` + `field=digest` 且状态仍 `approved`（配「盘上不动必须过」的反例）；没批完就 run → `100002` + `field=status`、不存在的 id → `100001`、approve 不存在的 step → `100001`；截图路径越界（解析层 + 执行层 `resolveShotPath` 的 Windows 大小写越界）；`fill.value` / `cookie set.value` 不进 status JSON（`digest` 仍在）；`text` 超 10KB / cookie value 超 4KB 的截断与 `truncated` + `original_len`（恰好 10240 / 4096 不带键、多字节字符不会被切坏）。
+**A 层 `test/agent.test.mjs`（12 项，进 `npm test`，不启内核；mock LLM 全本地、不联网）**：批完再改盘上任务 → `run` 当场 `100002` + `field=digest` 且状态仍 `approved`（配「盘上不动必须过」的反例）；没批完就 run → `100002` + `field=status`、不存在的 id → `100001`、approve 不存在的 step → `100001`；截图路径越界（解析层 + 执行层 `resolveShotPath` 的 Windows 大小写越界）；`fill.value` / `cookie set.value` 不进 status JSON（`digest` 仍在）；`text` 超 10KB / cookie value 超 4KB 的截断与 `truncated` + `original_len`（恰好 10240 / 4096 不带键、多字节字符不会被切坏）。
+**LLM 那六条（A6–A11）**：合法 JSON / ```json 围栏 / 前后空白都过且键序稳定；prompt 只带 goal + 动作清单（body 里没有 key、没有 profile 的 cookie/UA/代理）；未知动作 / 未知字段 / 空数组 / 超 20 步 → `100002` + `field`；401 / 500 / 超时 / 非 JSON 四档 `reason` 与文案互不相同、`code` 一律 `-1`、**文案里没有 key**；生成的动作建工作流后每步 64 位 `digest` 且全 `pending_approval`；没配 / goal 空 → `100002` 带 `field`。
 
-**B 层 `test/agent-smoke.test.mjs`（23 项，进 `npm run smoke`，真内核）**：七动作 happy path（`text` 读回填入值、截图是 png 且只回相对路径、cookie get 能看到 set 的 name）；失败即停（`error.step_id` + 实际抛的 `selector_not_found`，后续步 `result=null`）；超时（注入短预算，`reason=step_timeout`、不重试）；**跑完浏览器仍 `Active`**（在 stop 清理之前取状态）。
+**B 层 `test/agent-smoke.test.mjs`（30 项，进 `npm run smoke`，真内核）**：七动作 happy path（`text` 读回填入值、截图是 png 且只回相对路径、cookie get 能看到 set 的 name）；失败即停（`error.step_id` + 实际抛的 `selector_not_found`，后续步 `result=null`）；超时（注入短预算，`reason=step_timeout`、不重试）；**跑完浏览器仍 `Active`**（在 stop 清理之前取状态）；**B5**：mock LLM 出 2 步 → `create-from-goal` → 逐步批准 → 真跑 → 两步 `completed`，生成响应里没有 key。
+
+> 两处判定门口径调整（2026-11-13，如实记）：① B1 原来断言「status JSON 里没有 selector / op」，现在改成「`params` 里的 `value` 是 `***`」+「没有 `task` 原对象」—— 控制台审批面板必须显示「批的是什么」，所以参数键出现是预期的，**不许出现的只有值**；② 单步预算从 4000ms 调到 8000ms（4000ms 在整包 smoke 刚跑完、机器还忙时误杀过截图步），B3 的「<15s 收尾」断言不变（实测 8393ms）。
 
 **不写成断言的三条**（属于上面的已知限制，别当判据）：`click` 的 `isTrusted=false`、`open` 重开同 URL 靠让半拍、Chrome 自己把 cookie 封顶在 ~4096 B。
 
@@ -1016,9 +1055,9 @@ FREEPOWER_AGENT_HITL           写 `approve` 才放行，其余（含写错、�
 FREEPOWER_AGENT_STEP_TIMEOUT   单步执行超时（默认 30000 ms；`wait({ms})` 会按 ms + 5s 放宽）
 ```
 
-> **模型层还不发请求**：`AGENT_LLM_*` 现在只做「读配置 + 校验三样齐」（`resolveLlmConfig`）与请求构造（`buildChatRequest`），**设了 `FREEPOWER_AGENT_LLM_KEY` 也不会调模型** —— 真正的 `POST <endpoint>/chat/completions` 等模型层接上才发。别拿「设了 key」当「Agent 能自己规划了」。
+> **key 是你自己的，我们不带任何内置 key。** 请求直连你填的 endpoint（`POST <endpoint>/chat/completions`），不经过任何 adspower 域名、也不拿登录 token 当 key。三样（endpoint / key / model）缺一就明确报「没配」（`100002` + `data.field=llm` + `reason=llm_not_configured`），**不做默认模型猜测、不会偷偷用某个厂商的免费端点**。设了 `AGENT_LLM_*` 之后，`POST /api/v1/agent/workflow/create-from-goal` 或控制台「AI Agent」页的生成按钮就会真的调模型。
 
 ### 现在做到哪 / 下一步
 
-- **已做**：7 个动作的解析与字段白名单（含 http(s)、CSS 选择器、`wait` 三选一、cookie get/set）、任务 `digest`、工作流状态机与审批、**工作流落盘**（`DATA_DIR/agent/workflows/<id>.json`，原子写、重启 `running → aborted`）、**CDP 执行器**（`runWorkflow`：起环境 / 每步核 digest / 单步超时 / 失败即停 / `steps[].result` / 跑完不关浏览器）、四条路由、`cli.js` 的 list/start/stop/active 与 `cdpUrl()`、`llm.js` 的配置解析与请求构造（**不发请求**）、`x-freepower-agent: 1` 来源标记、**判定门**（A 层进 `npm test`、B 层进 `npm run smoke`，断言清单由巡检出）；
-- **未做（下一轮）**：`chat()` 真调用（模型层）、控制台审批弹窗（现在只有 API）、可信点击（`Input` 域）、`agent/workflow/purge`（清理历史）。
+- **已做**：7 个动作的解析与字段白名单（含 http(s)、CSS 选择器、`wait` 三选一、cookie get/set）、任务 `digest`、工作流状态机与审批、**工作流落盘**（`DATA_DIR/agent/workflows/<id>.json`，原子写、重启 `running → aborted`）、**CDP 执行器**（`runWorkflow`：起环境 / 每步核 digest / 单步超时 / 失败即停 / `steps[].result` / 跑完不关浏览器）、**模型调用**（`llm.js`：OpenAI 兼容真请求、围栏容错、错误分档、key 不外泄）、**目标→工作流路由**、**控制台 AI Agent 面板**（生成 / 逐条批准 / 运行 / 截图）、截图取图与短期票据、`cli.js` 的 list/start/stop/active 与 `cdpUrl()`、`x-freepower-agent: 1` 来源标记、**判定门**（A 层 12 项进 `npm test`、B 层 30 项进 `npm run smoke`）；
+- **未做（下一轮）**：多轮对话修改（现在一次生成就是最终提案）、自动批准、可信点击（`Input` 域）、`agent/workflow/purge`（清理历史）、流式输出、Anthropic 原生协议。
