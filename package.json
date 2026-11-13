@@ -23,7 +23,7 @@
     "test:ui": "node --no-warnings test/ui.test.mjs",
     "test:desktop": "node --no-warnings test/desktop.test.mjs",
     "test:profile": "node --no-warnings packages/profile/test/schema.test.mjs",
-    "test": "node --no-warnings packages/profile/test/schema.test.mjs && node --no-warnings test/net-rules.test.mjs && node --no-warnings test/chain-rules.test.mjs && node --no-warnings test/recycle.test.mjs && node --no-warnings test/unit.test.mjs && node --no-warnings test/agent.test.mjs && node --no-warnings test/api.test.mjs && node --no-warnings test/ui.test.mjs && node --no-warnings test/desktop.test.mjs",
+    "test": "node --no-warnings packages/profile/test/schema.test.mjs && node --no-warnings test/net-rules.test.mjs && node --no-warnings test/chain-rules.test.mjs && node --no-warnings test/recycle.test.mjs && node --no-warnings test/unit.test.mjs && node --no-warnings test/agent.test.mjs && node --no-warnings test/api.test.mjs && node --no-warnings test/ui.test.mjs && node --no-warnings test/desktop.test.mjs && node --no-warnings test/kernel-download.test.mjs",
     "gen": "node tools/gen-schema.mjs",
     "test:workers": "node --no-warnings test/workers.test.mjs",
     "test:all": "npm run test && npm run test:workers",
@@ -43,6 +43,7 @@
     "test:recycle": "node --no-warnings test/recycle.test.mjs",
     "test:switches": "node --no-warnings test/switches.test.mjs",
     "test:chain-rules": "node --no-warnings test/chain-rules.test.mjs",
+    "test:kernel-download": "node --no-warnings test/kernel-download.test.mjs",
     "test:proxy-chain": "node --no-warnings test/proxy-chain.test.mjs",
     "test:p9c-judge": "node --no-warnings tools/p9c-judge.mjs"
   },
