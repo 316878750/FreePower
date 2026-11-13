@@ -848,7 +848,7 @@ node --no-warnings test/proxy-chain.test.mjs   → 也行，单独跑同一套�
 - **自检**：启动后自动跑 19 项、覆盖度 7/10/2、四个哈希齐全、`rerun=1` 重跑、HTML 页可读且无外链
 - **双 Realm**（`test/workers.test.mjs`，已进 `npm run smoke`）：同一张页里起专用 worker / SharedWorker / ServiceWorker（**页面直接创建的**，嵌套 worker 另有三条断言，见已知限制第 6 条），断言三者的脚本首行已注入（`atTop === 'worker'`）、五处 canvas 哈希完全一致、硬件/语言/时区/UA 与主帧同值、`workerStats.injected === 3`；另断言 AudioWorklet 未被注入且可测表面只有 `sampleRate`/`currentTime`
 - **嵌套 worker**（同文件）：页面里起的 worker 再 `new Worker`，断言外层与嵌套层首行都已注入、主帧/外层/嵌套三者的 `hardwareConcurrency` 一致、两层都进注入计数 —— 防的是「同一台机器同时暴露伪装值与真实核数」
-- **本地 API 完整化**：`active` 的 Active/Inactive 形状、`local-active`、`cookies`、`kernels`、标签/代理列表 CRUD、占位接口明确不支持（`share` 之类）；**回收站两条已从占位变成真实现**，断言改成验「`code:0` + `data` 键全等 `limit,list,page` + 无 `total`」；**内核下载也已从占位变成真实现**（`test/kernel-download.test.mjs` 23 项，本地假源，见第十一节）
+- **本地 API 完整化**：`active` 的 Active/Inactive 形状、`local-active`、`cookies`、`kernels`、标签/代理列表 CRUD、占位接口明确不支持（`share` 之类）；**回收站两条已从占位变成真实现**，断言改成验「`code:0` + `data` 键全等 `limit,list,page` + 无 `total`」；**内核下载也已从占位变成真实现**（`test/kernel-download.test.mjs` 26 项，本地假源，见第十一节）
 - **批量启停**：一次起 3 个、批量停、失败清单带 code/message、中途失败即中断、并发上限生效
 - **cloud-active 明确报错**（`-1` + `supported:false`，不假成功）
 - 停环境后进程树回收干净、重复 start 幂等、重复 stop 800002
@@ -924,7 +924,7 @@ test/desktop.test.mjs  桌面壳契约测试（54 项：启动引导、票据、
 test/workers.test.mjs  双 Realm 真机验证（24 项：三类 worker + 嵌套 + AudioWorklet）
 test/agent.test.mjs    AI Agent 判定门 A 层（15 项，假 CDP / 纯函数 / 本地 mock LLM，不启内核、不联网）
 test/agent-smoke.test.mjs  AI Agent 判定门 B 层（30 项，真内核：七动作 / 失败即停 / 超时 / 跑完不关浏览器 / 目标→工作流 e2e）
-test/kernel-download.test.mjs  内核下载判定门（23 项，本地假源，不联网：正常/长度不符/大小写/Firefox/幂等/断线/重试/并发/自检不一致/404）
+test/kernel-download.test.mjs  内核下载判定门（26 项，本地假源，不联网：正常/长度不符/大小写/Firefox/幂等/断线/续传/停顿重连/并发/自检不一致/404）
 test/proxy-health.test.mjs  代理健康检查真机验证（15 项：四态 / 批量 / 只读 / 控制台）
 test/media-devices.test.mjs 媒体设备真机验证（P9-C，12 项：真实枚举 + 只改 label + toJSON + 按 kind 授权）
 test/speech.test.mjs   语音投影真机验证（P9-A，8 项）
@@ -1070,7 +1070,7 @@ FREEPOWER_AGENT_STEP_TIMEOUT   单步执行超时（默认 30000 ms；`wait({ms}
 
 ## 十一、内核下载（Chrome for Testing，0.4.1）
 
-**这一节的状态**：`POST /api/v2/browser-profile/download-kernel` 从「占位明确不支持」变成**真实现** —— 用户/脚本点一次，FreePower 真的从 Google 官方渠道下几百 MB 的 Chrome 内核，解压、自检、装进自己的 kernels 目录，之后 `GET …/kernels` 就能看到、环境就能用它起来。本机原来 `kernels` 目录是空的（**0 个内核**），所以「界面点启动环境」一个都起不来 —— 这条路补的就是那个根因。
+**这一节的状态**：`POST /api/v2/browser-profile/download-kernel` 从「占位明确不支持」变成**真实现** —— 用户/脚本点一次，FreePower 真的从 Google 官方渠道下几百 MB 的 Chrome 内核，解压、自检、装进自己的 kernels 目录，之后 `GET …/kernels` 就能看到、环境就能用它起来。**注意**：kernels 目录为空**不是**「环境起不来」的原因 —— `resolveChrome`（`src/kernel/chrome.js`）在 kernels 为空时会回落到本机已装的 Chrome，环境照样能起（smoke 一直是这么跑的）。内核下载补的是「自带内核、版本可钉死」这条路，不是修启动。
 
 ### 源：Chrome for Testing，不是对手的 CDN
 
@@ -1192,6 +1192,23 @@ FREEPOWER_KERNEL_DOWNLOAD_ATTEMPTS   续传最多重连几次（默认 12）
 
 **B 层没做**：测试里没有真下 200 MB。真机端到端是一次性手工验收（CEO 一次性授权），**不进测试、不进判据** —— 判据仍是不联网。
 
+### 真机端到端（一次性验收，**不进测试、不进判据**）
+
+2026-11-13 手工跑通一次（CEO 一次性授权）：真下 CfT `157.0.8103.78` → 装进 kernels → 起一个环境 → 停掉。
+
+| 项 | 实测 |
+|---|---|
+| 包体 | 209,854,321 B |
+| 下载 + 安装耗时 | 30,032 ms（**走 npmmirror 的 CfT 镜像**；到 GCS 只有 34 KB/s，见上） |
+| 装好的目录 | 463,930,192 B / 306 文件，`.tmp-*` 残留 **0** |
+| `chrome.exe --version` | `Google Chrome for Testing 157.0.8103.78` |
+| 起环境 | `code:0`，696 ms，`real_version=157.0.8103.78` |
+| 内核路径（WMI 读该进程 argv） | `…/kernels/157.0.8103.78/chrome.exe` —— **不是** `C:\Program Files\Google\Chrome` |
+| `--user-data-dir` | `<DATA_DIR>/profiles/<id>_<hash>/userdata` |
+| `active` → 停后 | `Active` → `Inactive`，停后 chrome 进程 **0** |
+
+镜像那条只为验收省时间：**产品默认仍是 Google 官方地址**，要换源用 `FREEPOWER_CFT_ZIP_BASE` 覆盖。
+
 ### 已知限制
 
 - **续传只在一次任务内部**：任务失败（重连 12 次还没下完）之后，下一次调用是**从头下**，不复用上次那半截（`.tmp-*` 已经被删了）。理由是「跨任务续」要维护一份下载账本，而 CfT 不给我们 ETag 之外的强校验，账本对不上反而更危险；
@@ -1199,3 +1216,4 @@ FREEPOWER_KERNEL_DOWNLOAD_ATTEMPTS   续传最多重连几次（默认 12）
 - **不支持 ZIP64 / 加密 / 非 store·deflate 的压缩方法**：遇到就明确报错，不静默跳过（CfT 的包是普通 deflate，不会碰到）；
 - **没有下载队列/并发上限**：不同版本可以同时下（各占一个 `.tmp-*`），同一版本并发调用会并到同一个任务上（测试钉住了「假源只收到 1 次请求」）；
 - **下到的是原版 Chrome**：它的 `--version`、`chrome://version` 显示的就是 Google Chrome 本体，不是「FreePower 内核」—— 这是有意为之（见「有意差异」第 1 条）。
+- **内核目录必须可写可删**：Chromium 的沙箱要求内核目录与用户数据目录能正常建/删文件。实测把 kernels 放在带 `Everyone … Deny` 受限 ACL 的目录下时，内核会以 `STATUS_BREAKPOINT`（`0x80000003`）**秒退**、从不写 `DevToolsActivePort`；`start` 现在直接报「启动后立即退出（exit code 2147483651 / 0x80000003）」并给出这条提示，不再死等 20 s 才报一个误导性的超时。默认的 `%APPDATA%\FreePower\kernels` 没有这个问题。
