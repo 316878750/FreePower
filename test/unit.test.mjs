@@ -17,7 +17,7 @@ import { fingerprintView, geoPolicy } from '../src/fingerprint/view.js';
 import { buildReport } from '../src/selfcheck/report.js';
 import { renderHtml } from '../src/selfcheck/html.js';
 import { pacInUse, pacMessage } from '../src/proxy/pac.js';
-import { buildArgs } from '../src/kernel/chrome.js';
+import { buildArgs, waitForDevToolsPort } from '../src/kernel/chrome.js';
 import { ok, unsupported } from '../src/api/contract.js';
 import { clampConcurrency } from '../src/runtime/batch.js';
 import { cookieToStorage, cookieText } from '../src/store/profiles.js';
@@ -332,6 +332,25 @@ test('launch_args：名单外的参数拒绝，不猜用户意图', () => {
   assert.deepEqual(parseLaunchArgs('["--a","--b"]'), ['--a', '--b']);
   assert.deepEqual(parseLaunchArgs('--a\n--b'), ['--a', '--b']);
   assert.deepEqual(parseLaunchArgs(null), []);
+});
+
+/* ------------------------- 内核起不来的报错 ------------------------- */
+
+/**
+ * 实测踩到过：内核秒退（STATUS_BREAKPOINT）时旧实现只会报「20000ms 内没暴露 DevTools 端口」，
+ * 把人往端口/防火墙方向带。这里钉住「内核自己退出了就立刻带退出码失败」。
+ */
+test('内核秒退：立刻带退出码失败，不空等满超时', async () => {
+  const t0 = Date.now();
+  await assert.rejects(
+    waitForDevToolsPort('.tmp-no-such-dir-fp', { timeoutMs: 20000, child: { exitCode: 0x80000003 } }),
+    /立即退出.*2147483651.*0x80000003.*STATUS_BREAKPOINT/s,
+  );
+  const waited = Date.now() - t0;
+  assert.ok(waited < 2000, `应当立刻失败，实际等了 ${waited}ms`);
+
+  // 没传 child 时保持老行为：超时就报「未在 Nms 内暴露」
+  await assert.rejects(waitForDevToolsPort('.tmp-no-such-dir-fp', { timeoutMs: 300 }), /未在 300ms 内暴露/);
 });
 
 /* ------------------------- UA 跟版 ------------------------- */

@@ -321,8 +321,15 @@ export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, use
   return merged;
 }
 
-/** 等 Chrome 把 DevToolsActivePort 写出来 */
-export async function waitForDevToolsPort(userDataDir, { timeoutMs = START_TIMEOUT_MS } = {}) {
+/**
+ * 等 Chrome 把 DevToolsActivePort 写出来。
+ *
+ * 传 `child` 时会**盯着内核自己退出**：内核秒退（典型是 STATUS_BREAKPOINT = 0x80000003）
+ * 根本不会再写 DevToolsActivePort，死等超时只会给出「20000ms 内没暴露端口」这种误导性结论
+ * （实测：内核目录/用户数据目录落在被限制 ACL 的路径下时就是秒退，报超时会让人往端口、
+ * 防火墙方向查）。这里改成立刻带退出码失败。
+ */
+export async function waitForDevToolsPort(userDataDir, { timeoutMs = START_TIMEOUT_MS, child = null } = {}) {
   const file = path.join(userDataDir, 'DevToolsActivePort');
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -331,6 +338,13 @@ export async function waitForDevToolsPort(userDataDir, { timeoutMs = START_TIMEO
       const port = Number(txt[0]);
       if (port > 0 && txt[1]) return { port, browserPath: txt[1] };
     } catch { /* 还没写出来 */ }
+    if (child && child.exitCode !== null && child.exitCode !== undefined) {
+      const hex = `0x${(child.exitCode >>> 0).toString(16).toUpperCase()}`;
+      const hint = child.exitCode === 0x80000003
+        ? '；0x80000003 是 STATUS_BREAKPOINT，常见于内核目录或用户数据目录不可写/不可删（受限 ACL、只读盘），或宿主限制了内核沙箱'
+        : '';
+      throw new Error(`Chrome 启动后立即退出（exit code ${child.exitCode} / ${hex}），未写 DevToolsActivePort：${file}${hint}`);
+    }
     await new Promise((r) => setTimeout(r, 120));
   }
   throw new Error(`Chrome 未在 ${timeoutMs}ms 内暴露 DevTools 端口：${file}`);

@@ -259,7 +259,7 @@ export async function startProfile(profile, { force = false, systemProxy = null 
     let client = null;
 
     try {
-      const { port, browserPath } = await waitForDevToolsPort(udd, { timeoutMs: START_TIMEOUT_MS });
+      const { port, browserPath } = await waitForDevToolsPort(udd, { timeoutMs: START_TIMEOUT_MS, child });
       const fallbackWs = `ws://127.0.0.1:${port}${browserPath}`;
       const version = await fetchJson(`http://127.0.0.1:${port}/json/version`);
       const reportedWs = version.webSocketDebuggerUrl || fallbackWs;
