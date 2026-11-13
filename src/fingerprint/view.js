@@ -175,6 +175,42 @@ export function fingerprintView(profile) {
   };
 }
 
+/**
+ * P2 · `location`（`block` / `allow` / `ask`）：位置权限策略 + 是否覆盖坐标。
+ *
+ * **按字段名办事，不是「什么都不做」**：
+ *   allow → `Browser.grantPermissions(['geolocation'])`，有经纬度时再覆盖坐标
+ *   ask   → 不授权（内核默认就是 prompt：有头会弹提示、无头自动拒），有经纬度时仍覆盖坐标
+ *   block → **显式** `Browser.setPermission({setting:'denied'})`，不覆盖坐标
+ *
+ * 实测（内核 157.0.8103.78、headless）：不授权时 `getCurrentPosition` 直接 `code=1`
+ * User denied Geolocation；只有 `grantPermissions` + `setGeolocationOverride` 一起上才拿得到
+ * 坐标（`37.7749 / -122.4194 / 12`）。`setPermission denied` 与「什么都不做」在无头下读数相同，
+ * 但**有头下不同**：什么都不做是 prompt（= ask，会弹提示），所以 block 必须显式拒绝，
+ * 否则 `block` 与 `ask` 无法区分 —— 那正是这一轮要消灭的「两个取值一样」。
+ *
+ * `location_switch` 不参与判断：对手客户端根本不消费它（"1"=按 IP 是服务端填坐标）。
+ */
+export function geoPolicy(profile) {
+  const mode = String(profile.location || 'ask');
+  // null / 空串**不算坐标**：Number(null) === 0，直接 Number() 会把「没填经纬度」当成 (0,0)
+  // —— 那是几内亚湾，比不覆盖更糟（探针实测抓到过这一版）。
+  const num = (v) => (v === null || v === undefined || v === '' ? NaN : Number(v));
+  const lat = num(profile.latitude);
+  const lng = num(profile.longitude);
+  const acc = num(profile.accuracy);
+  const hasCoords = Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
+  return {
+    mode,
+    permission: mode === 'allow' ? 'granted' : mode === 'block' ? 'denied' : 'prompt',
+    // block 一律不覆盖；缺经纬度时只做权限，**不把 undefined 塞进 CDP**
+    override: mode !== 'block' && hasCoords,
+    latitude: hasCoords ? lat : undefined,
+    longitude: hasCoords ? lng : undefined,
+    accuracy: Number.isFinite(acc) && acc > 0 ? Math.round(acc) : undefined,
+  };
+}
+
 /** 自检页要用的「声明值」快照（不含注入层内部结构） */
 export function declaredSnapshot(profile, view = fingerprintView(profile)) {
   return {

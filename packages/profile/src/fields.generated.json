@@ -2280,7 +2280,7 @@
       "default": "1",
       "defaultSource": "official",
       "domainNote": null,
-      "coverage": "full",
+      "coverage": "none",
       "note": null,
       "evidence": "实测"
     },

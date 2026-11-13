@@ -121,8 +121,12 @@ export const COVERAGE = {
   allow_scan_ports: 'partial',
 
   // 地理
+  // location（P2 ③）：真接了 —— allow=grantPermissions(+有坐标就 override)、ask=不授权但
+  // 仍 override、block=显式 setPermission denied 且不 override。坐标与权限都走 CDP 原生，无 JS 痕迹。
   location: 'full',
-  location_switch: 'full',
+  // location_switch：**假 full 纠错**。对手客户端根本不消费这个字段（"1"=按 IP 由服务端填坐标），
+  // 我们也没有本地生效路径 → 标 none + idle（真正的「拒绝定位」看 location="block"）。
+  location_switch: 'none',
   longitude: 'full',
   latitude: 'full',
   accuracy: 'full',

@@ -9,7 +9,7 @@ import { CdpClient, fetchJson } from '../kernel/cdp.js';
 import { buildInjectionSource, buildWorkerInjectionSource } from '../kernel/inject.js';
 import { compileNetRules, decideRequest } from '../kernel/net-rules.js';
 import { alignProfileToKernel } from '../kernel/version.js';
-import { fingerprintView } from '../fingerprint/view.js';
+import { fingerprintView, geoPolicy } from '../fingerprint/view.js';
 import { ensureNoiseSeeds } from '../fingerprint/seeds.js';
 import { checkProfile, markStatus, applyProfileFields, persistEgress } from '../store/profiles.js';
 import { checkProxy, hasProxy, normalizeProxyConfig } from '../proxy/probe.js';
@@ -285,6 +285,17 @@ export async function startProfile(profile, { force = false, systemProxy = null 
       const declared = effective.client_hints?.ua_full_version;
       if (declared && realVersion && declared !== realVersion) {
         warnings.push(soft('client_hints.ua_full_version', `UA 声明 ${declared}，真实内核 ${realVersion}（未开自动跟版？）`));
+      }
+
+      // P2 · 位置权限（浏览器级，设一次）：allow=授权 / ask=保持 prompt（不碰）/ block=显式拒绝。
+      // 坐标覆盖是 target 级的，挂在 applyToSession 里 —— 两处合起来才是 `location` 的完整语义。
+      const geoMode = geoPolicy(effective);
+      if (geoMode.permission === 'granted') {
+        await client.send('Browser.grantPermissions', { permissions: ['geolocation'] })
+          .catch((e) => warnings.push(soft('location', `授权定位失败：${e.message}`)));
+      } else if (geoMode.permission === 'denied') {
+        await client.send('Browser.setPermission', { permission: { name: 'geolocation' }, setting: 'denied' })
+          .catch((e) => warnings.push(soft('location', `拒绝定位失败：${e.message}`)));
       }
 
       const instance = {
@@ -923,6 +934,17 @@ async function applyToSession(client, sessionId, profile, view, { proxyAuth = tr
       screenWidth: view.screen.width,
       screenHeight: view.screen.height,
     }, s).catch(() => {});
+  }
+
+  // P2 · 位置覆盖：target/session 级（新 target 不继承），所以挂在每个页面会话的装配里。
+  // 权限是浏览器级的，在 start 里设一次（见 geoPolicy）。block 不覆盖；缺经纬度不传 undefined。
+  const geo = geoPolicy(profile);
+  if (geo.override) {
+    await client.send('Emulation.setGeolocationOverride', {
+      latitude: geo.latitude,
+      longitude: geo.longitude,
+      ...(geo.accuracy !== undefined ? { accuracy: geo.accuracy } : {}),
+    }, s).catch((e) => log(instance_profile(profile), 'WARN 定位覆盖失败', e.message));
   }
 
   // 与预检 / --proxy-server 同源：AdsPower 形状（proxy_user / proxy_password）也要认，

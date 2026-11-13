@@ -440,7 +440,7 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
     **这不是一次性事故（重要）**：在这台机器上，**下一次构建（0.3.3 及以后）出的 `setup.exe` 照样是 Low**（写进 `release\` 就继承），装进 Medium 的 `%LOCALAPPDATA%\Programs\FreePower` 会以同样方式失败。安装前必须二选一：① `icacls '<setup.exe>' /setintegritylevel Medium` 再跑；② 把 exe 复制到 Medium 位置（如 `%TEMP%`）再跑。**「为什么副本有效」要写对**：不是复制动作洗掉了标签，而是**新文件继承目标目录的标签** —— `%TEMP%` 是 Medium，所以副本是 Medium；反过来从 `%TEMP%` 往工作区里复制没用（会重新继承 Low），这正是「复制了还是失败」的常见误判。**现状：② 已被 2026-11-12 13:03 实测证实（复制到 `%TEMP%\fp-relabel\` 后 `/S` 装成功）；① `setintegritylevel Medium` 仍未实测**，别把两条写成同等证据。
     **证据保留**：`%TEMP%\Low` 下三个 `ns*.tmp`（09:45:48 / 09:49:18 / 09:52:43）是本次根因的现场证据，**留着别清** —— 等 0.3.3 安装成功后再一起删。（那里另有一个 `~nsu.tmp`，`2026/11/10 18:10:52`，是更早一次卸载留下的，不属于本次证据。）
 
-41. **字段表里有 24 个字段是「声明了、这一版不生效」**（`idle`）：`fonts` / `disabled_fonts` / `do_not_track` / `scan_port_type` / `allow_scan_ports` / `disable_console` / `device_name` / `device_name_switch` / `hidden_notification` / `disable_password_filling` / `gyroscope` / `virtual_camera` / `network_information_type` / `mac_address_config` / `open_google_api` / `translate_webpages` / `domain_https` / `storage_strategy` / `new_mobile_mode` / `browser_head` / `tls` / `tls_switch` / `whitelist_open` / `image_size`。`GET /api/v2/browser-profile/schema` 里这些字段带 `idle: true` + `idle_reason`，控制台表单把它们灰显、浮层写明「字段表声明，当前版本未生效」。**能填、能存，但不影响内核**。为什么不直接删字段：字段表是照对手的，脚本与导入导出按名字读写，删了会撞空 —— 标出来才是实话。`hidden_notification` 单独说：基线不带 `--enable-automation`，本来就没有「受自动化控制」横幅可消（`idle_reason` 写的是「基线已覆盖」，不是「还没做」）。**判据**：`test/unit.test.mjs` 的一条断言 —— BASIC 区 `coverage === 'none'` 的字段必须 `idle`、每个 `idle` 必须写原因、不许标 `coverage=full` 的字段、BASIC 里没标 `idle` 的必须在「已登记」清单里（新加字段忘标就红）、`overrides.mjs` 的 `coverage` 不许和 `idle` 矛盾（idle 字段不许在 overrides 里标 `full`）。**`disable_save_password` 已从 idle 摘出，但它不是复刻**：对手把 `DisableSavePassword=true` 塞进自家 `--extended-parameters` 的 base64 JSON，由自编译内核渲成 `--protected-disablesavepassword=1` —— 那条路我们没有（不自编译内核）。逆向核过：对手客户端 17 处 `--disable-features` 里没有一处含 `PasswordManager`（那个名字大概率不是有效 feature、写进去会被静默忽略），`AutofillServerCommunication` 也无证据；对手实际带的是 `--password-store=basic` 与 `--disable-features=EnablePasswordsAccountStorage`。我们照这对参数实现（`src/kernel/chrome.js`，`"1"` 才加），coverage 标 `partial`。**实测结论（别当成行为已验证）**：本地登录页在两种配置下都能正常提交，`chrome://password-manager-internals` 的文本在两种配置间没有出现与「保存密码」相关的差异；保存条是浏览器 UI 层，本机用无头跑不出来，所以「保存条不再出现」**没有本机证据** —— 这条判据需要非无头窗口 + 人眼看，不在 `npm test`/`npm run smoke` 里。另两点要记住：`--password-store=basic` 会让保存的密码落在明文 basic store（不走系统钥匙串），是这套参数的代价；默认值也不同 —— 对手默认 `"1"`（不填 = 关保存密码），我们没给默认（等于 `"0"`，照旧保存），**没有默默改极性**。`disable_password_filling` 仍是 `none` + `idle`（只有 API 边界归一 + 落库，`chrome.js` 无对应参数），`device_name_switch` 也仍是 `idle`（`src/` 零消费，连开关本身都没搭生效路径）。
+41. **字段表里有 25 个字段是「声明了、这一版不生效」**（`idle`）：`fonts` / `disabled_fonts` / `do_not_track` / `scan_port_type` / `allow_scan_ports` / `disable_console` / `device_name` / `device_name_switch` / `hidden_notification` / `disable_password_filling` / `location_switch` / `gyroscope` / `virtual_camera` / `network_information_type` / `mac_address_config` / `open_google_api` / `translate_webpages` / `domain_https` / `storage_strategy` / `new_mobile_mode` / `browser_head` / `tls` / `tls_switch` / `whitelist_open` / `image_size`。`GET /api/v2/browser-profile/schema` 里这些字段带 `idle: true` + `idle_reason`，控制台表单把它们灰显、浮层写明「字段表声明，当前版本未生效」。**能填、能存，但不影响内核**。为什么不直接删字段：字段表是照对手的，脚本与导入导出按名字读写，删了会撞空 —— 标出来才是实话。`hidden_notification` 单独说：基线不带 `--enable-automation`，本来就没有「受自动化控制」横幅可消（`idle_reason` 写的是「基线已覆盖」，不是「还没做」）。**判据**：`test/unit.test.mjs` 的一条断言 —— BASIC 区 `coverage === 'none'` 的字段必须 `idle`、每个 `idle` 必须写原因、不许标 `coverage=full` 的字段、BASIC 里没标 `idle` 的必须在「已登记」清单里（新加字段忘标就红）、`overrides.mjs` 的 `coverage` 不许和 `idle` 矛盾（idle 字段不许在 overrides 里标 `full`）。**`disable_save_password` 已从 idle 摘出，但它不是复刻**：对手把 `DisableSavePassword=true` 塞进自家 `--extended-parameters` 的 base64 JSON，由自编译内核渲成 `--protected-disablesavepassword=1` —— 那条路我们没有（不自编译内核）。逆向核过：对手客户端 17 处 `--disable-features` 里没有一处含 `PasswordManager`（那个名字大概率不是有效 feature、写进去会被静默忽略），`AutofillServerCommunication` 也无证据；对手实际带的是 `--password-store=basic` 与 `--disable-features=EnablePasswordsAccountStorage`。我们照这对参数实现（`src/kernel/chrome.js`，`"1"` 才加），coverage 标 `partial`。**实测结论（别当成行为已验证）**：本地登录页在两种配置下都能正常提交，`chrome://password-manager-internals` 的文本在两种配置间没有出现与「保存密码」相关的差异；保存条是浏览器 UI 层，本机用无头跑不出来，所以「保存条不再出现」**没有本机证据** —— 这条判据需要非无头窗口 + 人眼看，不在 `npm test`/`npm run smoke` 里。另两点要记住：`--password-store=basic` 会让保存的密码落在明文 basic store（不走系统钥匙串），是这套参数的代价；默认值也不同 —— 对手默认 `"1"`（不填 = 关保存密码），我们没给默认（等于 `"0"`，照旧保存），**没有默默改极性**。`disable_password_filling` 仍是 `none` + `idle`（只有 API 边界归一 + 落库，`chrome.js` 无对应参数），`device_name_switch` 也仍是 `idle`（`src/` 零消费，连开关本身都没搭生效路径）。**`location_switch` 是第三个假 full 纠错（P2 ③）**：`overrides.mjs` 原来标 `full`，`src/` 零读取；逆向确认对手客户端也**完全不消费**这个字段（`"1"`=按 IP 是**服务端**填坐标，无本地生效路径）。所以它不属于「还没做」而是「本来就没有可做的本地路径」—— 标 `idle` + coverage 改 `none`；用户要「拒绝定位」用 `location="block"`（那个已经真做了）。
 
 
 ## 八、验证
@@ -653,6 +653,27 @@ P2 这批是「字段表里有名字、`src/` 里零消费」的第二轮补漏�
 两处都要记住：① 注入层那句 `if (navigator.webdriver) defGetter(...false)` 原来是无条件的 —— **只改启动参数的话 `'1'` 会被我们自己的兜底改回 false**（字段接了却空转），所以它现在受 `CFG.automationControlled` 控制；② `navigator.webdriver` 只在主帧有，worker realm 两边都是 `undefined`，别拿 worker 的读数当判据。
 
 
+
+| `location` | `'allow'` / `'ask'` / `'block'` | 权限：`allow`→`Browser.grantPermissions(['geolocation'])`；`ask`→不授权（内核默认 prompt）；`block`→**显式** `Browser.setPermission({setting:'denied'})`。坐标：有 `longitude`/`latitude` 时每个页面会话装 `Emulation.setGeolocationOverride`（`block` 不装） | full | `src/fingerprint/view.js`（`geoPolicy`）+ `src/runtime/manager.js`（`start` 设权限、`applyToSession` 设坐标） |
+| `location_switch` | — | **不做，标 `idle`**：对手客户端根本不消费这个字段（`"1"`=按 IP，是**服务端**填坐标），我们也没有本地生效路径。真正的「拒绝定位」是 `location="block"` | none | 无（`src/` 零读取） |
+
+**`location` 的两处要说清（不是照字面「什么都不做」）**：
+
+1. `block` 走**显式拒绝** `Browser.setPermission({setting:'denied'})`，不是「不 grant 就完事」。实测：不 grant 时 `navigator.permissions` 是 **`prompt`**（有头会弹提示 —— 那就是 `ask` 的语义），`setPermission denied` 才是 `denied`。「什么都不做」会让 `block` 与 `ask` 在无头下读数一样、有头下行为一样，等于这两个取值白写。
+2. `ask` 只做坐标覆盖、不做授权：无头环境下没有权限提示可弹，`getCurrentPosition` 直接 `code=1` 拒绝（有头时才会弹）。所以 `ask` 的坐标覆盖在无头下**观测不到**，不写成「ask 也能拿到坐标」。
+
+**实测（2026-11-13，内核 `157.0.8103.78`，真内核、走 API 起环境、`headless=1`；读数取的是启动后**新建**的标签页，证明新 target 也被装配）**：
+
+| 配置 | `navigator.permissions` | `getCurrentPosition` |
+|---|---|---|
+| `location=allow` + `37.7749/-122.4194/12` | `granted` | **拿到 37.7749 / -122.4194 / 12** |
+| `location=ask` + 同坐标 | `prompt` | `code=1` User denied Geolocation（无头自动拒） |
+| `location=block` + 同坐标 | `denied` | `code=1` User denied Geolocation |
+| `location=allow`、经纬度 null | `granted` | `code=3` Timeout expired（只授权、不覆盖，内核没有可用的定位源） |
+
+还有一个探针抓到的真 bug：`Number(null) === 0` —— 直接把字段丢进 `Number()` 会把「没填经纬度」当成 **(0, 0)**（几内亚湾），比不覆盖更糟。现在 `null`/空串一律算「没有坐标」，只做权限、不传 `undefined` 进 CDP。
+
+### 多级代理链（2026-11-12 第二批）
 
 **它是什么（先说实话）**：对手的「多级」不是我们能配一串代理，而是**两跳拼出来的产物** —— `hop0 = 本机 Windows 系统代理`（`HKCU\...\Internet Settings`）+ `hop1 = 环境自己的代理`。我们复刻的就是这个两跳产物：开关 `is_multi_level_proxy='1'`（对手拼写 `mutli_level_proxy` 同样当开关认，两个字段的类型一个字节没改，都是 enum `'0'|'1'`）。
 

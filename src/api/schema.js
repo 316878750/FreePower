@@ -121,6 +121,7 @@ const IDLE = new Map([
   ['tls_switch', '零读取'],
   ['whitelist_open', '零读取（白名单本体走 whitelist + net-rules）'],
   ['image_size', '零读取'],
+  ['location_switch', '对手客户端不消费此字段："1"=按 IP 是服务端填充坐标，无本地生效路径；真正的拒绝定位是 location="block"'],
 ]);
 
 /** 基础区（其余进「高级」折叠） */

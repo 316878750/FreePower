@@ -13,7 +13,7 @@ import { checkProfile } from '../src/store/profiles.js';
 import { checkEgress, validateField, isValidTimezone, normalizeValue, csvToArray } from '../packages/profile/src/validate.js';
 import { deriveNoiseSeeds, ensureNoiseSeeds, seedOf } from '../src/fingerprint/seeds.js';
 import { generateFingerprint } from '../src/fingerprint/generate.js';
-import { fingerprintView } from '../src/fingerprint/view.js';
+import { fingerprintView, geoPolicy } from '../src/fingerprint/view.js';
 import { buildReport } from '../src/selfcheck/report.js';
 import { renderHtml } from '../src/selfcheck/html.js';
 import { pacInUse, pacMessage } from '../src/proxy/pac.js';
@@ -183,6 +183,45 @@ test('P2 automation_controlled：只有 "1" 才放开 navigator.webdriver，注�
   for (const src of [pageOn, pageOff, workerOn, workerOff]) {
     assert.match(src, /if \(!CFG\.automationControlled\)/, 'webdriver 兜底没有被 CFG.automationControlled 控住');
   }
+});
+
+test('P2 location：block/allow/ask 三档语义（权限 + 坐标覆盖）', () => {
+  const coords = { latitude: 37.7749, longitude: -122.4194, accuracy: 12 };
+
+  const allow = geoPolicy({ location: 'allow', ...coords });
+  assert.equal(allow.permission, 'granted');
+  assert.equal(allow.override, true);
+  assert.deepEqual([allow.latitude, allow.longitude, allow.accuracy], [37.7749, -122.4194, 12]);
+
+  const ask = geoPolicy({ location: 'ask', ...coords });
+  assert.equal(ask.permission, 'prompt', 'ask 不授权（靠内核默认 prompt）');
+  assert.equal(ask.override, true, 'ask 也下发坐标（对手 ask 同样下发）');
+
+  // block 必须显式拒绝：「什么都不做」在内核里等于 prompt（= ask），那样 block 与 ask 分不开
+  const block = geoPolicy({ location: 'block', ...coords });
+  assert.equal(block.permission, 'denied');
+  assert.equal(block.override, false, 'block 不许覆盖坐标');
+
+  // 缺经纬度：只做权限，不把 undefined 塞进 CDP
+  const noCoords = geoPolicy({ location: 'allow', accuracy: 1000 });
+  assert.equal(noCoords.permission, 'granted');
+  assert.equal(noCoords.override, false);
+  assert.equal(noCoords.latitude, undefined);
+  assert.equal(noCoords.longitude, undefined);
+  // null / 空串不算坐标：Number(null) === 0，会把「没填」当成 (0,0)——几内亚湾（探针抓到过）
+  const nullCoords = geoPolicy({ location: 'allow', latitude: null, longitude: null, accuracy: 1000 });
+  assert.equal(nullCoords.override, false, 'null 经纬度不许被当成 (0,0)');
+  assert.equal(nullCoords.latitude, undefined);
+  assert.equal(geoPolicy({ location: 'allow', latitude: '', longitude: '' }).override, false);
+
+  // accuracy 非法/缺失时不传（CDP 校验：10..5000 的整数）；合法值取整
+  assert.equal(geoPolicy({ location: 'allow', ...coords, accuracy: 1000.6 }).accuracy, 1001);
+  assert.equal(geoPolicy({ location: 'allow', latitude: 1, longitude: 2, accuracy: 0 }).accuracy, undefined);
+
+  // location_switch 不参与判断（它在 idle 表里：对手客户端不消费）
+  assert.equal(geoPolicy({ location: 'allow', location_switch: '0', ...coords }).permission, 'granted');
+  // 记录里没有 location 时按 ask 兜底（不主动授权）；正常记录由 db/generate 默认成 allow
+  assert.equal(geoPolicy({ ...coords }).permission, 'prompt');
 });
 
 test('httpGetViaProxy：非 200 也完整返回，交给上层判断', async () => {
@@ -1397,7 +1436,7 @@ const BASIC_NOT_IDLE = new Set([
   'screen_resolution', 'hardware_concurrency', 'device_memory',
   'media_devices', 'media_devices_num', 'speech_switch', 'speech_voices',
   'webrtc', 'bypass_proxy_check',
-  'location', 'location_switch', 'longitude', 'latitude', 'accuracy',
+  'location', 'longitude', 'latitude', 'accuracy',
   'automation_controlled', 'disable_image', 'disable_video', 'disable_save_password',
   'blacklist', 'whitelist',
   'launch_args', 'headless', 'new_startup_page', 'window_position', 'win_x', 'win_y',
@@ -1429,8 +1468,9 @@ test('空转字段：标了必须说清原因，BASIC 里一个都不许漏标',
   assert.deepEqual([...BASIC_NOT_IDLE].filter((n) => !names.has(n)), [], '清单里有字段表已经不存在的字段');
 
   // ⑥ 数量对得上（0.3.3 巡检那批 22 个 + `device_name_switch` / `disable_password_filling` 两个零消费
-  //    字段；`disable_save_password` 已在 P2 接了启动参数、摘掉 idle = 24），少一个或多一个都要先问清楚
-  assert.equal(idle.length, 24, `idle 字段 ${idle.length} 个：${idle.map((f) => f.name).join(',')}`);
+  //    字段 + P2 ③ 的 `location_switch`（对手客户端不消费）= 25；`disable_save_password` 已在 P2
+  //    接了启动参数、摘掉 idle。少一个或多一个都要先问清楚
+  assert.equal(idle.length, 25, `idle 字段 ${idle.length} 个：${idle.map((f) => f.name).join(',')}`);
   // ⑦ 单独钉一条：hidden_notification 的原因是「基线已覆盖」，不是「还没做」
   const hn = idle.find((f) => f.name === 'hidden_notification');
   assert.match(hn.idle_reason, /基线/, 'hidden_notification 的原因是「基线已覆盖」，不是「还没做」');
