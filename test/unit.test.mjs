@@ -1575,6 +1575,29 @@ const KERNEL_LAYERS = [
 ];
 const DERIVE_LAYERS = ['src/fingerprint/view.js'];
 
+/**
+ * 「登记 `none`，但派生层确实会读到它」的**例外表**（只有一条，且必须能被证伪）。
+ *
+ * 为什么需要它：判据 ④ 改成「内核层 + 派生层一起扫」之后，唯一一条 `none` 字段被抓了出来 ——
+ * `media_devices_num` 在 `src/fingerprint/view.js:98` 被读，算成 `CFG.media.counts`。
+ * 但它**确实不改变内核/页面行为**：注入层从不读 `counts`（`inject.js` 里只有 `CFG.media.mode`
+ * 与 `CFG.media.devices`），`counts` 只走到 `selfcheck/report.js` 与 `declaredSnapshot`，
+ * 是「拿声明值跟真实枚举比一比」的输入。所以登记 `none` 是对的，红的是判据的粗粒度。
+ *
+ * 例外不是橡皮章，下面 ④ 里钉三条：
+ *   1. 例外字段必须仍然是 `none`（改成生效层了，例外表就过期）；
+ *   2. 例外字段必须仍然有人读（读点没了，例外表也过期）；
+ *   3. 读点不许跑出登记的那个文件之外；
+ * 另外单独钉一条**可证伪**的：`inject.js` 一旦开始读 `counts`，这条先红 —— 因为那时
+ * `media_devices_num` 就真的生效了，`none` 不成立。
+ */
+const INERT_READ_EXCEPTIONS = {
+  media_devices_num: {
+    file: 'src/fingerprint/view.js',
+    why: 'view.js 把它算成 CFG.media.counts；注入层从不读 counts，只有自检页拿它比「声明值」',
+  },
+};
+
 /** 去掉注释（整行注释 + 行尾 `//`；含 `://` 的行整行保留，别把 URL 后面的代码切掉） */
 function stripComments(src) {
   return src.split('\n').map((line) => {
@@ -1650,20 +1673,39 @@ test('effect 注册表：每个字段说清在哪一层生效，登记与代码�
   }
   assert.deepEqual(badAnchors, [], 'effect 锚点对不上代码');
 
-  // ④ 反向：登记 none 的字段，内核层**零读取**；登记了生效层的，内核层/派生层至少读一处
+  // ④ 反向：登记 none 的字段，内核层 + 派生层**零读取**；登记了生效层的，至少读一处
   //    —— 两个方向都查，才是「既防假生效、也防假空转」
+  //
+  //    **两边必须扫同一批文件**：`location` / `do_not_track` / `screen_resolution` 这类字段的读取
+  //    只在派生层 `src/fingerprint/view.js`（`profile.location` 之类；`manager.js` 里只有
+  //    `geoPolicy(effective)` 这种调用，没有 `.location`）。只扫内核层的话，「把这类字段伪标成
+  //    none」永远不会被抓到 —— 判据一半严一半松，等于留了个后门。
   const noneWithReads = [];
   const effectWithoutReads = [];
+  const EFFECT_LAYERS = [...KERNEL_LAYERS, ...DERIVE_LAYERS];
   for (const [n, e] of Object.entries(OVERRIDES_EFFECT)) {
-    const kern = readSites(n, KERNEL_LAYERS);
+    const sites = readSites(n, EFFECT_LAYERS);
     if (e.effect === 'none') {
-      if (kern.length) noneWithReads.push(`${n}（${kern.slice(0, 3).join(' ')}）`);
-    } else if (!readSites(n, [...KERNEL_LAYERS, ...DERIVE_LAYERS]).length) {
+      if (sites.length && !INERT_READ_EXCEPTIONS[n]) noneWithReads.push(`${n}（${sites.slice(0, 3).join(' ')}）`);
+    } else if (!sites.length) {
       effectWithoutReads.push(n);
     }
   }
-  assert.deepEqual(noneWithReads, [], '登记 none，内核层却读到了它 —— 要么改登记，要么把那行代码删掉');
+  assert.deepEqual(noneWithReads, [], '登记 none，内核层/派生层却读到了它 —— 要么改登记，要么把那行代码删掉');
   assert.deepEqual(effectWithoutReads, [], '登记了生效层，但内核层与派生层一次都没读 —— 空转的另一种写法');
+
+  // ④' 例外表不许变成橡皮章：每条都得仍然「登记 none + 仍有人读 + 读点没跑出登记的文件」
+  for (const [n, exc] of Object.entries(INERT_READ_EXCEPTIONS)) {
+    assert.equal(OVERRIDES_EFFECT[n]?.effect, 'none', `${n} 已经不是 none 了，例外表过期`);
+    const sites = readSites(n, EFFECT_LAYERS);
+    assert.ok(sites.length > 0, `${n} 已经没人读了，例外表过期（可以删掉这条例外）`);
+    assert.deepEqual(sites.filter((s) => !s.startsWith(exc.file)), [],
+      `${n} 的读取跑到了例外登记的文件之外（只登记了 ${exc.file}）`);
+  }
+  // 唯一那条例外的可证伪部分：注入层从不读 counts。一旦有人让注入层按 counts 造设备，
+  // media_devices_num 就真的生效了，这条先红，逼着把登记从 none 改掉。
+  assert.equal(readSites('counts', ['src/kernel/inject.js']).length, 0,
+    'inject.js 开始读 counts 了：media_devices_num 不再成立 none，例外表要撤');
 
   // ⑤ inert 与 idle 必须一致（schema.js 的 idle 就是从 inert 派生的，这里钉死这条派生关系）
   const visible = new Set(fields.map((f) => f.name));
