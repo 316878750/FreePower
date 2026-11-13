@@ -37,6 +37,7 @@ import { readReportFile, summarize } from '../selfcheck/store.js';
 import { renderHtml } from '../selfcheck/html.js';
 import { issueTicket } from './tickets.js';
 import { listKernels } from '../kernel/chrome.js';
+import { runKernelDownload } from '../kernel/download.js';
 import { createWorkflow, getWorkflow, approveStep, presentWorkflow, runWorkflow, assertWorkflowRunnable } from '../agent/workflow.js';
 import { planTasksFromGoal } from '../agent/llm.js';
 import { normalizeShotPath, resolveShotPath } from '../agent/task.js';
@@ -201,6 +202,26 @@ export function buildRoutes() {
     if (t !== 'chrome' && t !== 'firefox') throw new ApiError(ERR.INVALID, 'Kernel type must be Chrome or Firefox.');
     const list = listKernels({ type: t });
     return ok({ list });
+  });
+
+  /**
+   * download-kernel（0.4.1 从占位变真实现）—— 契约 `23-内核下载契约.md`。
+   *
+   * 源是 **Chrome for Testing**（不是对手的 CDN，理由见 `src/kernel/download.js` 头注释）；
+   * **同步状态机、没有 task id、没有轮询端点**：每次调用推进一次，立刻回
+   * `{code:0,data:{status[,progress]}}`，要进度就再调这个端点。
+   *
+   * 错误照契约 §4 只回 `{code:-1,msg}`（**不塞 `data.reason`**，与 agent 那组路由的口径不同）：
+   * 缺参 / 类型大小写错 / 版本非数字 / Firefox 不支持 / 目录里没有该版本，都在这里**同步**抛出。
+   * 真下载在后台跑，失败不进响应 —— 下一次调用自动重试（契约 §2.1 的 `FAIL → RE_DOWNLOAD`）。
+   */
+  add(['POST'], ['/api/v2/browser-profile/download-kernel'], async (ctx) => {
+    try {
+      return await runKernelDownload(ctx.body || {});
+    } catch (e) {
+      if (e instanceof ApiError) throw e;
+      throw new ApiError(Number.isFinite(e?.code) ? e.code : ERR.GENERIC, e?.message || 'kernel download failed');
+    }
   });
 
   /* ---- list：v1 GET user/list，v2 POST browser-profile/list（limit 不传只回 1 条） ---- */
@@ -829,7 +850,7 @@ export function buildRoutes() {
   const placeholders = [
     '/api/v1/application/list', '/api/v2/category/list',
     '/api/v1/fb/list', '/api/v1/fb/page', '/api/v1/fb/bm',
-    '/api/v2/browser-profile/share', '/api/v2/browser-profile/download-kernel',
+    '/api/v2/browser-profile/share',
     '/api/v2/browser-profile/update-patch',
     '/api/v2/user/create', '/api/v2/user/update', '/api/v2/user/reset_password',
     '/api/v2/user/delete', '/api/v2/user/list', '/api/v2/user-group/list',
