@@ -14,6 +14,8 @@
  *   A9 401 / 500 / 超时 / 非 JSON：reason 与文案各不相同、code 不新造（-1）、文案里没有 key
  *   A10 生成的动作直接建工作流 → 每步 64 位 digest 且全 pending_approval
  *   A11 没配 / goal 空 → 100002 带 field；redactKey 不吐原文
+ *   A12 `params` 走 `TASK_SPECS` 白名单（fail-closed）：键 ⊆ required+optional、
+ *       裸对象里的 `secret:'SENT'` 不出现、`value` 一律 `***`（2026-11-13 CEO 纠偏 ⓪）
  *
  * B 层（真内核 happy path / 失败即停 / 超时 / 跑完浏览器仍 Active）在
  * `test/agent-smoke.test.mjs`，属于 `npm run smoke`，**不进** `npm test`。
@@ -39,10 +41,10 @@ fs.mkdirSync(DATA, { recursive: true });
 
 const { AGENT_WORKFLOW_DIR } = await import('../src/config.js');
 const {
-  createWorkflow, getWorkflow, approveStep, presentWorkflow, assertWorkflowRunnable,
+  createWorkflow, getWorkflow, approveStep, presentWorkflow, presentTaskParams, assertWorkflowRunnable,
 } = await import('../src/agent/workflow.js');
 const {
-  parseBrowserTask, runBrowserTask, resolveShotPath, TASK_ACTIONS,
+  parseBrowserTask, runBrowserTask, resolveShotPath, TASK_ACTIONS, TASK_SPECS,
 } = await import('../src/agent/task.js');
 const {
   planTasksFromGoal, resolveLlmConfig, redactKey, LLM_TASK_LIMIT,
@@ -434,4 +436,103 @@ test('A11 没配 / goal 空 → 100002 带 field；redactKey 不吐原文', asyn
   assert.equal(redactKey(KEY).includes(KEY), false);
   assert.equal(redactKey('short').includes('short'), false);
   assert.equal(redactKey(''), '');
+});
+
+/* ============================================================================
+ * A12：params 走 TASK_SPECS 白名单（fail-closed）
+ *
+ * 背景（2026-11-13 CEO 纠偏 ⓪）：原来的 `presentTaskParams` 是「复制所有键、只把 value 打码」，
+ * 安全性押在上游 `canonicalTask` 兜底上 —— 哪天有人给它一个没经过 parseTaskList 的对象
+ * （或上游加了个直通字段），敏感键就漏出去了。改成只遍历该动作 `required + optional` 的键，
+ * 没登记过的**不出现**，不依赖上游。
+ * ==========================================================================*/
+
+/** 每个动作一份「全字段」任务：required + optional 全给上，再塞两个不该出现的键 */
+const FULL_FIELD_CASES = {
+  open: { action: 'open', url: 'http://127.0.0.1:9/a' },
+  click: { action: 'click', selector: '#btn' },
+  fill: { action: 'fill', selector: '#pw', value: 'SENT_FILL' },
+  wait: { action: 'wait', selector: '#x', ms: 10, until: 'visible' },
+  text: { action: 'text', selector: 'h1', save_as: 'title' },
+  screenshot: { action: 'screenshot', full_page: true, path: 'shots/a.png' },
+  cookie: { action: 'cookie', op: 'set', name: 'tok', value: 'SENT_COOKIE', url: 'http://127.0.0.1:9/' },
+};
+
+test('A12 每个动作的 params 键 ⊆ TASK_SPECS 的 required+optional，且没有 action 本身', () => {
+  assert.deepEqual(Object.keys(FULL_FIELD_CASES).sort(), [...TASK_ACTIONS].sort(), '七动作一个不能漏');
+
+  for (const [action, task] of Object.entries(FULL_FIELD_CASES)) {
+    const spec = TASK_SPECS[action];
+    assert.ok(spec, `${action} 必须在 TASK_SPECS 里登记`);
+    const allowed = new Set([...spec.required, ...spec.optional]);
+    const keys = Object.keys(presentTaskParams(task));
+    for (const k of keys) {
+      assert.ok(allowed.has(k), `${action}: params 里出现了没登记的键 ${k}（allowed=${[...allowed].join(',')}）`);
+    }
+    assert.equal(keys.includes('action'), false, `${action}: params 里不该再带 action`);
+    // 该给的都得给：required 一个不少
+    for (const k of spec.required) {
+      assert.ok(keys.includes(k), `${action}: required 的 ${k} 必须出现在 params 里（审批的人要看）`);
+    }
+  }
+});
+
+test('A12 裸对象里的 secret / 未登记键不出现（不依赖上游 canonicalTask 兜底）', () => {
+  const dirty = {
+    action: 'fill',
+    selector: '#pw',
+    value: 'SENT_VALUE',
+    secret: 'SENT_SECRET',
+    token: 'SENT_TOKEN',
+    __proto__x: 'SENT_PROTO',
+  };
+  const params = presentTaskParams(dirty);
+  const json = JSON.stringify(params);
+  assert.equal(json.includes('SENT_SECRET'), false, `secret 漏了：${json}`);
+  assert.equal(json.includes('SENT_TOKEN'), false, `token 漏了：${json}`);
+  assert.equal(json.includes('SENT_PROTO'), false, `未登记键漏了：${json}`);
+  assert.equal('secret' in params, false);
+  assert.equal('token' in params, false);
+  assert.deepEqual(Object.keys(params).sort(), ['selector', 'value'], JSON.stringify(params));
+
+  // 动作都没登记 / 不是对象 → 空对象，不抛、不猜
+  assert.deepEqual(presentTaskParams({ action: 'hover', selector: '#a' }), {});
+  assert.deepEqual(presentTaskParams({ selector: '#a' }), {});
+  assert.deepEqual(presentTaskParams(null), {});
+  assert.deepEqual(presentTaskParams(undefined), {});
+  assert.deepEqual(presentTaskParams('open'), {});
+});
+
+test('A12 value 一律 ***（fill / cookie set），其余字段原样', () => {
+  // 直接喂：两种带 value 的动作
+  for (const task of [FULL_FIELD_CASES.fill, FULL_FIELD_CASES.cookie]) {
+    const p = presentTaskParams(task);
+    assert.equal(p.value, '***', `${task.action}: value 必须是 ***，实际 ${p.value}`);
+    assert.equal(JSON.stringify(p).includes(task.value), false, `${task.action}: 原文不该出现在 params 里`);
+  }
+  // 不带 value 的动作：不许凭空多出一个 value
+  assert.equal('value' in presentTaskParams(FULL_FIELD_CASES.click), false);
+  // 非敏感字段原样保留（审批的人得看得见自己在批什么）
+  const shot = presentTaskParams(FULL_FIELD_CASES.screenshot);
+  assert.equal(shot.path, 'shots/a.png');
+  assert.equal(shot.full_page, true);
+  assert.equal(presentTaskParams(FULL_FIELD_CASES.wait).ms, 10);
+
+  // 走一遍 presentWorkflow：status JSON 里也必须是 ***，且原值 0 次
+  const wf = createWorkflow({
+    profile_id: 'profile-for-tests',
+    goal: 'A12',
+    tasks: [
+      { action: 'fill', selector: '#pw', value: 'SENT_VIA_WF_FILL' },
+      { action: 'cookie', op: 'set', name: 'tok', value: 'SENT_VIA_WF_COOKIE', url: 'http://127.0.0.1:9/' },
+    ],
+  });
+  const view = presentWorkflow(wf);
+  assert.equal(view.steps[0].params.value, '***');
+  assert.equal(view.steps[1].params.value, '***');
+  const json = JSON.stringify(view);
+  assert.equal(json.includes('SENT_VIA_WF_FILL'), false);
+  assert.equal(json.includes('SENT_VIA_WF_COOKIE'), false);
+  // 没登记过的键（哪怕有人往盘上塞）不会因为 presentWorkflow 就漏出来
+  assert.equal(json.includes('"task"'), false, '不许回吐 task 原对象');
 });

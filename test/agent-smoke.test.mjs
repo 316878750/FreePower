@@ -34,7 +34,12 @@ process.env.FREEPOWER_DATA = DATA;
 process.env.FREEPOWER_EGRESS_PROBE = 'http://127.0.0.1:1/never';
 process.env.FREEPOWER_EGRESS_TIMEOUT = '800';
 process.env.FREEPOWER_SELFCHECK = '0';
-process.env.FREEPOWER_AGENT_STEP_TIMEOUT = '8000'; // B3 靠它收尾；4s 在「整包 smoke 刚跑完、机器还在忙」时会误杀截图步（见下方 B1 备注）
+// 单步预算 8s 不是魔法数（2026-11-13 CEO 批准的口径，改之前先读这段）：
+//   · 本文件是 `npm run smoke` 的**最后一个**文件，跑它时前面 152 + 37 + 24 项刚压完，机器还在忙；
+//   · 4000ms 在这个场景下误杀过 screenshot 步（14:29 实测），不是产品慢，是排队；
+//   · 默认单步预算是 30s（FREEPOWER_AGENT_STEP_TIMEOUT），8s 仍远小于它，所以这里不会掩盖真超时；
+//   · B3 那条「<15s 收尾」的上限不许动 —— 它才是防「预算悄悄放大」的锚。
+process.env.FREEPOWER_AGENT_STEP_TIMEOUT = '8000';
 fs.rmSync(DATA, { recursive: true, force: true });
 fs.mkdirSync(DATA, { recursive: true });
 

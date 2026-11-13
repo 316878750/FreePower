@@ -27,7 +27,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseTaskList, digestTask, runBrowserTask, TaskError, NotImplementedError } from './task.js';
+import { parseTaskList, digestTask, runBrowserTask, TaskError, NotImplementedError, TASK_SPECS } from './task.js';
 import { createCli } from './cli.js';
 import { getMeta } from '../store/db.js';
 import { CdpClient } from '../kernel/cdp.js';
@@ -179,18 +179,31 @@ export function listWorkflows() {
 const MASKED_VALUE = '***';
 
 /**
+ * 一律打码的字段名。目前只有 `value`（`fill` 要填的值、`cookie set` 的值）。
+ * `name` 是 cookie 名、`url` 是地址、`path` 是相对路径 —— 审批的人得看见，不打码。
+ */
+const MASKED_KEYS = new Set(['value']);
+
+/**
  * 审批单上的参数摘要（`presentWorkflow` 里每步的 `params`）。
  *
- * `fill` 的值、`cookie set` 的值可能是密码/token —— 只给占位符；其余字段
- * （url / selector / save_as / ms / op / path …）原样给：审批的人得看得见自己在批什么。
+ * **按 `TASK_SPECS` 白名单取字段，fail-closed**（2026-11-13 CEO 纠偏 ⓪）：
+ * 只遍历该动作 `required + optional` 里登记的键，没登记过的一律不出现 —— 不依赖上游
+ * `canonicalTask` 兜底，也不做「复制全部键再挑着打码」那种默认放行。
+ * 动作本身没登记（不可能来自 `parseTaskList`，但 `presentTaskParams` 是导出的公共函数）→ 返回空对象。
+ *
+ * 打码只针对 `MASKED_KEYS`：`fill` 的值、`cookie set` 的值可能是密码/token，只给 `***`；
+ * 其余字段（url / selector / save_as / ms / op / path …）原样给，审批的人得看得见自己在批什么。
  * 与 `steps[].result` 同一条口径：**不回吐任务原文里的敏感值**。
  */
 export function presentTaskParams(task) {
   const out = {};
   if (!task || typeof task !== 'object') return out;
-  for (const [k, v] of Object.entries(task)) {
-    if (k === 'action') continue;
-    out[k] = k === 'value' ? MASKED_VALUE : v;
+  const spec = TASK_SPECS[String(task.action)];
+  if (!spec) return out;
+  for (const k of [...spec.required, ...spec.optional]) {
+    if (!(k in task)) continue;
+    out[k] = MASKED_KEYS.has(k) ? MASKED_VALUE : task[k];
   }
   return out;
 }

@@ -459,7 +459,7 @@ npm run test
 npm run smoke
 ```
 
-当前实测（2026-11-13，本机）：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **78** + agent **12** + api **100** + ui **46** + desktop **54** + kernel-download **23**（`package.json` 里那条脚本就是这十组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **30/30**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测（2026-11-13，本机）：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **78** + agent **15** + api **100** + ui **46** + desktop **54** + kernel-download **23**（`package.json` 里那条脚本就是这十组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **30/30**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 > 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：
@@ -922,7 +922,7 @@ test/proxy-chain.test.mjs  多级代理链真机判据（37 项：两跳、断�
 test/ui.test.mjs       控制台契约测试（46 项：静态托管、schema、校验、删除清目录、限流额度、Agent 面板纯函数与截图取图）
 test/desktop.test.mjs  桌面壳契约测试（54 项：启动引导、票据、残留检查、安全姿势、打包配置）
 test/workers.test.mjs  双 Realm 真机验证（24 项：三类 worker + 嵌套 + AudioWorklet）
-test/agent.test.mjs    AI Agent 判定门 A 层（12 项，假 CDP / 纯函数 / 本地 mock LLM，不启内核、不联网）
+test/agent.test.mjs    AI Agent 判定门 A 层（15 项，假 CDP / 纯函数 / 本地 mock LLM，不启内核、不联网）
 test/agent-smoke.test.mjs  AI Agent 判定门 B 层（30 项，真内核：七动作 / 失败即停 / 超时 / 跑完不关浏览器 / 目标→工作流 e2e）
 test/kernel-download.test.mjs  内核下载判定门（23 项，本地假源，不联网：正常/长度不符/大小写/Firefox/幂等/断线/重试/并发/自检不一致/404）
 test/proxy-health.test.mjs  代理健康检查真机验证（15 项：四态 / 批量 / 只读 / 控制台）
@@ -1040,12 +1040,13 @@ docs/                  技术方案、阶段交付、curl 实测、截图（docs
 
 ### 判定门（断言清单由巡检出，分两层）
 
-**A 层 `test/agent.test.mjs`（12 项，进 `npm test`，不启内核；mock LLM 全本地、不联网）**：批完再改盘上任务 → `run` 当场 `100002` + `field=digest` 且状态仍 `approved`（配「盘上不动必须过」的反例）；没批完就 run → `100002` + `field=status`、不存在的 id → `100001`、approve 不存在的 step → `100001`；截图路径越界（解析层 + 执行层 `resolveShotPath` 的 Windows 大小写越界）；`fill.value` / `cookie set.value` 不进 status JSON（`digest` 仍在）；`text` 超 10KB / cookie value 超 4KB 的截断与 `truncated` + `original_len`（恰好 10240 / 4096 不带键、多字节字符不会被切坏）。
+**A 层 `test/agent.test.mjs`（15 项，进 `npm test`，不启内核；mock LLM 全本地、不联网）**：批完再改盘上任务 → `run` 当场 `100002` + `field=digest` 且状态仍 `approved`（配「盘上不动必须过」的反例）；没批完就 run → `100002` + `field=status`、不存在的 id → `100001`、approve 不存在的 step → `100001`；截图路径越界（解析层 + 执行层 `resolveShotPath` 的 Windows 大小写越界）；`fill.value` / `cookie set.value` 不进 status JSON（`digest` 仍在）；`text` 超 10KB / cookie value 超 4KB 的截断与 `truncated` + `original_len`（恰好 10240 / 4096 不带键、多字节字符不会被切坏）。
 **LLM 那六条（A6–A11）**：合法 JSON / ```json 围栏 / 前后空白都过且键序稳定；prompt 只带 goal + 动作清单（body 里没有 key、没有 profile 的 cookie/UA/代理）；未知动作 / 未知字段 / 空数组 / 超 20 步 → `100002` + `field`；401 / 500 / 超时 / 非 JSON 四档 `reason` 与文案互不相同、`code` 一律 `-1`、**文案里没有 key**；生成的动作建工作流后每步 64 位 `digest` 且全 `pending_approval`；没配 / goal 空 → `100002` 带 `field`。
+**A12（`params` 白名单，fail-closed）**：`presentTaskParams` **只遍历该动作 `TASK_SPECS` 的 `required + optional`**，没登记过的键不出现 —— 不再「复制全部键、只把 `value` 打码」把安全性押在上游 `canonicalTask` 上。三条断言：① 七动作逐个核对「`params` 键 ⊆ `required+optional`」且 `required` 一个不少、不带 `action` 本身；② 直接喂一个带 `secret:'SENT_SECRET'` / `token` / 未登记键的**裸对象** → `params` 里一个都不出现（这条防「以后有人加了个直通字段」），未登记动作/非对象 → 空对象不抛；③ `fill` / `cookie set` 的 `value` 一律 `***`、原值 0 次，其余字段（`path` / `full_page` / `ms`）原样。
 
 **B 层 `test/agent-smoke.test.mjs`（30 项，进 `npm run smoke`，真内核）**：七动作 happy path（`text` 读回填入值、截图是 png 且只回相对路径、cookie get 能看到 set 的 name）；失败即停（`error.step_id` + 实际抛的 `selector_not_found`，后续步 `result=null`）；超时（注入短预算，`reason=step_timeout`、不重试）；**跑完浏览器仍 `Active`**（在 stop 清理之前取状态）；**B5**：mock LLM 出 2 步 → `create-from-goal` → 逐步批准 → 真跑 → 两步 `completed`，生成响应里没有 key。
 
-> 两处判定门口径调整（2026-11-13，如实记）：① B1 原来断言「status JSON 里没有 selector / op」，现在改成「`params` 里的 `value` 是 `***`」+「没有 `task` 原对象」—— 控制台审批面板必须显示「批的是什么」，所以参数键出现是预期的，**不许出现的只有值**；② 单步预算从 4000ms 调到 8000ms（4000ms 在整包 smoke 刚跑完、机器还忙时误杀过截图步），B3 的「<15s 收尾」断言不变（实测 8393ms）。
+> 两处判定门口径调整（2026-11-13，如实记）：① B1 原来断言「status JSON 里没有 selector / op」，现在改成「`params` 里的 `value` 是 `***`」+「没有 `task` 原对象」—— 控制台审批面板必须显示「批的是什么」，所以参数键出现是预期的，**不许出现的只有值**。**这次放宽的条件是把 `params` 改成按 `TASK_SPECS` 白名单取字段（A12），条件已落地**；② 单步预算从 4000ms 调到 8000ms（4000ms 在整包 smoke 刚跑完、机器还忙时误杀过截图步），B3 的「<15s 收尾」断言不变（实测 8393ms）。**8s 不是魔法数**：它是「整包 smoke 的最后一个文件、机器仍被前面 152 项压着」这一场景下留出的余量，而默认单步预算是 30s，8s 仍远小于它 —— 想改这个数，先看 `test/agent-smoke.test.mjs` 顶部那条注释和 B3 的 15s 上限。
 
 **不写成断言的三条**（属于上面的已知限制，别当判据）：`click` 的 `isTrusted=false`、`open` 重开同 URL 靠让半拍、Chrome 自己把 cookie 封顶在 ~4096 B。
 
