@@ -2,7 +2,7 @@
  * Web 控制台的契约测试（不需要 Chrome）。
  *
  * 覆盖：静态托管边界、schema 接口形状、validate 与 create/update 同源、
- * 删除时清 user-data 目录、ui 客户端的限流额度。
+ * 删除时清 user-data 目录、ui 客户端的限流额度、AI Agent 面板的纯渲染逻辑与截图取图。
  * 起真服务、打真 HTTP —— 界面出问题时这些是最先该看的东西。
  */
 import assert from 'node:assert/strict';
@@ -138,6 +138,72 @@ try {
   check('建环境成功', created.code === 0 && !!created.data.profile_id, created.msg);
   const pid = created.data.profile_id;
   const pno = created.data.profile_no;
+
+  /* ---------------- AI Agent 面板（0.4.0）：纯渲染层 + 截图取图 ---------------- */
+  const agentJs = await raw('GET', '/ui/pages/agent.js');
+  check('/ui/pages/agent.js 200 + js 类型', agentJs.status === 200 && /javascript/.test(agentJs.headers['content-type'] || ''), agentJs.headers['content-type']);
+  check('侧栏有 AI Agent 入口', index.text.includes('data-nav="agent"'));
+
+  // 纯函数直接 import（这个页面模块在 Node 里不碰 DOM —— 碰了这条就会炸）
+  const agent = await import('../web/pages/agent.js');
+  check('digest8 只回前 8 位', agent.digest8('0123456789abcdef') === '01234567', agent.digest8('0123456789abcdef'));
+  const fillParams = { params: { action: 'fill', selector: '#pw', value: 'SENTINEL-UI-1' } };
+  check('参数摘要：fill 的值打码、其它字段照给',
+    agent.paramText(fillParams) === 'selector=#pw · value=••••'
+    && !agent.paramText(fillParams).includes('SENTINEL-UI-1'), agent.paramText(fillParams));
+  check('截图链接带上相对路径（query 转义）',
+    agent.shotHref('http://127.0.0.1:1/x?profile_id=p&ticket=t', 'a/b.png') === 'http://127.0.0.1:1/x?profile_id=p&ticket=t&path=a%2Fb.png',
+    agent.shotHref('http://127.0.0.1:1/x?profile_id=p&ticket=t', 'a/b.png'));
+  check('没有票据就不造链接', agent.shotHref('', 'a.png') === '');
+  check('状态色调：完成/失败/运行中',
+    agent.statusKind('completed') === 'ok' && agent.statusKind('failed') === 'bad' && agent.statusKind('running') === 'warn');
+
+  // 路由：参数错当面回，别等模型（这三条都不发任何网络请求）
+  const noPid = JSON.parse((await raw('POST', '/api/v1/agent/workflow/create-from-goal', {
+    headers: h, body: JSON.stringify({ goal: 'x' }),
+  })).text);
+  check('create-from-goal：缺 profile_id → 100002 + field', noPid.code === 100002 && noPid.data?.field === 'profile_id', JSON.stringify(noPid));
+
+  const noLlm = JSON.parse((await raw('POST', '/api/v1/agent/workflow/create-from-goal', {
+    // 显式传空串：空串压过 AGENT_LLM_*，保证这条在任何机器上都是"没配"而不是"去联网"
+    headers: h, body: JSON.stringify({ profile_id: pid, goal: '打开 example.com', llm: { endpoint: '', key: '', model: '' } }),
+  })).text);
+  check('create-from-goal：没配模型 → 100002 field=llm', noLlm.code === 100002 && noLlm.data?.field === 'llm', `${noLlm.code} ${JSON.stringify(noLlm.data)}`);
+
+  const wfRes = JSON.parse((await raw('POST', '/api/v1/agent/workflow/run', {
+    headers: h, body: JSON.stringify({ profile_id: pid, goal: 'ui-shot', tasks: [{ action: 'screenshot', path: 'ui-gate/a.png' }] }),
+  })).text);
+  check('工作流创建：每步 pending_approval + 64 位 digest',
+    wfRes.code === 0 && wfRes.data.steps[0].status === 'pending_approval' && /^[0-9a-f]{64}$/.test(wfRes.data.steps[0].digest),
+    JSON.stringify(wfRes.data?.steps?.[0]));
+  check('步骤回参数摘要（screenshot.path）', wfRes.data.steps[0].params?.path === 'ui-gate/a.png', JSON.stringify(wfRes.data.steps[0].params));
+
+  const wfFill = JSON.parse((await raw('POST', '/api/v1/agent/workflow/run', {
+    headers: h, body: JSON.stringify({ profile_id: pid, goal: 'ui-fill', tasks: [{ action: 'fill', selector: '#pw', value: 'SENTINEL-UI-2' }] }),
+  })).text);
+  check('fill 的值在 params 里是占位符（原文一个字节都不回）',
+    wfFill.code === 0 && wfFill.data.steps[0].params.value === '***' && !JSON.stringify(wfFill).includes('SENTINEL-UI-2'),
+    JSON.stringify(wfFill.data?.steps?.[0]?.params));
+
+  // 截图取图（不跑内核：直接放一个 8 字节 PNG 签名进截图目录）
+  const wfId = wfRes.data.workflow_id;
+  const shotDir = path.join(DATA, 'agent', 'screenshots', 'ui-gate');
+  fs.mkdirSync(shotDir, { recursive: true });
+  fs.writeFileSync(path.join(shotDir, 'a.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  const img = await raw('GET', `/api/v1/agent/workflow/${wfId}/screenshot?path=ui-gate%2Fa.png`, { headers: h });
+  check('取图 200 + image/png + 字节数对', img.status === 200 && /image\/png/.test(img.headers['content-type'] || '')
+    && img.headers['content-length'] === '8', `${img.status} ${img.headers['content-type']} ${img.headers['content-length']}`);
+  const travShot = JSON.parse((await raw('GET', `/api/v1/agent/workflow/${wfId}/screenshot?path=..%2Fpackage.json`, { headers: h })).text);
+  check('取图路径越界 → 100002', travShot.code === 100002, `${travShot.code} ${travShot.msg}`);
+  const noAuthShot = await raw('GET', `/api/v1/agent/workflow/${wfId}/screenshot?path=ui-gate%2Fa.png`);
+  check('取图：没有 api-key 也没有票据 → 401', noAuthShot.status === 401, `${noAuthShot.status}`);
+
+  const tk = JSON.parse((await raw('POST', `/api/v1/agent/workflow/${wfId}/screenshot-ticket`, { headers: h, body: '{}' })).text);
+  check('截图票据：url 里有 ticket、没有 master key',
+    tk.code === 0 && /[?&]ticket=/.test(tk.data.url) && !tk.data.url.includes(apiKey), String(tk.data?.url));
+  const viaTicket = await raw('GET', `${tk.data.url}&path=ui-gate%2Fa.png`);
+  check('票据能直接取图（<img> 带不了 api-key 头）',
+    viaTicket.status === 200 && /image\/png/.test(viaTicket.headers['content-type'] || ''), `${viaTicket.status}`);
 
   // 手动造一个 user-data 目录，验证删除时**不**被带走（恢复后要能直接启动）
   const envDir = path.join(DATA, 'profiles', `${pno}_${String(pid).slice(0, 8)}`);

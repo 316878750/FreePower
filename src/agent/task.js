@@ -83,8 +83,11 @@ function isSelector(v) {
 /**
  * 截图路径：只许相对路径、不许 `..`、只出 png（第一版截图格式固定 png）。
  * 校验放在解析层：审批时就能看到错，不必等到执行到那一步才发现文件被写到别处。
+ *
+ * **导出**：截图文件的取图路由（`GET /api/v1/agent/workflow/:id/screenshot`）也用它 ——
+ * 查询串是用户能改的，不能因为"生成时校验过"就相信 path。
  */
-function normalizeShotPath(value) {
+export function normalizeShotPath(value) {
   const raw = String(value ?? '').trim().replace(/\\/g, '/');
   if (!raw) throw new TaskError('screenshot: path 不能是空串', { field: 'path' });
   if (raw.length > 200) throw new TaskError('screenshot: path 太长（上限 200）', { field: 'path' });

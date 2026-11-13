@@ -119,4 +119,16 @@ export const api = {
 
   /* ---- 内核 ---- */
   kernels: () => call('/api/v2/browser-profile/kernels', { query: { kernel_type: 'chrome' } }),
+
+  /* ---- AI Agent（0.4.0） ---- */
+  /** 一句话目标 → 工作流：等服务端调模型（默认 60s 超时），所以给足本端等待时间 */
+  agentCreateFromGoal: (body) => call('/api/v1/agent/workflow/create-from-goal', { method: 'POST', body }),
+  agentStatus: (id) => call(`/api/v1/agent/workflow/${encodeURIComponent(id)}/status`),
+  agentApprove: (id, body) => call(`/api/v1/agent/workflow/${encodeURIComponent(id)}/approve`, { method: 'POST', body }),
+  agentRun: (id) => call(`/api/v1/agent/workflow/${encodeURIComponent(id)}/run`, { method: 'POST', body: {} }),
+  /**
+   * 截图要放进 `<img src>`，带不了 api-key 头；换一张 120 秒、绑 profile 的票据
+   * （master key 绝不进 URL）。返回 `{url, ticket, expires_in, profile_id}`。
+   */
+  agentScreenshotTicket: (id) => call(`/api/v1/agent/workflow/${encodeURIComponent(id)}/screenshot-ticket`, { method: 'POST', body: {} }),
 };

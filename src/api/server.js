@@ -135,6 +135,20 @@ function sendHtml(res, html, extraHeaders = {}) {
   res.end(html);
 }
 
+/**
+ * 二进制应答：只给工作流截图（PNG）用。**不**做成通用文件读取通道 ——
+ * 路径校验在路由里（`normalizeShotPath` + `resolveShotPath`），这里只管写字节。
+ */
+function sendBytes(res, bytes, type = 'application/octet-stream', extraHeaders = {}) {
+  res.writeHead(200, {
+    'content-type': type,
+    'content-length': bytes.length,
+    'cache-control': 'no-store',
+    ...extraHeaders,
+  });
+  res.end(bytes);
+}
+
 export function createApiServer({ port } = {}) {
   const apiKey = ensureApiKey({ port: port || API_PORT });
   const routes = buildRoutes();
@@ -219,6 +233,7 @@ export function createApiServer({ port } = {}) {
       };
       const out = await route.handler(ctx);
       if (out && typeof out.__html === 'string') sendHtml(res, out.__html, corsHeaders);
+      else if (out && out.__bytes) sendBytes(res, out.__bytes, out.contentType, corsHeaders);
       else send(res, 200, out, corsHeaders);
     } catch (e) {
       if (e instanceof ApiError) {

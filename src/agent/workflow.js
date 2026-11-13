@@ -175,6 +175,26 @@ export function listWorkflows() {
   return loadWorkflows();
 }
 
+/** 敏感参数占位：能看出"这里有值"，但原文一个字节都不下发 */
+const MASKED_VALUE = '***';
+
+/**
+ * 审批单上的参数摘要（`presentWorkflow` 里每步的 `params`）。
+ *
+ * `fill` 的值、`cookie set` 的值可能是密码/token —— 只给占位符；其余字段
+ * （url / selector / save_as / ms / op / path …）原样给：审批的人得看得见自己在批什么。
+ * 与 `steps[].result` 同一条口径：**不回吐任务原文里的敏感值**。
+ */
+export function presentTaskParams(task) {
+  const out = {};
+  if (!task || typeof task !== 'object') return out;
+  for (const [k, v] of Object.entries(task)) {
+    if (k === 'action') continue;
+    out[k] = k === 'value' ? MASKED_VALUE : v;
+  }
+  return out;
+}
+
 /** 对外形状：不把内部 task 全量回吐（模型看到的 DSL 可能含敏感值），只回动作与摘要 */
 export function presentWorkflow(wf) {
   if (!wf) return null;
@@ -189,6 +209,8 @@ export function presentWorkflow(wf) {
     steps: wf.steps.map((s) => ({
       step_id: s.step_id,
       action: s.task.action,
+      // 参数摘要：敏感值已打码，见 presentTaskParams
+      params: presentTaskParams(s.task),
       status: s.state,
       digest: s.digest,
       decision: s.decision,

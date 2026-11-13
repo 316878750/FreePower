@@ -39,8 +39,9 @@ import { issueTicket } from './tickets.js';
 import { listKernels } from '../kernel/chrome.js';
 import { createWorkflow, getWorkflow, approveStep, presentWorkflow, runWorkflow, assertWorkflowRunnable } from '../agent/workflow.js';
 import { planTasksFromGoal } from '../agent/llm.js';
+import { normalizeShotPath, resolveShotPath } from '../agent/task.js';
 import { createCli } from '../agent/cli.js';
-import { API_PORT } from '../config.js';
+import { API_PORT, AGENT_SCREENSHOT_DIR } from '../config.js';
 import { toCanonical, toV2 } from '../../packages/profile/src/aliases.js';
 import {
   ApiError, ERR, ok, unsupported, normalizeLaunchArgs, serializeLaunchArgs, normalizePasswordFilling, serializePasswordFilling,
@@ -736,6 +737,39 @@ export function buildRoutes() {
     if (!wf) throw new ApiError(ERR.NOT_FOUND, 'Workflow does not exist');
     return ok(presentWorkflow(wf));
   });
+
+  /**
+   * 截图取图的**短期票据**：控制台要把图片塞进 `<img src>`，没法带 api-key 头；
+   * 把 master key 拼进 URL 又会留在浏览器历史/日志里（同自检报告的坑，见 tickets.js）。
+   * 票 120 秒、绑 workflow 的 profile_id，只读那一个环境的截图。
+   */
+  add(['POST'], ['/api/v1/agent/workflow/:id/screenshot-ticket'], (ctx) => {
+    const wf = getWorkflow(ctx.params?.id);
+    if (!wf) throw new ApiError(ERR.NOT_FOUND, 'Workflow does not exist');
+    const t = issueTicket(wf.profile_id);
+    return ok({
+      ...t,
+      url: `/api/v1/agent/workflow/${encodeURIComponent(wf.id)}/screenshot?profile_id=${encodeURIComponent(wf.profile_id)}&ticket=${encodeURIComponent(t.ticket)}`,
+    });
+  });
+
+  /**
+   * 取一张工作流截图（PNG）。`path` 是相对 `DATA_DIR/agent/screenshots/` 的相对路径，
+   * 复用 DSL 层的 `normalizeShotPath`（只 .png、不许 `..`/绝对路径）+ 执行层 `resolveShotPath`
+   * 兜越界 —— 查询串是用户能改的，必须在这里再校验一次。
+   */
+  add(['GET'], ['/api/v1/agent/workflow/:id/screenshot'], (ctx) => {
+    const wf = getWorkflow(ctx.params?.id);
+    if (!wf) throw new ApiError(ERR.NOT_FOUND, 'Workflow does not exist');
+    const { abs } = agentCall(() => resolveShotPath(normalizeShotPath(ctx.query.path), AGENT_SCREENSHOT_DIR, ''));
+    let buf;
+    try {
+      buf = fs.readFileSync(abs);
+    } catch {
+      throw new ApiError(ERR.NOT_FOUND, 'screenshot not found（这步可能还没跑，或被清理了）');
+    }
+    return { __bytes: buf, contentType: 'image/png' };
+  }, { ticket: true });
 
   add(['POST'], ['/api/v1/agent/workflow/:id/approve'], (ctx) => {
     const b = ctx.body || {};
