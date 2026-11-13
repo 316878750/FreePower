@@ -215,6 +215,22 @@ test('P2 location：block/allow/ask 三档语义（权限 + 坐标覆盖）', ()
   assert.equal(nullCoords.latitude, undefined);
   assert.equal(geoPolicy({ location: 'allow', latitude: '', longitude: '' }).override, false);
 
+  // 纯空白串同理：`Number('  ') === 0`。漏了这条，表单里打一个空格就下发 (0,0)（几内亚湾）。
+  // 断言到「不下发」为止：override=false 是 applyToSession 里 setGeolocationOverride 的唯一开关
+  // （manager.js:942 `if (geo.override)`），所以这里 false 就等于「一个字节的坐标都没发给内核」。
+  for (const blank of ['  ', '\t', '   ', '\r\n', ' \t ']) {
+    const g = geoPolicy({ location: 'allow', latitude: blank, longitude: blank, accuracy: 12 });
+    assert.equal(g.override, false, `经纬度是 ${JSON.stringify(blank)} 时不许下发坐标覆盖`);
+    assert.equal(g.latitude, undefined, `经纬度是 ${JSON.stringify(blank)} 时 latitude 不许有值`);
+    assert.equal(g.longitude, undefined);
+    // 只填了一边是空白、另一边是真值，同样不许下发（两边都得是真坐标）
+    assert.equal(geoPolicy({ location: 'allow', latitude: blank, longitude: -122.4 }).override, false);
+  }
+  // 正例成对：带前后空白的真坐标仍然认（Number 自己会 trim），别把「空格」修成「空格包着的数字也不认」
+  const padded = geoPolicy({ location: 'allow', latitude: ' 12.5 ', longitude: ' -77.25 ', accuracy: 12 });
+  assert.equal(padded.override, true);
+  assert.deepEqual([padded.latitude, padded.longitude], [12.5, -77.25]);
+
   // accuracy 非法/缺失时不传（CDP 校验：10..5000 的整数）；合法值取整
   assert.equal(geoPolicy({ location: 'allow', ...coords, accuracy: 1000.6 }).accuracy, 1001);
   assert.equal(geoPolicy({ location: 'allow', latitude: 1, longitude: 2, accuracy: 0 }).accuracy, undefined);

@@ -198,7 +198,12 @@ export function geoPolicy(profile) {
   const mode = String(profile.location || 'ask');
   // null / 空串**不算坐标**：Number(null) === 0，直接 Number() 会把「没填经纬度」当成 (0,0)
   // —— 那是几内亚湾，比不覆盖更糟（探针实测抓到过这一版）。
-  const num = (v) => (v === null || v === undefined || v === '' ? NaN : Number(v));
+  // **纯空白串也算没填**：`Number('  ') === 0`，漏了这一条，表单里打一个空格就中招（同样下发 (0,0)）。
+  const num = (v) => {
+    if (v === null || v === undefined) return NaN;
+    if (typeof v === 'string' && v.trim() === '') return NaN;
+    return Number(v);
+  };
   const lat = num(profile.latitude);
   const lng = num(profile.longitude);
   const acc = num(profile.accuracy);
