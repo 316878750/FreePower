@@ -88,40 +88,20 @@ const CLOUD_ONLY = new Set([
 ]);
 
 /**
- * 空转字段：**字段表照对手收了、这一版代码不消费**（0.3.3 巡检扫出来的那批）。
- * 不删字段 —— 字段表是照着对手的，脚本/导入导出按名字读写，删了会撞空；
- * 但要如实标出来：schema 出参带 `idle: true` + `idle_reason`，表单灰显并浮层说明。
+ * 空转字段：**字段表照对手收了、这一版代码不消费**。
  *
- * 键 = 字段名，值 = 为什么没生效（写给用户和下一个改代码的人看，不写「暂不支持」这种废话）。
- * 判定在 `test/unit.test.mjs`：BASIC 里 `coverage === 'none'` 必须标、每个 idle 必须有原因、
- * BASIC 里没标的字段必须出现在「已生效」白名单里（新加字段忘标就红）。
+ * 事实源只有一个：`packages/profile/reference/overrides.mjs` 的 `effect` 注册表 ——
+ * 字段带 `inert`（读了不生效的理由）或 `effect: 'none'`（内核层零读取）就是空转，
+ * 由 `tools/gen-schema.mjs` 写进 `fields.generated.json`，这里**只是把它翻译成 UI 状态**。
+ * 这里不再维护第二张表（以前那张硬编码 24 条的 IDLE 表，和代码对不上时没人发现）。
+ *
+ * 出参带 `idle: true` + `idle_reason`（= 注册表里的 `inert` 原文）+ `effect`（在哪一层生效）。
+ * 表单据此灰显并浮层说明；判定在 `test/unit.test.mjs`（effect 注册表那条 + 空转那条）。
  */
-const IDLE = new Map([
-  ['fonts', '注入层只把它挂成 window.__fpFontsDeclared（诊断用），没有禁用过滤；改它不影响渲染'],
-  ['disabled_fonts', '全 src 零读取（只在校验与详情视图里出现）'],
-  ['scan_port_type', '零读取；端口扫描是内核级特性，我们走 CDP/启动参数做不了'],
-  ['allow_scan_ports', '零读取；同上'],
-  ['disable_console', '零读取；禁用控制台是内核级特性，我们走 CDP/启动参数做不了'],
-  ['device_name', 'device_name_switch 有默认值，但 device_name 本身没有被消费'],
-  ['device_name_switch', '字段表登记但 src 零消费，连开关本身都没搭生效路径'],
-  ['hidden_notification', '基线不带 --enable-automation，本来就没有「受自动化控制」横幅可消（基线已覆盖）'],
-  ['disable_password_filling', 'API 边界有归一与落库，chrome.js 零消费'],
-  ['gyroscope', '零读取'],
-  ['virtual_camera', '零读取'],
-  ['network_information_type', '零读取'],
-  ['mac_address_config', '零读取（storage=fp，只存不注入）'],
-  ['open_google_api', '零读取'],
-  ['translate_webpages', '零读取'],
-  ['domain_https', '零读取'],
-  ['storage_strategy', '零读取'],
-  ['new_mobile_mode', '零读取'],
-  ['browser_head', '零读取'],
-  ['tls', '零读取（同名 tls 在代理代码里是协议名，不是这个字段）'],
-  ['tls_switch', '零读取'],
-  ['whitelist_open', '零读取（白名单本体走 whitelist + net-rules）'],
-  ['image_size', '零读取'],
-  ['location_switch', '对手客户端不消费此字段："1"=按 IP 是服务端填充坐标，无本地生效路径；真正的拒绝定位是 location="block"'],
-]);
+function inertReason(f) {
+  return f.inert && String(f.inert).trim() ? String(f.inert).trim() : null;
+}
+
 
 /** 基础区（其余进「高级」折叠） */
 const BASIC = new Set([
@@ -182,8 +162,11 @@ export function profileFormSchema() {
       basic: BASIC.has(f.name),
       cloudOnly: CLOUD_ONLY.has(f.name),
       // 空转字段：填了能存、但不影响内核。表单按它灰显 + 浮层，别让用户以为「配了就有用」
-      idle: IDLE.has(f.name),
-      idle_reason: IDLE.get(f.name) || null,
+      idle: inertReason(f) !== null,
+      idle_reason: inertReason(f),
+      // 生效层（args / cdp / inject / none，或它们的数组）：注册表的原样，给 UI/脚本看「这条走哪条路」
+      effect: f.effect ?? null,
+      effectSites: Array.isArray(f.effectSites) ? f.effectSites : [],
       apiV2Alias: f.apiV2Alias || null,
     };
   });

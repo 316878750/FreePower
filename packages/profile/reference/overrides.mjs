@@ -45,7 +45,9 @@ export const STORAGE = {
 /** CDP 覆盖度 */
 export const COVERAGE = {
   // 浏览器 / 内核
-  browser_kernel_config: 'full',
+  // browser_kernel_config：**假 full 纠错**（effect 注册表那批）。对象照字段表收着，但 src 里
+  // 没有任何代码读它 —— 内核版本走 kernel_version + ua_auto，这份 JSON 只是存下来。
+  browser_kernel_config: 'none',
   browser_head: 'partial',
   platform: 'partial',
   new_mobile_mode: 'partial',
@@ -53,8 +55,10 @@ export const COVERAGE = {
   browser_compatibility_mode: 'n/a',
   gpu: 'partial',
   gpu_switch: 'partial',
-  cdp_mask: 'full',
-  ban_dev_tools: 'full',
+  // cdp_mask / ban_dev_tools：假 full 纠错。`--remote-debugging-port` 是启动必需（没它连不上内核），
+  // 禁用 DevTools 是内核级能力 —— 两个字段在 src 里都零读取。
+  cdp_mask: 'none',
+  ban_dev_tools: 'none',
   renderer_accessibility: 'n/a',
   device_scale: 'full',
   virtual_camera: 'none',
@@ -63,12 +67,15 @@ export const COVERAGE = {
   ua: 'full',
   client_hints: 'full',
   language: 'full',
-  language_switch: 'full',
+  // language_switch / page_language_switch / automatic_timezone：假 full 纠错。三个「自动生成」开关
+  // 只有生成器把默认值写进新环境（`generate.js` 的 `language_switch: '0'` 之类），**没有任何分支
+  // 按开关选语言/时区** —— 语言与时区是 country/geo 表直接生成的。改了开关，启动结果一个字节不变。
+  language_switch: 'none',
   lang: 'n/a',
   page_language: 'full',
-  page_language_switch: 'full',
+  page_language_switch: 'none',
   timezone: 'full',
-  automatic_timezone: 'full',
+  automatic_timezone: 'none',
 
   // 噪点四件套
   canvas: 'partial',
@@ -99,7 +106,10 @@ export const COVERAGE = {
 
   // 媒体设备
   media_devices: 'partial',
-  media_devices_num: 'partial',
+  // media_devices_num：**假 partial 纠错**（effect 注册表那批）。P9-C 起设备列表来自内核真实
+  // enumerateDevices，数量字段只进 `CFG.media.counts`，注入层**不按它造设备**（伪造数量会同时踩
+  // 跨 origin deviceId / 未授权 label / 枚举与 getUserMedia 不一致三条检测面）；自检页拿它比「声明值」。
+  media_devices_num: 'none',
   media_devices_config: 'partial',
   media_devices_config_v2: 'partial',
   speech_switch: 'partial',
@@ -174,18 +184,23 @@ export const COVERAGE = {
 
   // 启动 / 缓存
   launch_args: 'full',
-  browser_run_args: 'full',
-  no_args: 'full',
-  cover_args: 'full',
+  // browser_run_args / no_args / cover_args：假 full 纠错。前两个是 v1 的旧参数名（合并参数只认
+  // launch_args），cover_args 在 src 里零读取 —— 三个都只是「能存」。
+  browser_run_args: 'none',
+  no_args: 'none',
+  cover_args: 'none',
   headless: 'full',
   optimize_launch: 'n/a',
   use_launch_optimize: 'n/a',
-  open_tabs: 'full',
-  new_startup_page: 'full',
+  // open_tabs / new_startup_page / win_x / win_y / clear_cache_after_closing：假 full 纠错。
+  // 打开哪些页面只看 open_urls；启动页、标签数、窗口 X/Y、关闭后清缓存都没有实现，
+  // 窗口只有 window_position（maximize/default）这一个真生效的取值。
+  open_tabs: 'none',
+  new_startup_page: 'none',
   window_position: 'full',
-  win_x: 'full',
-  win_y: 'full',
-  clear_cache_after_closing: 'full',
+  win_x: 'none',
+  win_y: 'none',
+  clear_cache_after_closing: 'none',
   cache_backup: 'n/a',
   storage_strategy: 'partial',
   storage_cloud_option: 'n/a',
@@ -194,11 +209,164 @@ export const COVERAGE = {
   sync_extension_cache: 'n/a',
   sync_history: 'n/a',
   not_sync_cache_not_open: 'n/a',
-  browser_security_lock: 'full',
+  browser_security_lock: 'none',
   browser_security_lock_ignore_ids: 'n/a',
   api_merged: 'n/a',
   is_fb_network_acceleration: 'n/a',
   ignore_agent_config: 'n/a',
+};
+
+/**
+ * effect 注册表：这个字段**在哪一层**真的改变内核/页面的行为。
+ *
+ * 为什么要有它（coverage 与 idle 都不够用）：
+ *   coverage 说的是「CDP 这条路能做到什么程度」，是技术判断；idle 说的是「表单灰不灰」，是 UI 状态。
+ *   两者都不回答一个问题：**这个字段到底有没有一行代码读它**。于是出现了三批假标签：
+ *   `disable_save_password` / `location_switch` / `location` / `do_not_track` 那种「字段表收了、
+ *   代码没读，UI 却当它能配」，以及反过来的「代码删了、标签还写着 full」。
+ *
+ * 取值（`effect`）：
+ *   args   —— 只进内核命令行（`src/kernel/chrome.js`、`src/kernel/launch-args.js`、代理装配）
+ *   cdp    —— 走 CDP（`src/runtime/manager.js` 的 Emulation/Browser/Network、`src/kernel/net-rules.js` 的 Fetch）
+ *   inject —— 走页面注入（`src/kernel/inject.js` 生成的源码）
+ *   none   —— 内核层没有任何代码读它（**必须**配 `inert`，说明为什么没有）
+ * 一个字段同时走两条路就写数组（如 `do_not_track` = 注入 `navigator.doNotTrack` + 会话级 DNT 头）。
+ *
+ * `sites`：读取点锚，`<文件>#<代码里真的出现的字符串>`。unit 会去掉注释后逐条核「这个文件里
+ * 还有没有这串」—— 代码删了、改名了，注册表没跟上就红。锚是**证据**，不是装饰：写一条不存在的锚
+ * 等于没登记。
+ *
+ * `inert`：**读了但不改变行为**的理由（诊断变量、只喂自检的「声明值」对比、生成器只写默认值）。
+ * 有 `inert` 的字段在 UI 里就是空转（`idle`）—— 空转的判定从此只有这一处事实源，`schema.js` 不再
+ * 自己维护一张表。没有 `inert` 的字段才是真生效。
+ *
+ * 判定在 `test/unit.test.mjs`（「effect 注册表」那条）：
+ *   ① 每个指纹/隐私字段（coverage ≠ n/a）必须登记，n/a 字段不许登记；
+ *   ② `effect: 'none'` 必须写 `inert`，且**内核层零读取**（属性读取扫描，注释不算）；
+ *   ③ 非 none 必须至少一条 `sites`，且每条锚在文件里真的存在；
+ *   ④ `inert` 与 `idle` 必须一致（有 inert ⇔ 表单灰显）；
+ *   ⑤ 各档数量钉死（改一个字段就得改数字，防「悄悄加一个」）。
+ */
+export const EFFECT = {
+  // 浏览器 / 内核
+  browser_kernel_config: { effect: 'none', inert: '零读取：内核版本走 kernel_version + ua_auto，这份 JSON 只是照字段表存着' },
+  browser_head: { effect: 'none', inert: '零读取（表单能填，启动与注入都不读）' },
+  platform: { effect: 'inject', sites: ['src/fingerprint/view.js#p.platform', 'src/kernel/inject.js#CFG.platform'] },
+  new_mobile_mode: { effect: 'none', inert: '零读取（移动端模式没有对应启动参数，也没有 CDP 分支）' },
+  gpu: { effect: 'none', inert: '零读取：GPU 相关只有 webgl_config.webgpu_switch 与用户白名单里的 --disable-gpu' },
+  gpu_switch: { effect: 'none', inert: '零读取：--disable-gpu 只能由用户在 launch_args 里手填，开关字段本身没有读取点' },
+  cdp_mask: { effect: 'none', inert: '零读取：--remote-debugging-port 是启动必需，没有「隐藏 CDP 特征」的分支读它' },
+  ban_dev_tools: { effect: 'none', inert: '零读取：禁用 DevTools 是内核级能力（对手自编译内核），我们没有对应参数' },
+  device_scale: { effect: 'cdp', sites: ['src/fingerprint/view.js#p.device_scale', 'src/runtime/manager.js#deviceScaleFactor'] },
+
+  // 杂项：明确不做
+  virtual_camera: { effect: 'none', inert: '零读取（虚拟摄像头是内核级特性，CDP/启动参数做不到）' },
+
+  // UA / 语言
+  ua: { effect: ['inject', 'cdp'], sites: ['src/kernel/inject.js#CFG.ua', 'src/runtime/manager.js#setUserAgentOverride'] },
+  client_hints: { effect: 'cdp', sites: ['src/fingerprint/view.js#p.client_hints', 'src/runtime/manager.js#ua_metadata'] },
+  language: { effect: ['args', 'inject'], sites: ['src/kernel/chrome.js#--accept-lang', 'src/kernel/inject.js#CFG.language'] },
+  language_switch: { effect: 'none', inert: '零读取：生成器只把 "0" 写进默认值，没有任何分支按它选语言（语言由 country/geo 表生成）' },
+  page_language: { effect: ['args', 'cdp'], sites: ['src/fingerprint/view.js#p.page_language', 'src/kernel/chrome.js#view.locale', 'src/runtime/manager.js#setLocaleOverride'] },
+  page_language_switch: { effect: 'none', inert: '零读取：生成器只写默认值，页面语言由 country/geo 表直接生成' },
+  timezone: { effect: 'cdp', sites: ['src/runtime/manager.js#setTimezoneOverride'] },
+  automatic_timezone: { effect: 'none', inert: '零读取：生成器只写默认值，时区由 country/geo 表直接生成' },
+
+  // 噪点四件套 + WebGL
+  canvas: { effect: 'inject', sites: ['src/kernel/inject.js#CFG.canvas'] },
+  webgl_image: { effect: 'inject', sites: ['src/kernel/inject.js#CFG.webgl_image'] },
+  webgl: { effect: 'inject', sites: ['src/fingerprint/view.js#p.webgl', 'src/kernel/inject.js#CFG.webgl'] },
+  webgl_config: { effect: ['args', 'inject'], sites: ['src/kernel/chrome.js#webgpu_switch', 'src/fingerprint/view.js#p.webgl_config'] },
+  audio: { effect: 'inject', sites: ['src/kernel/inject.js#CFG.audio'] },
+  client_rects: { effect: 'inject', sites: ['src/kernel/inject.js#CFG.client_rects'] },
+
+  // 字体：CDP 路线的结构性硬伤
+  fonts: {
+    effect: 'inject',
+    sites: ['src/kernel/inject.js#__fpFontsDeclared'],
+    inert: '注入层只把列表挂成 window.__fpFontsDeclared（自检页拿它比对「声明的字体」），没有禁用/过滤；页面能枚举到的字体一条不变',
+  },
+  disabled_fonts: { effect: 'none', inert: '全 src 零读取（只在校验与详情视图里出现）' },
+
+  // 屏幕 / 硬件
+  screen_resolution: { effect: ['cdp', 'inject'], sites: ['src/fingerprint/view.js#p.screen_resolution', 'src/runtime/manager.js#screenWidth', 'src/kernel/inject.js#CFG.screen'] },
+  hardware_concurrency: { effect: ['cdp', 'inject'], sites: ['src/runtime/manager.js#setHardwareConcurrencyOverride', 'src/kernel/inject.js#hardwareConcurrency'] },
+  device_memory: { effect: 'inject', sites: ['src/fingerprint/view.js#p.device_memory', 'src/kernel/inject.js#deviceMemory'] },
+  device_name: { effect: 'none', inert: '零读取：device_name_switch 有默认值，device_name 本身没有任何读取点' },
+  mac_address_config: { effect: 'none', inert: '零读取（storage=fp，只存不注入）' },
+  gyroscope: { effect: 'none', inert: '零读取：传感器是内核级设备面，CDP 没有对应域，页面注入也改不了' },
+  network_information_type: { effect: 'none', inert: '零读取：NetInfo 走 networkInformation.type，启动参数与 CDP 都没有对应旋钮' },
+
+  // 媒体设备 / 语音
+  media_devices: { effect: 'inject', sites: ['src/fingerprint/view.js#profile.media_devices', 'src/kernel/inject.js#CFG.media'] },
+  media_devices_num: {
+    effect: 'none',
+    inert: '只进 CFG.media.counts：注入层不按它造设备（P9-C 起列表来自内核真实枚举），只有自检页拿它比「声明值」',
+  },
+  media_devices_config: { effect: 'inject', sites: ['src/fingerprint/view.js#profile.media_devices_config', 'src/kernel/inject.js#CFG.media'] },
+  media_devices_config_v2: { effect: 'none', inert: '零读取：生效的是 media_devices_config，v2 设备列表没人读' },
+  speech_switch: { effect: 'inject', sites: ['src/fingerprint/view.js#profile.speech_switch', 'src/kernel/inject.js#CFG.speech'] },
+  speech_voices: { effect: 'none', inert: '零读取：speech_switch 只投影 getVoices() 的启用状态，音色列表没人读' },
+
+  // 网络 / 代理
+  webrtc: { effect: 'args', sites: ['src/fingerprint/view.js#p.webrtc', 'src/kernel/chrome.js#view.webrtc'] },
+  user_proxy_config: { effect: 'args', sites: ['src/runtime/manager.js#profile.user_proxy_config', 'src/kernel/chrome.js#--proxy-server'] },
+  is_multi_level_proxy: { effect: 'args', sites: ['src/proxy/chain.js#profile.is_multi_level_proxy'] },
+  mutli_level_proxy: { effect: 'args', sites: ['src/proxy/chain.js#profile.mutli_level_proxy'] },
+  full_pac_url: { effect: 'args', sites: ['src/kernel/chrome.js#profile.full_pac_url', 'src/proxy/pac.js#input.full_pac_url'] },
+  scan_port_type: { effect: 'none', inert: '零读取；端口扫描是内核级特性，我们走 CDP/启动参数做不了' },
+  allow_scan_ports: { effect: 'none', inert: '零读取；同上' },
+
+  // 地理
+  location: { effect: 'cdp', sites: ['src/fingerprint/view.js#profile.location', 'src/runtime/manager.js#geoPolicy'] },
+  location_switch: { effect: 'none', inert: '对手客户端不消费此字段："1"=按 IP 是服务端填充坐标，无本地生效路径；真正的拒绝定位是 location="block"' },
+  longitude: { effect: 'cdp', sites: ['src/fingerprint/view.js#profile.longitude', 'src/runtime/manager.js#geo.longitude'] },
+  latitude: { effect: 'cdp', sites: ['src/fingerprint/view.js#profile.latitude', 'src/runtime/manager.js#geo.latitude'] },
+  accuracy: { effect: 'cdp', sites: ['src/fingerprint/view.js#profile.accuracy', 'src/runtime/manager.js#geo.accuracy'] },
+
+  // 隐私开关
+  do_not_track: { effect: ['inject', 'cdp'], sites: ['src/fingerprint/view.js#p.do_not_track', 'src/kernel/inject.js#CFG.doNotTrack', 'src/runtime/manager.js#setExtraHTTPHeaders'] },
+  tls: { effect: 'none', inert: '零读取（同名 tls 在代理代码里是协议名 node:tls，不是这个字段）' },
+  tls_switch: { effect: 'none', inert: '零读取：只有生成器写默认值，没有分支读它' },
+  automation_controlled: { effect: ['args', 'inject'], sites: ['src/kernel/chrome.js#profile.automation_controlled', 'src/fingerprint/view.js#p.automation_controlled', 'src/kernel/inject.js#CFG.automationControlled'] },
+  disable_image: { effect: 'args', sites: ['src/kernel/chrome.js#profile.disable_image'] },
+  disable_video: { effect: 'cdp', sites: ['src/kernel/net-rules.js#profile.disable_video'] },
+  disable_console: { effect: 'none', inert: '零读取；禁用控制台是内核级特性，我们走 CDP/启动参数做不了' },
+  disable_save_password: { effect: 'args', sites: ['src/kernel/chrome.js#profile.disable_save_password'] },
+  disable_password_filling: { effect: 'none', inert: 'API 边界有归一与落库，chrome.js 零消费' },
+  open_google_api: { effect: 'none', inert: '零读取：Google API 密钥注入是客户端内建能力，我们没有对应入口' },
+  translate_webpages: { effect: 'none', inert: '零读取：内置翻译只在启动参数里禁掉了 Translate 特性，这个开关本身没人读' },
+  blacklist: { effect: 'cdp', sites: ['src/kernel/net-rules.js#profile.blacklist'] },
+  whitelist: { effect: 'cdp', sites: ['src/kernel/net-rules.js#profile.whitelist'] },
+  domain_https: { effect: 'none', inert: '零读取：HTTPS 强制跳转是请求级规则，我们没有实现（黑白名单只做阻断）' },
+
+  // 启动 / 缓存
+  launch_args: { effect: 'args', sites: ['src/runtime/manager.js#effective.launch_args', 'src/kernel/launch-args.js#mergeLaunchArgs'] },
+  browser_run_args: { effect: 'none', inert: '零读取：v1 的旧别名，合并参数用的是 launch_args' },
+  no_args: { effect: 'none', inert: '零读取（v1 的参数开关，启动链路没有对应分支）' },
+  cover_args: { effect: 'none', inert: '零读取（同上，启动链路没有对应分支）' },
+  headless: { effect: 'args', sites: ['src/kernel/chrome.js#profile.headless'] },
+  open_tabs: { effect: 'none', inert: '零读取：打开哪些页面只看 open_urls，没有「开几个标签」的实现' },
+  new_startup_page: { effect: 'none', inert: '零读取：启动页没有实现（启动打开的仍然是 open_urls）' },
+  window_position: { effect: 'args', sites: ['src/kernel/chrome.js#profile.window_position'] },
+  win_x: { effect: 'none', inert: '零读取：窗口只有 window_position（maximize/default），X/Y 没人读' },
+  win_y: { effect: 'none', inert: '零读取：同上' },
+  clear_cache_after_closing: { effect: 'none', inert: '零读取：关闭后清缓存没有实现（缓存清理走的是另一条显式接口）' },
+  storage_strategy: { effect: 'none', inert: '零读取：存储策略是内核级的目录布局，我们没有对应实现' },
+  browser_security_lock: { effect: 'none', inert: '零读取：环境密码锁没有实现（API 与启动链路都不读）' },
+};
+
+/**
+ * coverage = n/a（不是指纹维度）却也读不到的字段。
+ *
+ * 这些字段不在 `EFFECT` 的范围内（n/a 不是一个「效果档」），但它们同样是空转，UI 一样要灰显 ——
+ * 所以 `inert` 单独写在这里，由生成器一并写进字段表。四个都是「声明了、代码不读」。
+ */
+export const INERT_EXTRA = {
+  device_name_switch: '字段表登记但 src 零消费，连开关本身都没搭生效路径',
+  hidden_notification: '基线不带 --enable-automation，本来就没有「受自动化控制」横幅可消（基线已覆盖）',
+  image_size: '零读取',
+  whitelist_open: '零读取（白名单本体走 whitelist + net-rules）',
 };
 
 /**

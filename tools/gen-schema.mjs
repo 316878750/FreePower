@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { STORAGE, COVERAGE, DEFAULTS, DEFAULT_SOURCE, DOMAIN_NOTES, NOTES, VALUES_EXTRA } from '../packages/profile/reference/overrides.mjs';
+import { STORAGE, COVERAGE, EFFECT, INERT_EXTRA, DEFAULTS, DEFAULT_SOURCE, DOMAIN_NOTES, NOTES, VALUES_EXTRA } from '../packages/profile/reference/overrides.mjs';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const refPath = path.join(root, 'packages/profile/reference/ads-8.9.23-fields.json');
@@ -46,6 +46,11 @@ for (const [group, defs] of Object.entries(ref.profile)) {
       defaultSource: DEFAULTS[name] === undefined ? null : DEFAULT_SOURCE[name] ?? 'guessed',
       domainNote: DOMAIN_NOTES[name] ?? null,
       coverage: COVERAGE[name] ?? 'n/a',
+      // effect 注册表（overrides.mjs 是唯一事实源）：内核层在哪一层真读它；`inert` 非空 = 读了但不生效。
+      // n/a 字段没有 effect（null），但可能有 inert（INERT_EXTRA，同样是空转）。
+      effect: EFFECT[name]?.effect ?? null,
+      effectSites: EFFECT[name]?.sites ?? [],
+      inert: EFFECT[name]?.inert ?? INERT_EXTRA[name] ?? null,
       note: NOTES[name] ?? null,
       evidence: '实测',
     };
@@ -194,8 +199,14 @@ if (invokedAsScript) {
 
   const byGroup = fields.reduce((a, f) => ((a[f.group] = (a[f.group] ?? 0) + 1), a), {});
   const byCov = fields.reduce((a, f) => ((a[f.coverage] = (a[f.coverage] ?? 0) + 1), a), {});
+  // 生效层分布：一眼看出「多少字段真的接了内核」，别只看 coverage 好看
+  const byEffect = fields.reduce((a, f) => {
+    const k = f.effect === null ? 'n/a' : Array.isArray(f.effect) ? f.effect.join('+') : f.effect;
+    return ((a[k] = (a[k] ?? 0) + 1), a);
+  }, {});
   console.log('fields:', fields.length, 'ext:', EXT.length);
   console.log('by group:', byGroup);
   console.log('by coverage:', byCov);
+  console.log('by effect:', byEffect, '| inert(读了不生效):', fields.filter((f) => f.inert).length);
   console.log('written: packages/profile/src/{fields.generated.json,schema.sql}');
 }

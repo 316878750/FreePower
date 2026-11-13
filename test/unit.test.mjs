@@ -26,7 +26,8 @@ import { normalizeImportItem } from '../src/store/transfer.js';
 import { parseAdspowerTxt, formatAdspowerTxt, proxyLineOf } from '../src/store/adspower-txt.js';
 import { startFakeProxy } from './fake-proxy.mjs';
 import { profileFormSchema } from '../src/api/schema.js';
-import { COVERAGE as OVERRIDES_COVERAGE } from '../packages/profile/reference/overrides.mjs';
+import { FIELDS as REGISTRY_FIELDS } from '../packages/profile/src/fields.js';
+import { COVERAGE as OVERRIDES_COVERAGE, EFFECT as OVERRIDES_EFFECT, INERT_EXTRA as OVERRIDES_INERT_EXTRA } from '../packages/profile/reference/overrides.mjs';
 import vm from 'node:vm';
 import fs from 'node:fs';
 import { buildArtifacts } from '../tools/gen-schema.mjs';
@@ -1436,30 +1437,17 @@ test('txt 对齐：group 写空串、countrycode 写小写（JSON 侧各自保�
 });
 
 /* ============================================================================
- * 空转字段（0.4.0 追加）：字段表照对手收了、这一版代码不消费的那批
+ * 空转字段与生效层（0.4.0 追加）：字段表照对手收了，这一版到底哪一层读它
  * ==========================================================================*/
 
 /**
- * BASIC 区里**没标 idle**的字段清单。两个作用：
- *  1. 新加一个 BASIC 字段时，必须在这里登记（或者标 idle），否则本条红 —— 防「加了字段忘标」；
- *  2. 登记 ≠ 全都验证过生效。0.4.0 之前有三个字段只做到「存下来 + 边界别名归一」（`device_name_switch` /
- *     `disable_save_password` / `disable_password_filling`），当时登记在这里；现在它们已改标 `idle`，
- *     从清单里去掉 —— 清单只留「有消费点、或者根本不是指纹维度」的字段。
+ * coverage = n/a（不是指纹维度）**又在 BASIC 区**的字段。
+ *
+ * 它们不需要 `effect` 登记（n/a 没有「在哪一层生效」这回事），但也不该标 `idle` ——
+ * 名字/分组/标签/备注/域名/启动网址/Cookie 都是「能填、能存、启动链路会读」的元信息。
+ * 新加一个 BASIC 字段时三选一：进 effect 注册表（coverage ≠ n/a）、标 idle、登记到这里。
  */
-const BASIC_NOT_IDLE = new Set([
-  'name', 'group_id', 'profile_tag_ids', 'remark', 'domain_name', 'open_urls', 'cookie',
-  'browser', 'platform', 'gpu', 'device_scale', 'ua', 'language', 'language_switch',
-  'timezone', 'automatic_timezone',
-  'canvas', 'webgl_image', 'webgl', 'audio', 'client_rects',
-  'screen_resolution', 'hardware_concurrency', 'device_memory',
-  'media_devices', 'media_devices_num', 'speech_switch', 'speech_voices',
-  'webrtc', 'bypass_proxy_check',
-  'location', 'longitude', 'latitude', 'accuracy',
-  'automation_controlled', 'disable_image', 'disable_video', 'disable_save_password', 'do_not_track',
-  'blacklist', 'whitelist',
-  'launch_args', 'headless', 'new_startup_page', 'window_position', 'win_x', 'win_y',
-  'clear_cache_after_closing',
-]);
+const NON_FP_BASIC = new Set(['name', 'group_id', 'profile_tag_ids', 'remark', 'domain_name', 'open_urls', 'cookie']);
 
 test('空转字段：标了必须说清原因，BASIC 里一个都不许漏标', () => {
   const { fields } = profileFormSchema();
@@ -1477,29 +1465,175 @@ test('空转字段：标了必须说清原因，BASIC 里一个都不许漏标',
   assert.deepEqual(fields.filter((f) => f.basic && f.coverage === 'none' && !f.idle).map((f) => f.name), [],
     '这些 BASIC 字段 coverage=none 却没标 idle');
 
-  // ④ 防「以后加字段忘标」：BASIC 里没标 idle 的必须在上面的清单里
-  assert.deepEqual(fields.filter((f) => f.basic && !f.idle && !BASIC_NOT_IDLE.has(f.name)).map((f) => f.name), [],
-    '新 BASIC 字段既没标 idle、也没登记 —— 先判断它是真生效还是空转');
+  // ④ 反过来：BASIC 里既没标 idle、又不是 n/a 的，必须在 effect 注册表里真的有生效层
+  //    （「加了字段忘标」从此由注册表兜住：没登记就是红的，不用再维护一张 49 行的白名单）
+  const notIdleNotNa = fields.filter((f) => f.basic && !f.idle && f.coverage !== 'n/a');
+  assert.deepEqual(notIdleNotNa.filter((f) => {
+    const kinds = Array.isArray(f.effect) ? f.effect : [f.effect];
+    return !f.effect || kinds.includes('none');
+  }).map((f) => f.name), [], '这些 BASIC 字段没标 idle，注册表里却没有生效层');
 
-  // ⑤ 清单里不许留着已经不存在的字段（删字段时要同步，别让白名单变成化石）
+  // ⑤ n/a 的 BASIC 元信息字段：登记在清单里、coverage 必须是 n/a、不许标 idle
   const names = new Set(fields.map((f) => f.name));
-  assert.deepEqual([...BASIC_NOT_IDLE].filter((n) => !names.has(n)), [], '清单里有字段表已经不存在的字段');
+  assert.deepEqual([...NON_FP_BASIC].filter((n) => !names.has(n)), [], '清单里有字段表已经不存在的字段');
+  assert.deepEqual([...NON_FP_BASIC].filter((n) => {
+    const f = fields.find((x) => x.name === n);
+    return f.coverage !== 'n/a' || f.idle;
+  }), [], '这些字段在清单里，却不是「n/a 且不空转」');
 
-  // ⑥ 数量对得上（0.3.3 巡检那批 22 个 + `device_name_switch` / `disable_password_filling` 两个零消费
-  //    字段 + P2 ③ 的 `location_switch`（对手客户端不消费）= 25；`disable_save_password` 已在 P2
-  //    接了启动参数、摘掉 idle；`do_not_track` 在 P2 ④ 接了真行为、也摘掉 = 24）。少一个或多一个都要先问清楚
-  assert.equal(idle.length, 24, `idle 字段 ${idle.length} 个：${idle.map((f) => f.name).join(',')}`);
+  // ⑥ 数量对得上（0.4.0 effect 注册表那批：从 24 变 43 个**表单可见**的空转字段 —— +19 个
+  //    「内核层零读取」的假 full/partial 纠错（browser_kernel_config / cdp_mask / ban_dev_tools /
+  //    language_switch / page_language_switch / automatic_timezone / browser_run_args / no_args /
+  //    cover_args / open_tabs / new_startup_page / win_x / win_y / clear_cache_after_closing /
+  //    browser_security_lock / gpu / gpu_switch / speech_voices / media_devices_config_v2）、
+  //    +1 个 media_devices_num（数量字段 P9-C 起不再造设备）。注册表里总共 44 个空转，
+  //    其中 browser_run_args 是 HIDDEN（launch_args 的旧别名，不进表单）。少一个或多一个都要先问清楚
+  assert.equal(idle.length, 43, `idle 字段 ${idle.length} 个：${idle.map((f) => f.name).join(',')}`);
   // ⑦ 单独钉一条：hidden_notification 的原因是「基线已覆盖」，不是「还没做」
   const hn = idle.find((f) => f.name === 'hidden_notification');
   assert.match(hn.idle_reason, /基线/, 'hidden_notification 的原因是「基线已覆盖」，不是「还没做」');
-  // ⑧ overrides.mjs（coverage 的事实源）与这里的 idle 不许互相矛盾：idle 的字段不许标 full。
-  //    假 full 比不标更坏 —— UI 会说「CDP 能做到且不留痕迹」，而 src 一次都没读。
+  // ⑧ overrides.mjs（coverage 的事实源）与 idle 不许互相矛盾：idle 的字段不许标 full。
   //    判据是「不是 full」而不是「必须是 none|partial」：overrides 里还有 n/a（不是指纹维度），
   //    现有 idle 里 hidden_notification / whitelist_open / image_size / device_name_switch 就是 n/a，
   //    它们该留 n/a，不该为了过判据把标签改成 none。
   assert.deepEqual(idle.filter((f) => OVERRIDES_COVERAGE[f.name] === 'full').map((f) => f.name), [],
     '这些字段 schema 标了 idle，overrides 却标 coverage=full —— 假 full 标签');
 });
+
+/* ============================================================================
+ * effect 注册表：每个字段「在哪一层真的生效」，登记与代码必须对得上
+ * ==========================================================================*/
+
+/**
+ * 「内核层」：读字段是为了**改变内核/页面的行为**。只有这几类文件算数。
+ *
+ * 不算的三类（读了也只是搬运，不是生效）：
+ *   - `src/api/*`、`src/store/*`：传输/校验/持久化 —— 它们按名字读写字段，但改了不会改行为；
+ *   - `src/selfcheck/*`：探针与报告，读的是「声明值」用来比对；
+ *   - `src/fingerprint/generate.js`：生成器只**写**默认值（`location_switch: '0'` 这种），不是读。
+ * `src/fingerprint/view.js` 单独列为「派生层」：它把平铺字段翻译成注入/启动层要的视图，
+ * 判据要它一起算 —— 否则 `screen_resolution`/`device_scale` 这种两条字段的读取点会被误判成零消费。
+ */
+const KERNEL_LAYERS = [
+  'src/kernel/chrome.js', 'src/kernel/launch-args.js', 'src/kernel/inject.js', 'src/kernel/net-rules.js',
+  'src/kernel/cookies.js', 'src/kernel/cdp.js', 'src/kernel/version.js',
+  'src/runtime/manager.js', 'src/runtime/batch.js',
+  'src/proxy/chain.js', 'src/proxy/pac.js', 'src/proxy/egress.js', 'src/proxy/health.js', 'src/proxy/probe.js',
+];
+const DERIVE_LAYERS = ['src/fingerprint/view.js'];
+
+/** 去掉注释（整行注释 + 行尾 `//`；含 `://` 的行整行保留，别把 URL 后面的代码切掉） */
+function stripComments(src) {
+  return src.split('\n').map((line) => {
+    const t = line.trim();
+    if (!t) return '';
+    if (t.startsWith('//') || t.startsWith('*') || t.startsWith('/*')) return '';
+    if (line.includes('://')) return line;
+    const m = /\s\/\//.exec(line);
+    return m ? line.slice(0, m.index) : line;
+  }).join('\n');
+}
+
+/** 去注释后的源码，按文件缓存（78 个字段 × 16 个文件，别每字段重读重切一遍） */
+const layerCache = new Map();
+function layerText(file) {
+  if (!layerCache.has(file)) layerCache.set(file, stripComments(fs.readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')));
+  return layerCache.get(file);
+}
+
+/**
+ * 属性读取点：`.字段名` 或 `['字段名']`。
+ * 不用「整词出现」——`tls` 会撞上 `import tls from 'node:tls'`，`location_switch: '0'`（生成器写默认值）
+ * 也不是读取。写成 `.name` 之后这两种都不会误报。
+ */
+function readSites(fieldName, files) {
+  const esc = fieldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`(?:\\.\\s*${esc}(?![\\w$])|\\[\\s*['"]${esc}['"]\\s*\\])`);
+  const hits = [];
+  for (const f of files) {
+    layerText(f).split('\n').forEach((line, i) => { if (re.test(line)) hits.push(`${f}:${i + 1}`); });
+  }
+  return hits;
+}
+
+test('effect 注册表：每个字段说清在哪一层生效，登记与代码必须对得上', () => {
+  const { fields } = profileFormSchema();
+  // 判定用**全量注册表**（138）：schema 出参里有 HIDDEN 字段（launch_args 的旧别名等），
+  // 拿它判覆盖范围会把 user_proxy_config / browser_run_args 误判成「n/a 却登记了」。
+  const scoped = REGISTRY_FIELDS.filter((f) => f.coverage !== 'n/a').map((f) => f.name);
+  const VALID = new Set(['args', 'cdp', 'inject', 'none']);
+  const kindsOf = (e) => (Array.isArray(e.effect) ? e.effect : [e.effect]);
+
+  // ① 覆盖范围：指纹/隐私字段一个不许漏、n/a 字段一个不许进
+  assert.deepEqual(scoped.filter((n) => !OVERRIDES_EFFECT[n]), [], '这些字段（coverage ≠ n/a）没有登记 effect');
+  assert.deepEqual(Object.keys(OVERRIDES_EFFECT).filter((n) => !scoped.includes(n)), [],
+    '这些字段登记了 effect，但 coverage 是 n/a（n/a 没有「在哪一层生效」这回事）');
+  assert.deepEqual(Object.keys(OVERRIDES_INERT_EXTRA).filter((n) => scoped.includes(n)), [],
+    'INERT_EXTRA 是给 n/a 字段用的，scoped 字段的空转理由写在 EFFECT.inert 里');
+
+  // ② 取值合法：none 不许混写；none 必须写 inert；非 none 必须至少一条锚
+  for (const [n, e] of Object.entries(OVERRIDES_EFFECT)) {
+    const kinds = kindsOf(e);
+    assert.ok(kinds.length > 0 && kinds.every((k) => VALID.has(k)), `${n}: 非法 effect ${JSON.stringify(e.effect)}`);
+    assert.equal(kinds.includes('none') && kinds.length > 1, false, `${n}: none 不能和别的档混写`);
+    if (e.effect === 'none') {
+      assert.ok(e.inert && e.inert.trim().length >= 4, `${n}: 登记 none 却没写 inert 理由`);
+      assert.ok(!e.sites || !e.sites.length, `${n}: 登记 none 却写了 sites`);
+    } else {
+      assert.ok(Array.isArray(e.sites) && e.sites.length > 0, `${n}: 登记了 ${e.effect} 却没有 sites 锚`);
+    }
+  }
+
+  // ③ 每个锚都得在文件里真的存在（代码删了/改名了，注册表没跟上就红）
+  const badAnchors = [];
+  for (const [n, e] of Object.entries(OVERRIDES_EFFECT)) {
+    for (const s of e.sites ?? []) {
+      const [file, symbol] = String(s).split('#');
+      if (!file || !symbol) { badAnchors.push(`${n}: 锚格式错 ${s}`); continue; }
+      let text;
+      try { text = layerText(file); } catch { badAnchors.push(`${n}: 锚指向不存在的文件 ${file}`); continue; }
+      if (!text.includes(symbol)) badAnchors.push(`${n}: ${file} 里已经没有 "${symbol}"`);
+    }
+  }
+  assert.deepEqual(badAnchors, [], 'effect 锚点对不上代码');
+
+  // ④ 反向：登记 none 的字段，内核层**零读取**；登记了生效层的，内核层/派生层至少读一处
+  //    —— 两个方向都查，才是「既防假生效、也防假空转」
+  const noneWithReads = [];
+  const effectWithoutReads = [];
+  for (const [n, e] of Object.entries(OVERRIDES_EFFECT)) {
+    const kern = readSites(n, KERNEL_LAYERS);
+    if (e.effect === 'none') {
+      if (kern.length) noneWithReads.push(`${n}（${kern.slice(0, 3).join(' ')}）`);
+    } else if (!readSites(n, [...KERNEL_LAYERS, ...DERIVE_LAYERS]).length) {
+      effectWithoutReads.push(n);
+    }
+  }
+  assert.deepEqual(noneWithReads, [], '登记 none，内核层却读到了它 —— 要么改登记，要么把那行代码删掉');
+  assert.deepEqual(effectWithoutReads, [], '登记了生效层，但内核层与派生层一次都没读 —— 空转的另一种写法');
+
+  // ⑤ inert 与 idle 必须一致（schema.js 的 idle 就是从 inert 派生的，这里钉死这条派生关系）
+  const visible = new Set(fields.map((f) => f.name));
+  const genIdle = fields.filter((f) => f.idle).map((f) => f.name).sort();
+  const wantIdle = REGISTRY_FIELDS.filter((f) => f.inert && visible.has(f.name)).map((f) => f.name).sort();
+  assert.deepEqual(genIdle, wantIdle, 'idle 与 inert 不一致（idle 应当 = 有 inert 且进表单的字段）');
+  assert.deepEqual(
+    REGISTRY_FIELDS.filter((f) => (OVERRIDES_EFFECT[f.name]?.inert ?? OVERRIDES_INERT_EXTRA[f.name] ?? null) !== (f.inert ?? null)).map((f) => f.name),
+    [], '生成物里的 inert 与 overrides.mjs 不一致 —— 忘了重跑 tools/gen-schema.mjs？',
+  );
+
+  // ⑥ 各档数量钉死（改一个字段就得改数字，防「悄悄加一个」）
+  const census = { none: 0, args: 0, cdp: 0, inject: 0, multi: 0 };
+  for (const e of Object.values(OVERRIDES_EFFECT)) {
+    const kinds = kindsOf(e);
+    if (kinds.length > 1) census.multi += 1;
+    else census[kinds[0]] += 1;
+  }
+  assert.deepEqual(census, { none: 39, args: 10, cdp: 10, inject: 11, multi: 8 },
+    `生效层分布变了：${JSON.stringify(census)} —— 新增/删除字段时同步这条与 README 第 41 条`);
+  assert.equal(scoped.length, 78, `指纹/隐私字段 ${scoped.length} 个`);
+});
+
 
 /* ============================================================================
  * 判据⑨：字段表产物必须是最新生成的结果
