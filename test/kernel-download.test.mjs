@@ -90,6 +90,8 @@ const zipFor = (version) => makeZip({
 
 const zips = new Map();
 const hits = new Map();
+/** 镜像侧收到的请求（断言「换源后整包请求不带 Range」用） */
+const mirrorHits = [];
 let BASE = '';
 
 const server = http.createServer((req, res) => {
@@ -111,6 +113,98 @@ const server = http.createServer((req, res) => {
     });
   }
   if (p === '/meta/known-good-versions-with-downloads.json') return sendJson({ versions: [] });
+
+  /* ---------- 镜像那批用的端点（官方侧） ---------- */
+  // 官方「卡死」：整包 GET **一个字节都不给**（客户端靠 stall 检测断开 → 判定这一源不可用 → 换镜像）；
+  // 但 HEAD 与 Range 正常 —— 因为装之前的交叉核验要用官方 URL 抽段比对。
+  const officialSlow = /^\/slow-official\/([\d.]+)\/win64\/chrome-win64\.zip$/.exec(p);
+  if (officialSlow) {
+    const z = zipFor(officialSlow[1]);
+    if (req.method === 'HEAD') {
+      res.writeHead(200, { 'content-type': 'application/zip', 'content-length': z.length });
+      res.end();
+      return;
+    }
+    const range = req.headers.range;
+    if (range) {
+      const start = Number((/bytes=(\d+)-/.exec(range) || [])[1] || 0);
+      const end = Number((/bytes=\d+-(\d+)/.exec(range) || [])[1] || z.length - 1);
+      const body = z.subarray(start, Math.min(end + 1, z.length));
+      res.writeHead(206, {
+        'content-type': 'application/zip',
+        'content-length': body.length,
+        'content-range': `bytes ${start}-${start + body.length - 1}/${z.length}`,
+      });
+      res.end(body);
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/zip', 'content-length': z.length });
+    return; // 永不结束、也不发字节 → 客户端 stall
+  }
+
+  // 官方「先给 40% 再断、之后一律 500」：用来打「**中途换源必须从头下**」。
+  // 有字节流进来的时候我们**不换源**（CEO 口径：不是一慢就切），但重连撞上 500 就算这一源不可用。
+  const officialFlaky = /^\/flaky-official\/([\d.]+)\/win64\/chrome-win64\.zip$/.exec(p);
+  if (officialFlaky) {
+    const z = zipFor(officialFlaky[1]);
+    if (req.method === 'HEAD') {
+      res.writeHead(200, { 'content-type': 'application/zip', 'content-length': z.length });
+      res.end();
+      return;
+    }
+    const range = req.headers.range;
+    // 续传请求（`bytes=991-`，**没有结束位置**）→ 500：模拟官方这条链路彻底坏了
+    if (range && /-$/.test(range)) {
+      res.writeHead(500, { 'content-type': 'text/plain' });
+      res.end('boom');
+      return;
+    }
+    // 抽段请求（`bytes=a-b`，有结束位置）→ 正常 206：装之前的交叉核验要用官方 URL 抽段
+    if (range) {
+      const start = Number((/bytes=(\d+)-/.exec(range) || [])[1] || 0);
+      const end = Number((/bytes=\d+-(\d+)/.exec(range) || [])[1] || z.length - 1);
+      const body = z.subarray(start, Math.min(end + 1, z.length));
+      res.writeHead(206, {
+        'content-type': 'application/zip',
+        'content-length': body.length,
+        'content-range': `bytes ${start}-${start + body.length - 1}/${z.length}`,
+      });
+      res.end(body);
+      return;
+    }
+    // 第一条：给 40% 就断（客户端会带 Range 重连）；重连那次走上面的 500 分支
+    res.writeHead(200, { 'content-type': 'application/zip', 'content-length': z.length });
+    res.write(z.subarray(0, Math.floor(z.length * 0.4)));
+    setTimeout(() => res.destroy(), 20);
+    return;
+  }
+
+  /* ---------- 镜像侧 ---------- */
+  const mirror = /^\/mirror-(ok|badlen|badhash)\/([\d.]+)\/win64\/chrome-win64\.zip$/.exec(p);
+  if (mirror) {
+    const [, kind, version] = mirror;
+    const real = zipFor(version);
+    // 记下这次镜像请求带没带 Range —— 「换源必须从头下」靠这条断言（带了就是跨源拼接）
+    mirrorHits.push({ kind, version, range: req.headers.range || null });
+    if (kind === 'badlen') {
+      // 长度不符：少给 1 字节，且 content-length 也按少的报（这样「下完」是干净的，只有核验能抓）
+      const short = real.subarray(0, real.length - 1);
+      res.writeHead(200, { 'content-type': 'application/zip', 'content-length': short.length });
+      res.end(short);
+      return;
+    }
+    if (kind === 'badhash') {
+      // 抽样不符：长度与官方一模一样，只改中间一个字节（只有逐段 sha256 能抓）
+      const tampered = Buffer.from(real);
+      tampered[Math.floor(tampered.length / 2)] ^= 0xff;
+      res.writeHead(200, { 'content-type': 'application/zip', 'content-length': tampered.length });
+      res.end(tampered);
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/zip', 'content-length': real.length });
+    res.end(real);
+    return;
+  }
 
   const m = /^\/(ok|cut|mismatch|missing404|resume|stall)\/([\d.]+)\/win64\/chrome-win64\.zip$/.exec(p);
   if (!m) { res.writeHead(404); res.end('nope'); return; }
@@ -169,6 +263,10 @@ process.env.FREEPOWER_RATE_LIMIT_MCP = '10000';
 process.env.FREEPOWER_CFT_ZIP_BASE = `${BASE}/ok`;
 process.env.FREEPOWER_CFT_META_URL = `${BASE}/meta/last-known-good-versions-with-downloads.json`;
 process.env.FREEPOWER_CFT_VERSIONS_URL = `${BASE}/meta/known-good-versions-with-downloads.json`;
+// **默认关掉镜像回落**：这个文件必须全程不联网。产品默认是 npmmirror 镜像，
+// 但判据里凡是官方失败的那几条（断线 / 404 / 自检不一致）如果不关，就会真的去请求公网。
+// 镜像那批用例单独用 `mirrorBase` 显式指到本地假镜像。
+process.env.FREEPOWER_KERNEL_MIRROR = 'off';
 fs.rmSync(dataDir, { recursive: true, force: true });
 fs.mkdirSync(dataDir, { recursive: true });
 
@@ -225,6 +323,30 @@ async function waitFailure(version, ms = 10000) {
   return null;
 }
 
+/**
+ * 等**当前这个**后台任务自己结束（成功或失败），**不调 API**。
+ *
+ * 为什么不能拿 `pollUntilSettled` 等：那个走 HTTP 路由，路由不带 `mirrorBase`（用全局配置），
+ * 任务一失败它就**再触发一次下载** —— 而测试里全局 `CFT_ZIP_BASE` 指在假源的 `/ok` 目录，
+ * 于是重试那次会走 `/ok` 成功，把「镜像回落」的断言污染成 `source:official`。
+ * 这里只读进程内状态表，不产生副作用。
+ */
+async function waitJob(version, ms = 25000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    const st = kernelDownloadState(version);
+    if (st?.status === 'completed') return { ok: true, state: st };
+    // 成功分支会把 inflight 里那条**删掉**（只留盘上的东西），所以「装好了」才是成功判据
+    if (installedExe(version, KERNELS_DIR)) return { ok: true, state: st };
+    if (!st) {
+      const f = lastKernelFailure(version);
+      if (f) return { ok: false, failure: f };
+    }
+    await sleep(25);
+  }
+  return { ok: false, failure: lastKernelFailure(version), timeout: true };
+}
+
 const tmpLeftovers = () => (fs.existsSync(KERNELS_DIR)
   ? fs.readdirSync(KERNELS_DIR).filter((n) => n.startsWith('.tmp-'))
   : []);
@@ -239,7 +361,12 @@ try {
 
   const settled = await pollUntilSettled(V1);
   check('A1 轮询到 completed', settled?.code === 0 && settled?.data?.status === 'completed', JSON.stringify(settled));
-  check('A1 completed 的 data 只有 status 一个键', JSON.stringify(Object.keys(settled?.data || {})) === '["status"]', JSON.stringify(settled?.data));
+  // 0.4.1 起 completed 的 data 多了 `source` / `mirror_verified`（CEO 2026-11-13 批的镜像口径：
+  // 要如实告诉调用方「这份是谁给的、镜像的字节有没有对回官方」）。键集合钉死，防止再悄悄加键。
+  check('A1 completed 的 data 键集合 = status + source + mirror_verified（走官方 → official / false）',
+    JSON.stringify(Object.keys(settled?.data || {})) === '["status","source","mirror_verified"]'
+      && settled?.data?.source === 'official' && settled?.data?.mirror_verified === false,
+    JSON.stringify(settled?.data));
 
   const exe = path.join(KERNELS_DIR, V1, 'chrome.exe');
   check('A1 落盘 <kernels>/<版本>/chrome.exe（chrome-win64/ 那层被剥掉）',
@@ -256,9 +383,9 @@ try {
 
   /* -------------------- A5 幂等 -------------------- */
   const again = await api({ kernel_type: 'Chrome', kernel_version: V1 });
-  check('A5 已装再调：completed + msg:"success"（分支 A），data 只有 status',
+  check('A5 已装再调：completed + msg:"success"（分支 A），data 键集合与 A1 相同',
     again.json.code === 0 && again.json.data?.status === 'completed' && again.json.msg === 'success'
-      && JSON.stringify(Object.keys(again.json.data)) === '["status"]',
+      && JSON.stringify(Object.keys(again.json.data)) === '["status","source","mirror_verified"]',
     JSON.stringify(again.json));
 
   const partial = await api({ kernel_type: 'Chrome', kernel_version: '157' });
@@ -418,6 +545,112 @@ try {
     ['pending', 'downloading'].includes(st1) && ['pending', 'downloading'].includes(st2)
       && after - before === 1 && done6?.data?.status === 'completed',
     `${st1}/${st2} hits=${after - before} final=${done6?.data?.status}`);
+
+  /* ============================================================================
+   * 镜像回落（2026-11-13 CEO 定的六条口径）—— 全部本地假源，不联网
+   *
+   * 口径要点（代码在 `src/kernel/download.js` 的 `downloadFromSources` / `verifyMirrorBytes`）：
+   *   - 元数据只从官方取（这里的 `metaUrl` 就是假「官方」）；
+   *   - **官方这一源零字节卡死 / HTTP 错误**才换镜像；字节还在流时不换（34 KB/s 那种不切）；
+   *   - 换源必丢半成品（镜像收到的整包请求**不带 Range**）；
+   *   - 装之前用官方 URL 随机抽 5 段 128 KB 逐段核 sha256，不符 → 删包、不装、报
+   *     `kernel_mirror_verify_failed`；
+   *   - 响应/落盘标记如实给 `source` 与 `mirror_verified`。
+   * ========================================================================== */
+  const dlMirror = (version, { official, mirror, ...rest }) => runKernelDownload(
+    { kernel_type: 'Chrome', kernel_version: version },
+    { zipBase: `${BASE}/${official}`, mirrorBase: `${BASE}/${mirror}`, stallMs: 700, maxAttempts: 4, ...rest },
+  );
+
+  /* M1 官方零字节卡死 → 切镜像 → 装好，且镜像整包请求不带 Range */
+  const V9 = '157.0.9010.10';
+  const r9 = await dlMirror(V9, { official: 'slow-official', mirror: 'mirror-ok' });
+  const j9 = await waitJob(V9);
+  const mh9 = mirrorHits.filter((h) => h.version === V9);
+  check('镜像回落：官方零字节卡死（stall）→ 切镜像 → 装好',
+    r9.code === 0 && j9.ok
+      && fs.existsSync(path.join(KERNELS_DIR, V9, 'chrome.exe')),
+    `${j9.ok ? 'completed' : j9.failure?.reason} 镜像请求 ${mh9.length} 次`);
+  // 装好之后走一次 HTTP 路由，读它对外报的形状（此时已 installed，不会再触发下载）
+  const ok9 = (await api({ kernel_type: 'Chrome', kernel_version: V9 })).json;
+  check('镜像回落：completed 如实标 source=mirror + mirror_verified=true',
+    ok9?.data?.source === 'mirror' && ok9?.data?.mirror_verified === true,
+    JSON.stringify(ok9?.data));
+  check('镜像回落：换源后**整包请求不带 Range**（半成品已丢弃，不跨源拼接）',
+    mh9.length === 1 && mh9[0].range === null,
+    JSON.stringify(mh9.map((h) => h.range)));
+
+  /* M2 官方 404 → 会试镜像，但**官方拿不到包体总长就没法核验** → 不装（fail-closed） */
+  const V10 = '157.0.9011.11';
+  const r10 = await dlMirror(V10, { official: 'missing404', mirror: 'mirror-ok' });
+  const f10 = await waitFailure(V10, 25000);
+  const mh10 = mirrorHits.filter((h) => h.version === V10);
+  check('镜像核验：官方包体 404 → 镜像试过，但官方拿不到总长 → 不装（宁可失败也不装没证明的东西）',
+    r10.code === 0 && f10?.reason === 'kernel_mirror_verify_failed' && mh10.length >= 1
+      && !fs.existsSync(path.join(KERNELS_DIR, V10)),
+    `${f10?.reason} 镜像请求 ${mh10.length} 次 / ${f10?.message || ''}`.slice(0, 180));
+
+  /* M3 镜像长度与官方不符 → 删包、不装 */
+  const V11 = '157.0.9012.12';
+  const r11 = await dlMirror(V11, { official: 'slow-official', mirror: 'mirror-badlen' });
+  const f11 = await waitFailure(V11, 25000);
+  check('镜像核验：长度与官方不符 → kernel_mirror_verify_failed，不留目录、不留 .tmp-*',
+    r11.code === 0 && f11?.reason === 'kernel_mirror_verify_failed'
+      && !fs.existsSync(path.join(KERNELS_DIR, V11)) && tmpLeftovers().length === 0,
+    `${f11?.reason} ${tmpLeftovers().join(',')}`);
+
+  /* M4 镜像长度对、内容改了一个字节 → 抽样 sha256 抓出来 */
+  const V12 = '157.0.9013.13';
+  const r12 = await dlMirror(V12, { official: 'slow-official', mirror: 'mirror-badhash' });
+  const f12 = await waitFailure(V12, 25000);
+  check('镜像核验：长度相同但内容被改 → 抽样 sha256 抓出 kernel_mirror_verify_failed',
+    r12.code === 0 && f12?.reason === 'kernel_mirror_verify_failed'
+      && !fs.existsSync(path.join(KERNELS_DIR, V12)),
+    `${f12?.reason} ${f12?.message || ''}`.slice(0, 160));
+
+  /* M5 中途换源：官方先给 40% 再断、续传撞 500 → 换镜像，且必须从头下 */
+  const V13 = '157.0.9014.14';
+  const r13 = await dlMirror(V13, { official: 'flaky-official', mirror: 'mirror-ok' });
+  const j13 = await waitJob(V13);
+  const mh13 = mirrorHits.filter((h) => h.version === V13);
+  const ok13 = (await api({ kernel_type: 'Chrome', kernel_version: V13 })).json;
+  check('镜像回落：官方先给 40% 再断、续传撞 500 → 换镜像后**从头下**（不带 Range）',
+    r13.code === 0 && j13.ok && ok13?.data?.source === 'mirror'
+      && mh13.length === 1 && mh13[0].range === null,
+    `${JSON.stringify(ok13?.data)} 镜像请求 ${JSON.stringify(mh13.map((h) => h.range))}`);
+  // 装出来的必须与「一次给完的同一个包」逐字节相同 —— 证明没把两个源的字节拼在一起
+  const { extractZipBuffer: unzip } = await import('../src/kernel/zip.js');
+  const oneShot13 = path.join(dataDir, 'oneshot-13');
+  fs.mkdirSync(oneShot13, { recursive: true });
+  unzip(zipFor(V13), oneShot13, { flatten: true });
+  check('中途换源装出来的内核与「一次给完的同一个包」逐字节一致（没有跨源拼接）',
+    fs.readFileSync(path.join(KERNELS_DIR, V13, 'chrome.exe'))
+      .equals(fs.readFileSync(path.join(oneShot13, 'chrome.exe'))));
+
+  /* M6 镜像明确关掉（off）→ 官方卡死就是失败，绝不偷偷用镜像 */
+  const V14 = '157.0.9015.15';
+  const r14 = await runKernelDownload(
+    { kernel_type: 'Chrome', kernel_version: V14 },
+    { zipBase: `${BASE}/slow-official`, mirrorBase: 'off', stallMs: 700, maxAttempts: 2 },
+  );
+  const f14 = await waitFailure(V14, 25000);
+  const mh14 = mirrorHits.filter((h) => h.version === V14);
+  check('FREEPOWER_KERNEL_MIRROR=off：官方卡死 → 失败，且**一次镜像请求都没发**',
+    r14.code === 0 && !!f14 && mh14.length === 0 && !fs.existsSync(path.join(KERNELS_DIR, V14)),
+    `${f14?.reason} 镜像请求 ${mh14.length} 次`);
+
+  /* M7 走官方时不带 mirror_verified，且 source=official（标记写进盘上） */
+  const { readSourceMarker } = await import('../src/kernel/download.js');
+  const mk9 = readSourceMarker(V9, KERNELS_DIR);
+  const mk3 = readSourceMarker(V3, KERNELS_DIR);
+  check('来源标记：镜像装的那份盘上记 source=mirror + mirror_verified=true；走官方的是 official',
+    mk9?.source === 'mirror' && mk9?.mirror_verified === true
+      && mk3?.source === 'official' && mk3?.mirror_verified === false,
+    `mirror=${JSON.stringify(mk9?.source)}/${mk9?.mirror_verified} official=${JSON.stringify(mk3?.source)}/${mk3?.mirror_verified}`);
+  const again9 = await api({ kernel_type: 'Chrome', kernel_version: V9 });
+  check('已装的再调一次：completed 仍如实报 source=mirror（读盘上标记，不猜成 official）',
+    again9.json.data?.source === 'mirror' && again9.json.data?.mirror_verified === true,
+    JSON.stringify(again9.json.data));
 
   /* -------------------- 收尾：目录里只剩合法版本 -------------------- */
   const dirs = fs.readdirSync(KERNELS_DIR).sort();

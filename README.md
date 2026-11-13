@@ -463,7 +463,7 @@ npm run test
 npm run smoke
 ```
 
-当前实测（2026-11-13，本机）：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **80** + agent **15** + api **100** + ui **46** + desktop **54** + kernel-download **26**（`package.json` 里那条脚本就是这十组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **30/30**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测（2026-11-13，本机）：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **80** + agent **15** + api **100** + ui **46** + desktop **54** + kernel-download **37**（`package.json` 里那条脚本就是这十组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **30/30**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 > 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：
@@ -869,7 +869,7 @@ node --no-warnings test/proxy-chain.test.mjs   → 也行，单独跑同一套�
 - **自检**：启动后自动跑 19 项、覆盖度 7/10/2、四个哈希齐全、`rerun=1` 重跑、HTML 页可读且无外链
 - **双 Realm**（`test/workers.test.mjs`，已进 `npm run smoke`）：同一张页里起专用 worker / SharedWorker / ServiceWorker（**页面直接创建的**，嵌套 worker 另有三条断言，见已知限制第 6 条），断言三者的脚本首行已注入（`atTop === 'worker'`）、五处 canvas 哈希完全一致、硬件/语言/时区/UA 与主帧同值、`workerStats.injected === 3`；另断言 AudioWorklet 未被注入且可测表面只有 `sampleRate`/`currentTime`
 - **嵌套 worker**（同文件）：页面里起的 worker 再 `new Worker`，断言外层与嵌套层首行都已注入、主帧/外层/嵌套三者的 `hardwareConcurrency` 一致、两层都进注入计数 —— 防的是「同一台机器同时暴露伪装值与真实核数」
-- **本地 API 完整化**：`active` 的 Active/Inactive 形状、`local-active`、`cookies`、`kernels`、标签/代理列表 CRUD、占位接口明确不支持（`share` 之类）；**回收站两条已从占位变成真实现**，断言改成验「`code:0` + `data` 键全等 `limit,list,page` + 无 `total`」；**内核下载也已从占位变成真实现**（`test/kernel-download.test.mjs` 26 项，本地假源，见第十一节）
+- **本地 API 完整化**：`active` 的 Active/Inactive 形状、`local-active`、`cookies`、`kernels`、标签/代理列表 CRUD、占位接口明确不支持（`share` 之类）；**回收站两条已从占位变成真实现**，断言改成验「`code:0` + `data` 键全等 `limit,list,page` + 无 `total`」；**内核下载也已从占位变成真实现**（`test/kernel-download.test.mjs` 37 项，本地假源，见第十一节）
 - **批量启停**：一次起 3 个、批量停、失败清单带 code/message、中途失败即中断、并发上限生效
 - **cloud-active 明确报错**（`-1` + `supported:false`，不假成功）
 - 停环境后进程树回收干净、重复 start 幂等、重复 stop 800002
@@ -945,7 +945,7 @@ test/desktop.test.mjs  桌面壳契约测试（54 项：启动引导、票据、
 test/workers.test.mjs  双 Realm 真机验证（24 项：三类 worker + 嵌套 + AudioWorklet）
 test/agent.test.mjs    AI Agent 判定门 A 层（15 项，假 CDP / 纯函数 / 本地 mock LLM，不启内核、不联网）
 test/agent-smoke.test.mjs  AI Agent 判定门 B 层（30 项，真内核：七动作 / 失败即停 / 超时 / 跑完不关浏览器 / 目标→工作流 e2e）
-test/kernel-download.test.mjs  内核下载判定门（26 项，本地假源，不联网：正常/长度不符/大小写/Firefox/幂等/断线/续传/停顿重连/并发/自检不一致/404）
+test/kernel-download.test.mjs  内核下载判定门（37 项，本地假源，不联网：正常/长度不符/大小写/Firefox/幂等/断线/续传/停顿重连/并发/自检不一致/404 + 镜像回落 11 项）
 test/proxy-health.test.mjs  代理健康检查真机验证（15 项：四态 / 批量 / 只读 / 控制台）
 test/media-devices.test.mjs 媒体设备真机验证（P9-C，12 项：真实枚举 + 只改 label + toJSON + 按 kind 授权）
 test/speech.test.mjs   语音投影真机验证（P9-A，8 项）
@@ -1115,9 +1115,10 @@ POST /api/v2/browser-profile/download-kernel
 - **同步状态机、没有 task id、没有轮询端点**：每次调用都重新算「已装 / 正在下 / 正在装 / 该下」，然后**立刻**回 `{code:0,data:{status[,progress]}}`。要进度就**再调同一个端点**。
 - `status` 只会是 `pending` / `downloading` / `installing` / `completed`。`progress` 只在 `pending` / `downloading` 出现，**单位我们定 0–100**（契约里对手是原样透传，单位无证据，见契约 §7）。
 - **三条响应分支，形状不同**（契约 §2.2）：
-  - **A. 什么都不做**（已装好 / 正在下 / 正在装）→ `{code:0,data:{status[,progress]},msg:"success"}` —— **只有这条带 `msg`**；
-  - **B. 触发了下载** → `{code:0,data:{status:"pending",progress:0}}` —— **没有 `msg`**；
-  - **C. 装完了**（本次调用推进到 `completed`）→ `{code:0,data:{status:"completed"}}`。
+  - **A. 什么都不做**（已装好 / 正在下 / 正在装）→ `{code:0,data:{status[,progress],source,mirror_verified},msg:"success"}` —— **只有这条带 `msg`**；
+  - **B. 触发了下载** → `{code:0,data:{status:"pending",progress:0,source:null,mirror_verified:false}}` —— **没有 `msg`**（此刻还不知道这份最终是谁给的，如实给 `null`，不预设成 `official`）；
+  - **C. 装完了**（本次调用推进到 `completed`）→ `{code:0,data:{status:"completed",source,mirror_verified}}`。
+- **`source` / `mirror_verified` 是 0.4.1 加的**（镜像回落那批，见下面「包体镜像回落」）：`source ∈ 'official'|'mirror'|'unknown'`，`mirror_verified` 只有走镜像且抽样核验通过才是 `true`。已装的那份**从盘上的来源标记读**（`<kernels>/<版本>/.freepower-source.json`），读不到就如实报 `unknown` —— 不猜成 `official`。
 - **幂等推进，不是「下载一次」**：已经装好的再调一次回 `completed` + `msg:"success"`，不会重下。
 - **失败不进响应**：真下载/解压/自检在后台跑，同步这一发只回 `pending`。失败后**状态表立刻清空**（不留 `installing` 僵尸），**下一次调用就是重试**（契约 §2.1 的 `FAIL → RE_DOWNLOAD`）—— 用户/脚本看到没变成 `completed`，就再打一次同一发请求。
 
@@ -1183,6 +1184,27 @@ POST /api/v2/browser-profile/download-kernel
 
 总预算 `FREEPOWER_KERNEL_DOWNLOAD_TIMEOUT` 默认 **2 小时**（原来 10 分钟 → 60 分钟 → 2 小时，都是被实测数字推着改的：34 KB/s × 200 MB ≈ 90 分钟以上）。**注意这不等于请求会挂 2 小时**：`download-kernel` 立刻回 `pending`，下载在后台跑，用户/脚本轮询同一个端点即可；真正卡死由停顿检测兜。
 
+### 包体镜像回落（0.4.1，2026-11-13）
+
+**为什么要做**：本机实测到 `storage.googleapis.com` 只有 **34 KB/s**，200 MB 要 **90 分钟以上**；同一份 CfT 包在 `cdn.npmmirror.com` 的镜像上实测 **11.2 MB/s**（Content-Length 相同、抽两段 1 MB 逐字节 SHA256 相同）。不回落的话，「内核下载」在慢网下等于不可用。
+
+**为什么不能「一慢就切」**：34 KB/s 时字节还在流，切源反而丢掉已经下的进度。所以触发条件写死成**「这个源根本给不出字节」**。
+
+**口径（我们自己的，对手没有这个机制）**：我们这条产品线一路上都是 fail-closed —— PAC 宁可拒绝也不猜 `DIRECT`、代理链宁可报 `800003` 也不直连。但**内核下载不能 fail-closed 到「用户 90 分钟下不完」**，那是把功能做成不可用。所以这里改成**「可回落 + 可验证 + 可标注」**，不是「静默降级」。
+
+| 条 | 做法 |
+|---|---|
+| 1. 元数据只从官方取 | 版本列表 / 包体 URL / 总长全部来自 `googlechromelabs.github.io` 与官方包体地址；**镜像只用于包体字节**，没有「决定有哪些版本」的资格（镜像地址是按官方解析出的版本号拼出来的） |
+| 2. 触发条件写死 | 官方这一源**零字节卡死**（`FREEPOWER_KERNEL_DOWNLOAD_STALL` 内一个字节都没收到）**或任何 HTTP 错误**才切镜像。字节还在流时**绝不切** |
+| 3. 装之前交叉核验 | 先比总长（镜像自己的 `content-length` 与**官方端点**报的总长）；再从**官方 URL** 随机抽 **5 段 × 128 KB**（`Range`），逐段 sha256 与本地文件同偏移字节比对。**抽样位置每次随机**（`crypto.randomInt`），不是固定那 5 段。任一不符 → 删包、不装、报 `kernel_mirror_verify_failed` |
+| 4. 续传不许跨源拼接 | 每次换源前**把半成品删掉、从 0 重下**。两个不同来源的字节拼在一起，长度对得上也可能内容错位 —— 测试里钉住「镜像收到的整包请求不带 `Range`」 |
+| 5. 如实标注 | 响应与盘上标记都带 `source: 'official'\|'mirror'` + `mirror_verified: true\|false`；走官方就是 `official` |
+| 6. 可关 | `FREEPOWER_KERNEL_MIRROR=off` 彻底禁用回落（一次镜像请求都不发）；给一个 URL 就只认那一个 |
+
+**能证明什么、不能证明什么（必须原样读这句）**：**「抽样区间与官方一致 + 总长一致」不等于「全文件逐字节等同」**。5 段 × 128 KB 只覆盖 640 KB（209,854,321 B 的 0.3%），它挡的是「镜像给了另一个构建 / 被截断 / 内容被动过」这类整体性错误，**挡不住**「只改了我们没抽到的区间」这种定向篡改。真要做到逐字节，得 CfT 提供 sha256 —— 而它**没有**（见上一节）。
+
+**官方 404 时会发生什么（一个反直觉但正确的行为）**：官方包体 404 会触发切镜像，但**镜像下完也装不上** —— 因为核验要读官方端点报的总长，官方 404 就读不到，于是报 `kernel_mirror_verify_failed`。这是我们主动选的 fail-closed：**宁可失败，也不装一份「没法证明和官方一致」的东西**。要救「官方整体不可用」这种场面，得另做一个「显式信任某个镜像」的开关，本轮不做。
+
 ### 与对手的有意差异（写清楚，不当 bug）
 
 1. **源不同**：Chrome for Testing，不是 `version.adspower.net` 的 SunBrowser 二进制（理由见上）。所以下到的是**原版 Chrome**，没有对手那套 `SunBrowser.exe` / `browser_key_<v>` / `components\` 布局。
@@ -1190,6 +1212,7 @@ POST /api/v2/browser-profile/download-kernel
 3. **版本号放宽到 1–4 段**：对手用 `Number(kernel_version)` 判真假，`"157.0.8103.78"` 会算出 `NaN` 被它自己拒掉；但 CfT 是按**完整四段**发版的，不放宽就等于下不了任何内核。所以 `157` / `157.0` / `157.0.8103` / `157.0.8103.78` 都收（`"0"` 仍按契约拒）。短版本按前缀匹配 CfT 目录里最新的那条。
 4. **`progress` 单位定 0–100**（契约无证据，见 §7）。
 5. **没有 `update-patch`**：对手那套增量补丁仍不在范围（`placeholders` 里那条保留）。
+6. **包体镜像回落（0.4.1）是我们自己的机制**：对手没有。它的包来自自己 CDN，不存在「换第三方镜像还要证明字节一致」这个问题。我们把「能证明什么」写死在上一节，不当成「和官方逐字节等同」卖。
 
 ### 配置
 
@@ -1197,14 +1220,15 @@ POST /api/v2/browser-profile/download-kernel
 FREEPOWER_CFT_META_URL      CfT 元数据（默认 googlechromelabs.github.io/.../last-known-good-versions-with-downloads.json）
 FREEPOWER_CFT_VERSIONS_URL  历史版本目录（默认 .../known-good-versions-with-downloads.json）
 FREEPOWER_CFT_ZIP_BASE      包体基地址（默认 https://storage.googleapis.com/chrome-for-testing-public）
+FREEPOWER_KERNEL_MIRROR     包体镜像（默认 https://cdn.npmmirror.com/binaries/chrome-for-testing；off = 禁用回落）
 FREEPOWER_KERNEL_DOWNLOAD_TIMEOUT    下载+安装整体预算（默认 7200000 ms = 2 小时）
 FREEPOWER_KERNEL_DOWNLOAD_STALL      单条连接多久没字节就断开重连（默认 120000 ms）
 FREEPOWER_KERNEL_DOWNLOAD_ATTEMPTS   续传最多重连几次（默认 12）
 ```
 
-三个地址都可覆盖：内网镜像、离线自测都改这三个（`test/kernel-download.test.mjs` 就是把它指到本地 `node:http` 假源）。
+三个地址都可覆盖：内网镜像、离线自测都改这三个（`test/kernel-download.test.mjs` 就是把它指到本地 `node:http` 假源）。**`FREEPOWER_KERNEL_MIRROR` 在测试里被显式设成 `off`** —— 否则「官方断线 / 404 / 自检不一致」那几条判据会真的去请求公网。
 
-### 判定门（`test/kernel-download.test.mjs`，26 项，**不联网**）
+### 判定门（`test/kernel-download.test.mjs`，37 项，**不联网**）
 
 假源是本地 `node:http`，zip 由测试自己造（store 方法 + 真 CRC32），走的是**真**解包/校验/改名路径。唯一替换的是「解压后跑 `chrome.exe --version`」这一步（`hooks.verifyExe`）—— 假源里那个 exe 是几字节文本，不是 PE、跑不起来；换掉它只为在不联网的前提下走完整条路，**不改下载/解压/改名任何逻辑**。
 
@@ -1212,6 +1236,10 @@ FREEPOWER_KERNEL_DOWNLOAD_ATTEMPTS   续传最多重连几次（默认 12）
 另加：缺参、`"0"`、非数字、目录里没有该版本、失败后重试能装好、自检版本不一致、包体 404、并发两次调用只下一次（假源只收到 1 次 zip 请求）、**断点续传**（假源第一次只给 40% 就断 → 带 `Range` 续上 → 装好，且续出来的包与「一次给完的同一个包」解出来**逐字节一致**）、**停顿检测**（假源发 100 字节后永不结束 → `stall=600ms` 主动断开重连 → 装好）。
 
 **B 层没做**：测试里没有真下 200 MB。真机端到端是一次性手工验收（CEO 一次性授权），**不进测试、不进判据** —— 判据仍是不联网。
+
+**镜像那批（M1–M7，11 项）也是本地假源**：假「官方」有「零字节卡死」「包体 404」「先给 40% 再断、续传撞 500」三种坏法，假「镜像」有「正常」「长度差 1 字节」「长度相同但中间改一个字节」三种。断言的是：官方卡死 → 切镜像 → 装好且 `source:mirror`；换源后镜像收到的**整包请求不带 `Range`**（不跨源拼接）；长度/抽样不符 → `kernel_mirror_verify_failed` 且不留目录、不留 `.tmp-*`；官方 404 → 镜像试过但**不装**；`FREEPOWER_KERNEL_MIRROR=off` → 官方卡死就是失败、**一次镜像请求都没发**；来源标记落盘并能被「已装再调」读回。
+
+> 一个测试自身的坑记在这：等后台任务**不能**用「再打一次 HTTP 路由」那个轮询（`pollUntilSettled`）—— 路由不带 `mirrorBase`，任务一失败它就再触发一次下载，而全局 `CFT_ZIP_BASE` 指在假源的 `/ok` 目录，重试那次会走 `/ok` 成功，把断言污染成 `source:official`。镜像那批统一用 `waitJob()`（只读进程内状态 + 盘上是否装好，不产生副作用）。
 
 ### 真机端到端（一次性验收，**不进测试、不进判据**）
 
@@ -1232,6 +1260,8 @@ FREEPOWER_KERNEL_DOWNLOAD_ATTEMPTS   续传最多重连几次（默认 12）
 
 ### 已知限制
 
+- **镜像核验只抽样、不是逐字节**：5 段 × 128 KB 只覆盖 0.3%，挡整体性错误（换了个构建 / 截断 / 内容被动过），挡不住「只改没抽到的区间」。要逐字节得有 CfT 的 sha256，而它没有。
+- **官方整体不可用时装不上**：核验必须读官方端点报的总长，官方 404 / 全挂时连镜像也装不了（报 `kernel_mirror_verify_failed`）。这是故意的 fail-closed，见上面那一节；
 - **续传只在一次任务内部**：任务失败（重连 12 次还没下完）之后，下一次调用是**从头下**，不复用上次那半截（`.tmp-*` 已经被删了）。理由是「跨任务续」要维护一份下载账本，而 CfT 不给我们 ETag 之外的强校验，账本对不上反而更危险；
 - **没有并行分片下载**：单连接 + 续传。真机实测同一条连接会衰减，理论上分片能更快，但那是另一件事（要处理合并、分片校验），没做；
 - **不支持 ZIP64 / 加密 / 非 store·deflate 的压缩方法**：遇到就明确报错，不静默跳过（CfT 的包是普通 deflate，不会碰到）；

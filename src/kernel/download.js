@@ -29,13 +29,36 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import {
   KERNELS_DIR, CFT_META_URL, CFT_VERSIONS_URL, CFT_ZIP_BASE,
-  KERNEL_DOWNLOAD_TIMEOUT_MS, KERNEL_DOWNLOAD_STALL_MS, KERNEL_DOWNLOAD_ATTEMPTS,
+  KERNEL_DOWNLOAD_TIMEOUT_MS, KERNEL_DOWNLOAD_STALL_MS, KERNEL_DOWNLOAD_ATTEMPTS, KERNEL_MIRROR,
 } from '../config.js';
-import { cftPlatform, resolveCftKernel } from './cft.js';
+import { cftPlatform, resolveCftKernel, cftZipName } from './cft.js';
 import { extractZipFile } from './zip.js';
 
 /** 解压后认的三种布局（与 `listKernels` 同一份口径，顺序也一样） */
 const EXE_RELS = ['chrome.exe', 'chrome-win64/chrome.exe', 'chrome-win/chrome.exe'];
+
+/** 装好之后写在版本目录里的来源标记（隐藏文件；`listKernels` 只认目录，不受影响） */
+const SOURCE_MARKER = '.freepower-source.json';
+
+/** 镜像核验：默认抽几段、每段多大（CEO 2026-11-13 定的口径：5 段 × 128 KB） */
+export const MIRROR_VERIFY_SEGMENTS = 5;
+export const MIRROR_VERIFY_CHUNK = 131072;
+
+/**
+ * 镜像基地址 → 可用值（`''` = 禁用）。
+ * `off` / `0` / `false` / 空串都算「明确关掉」，**不做「配错就静默回落到默认镜像」**。
+ */
+export function mirrorBaseOf(value = KERNEL_MIRROR) {
+  const v = String(value ?? '').trim().replace(/\/+$/, '');
+  if (!v) return '';
+  if (/^(off|0|false|no|none)$/i.test(v)) return '';
+  return v;
+}
+
+/** 镜像上的包体地址：与官方同构（`<base>/<版本>/<平台>/chrome-<平台>.zip`） */
+export function mirrorZipUrl(mirrorBase, version, platform = cftPlatform()) {
+  return `${String(mirrorBase).replace(/\/+$/, '')}/${version}/${platform}/${cftZipName(platform)}`;
+}
 
 /** Firefox 的明确说法：CfT 没有 Firefox 构建，我们不假装「目录里没有」 */
 export const FIREFOX_UNSUPPORTED_MSG = 'Firefox kernel download is not supported: FreePower downloads Chrome kernels from Chrome for Testing only (there is no Firefox build there).';
@@ -102,6 +125,22 @@ export function installedExe(version, root = KERNELS_DIR) {
   return firstExe(path.join(root, String(version)));
 }
 
+/**
+ * 读来源标记（`source` / `mirror_verified` 的唯一事实源）。
+ *
+ * 没有标记有两种情况，都如实报 `unknown`、不猜：① 这份内核是本版本之前装的（那时候还没这个文件）；
+ * ② 用户自己把一份 Chrome 目录拷进了 kernels。**不许默认成 `official`** —— 那是在没有证据时撒谎。
+ */
+export function readSourceMarker(version, root = KERNELS_DIR) {
+  try {
+    const p = path.join(root, String(version), SOURCE_MARKER);
+    const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
+    return raw && typeof raw === 'object' ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
 /* ------------------------------ 版本解析（带缓存） ------------------------------ */
 
 /** 目录解析缓存：契约里对手的 sysVersion 缓存 300 s，这里对齐；只缓存成功结果 */
@@ -150,13 +189,23 @@ export function lastKernelFailure(version) {
 }
 
 function snapshot(entry) {
-  if (entry.status === 'completed') return { status: 'completed' };
-  if (entry.status === 'installing') return { status: 'installing' };
+  // 来源与「镜像是否核验过」跟着状态一起回，**任何分支都带**（脚本据此判断这份是谁给的）
+  const tag = { source: entry.source || null, mirror_verified: entry.mirror_verified === true };
+  if (entry.status === 'completed') return { status: 'completed', ...tag };
+  if (entry.status === 'installing') return { status: 'installing', ...tag };
   const progress = Math.max(0, Math.min(100, Math.round(entry.progress || 0)));
-  return { status: entry.status === 'downloading' ? 'downloading' : 'pending', progress };
+  return { status: entry.status === 'downloading' ? 'downloading' : 'pending', progress, ...tag };
 }
 
-const completedRes = () => ({ code: 0, data: { status: 'completed' }, msg: 'success' });
+/** 已装：来源从盘上的标记读；没有标记如实报 `unknown`（不猜成 official） */
+const completedRes = (version, root = KERNELS_DIR) => {
+  const m = readSourceMarker(version, root);
+  return {
+    code: 0,
+    data: { status: 'completed', source: m?.source || 'unknown', mirror_verified: m?.mirror_verified === true },
+    msg: 'success',
+  };
+};
 const noopRes = (entry) => ({ code: 0, data: snapshot(entry), msg: 'success' });
 
 /* ------------------------------ 对外入口 ------------------------------ */
@@ -186,10 +235,15 @@ export async function runKernelDownload(body = {}, opts = {}) {
     timeoutMs: opts.timeoutMs || KERNEL_DOWNLOAD_TIMEOUT_MS,
     stallMs: opts.stallMs || KERNEL_DOWNLOAD_STALL_MS,
     maxAttempts: opts.maxAttempts || KERNEL_DOWNLOAD_ATTEMPTS,
+    // `undefined` = 用全局配置（默认 npmmirror）；`''` / `'off'` = 明确禁用回落
+    mirrorBase: opts.mirrorBase,
+    verifySegments: opts.verifySegments,
+    verifyChunk: opts.verifyChunk,
+    randomInt: opts.randomInt,
   };
 
   // ① 已装：幂等 completed（分支 A，带 msg）
-  if (installedExe(req.kernel_version, root)) return completedRes();
+  if (installedExe(req.kernel_version, root)) return completedRes(req.kernel_version, root);
 
   // ② 正在下/装：只回报状态，不重复触发（契约 §2.3 的并发去重）
   const running = inflight.get(req.kernel_version);
@@ -210,7 +264,7 @@ export async function runKernelDownload(body = {}, opts = {}) {
   // ③ 解析出来的具体版本已经装好了（请求 `"157"`、盘上有 `157.0.8103.78`）
   if (installedExe(resolved.version, root)) {
     inflight.delete(req.kernel_version);
-    return completedRes();
+    return completedRes(resolved.version, root);
   }
   // ④ 同一个具体版本已经在跑（`"157"` 与 `"157.0.8103.78"` 同时来）：并到那条上
   const same = inflight.get(resolved.version);
@@ -225,8 +279,11 @@ export async function runKernelDownload(body = {}, opts = {}) {
   }
 
   startJob(entry, resolved, ctx);
-  // 分支 B：触发了下载 —— 没有 msg（契约 §2.2）
-  return { code: 0, data: { status: 'pending', progress: 0 } };
+  // 分支 B：触发了下载 —— **没有 msg**（契约 §2.2），status 固定 `pending`、progress 固定 0
+  // （契约形状不能因为后台跑快了就变成 downloading）。
+  // `source` 此刻还**不知道**（先试官方，卡死才切镜像），所以如实给 null，不预设成 official；
+  // 轮询时按真实进度给。要「这份是谁给的」看 `completed` 那一发（读盘上的来源标记）。
+  return { code: 0, data: { status: 'pending', progress: 0, source: null, mirror_verified: false } };
 }
 
 /** 目录/网络错误 → 带契约文案的 KernelError */
@@ -249,11 +306,18 @@ function startJob(entry, resolved, ctx) {
         timeoutMs: ctx.timeoutMs,
         stallMs: ctx.stallMs,
         maxAttempts: ctx.maxAttempts,
+        mirrorBase: ctx.mirrorBase,
+        verifySegments: ctx.verifySegments,
+        verifyChunk: ctx.verifyChunk,
+        randomInt: ctx.randomInt,
         onPhase: (ph) => { entry.status = ph; },
         onProgress: (p) => { entry.progress = p; },
+        onSource: (kind) => { entry.source = kind; },
       });
       entry.status = 'completed';
       entry.progress = 100;
+      entry.source = r.source;
+      entry.mirror_verified = r.mirror_verified;
       entry.result = r;
       inflight.delete(entry.version);
       failures.delete(entry.version);
@@ -312,6 +376,7 @@ export async function downloadToFile(url, zipPath, {
   stallMs = KERNEL_DOWNLOAD_STALL_MS,
   maxAttempts = KERNEL_DOWNLOAD_ATTEMPTS,
   onProgress = () => {},
+  giveUpOn = null,
 } = {}) {
   fs.mkdirSync(path.dirname(zipPath), { recursive: true });
   const deadline = Date.now() + timeoutMs;
@@ -320,6 +385,18 @@ export async function downloadToFile(url, zipPath, {
   let attempts = 0;
   let resumed = false;
   let lastErr = null;
+
+  /**
+   * 「这个源不用再试了，换下一个」——由调用方判定（见 `downloadFromSources`）。
+   * 命中就**立刻抛出**，不再重试本源；异常上带 `sourceUnusable` 标记，调用方据此切源。
+   */
+  const bailIfUnusable = (err, got) => {
+    if (typeof giveUpOn !== 'function') return;
+    if (giveUpOn(err, got)) {
+      err.sourceUnusable = true;
+      throw err;
+    }
+  };
 
   while (attempts < maxAttempts) {
     if (Date.now() > deadline) {
@@ -351,6 +428,7 @@ export async function downloadToFile(url, zipPath, {
       if (!res.ok) {
         const retryable = res.status === 408 || res.status === 429 || res.status >= 500;
         const err = new KernelError(`内核包下载失败：HTTP ${res.status}（${url}）`, { reason: `download_http_${res.status}` });
+        bailIfUnusable(err, received);
         if (!retryable) throw err;
         lastErr = err;
         continue;
@@ -395,7 +473,9 @@ export async function downloadToFile(url, zipPath, {
       if (total === 0) break; // 服务端没给长度：靠后面的结构校验兜（解包时会红）
       // 流干净结束但没下完：当作一次中断，接着续
       lastErr = new KernelError(`内核包不完整：content-length 声明 ${total} 字节，实收 ${received} 字节`, { reason: 'download_length_mismatch' });
+      bailIfUnusable(lastErr, received);
     } catch (e) {
+      if (e?.sourceUnusable) throw e;
       if (e instanceof KernelError && !/^download_http_(408|429|5\d\d)$/.test(String(e.reason))) throw e;
       lastErr = e instanceof KernelError
         ? e
@@ -405,6 +485,7 @@ export async function downloadToFile(url, zipPath, {
             : `内核包下载中断：${e?.cause?.code || e?.message || e}`,
           { reason: ac.signal.aborted ? 'download_stalled' : 'download_interrupted', cause: e },
         );
+      bailIfUnusable(lastErr, received);
     } finally {
       if (stallTimer) clearTimeout(stallTimer);
     }
@@ -421,12 +502,184 @@ export async function downloadToFile(url, zipPath, {
 }
 
 /**
+ * 多源下载：**官方优先，镜像只在「这个源根本给不出字节」时回落**。
+ *
+ * CEO 2026-11-13 定的口径（六条里落在这里的四条）：
+ *   - 触发条件写死：**官方这一源零字节卡死（`stallMs` 内一个字节都没有）或任何 HTTP 错误**
+ *     才换源。**不是「一慢就切」** —— 实测 34 KB/s 时字节还在流，切了反而丢进度；
+ *   - **不许跨源拼接**：每次换源前把半成品删掉、从 0 重下。两个不同来源的字节拼在一起，
+ *     长度对得上也可能内容错位（这条最容易被忽略，所以测试里钉「镜像收到的请求不带 Range」）；
+ *   - 镜像**只当传输层**：这里的 `sources` 由调用方按官方元数据算出来，镜像不参与「有哪些版本」；
+ *   - 如实标注：返回值带 `source` / `switched`，装完由 `installKernel` 落进来源标记。
+ *
+ * @param {{kind: 'official'|'mirror', url: string}[]} sources 按优先级排列
+ * @returns {Promise<{bytes:number,total:number,attempts:number,resumed:boolean,
+ *                    source:'official'|'mirror',url:string,switched:boolean,previousError?:Error}>}
+ */
+export async function downloadFromSources(sources, zipPath, {
+  fetchImpl = fetch,
+  timeoutMs = KERNEL_DOWNLOAD_TIMEOUT_MS,
+  stallMs = KERNEL_DOWNLOAD_STALL_MS,
+  maxAttempts = KERNEL_DOWNLOAD_ATTEMPTS,
+  onProgress = () => {},
+  onSource = () => {},
+} = {}) {
+  const list = (Array.isArray(sources) ? sources : []).filter((s) => s && s.url);
+  if (!list.length) throw new KernelError('没有可用的内核包源', { reason: 'kernel_no_source' });
+
+  let lastErr = null;
+  for (let i = 0; i < list.length; i += 1) {
+    const src = list[i];
+    const isLast = i === list.length - 1;
+
+    // 换源必丢半成品（含第一次：上一次失败留下的前一个源的文件不能留）
+    try { fs.rmSync(zipPath, { force: true }); } catch { /* 首次本来就没有 */ }
+    onSource(src.kind);
+
+    try {
+      const r = await downloadToFile(src.url, zipPath, {
+        fetchImpl, timeoutMs, stallMs, maxAttempts, onProgress,
+        giveUpOn: isLast ? null : (err, received) => {
+          // ① 零字节卡死；② 任何 HTTP 错误（404 也算 —— 官方没有这个包，镜像也许有，
+          //    但反过来「官方 500、镜像好」正是要救的场面）。**字节还在流时绝不换源。**
+          if (received === 0 && err?.reason === 'download_stalled') return true;
+          if (/^download_http_\d+$/.test(String(err?.reason))) return true;
+          return false;
+        },
+      });
+      return { ...r, source: src.kind, url: src.url, switched: i > 0, previousError: lastErr };
+    } catch (e) {
+      lastErr = e;
+      if (isLast || !e?.sourceUnusable) throw e;
+    }
+  }
+  throw lastErr || new KernelError('没有可用的内核包源', { reason: 'kernel_no_source' });
+}
+
+/* ------------------------------ 镜像字节核验 ------------------------------ */
+
+/** 官方端点的包体总长：先 HEAD，服务端不认 HEAD 再用 `Range: bytes=0-0` 读 `content-range` */
+async function officialSize(url, { fetchImpl = fetch, timeoutMs = 60000 } = {}) {
+  const grab = async (init) => {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      return await fetchImpl(url, { ...init, signal: ac.signal, redirect: 'follow' });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  try {
+    const head = await grab({ method: 'HEAD' });
+    if (head?.ok) {
+      const n = Number(head.headers?.get?.('content-length') || 0);
+      if (n > 0) return n;
+    }
+    const probe = await grab({ headers: { range: 'bytes=0-0' } });
+    const cr = /\/\s*(\d+)\s*$/.exec(String(probe?.headers?.get?.('content-range') || ''));
+    return Number(cr?.[1] || 0);
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * **装之前**用官方 URL 交叉核验镜像给的字节（CEO 口径第 3 条）。
+ *
+ * 做两件事：
+ *   1. 总长：镜像给的 `content-length` 必须等于官方端点报的总长；
+ *   2. 抽样：从**官方 URL** 随机抽 `segments` 段、每段 `chunk` 字节（默认 5 × 128 KB），
+ *      逐段 sha256 与本地文件同一偏移的字节比对。抽样位置每次随机（`crypto.randomInt`），不许固定。
+ *
+ * 任一不符（长度、任一段哈希、官方端点不认 Range）→ 抛 `kernel_mirror_verify_failed`，
+ * 调用方负责删包、不装。
+ *
+ * **能证明什么、不能证明什么（README 原样写）**：「抽样区间与官方一致 + 总长一致」
+ * **不等于**「全文件逐字节等同」。
+ */
+export async function verifyMirrorBytes({
+  officialUrl, zipPath, total = 0,
+  fetchImpl = fetch,
+  segments = MIRROR_VERIFY_SEGMENTS,
+  chunk = MIRROR_VERIFY_CHUNK,
+  timeoutMs = 60000,
+  randomInt = crypto.randomInt,
+} = {}) {
+  const fail = (message, cause) => new KernelError(message, { reason: 'kernel_mirror_verify_failed', cause });
+
+  const size = fs.statSync(zipPath).size;
+  if (total > 0 && size !== total) {
+    throw fail(`镜像包长度与它自己声明的 content-length 不符（声明 ${total}，实收 ${size}）`);
+  }
+  const officialTotal = await officialSize(officialUrl, { fetchImpl, timeoutMs });
+  if (!officialTotal) {
+    throw fail(`读不到官方包体总长，无法核验镜像（${officialUrl}）`);
+  }
+  if (size !== officialTotal) {
+    throw fail(`镜像包总长 ${size} 与官方 ${officialTotal} 不一致`);
+  }
+
+  const fd = fs.openSync(zipPath, 'r');
+  const local = Buffer.alloc(Math.min(chunk, size));
+  const checked = [];
+  try {
+    const count = Math.max(1, Math.min(Number(segments) || 1, Math.floor(size / Math.max(1, chunk)) || 1));
+    const span = Math.max(1, size - local.length + 1);
+    for (let i = 0; i < count; i += 1) {
+      const start = span > 1 ? randomInt(0, span) : 0;
+      const len = Math.min(local.length, size - start);
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), timeoutMs);
+      let res;
+      try {
+        res = await fetchImpl(officialUrl, {
+          signal: ac.signal,
+          redirect: 'follow',
+          headers: { range: `bytes=${start}-${start + len - 1}` },
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!res?.ok) throw fail(`从官方 URL 抽段失败：HTTP ${res?.status}（偏移 ${start}）`);
+      if (res.status !== 206) {
+        // 官方端点不认 Range 就退回整包 —— 那等于没法「只核一段」，宁可失败也不瞎猜
+        throw fail(`官方 URL 不认 Range（偏移 ${start} 返回 ${res.status}），无法核验镜像`);
+      }
+      const got = Buffer.concat(await collectBody(res, len));
+      if (got.length !== len) throw fail(`官方抽段长度不对：要 ${len} 字节，实收 ${got.length}（偏移 ${start}）`);
+      fs.readSync(fd, local, 0, len, start);
+      const a = crypto.createHash('sha256').update(got).digest('hex');
+      const b = crypto.createHash('sha256').update(local.subarray(0, len)).digest('hex');
+      if (a !== b) throw fail(`抽段哈希与官方不一致（偏移 ${start}，长度 ${len}）`);
+      checked.push({ start, length: len, sha256: a });
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return { size, official_total: officialTotal, segments: checked.length, chunk: local.length, ranges: checked };
+}
+
+/** 读响应体，最多要 `want` 字节（多出来的不读，省流量） */
+async function collectBody(res, want) {
+  const out = [];
+  let got = 0;
+  for await (const part of res.body) {
+    const buf = Buffer.from(part);
+    out.push(buf);
+    got += buf.length;
+    if (got >= want) break;
+  }
+  return out;
+}
+
+/**
  * 下载 → 校验 → 解压 → 自检 → 原子改名。**await 到「真装好」才返回**。
  *
  * 失败：`.tmp-*` 整个删掉（zip、半解压目录一起），目标版本目录不会出现半个。
  * @returns {Promise<{version: string, path: string, bytes: number, files: number,
  *                    checksum_source: 'metadata'|'none', verified_by: string,
- *                    download_attempts: number, resumed: boolean}>}
+ *                    download_attempts: number, resumed: boolean,
+ *                    source: 'official'|'mirror', mirror_verified: boolean}>}
  */
 export async function installKernel(resolved, {
   root = KERNELS_DIR,
@@ -435,14 +688,25 @@ export async function installKernel(resolved, {
   timeoutMs = KERNEL_DOWNLOAD_TIMEOUT_MS,
   stallMs = KERNEL_DOWNLOAD_STALL_MS,
   maxAttempts = KERNEL_DOWNLOAD_ATTEMPTS,
+  mirrorBase = undefined,
+  verifySegments = MIRROR_VERIFY_SEGMENTS,
+  verifyChunk = MIRROR_VERIFY_CHUNK,
+  randomInt = undefined,
   onPhase = () => {},
   onProgress = () => {},
+  onSource = () => {},
 } = {}) {
   const { version, url, platform = cftPlatform(), checksum = '' } = resolved || {};
   if (!version || !url) throw new KernelError('内核下载参数不完整（缺 version / url）', { reason: 'kernel_bad_resolve' });
 
   const done = installedExe(version, root);
   if (done) return { version, path: done, bytes: 0, files: 0, checksum_source: 'none', verified_by: 'already-installed' };
+
+  // 镜像只当传输层：地址按**官方元数据解析出来的版本**拼，镜像没有「决定有哪些版本」的资格
+  const mirror = mirrorBaseOf(mirrorBase === undefined ? KERNEL_MIRROR : mirrorBase);
+  const mirrorUrl = mirror ? mirrorZipUrl(mirror, version, platform) : '';
+  const sources = [{ kind: 'official', url }];
+  if (mirrorUrl && mirrorUrl !== url) sources.push({ kind: 'mirror', url: mirrorUrl });
 
   fs.mkdirSync(root, { recursive: true });
   const dst = path.join(root, version);
@@ -451,8 +715,8 @@ export async function installKernel(resolved, {
   const xDir = path.join(tmp, 'x');
   try {
     onPhase('downloading');
-    const dl = await downloadToFile(url, zipPath, {
-      fetchImpl, timeoutMs, stallMs, maxAttempts, onProgress,
+    const dl = await downloadFromSources(sources, zipPath, {
+      fetchImpl, timeoutMs, stallMs, maxAttempts, onProgress, onSource,
     });
     const received = dl.bytes;
 
@@ -471,6 +735,20 @@ export async function installKernel(resolved, {
         throw new KernelError(`内核包 sha256 不符（期望 ${checksum}，实得 ${got}）`, { reason: 'download_checksum_mismatch' });
       }
       checksumSource = 'metadata';
+    }
+    // ③ **镜像的字节必须能对回官方**才允许装（见 `verifyMirrorBytes`）。
+    //    不符就抛 `kernel_mirror_verify_failed`，下面是 finally 里删包的路径 —— 绝不「先装了再说」。
+    let mirrorVerify = null;
+    if (dl.source === 'mirror') {
+      mirrorVerify = await verifyMirrorBytes({
+        officialUrl: url,
+        zipPath,
+        total: dl.total,
+        fetchImpl,
+        segments: verifySegments,
+        chunk: verifyChunk,
+        ...(randomInt ? { randomInt } : {}),
+      });
     }
 
     onPhase('installing');
@@ -492,6 +770,26 @@ export async function installKernel(resolved, {
     if (!fs.existsSync(dst)) fs.renameSync(xDir, dst);
     const installed = installedExe(version, root);
     if (!installed) throw new KernelError(`内核安装后仍找不到 chrome.exe（${dst}）`, { reason: 'kernel_install_failed' });
+
+    // ⑤ 来源标记：装好之后才知道「这份是谁给的」，落在版本目录里（隐藏文件，不动 chrome 自己的布局）。
+    //    为什么不写数据库：kernels 目录是可搬迁的（换 DATA_DIR、拷 U 盘都行），标记要跟着走。
+    const mirror_verified = !!mirrorVerify;
+    const sourceInfo = {
+      version,
+      source: dl.source,
+      mirror_verified,
+      bytes: received,
+      verified_at: new Date().toISOString(),
+      ...(mirrorVerify ? { mirror_segments: mirrorVerify.segments, mirror_chunk: mirrorVerify.chunk } : {}),
+      ...(dl.switched ? { switched_from: 'official', switched_reason: dl.previousError?.reason || null } : {}),
+    };
+    try {
+      fs.writeFileSync(path.join(dst, SOURCE_MARKER), `${JSON.stringify(sourceInfo, null, 2)}\n`, 'utf8');
+    } catch (e) {
+      // 标记写不上不影响内核可用，但要留痕：否则 `completed` 会退化成 source:'unknown'
+      try { console.warn(`[kernel] 写来源标记失败（${dst}）：${e?.message || e}`); } catch { /* ignore */ }
+    }
+
     return {
       version,
       path: installed,
@@ -501,6 +799,9 @@ export async function installKernel(resolved, {
       verified_by: 'chrome.exe --version',
       download_attempts: dl.attempts,
       resumed: dl.resumed,
+      source: dl.source,
+      mirror_verified,
+      ...(mirrorVerify ? { mirror_verify: mirrorVerify } : {}),
     };
   } finally {
     // 成功路径：xDir 已被改名走，这里只剩 zip 和空壳；失败路径：zip + 半解压目录一起删

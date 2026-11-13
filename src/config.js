@@ -81,6 +81,24 @@ export const KERNEL_DOWNLOAD_STALL_MS = Number(process.env.FREEPOWER_KERNEL_DOWN
  */
 export const KERNEL_DOWNLOAD_ATTEMPTS = Number(process.env.FREEPOWER_KERNEL_DOWNLOAD_ATTEMPTS || 12);
 
+/**
+ * 包体镜像（**只当传输层**，元数据永远只从官方取）。
+ *
+ * 为什么需要：本机实测到 `storage.googleapis.com` 只有 34 KB/s（200 MB 要 90 分钟以上），
+ * 而同一份 CfT 包在 npmmirror 上实测 11.2 MB/s，两段 1 MB 抽样与 Google 逐字节相同。
+ * 不回落的话「内核下载」在慢网下等于不可用 —— 但也不许静默降级，所以配套三条硬约束
+ * （见 `src/kernel/download.js`）：官方零字节卡死 / HTTP 错误才切、换源必丢半成品、
+ * 装前用**官方 URL**随机抽 5 段 128 KB 逐段核 sha256。
+ *
+ * 取值：
+ *   - `off`（或 `0` / `false` / 空串）→ **彻底禁用回落**，只从官方下；
+ *   - 一个基地址 → 只认这一个镜像；
+ *   - 不设 → 默认用实测过的 CfT 镜像（npmmirror 的 `binaries/chrome-for-testing`）。
+ */
+export const KERNEL_MIRROR = String(
+  process.env.FREEPOWER_KERNEL_MIRROR ?? 'https://cdn.npmmirror.com/binaries/chrome-for-testing',
+).trim().replace(/\/+$/, '');
+
 /** 环境启动后保持的调试端口随机分配；外部脚本通过返回的 ws 地址接入 */
 export const START_TIMEOUT_MS = Number(process.env.FREEPOWER_START_TIMEOUT || 20000);
 
