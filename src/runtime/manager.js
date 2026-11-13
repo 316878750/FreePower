@@ -952,7 +952,11 @@ async function applyToSession(client, sessionId, profile, view, { proxyAuth = tr
   // 但一个请求都没被改（静默空转的典型）。不走 `Fetch.requestPaused` —— 那条是拦截用的，
   // 拿来逐请求改头会把 installRequestGating 的职责搅混。
   if (view.doNotTrack === '1') {
-    await client.send('Network.enable', {}, s).catch(() => {});
+    // 这一条**不许静默吞**：enable 失败时 `setExtraHTTPHeaders` 照样返回 ok，但一个请求都不改，
+    // 表现为「DNT 头配了却没生效」——正是踩过的那种静默空转。行为不变（仍继续设头），
+    // 但失败要留一句日志，不然下次还得靠人肉抓包才发现。
+    await client.send('Network.enable', {}, s)
+      .catch((e) => log(instance_profile(profile), 'WARN Network.enable 失败，DNT 头可能不生效', e.message));
     await client.send('Network.setExtraHTTPHeaders', { headers: { DNT: '1' } }, s)
       .catch((e) => log(instance_profile(profile), 'WARN DNT 头设置失败', e.message));
   }

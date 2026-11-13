@@ -259,6 +259,24 @@ test('P2 do_not_track：只有 "true" 才做两半，其余写法一个字节都
   assert.equal(off.includes("defGetter(Navigator.prototype, 'doNotTrack', '0')"), false);
 });
 
+/**
+ * 源码级判据（不是行为判据，行为要靠真内核才测得到）：`Network.enable` 失败**不许静默吞**。
+ * 理由：未 enable 时 `setExtraHTTPHeaders` 返回 ok 但一个请求都不改 —— 失败被 `.catch(() => {})`
+ * 吃掉，就变成「DNT 配了却没生效」且没有任何线索。这里钉住「失败要留一句日志、且仍继续设头」。
+ */
+test('P2 do_not_track：Network.enable 失败不许静默吞（要留日志，行为仍是继续设头）', () => {
+  const src = fs.readFileSync(new URL('../src/runtime/manager.js', import.meta.url), 'utf8');
+  const start = src.indexOf("view.doNotTrack === '1'");
+  assert.ok(start > 0, 'manager.js 里找不到 DNT 那段');
+  // 用**带引号的**调用名定位，避开注释里的同名标识符（注释里是反引号写法）
+  const enableAt = src.indexOf("'Network.enable'", start);
+  const setAt = src.indexOf("'Network.setExtraHTTPHeaders'", start);
+  assert.ok(enableAt > start && setAt > enableAt, 'DNT 段里应当先 enable 再设头');
+  const head = src.slice(enableAt, setAt);
+  assert.equal(head.includes('.catch(() => {})'), false, 'Network.enable 的失败被静默吞了');
+  assert.match(head, /WARN Network\.enable 失败/, 'enable 失败没有留日志');
+});
+
 test('httpGetViaProxy：非 200 也完整返回，交给上层判断', async () => {
   const fake = await startFakeProxy();
   try {
