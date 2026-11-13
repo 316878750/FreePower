@@ -760,6 +760,10 @@ try {
       .equals(fs.readFileSync(path.join(oneShot13, 'chrome.exe'))));
 
   /* M6 镜像明确关掉（off）→ 官方卡死就是失败，绝不偷偷用镜像 */
+  // 这条原来只断言「失败 + 镜像 0 次」，而实际的失败原因是 `ENOENT: …chrome-win64.zip`
+  // （0 字节被当成功、调用方去解一个不存在的文件）—— 判据照样绿，是**假绿**。
+  // 现在钉死具体 reason：失败必须来自下载层本身（`download_timeout` / `download_interrupted`），
+  // 不是「文件不存在」这种下游症状。判据只能改严。
   const V14 = '157.0.9015.15';
   const r14 = await runKernelDownload(
     { kernel_type: 'Chrome', kernel_version: V14 },
@@ -767,8 +771,9 @@ try {
   );
   const f14 = await waitFailure(V14, 25000);
   const mh14 = mirrorHits.filter((h) => h.version === V14);
-  check('FREEPOWER_KERNEL_MIRROR=off：官方卡死 → 失败，且**一次镜像请求都没发**',
-    r14.code === 0 && !!f14 && mh14.length === 0 && !fs.existsSync(path.join(KERNELS_DIR, V14)),
+  check('FREEPOWER_KERNEL_MIRROR=off：官方卡死 → 失败原因是 download_timeout/download_interrupted 之一，且**一次镜像请求都没发**',
+    r14.code === 0 && /^download_(timeout|interrupted)$/.test(String(f14?.reason))
+      && mh14.length === 0 && !fs.existsSync(path.join(KERNELS_DIR, V14)),
     `${f14?.reason} 镜像请求 ${mh14.length} 次`);
 
   /* ---------------------------------------------------------------------------
