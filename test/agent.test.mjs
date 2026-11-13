@@ -1,5 +1,5 @@
 /**
- * AI Agent 判定门 A 层（0.4.0）—— **不启内核**，全部走假 CDP / 纯函数。
+ * AI Agent 判定门 A 层（0.4.0）—— **不启内核**，全部走假 CDP / 纯函数 / 本地 mock LLM。
  *
  * 断言清单来自巡检（CEO 转达），A1–A5 一条不多一条不少：
  *   A1 批完改盘上任务 → run 当场 100002 + field=digest，状态仍 approved（含反例）
@@ -8,14 +8,23 @@
  *   A4 fill.value / cookie set 的值不出现在 status JSON（digest 还在）
  *   A5 text 超 10KB / cookie value 超 4KB → 截断 + truncated + original_len（含未超限不带键）
  *
+ * 0.4.0 收尾补的 LLM 判定（同样不进 `npm test` 之外的任何东西）：
+ *   A6/A7 合法 JSON 与 ```json 围栏都过；prompt 只有 goal + 动作清单，body 里没有 key、也没塞 profile 数据
+ *   A8 未知动作 / 未知字段 / 空数组 / 超 20 步 → 100002 + field
+ *   A9 401 / 500 / 超时 / 非 JSON：reason 与文案各不相同、code 不新造（-1）、文案里没有 key
+ *   A10 生成的动作直接建工作流 → 每步 64 位 digest 且全 pending_approval
+ *   A11 没配 / goal 空 → 100002 带 field；redactKey 不吐原文
+ *
  * B 层（真内核 happy path / 失败即停 / 超时 / 跑完浏览器仍 Active）在
  * `test/agent-smoke.test.mjs`，属于 `npm run smoke`，**不进** `npm test`。
  *
  * 数据目录一次性：`<repo>/.tmp/pa2-agent-test-<pid>`，跑完删；不碰 `%APPDATA%\FreePower`。
+ * **不联网**：mock LLM 是 `node:http` 起在 127.0.0.1 的随机端口上。
  */
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -33,8 +42,11 @@ const {
   createWorkflow, getWorkflow, approveStep, presentWorkflow, assertWorkflowRunnable,
 } = await import('../src/agent/workflow.js');
 const {
-  parseBrowserTask, runBrowserTask, resolveShotPath,
+  parseBrowserTask, runBrowserTask, resolveShotPath, TASK_ACTIONS,
 } = await import('../src/agent/task.js');
+const {
+  planTasksFromGoal, resolveLlmConfig, redactKey, LLM_TASK_LIMIT,
+} = await import('../src/agent/llm.js');
 
 after(() => {
   fs.rmSync(DATA, { recursive: true, force: true });
@@ -268,4 +280,158 @@ test('A5 cookie value 超 4KB：单条截断，恰好 4096 不截断', async () 
   assert.equal(Buffer.byteLength(edge.cookies[0].value, 'utf8'), 4096);
   assert.equal('truncated' in edge.cookies[0], false, '恰好 4096 不该带 truncated');
   assert.equal('original_len' in edge.cookies[0], false);
+});
+
+/* ============================================================================
+ * LLM 判定（A6–A11）：mock LLM 起在 127.0.0.1 随机端口，**不联网**
+ * ==========================================================================*/
+
+const KEY = 'sk-gate-0123456789abcdef';
+
+/**
+ * 起一个本地 mock OpenAI 兼容端点。
+ * @param {(req:{headers:object, body:string}) => object} reply
+ *        返回 `{status?, json?, text?, type?, hang?}`；`hang:true` = 永不回应（超时用）
+ */
+async function mockLlm(reply) {
+  const state = { last: null };
+  const server = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      state.last = { headers: req.headers, body: raw };
+      const r = reply({ headers: req.headers, body: raw }) || {};
+      if (r.hang) return;
+      res.writeHead(r.status || 200, { 'content-type': r.type || 'application/json' });
+      res.end(r.text !== undefined ? r.text : JSON.stringify(r.json ?? {}));
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  return {
+    base: `http://127.0.0.1:${server.address().port}`,
+    state,
+    close: () => { try { server.closeAllConnections?.(); } catch { /* ignore */ } server.close(); },
+  };
+}
+
+/** 一次指向 mock 的显式配置（不读 AGENT_LLM_*，测试不依赖本机环境） */
+const llmCfg = (base, extra = {}) => ({ endpoint: base, key: KEY, model: 'mock-model', timeout_ms: 3000, ...extra });
+const replyWith = (content) => ({ json: { choices: [{ message: { content } }], usage: { total_tokens: 7 } } });
+
+test('A6 合法 JSON / ```json 围栏 / 前后空白都能过，canonicalTask 后键序稳定', async () => {
+  const good = JSON.stringify([
+    { action: 'open', url: 'http://127.0.0.1:9/a' },
+    { selector: 'h1', action: 'text' }, // 故意把键序写反
+  ]);
+  for (const content of [good, '```json\n' + good + '\n```', `  ${good}  `]) {
+    const m = await mockLlm(() => replyWith(content));
+    try {
+      const r = await planTasksFromGoal(llmCfg(m.base), { goal: '打开本地页读标题' });
+      assert.equal(r.tasks.length, 2, content.slice(0, 30));
+      assert.equal(r.tasks[0].action, 'open');
+      assert.equal(JSON.stringify(Object.keys(r.tasks[1])), '["action","selector"]', '键序应按字典序稳定');
+      assert.equal(r.model, 'mock-model');
+      assert.equal(r.usage?.total_tokens, 7);
+    } finally { m.close(); }
+  }
+});
+
+test('A7 prompt 只带 goal + 动作清单：body 里没有 key、没有 profile 的 cookie/UA/代理', async () => {
+  const m = await mockLlm(() => replyWith('[{"action":"wait","ms":5}]'));
+  try {
+    await planTasksFromGoal(llmCfg(m.base), { goal: 'GOAL_SENTINEL_A7' });
+    const { headers, body } = m.state.last;
+    const sent = JSON.parse(body);
+    assert.equal(sent.messages.length, 2, 'system + user 两条');
+    assert.equal(sent.messages[0].role, 'system');
+    assert.equal(sent.messages[1].content, 'GOAL_SENTINEL_A7');
+    for (const a of TASK_ACTIONS) assert.ok(body.includes(a), `动作清单里应该有 ${a}`);
+    assert.equal(/SENTINEL_(COOKIE|UA|PROXY)/.test(body), false, '不许把 profile 数据拼进 prompt');
+    assert.equal(body.includes(KEY), false, 'key 只能进 Authorization 头，不能进 body');
+    assert.equal(headers.authorization, `Bearer ${KEY}`);
+    assert.equal(sent.model, 'mock-model');
+  } finally { m.close(); }
+});
+
+test('A8 未知动作 / 未知字段 / 空数组 / 超 20 步：100002 + field', async () => {
+  const many = JSON.stringify(Array.from({ length: LLM_TASK_LIMIT + 1 }, (_, i) => ({ action: 'open', url: `https://a.test/${i}` })));
+  const cases = [
+    ['[{"action":"hover","selector":"#a"}]', 'tasks[0].action', /unsupported action/],
+    ['[{"action":"open","url":"https://a.test","cookie":"x"}]', 'tasks[0].cookie', /unknown field/],
+    ['[]', 'tasks', /空数组/],
+    [many, 'tasks', /超过上限/],
+  ];
+  assert.equal(LLM_TASK_LIMIT, 20, '模型一次最多 20 步（别和 parseTaskList 的 200 混）');
+  for (const [content, field, match] of cases) {
+    const m = await mockLlm(() => replyWith(content));
+    try {
+      await assert.rejects(() => planTasksFromGoal(llmCfg(m.base), { goal: 'x' }), (e) => {
+        assert.equal(e.code, 100002, `${field}: code 应为 100002，实际 ${e.code}（${e.message}）`);
+        assert.equal(e.field, field);
+        assert.match(e.message, match);
+        return true;
+      });
+    } finally { m.close(); }
+  }
+});
+
+test('A9 401 / 500 / 超时 / 非 JSON：reason 与文案各不相同，code 不新造，都不含 key', async () => {
+  const cases = [
+    [{ status: 401, json: { error: { message: `invalid key ${KEY}` } } }, 'llm_unauthorized'],
+    [{ status: 500, text: 'upstream boom' }, 'llm_upstream_error'],
+    [{ hang: true }, 'llm_timeout'],
+    [{ text: '<html>gateway</html>', type: 'text/html' }, 'llm_bad_json'],
+  ];
+  const messages = new Set();
+  for (const [reply, reason] of cases) {
+    const m = await mockLlm(() => reply);
+    try {
+      const t0 = Date.now();
+      await assert.rejects(() => planTasksFromGoal(llmCfg(m.base, { timeout_ms: 300 }), { goal: 'x' }), (e) => {
+        assert.equal(e.reason, reason, `实际 ${e.reason}：${e.message}`);
+        assert.equal(e.code, -1, '上游那一层用 -1（通用失败），不发明新码');
+        assert.equal(String(e.message).includes(KEY), false, `文案里不许出现 key：${e.message}`);
+        assert.ok(String(e.message).length > 10, '错误文案要能定位，不能是空话');
+        messages.add(e.message);
+        return true;
+      });
+      if (reason === 'llm_timeout') assert.ok(Date.now() - t0 >= 250, `超时该真的等过：${Date.now() - t0}ms`);
+    } finally { m.close(); }
+  }
+  assert.equal(messages.size, cases.length, '四档文案必须各不相同，不能一句"LLM 失败"糊过去');
+});
+
+test('A10 生成的动作直接建工作流：每步 64 位 digest 且全 pending_approval', async () => {
+  const m = await mockLlm(() => replyWith('[{"action":"open","url":"http://127.0.0.1:9/a"},{"action":"wait","selector":"#x"}]'));
+  try {
+    const plan = await planTasksFromGoal(llmCfg(m.base), { goal: 'gate' });
+    const view = presentWorkflow(createWorkflow({ profile_id: 'profile-for-tests', goal: 'gate', tasks: plan.tasks }));
+    assert.equal(view.status, 'created');
+    assert.deepEqual(view.steps.map((s) => s.action), ['open', 'wait']);
+    assert.ok(view.steps.every((s) => s.status === 'pending_approval'), JSON.stringify(view.steps.map((s) => s.status)));
+    assert.ok(view.steps.every((s) => /^[0-9a-f]{64}$/.test(s.digest)), JSON.stringify(view.steps.map((s) => s.digest)));
+    // 参数摘要要给审批的人看，但 model 的键序不影响 digest
+    assert.equal(view.steps[1].params.selector, '#x');
+  } finally { m.close(); }
+});
+
+test('A11 没配 / goal 空 → 100002 带 field；redactKey 不吐原文', async () => {
+  assert.equal(resolveLlmConfig({ endpoint: '', key: '', model: '' }).configured, false);
+  await assert.rejects(() => planTasksFromGoal({ endpoint: '', key: '', model: '' }, { goal: 'x' }), (e) => {
+    assert.equal(e.code, 100002);
+    assert.equal(e.field, 'llm');
+    assert.match(e.message, /未配置/);
+    return true;
+  });
+
+  // goal 空：在发请求之前就该拦下（endpoint 指向一个没人监听的端口，真发出去会变成 llm_unreachable）
+  await assert.rejects(() => planTasksFromGoal(llmCfg('http://127.0.0.1:9'), { goal: '   ' }), (e) => {
+    assert.equal(e.code, 100002);
+    assert.equal(e.field, 'goal');
+    return true;
+  });
+
+  assert.equal(redactKey(KEY).includes(KEY), false);
+  assert.equal(redactKey('short').includes('short'), false);
+  assert.equal(redactKey(''), '');
 });

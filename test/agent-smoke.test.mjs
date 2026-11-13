@@ -11,6 +11,10 @@
  *      reason=step_timeout；后续步 result===null；没有重试
  *   B4 跑完浏览器仍 Active：在 stop 清理**之前**取状态
  *
+ * 0.4.0 收尾加的一条（按 CEO「B 层只加一条，别把 smoke 拖成分钟级」）：
+ *   B5 一句话目标 → 工作流：mock LLM（127.0.0.1 随机端口）出 2 步（open 本地页 + text）
+ *      → 逐步批准 → 真跑 → 两步 completed；生成响应里没有 key
+ *
  * 不写成断言的三条（README 已知限制）：click 的 isTrusted=false、open 重开同 URL 让半拍、
  * Chrome 自己把 cookie 封顶 ~4096 B。
  *
@@ -30,7 +34,7 @@ process.env.FREEPOWER_DATA = DATA;
 process.env.FREEPOWER_EGRESS_PROBE = 'http://127.0.0.1:1/never';
 process.env.FREEPOWER_EGRESS_TIMEOUT = '800';
 process.env.FREEPOWER_SELFCHECK = '0';
-process.env.FREEPOWER_AGENT_STEP_TIMEOUT = '4000'; // B3 靠它，别让整组拖到分钟级
+process.env.FREEPOWER_AGENT_STEP_TIMEOUT = '8000'; // B3 靠它收尾；4s 在「整包 smoke 刚跑完、机器还在忙」时会误杀截图步（见下方 B1 备注）
 fs.rmSync(DATA, { recursive: true, force: true });
 fs.mkdirSync(DATA, { recursive: true });
 
@@ -120,6 +124,7 @@ async function runAndWait(id, { timeoutMs = 60000 } = {}) {
 }
 
 let profileId = null;
+let llmSrv = null;
 try {
   /* ---------------- 建环境（headless，不弹窗） ---------------- */
   const c = await api('POST', '/api/v1/user/create', { name: 'agent-gate', country: 'US', headless: '1' });
@@ -129,6 +134,10 @@ try {
 
   /* ============================================================================
    * B1 七动作 happy path
+   *
+   * 单步预算是测试注入的 8s（不是默认 30s）。以前设 4s：整包 smoke 刚跑完、机器还在忙时
+   * `screenshot` 那一步被 4s 误杀过一次（14:29 实测：step screenshot 超时 4000ms）。
+   * 8s 既保留「短预算」的意思，又不会把 B3 的收尾拖过 15s。
    * ==========================================================================*/
   const FILL = 'hello-e2e-9f3a';
   const wf1 = await makeApprovedWorkflow([
@@ -160,13 +169,20 @@ try {
   check('B1 cookie get 能看到 set 的 name', names.includes('gate'), JSON.stringify(names));
 
   // A4 在真跑之后再验一次：status JSON 里没有「任务原文」。
-  // 注意 `text` 会读回同一个字符串 —— 那是**页面内容**，不是任务原文；判据是
-  // 「没有 task 对象被回吐」：selector 与 cookie 值都不该出现。
+  // 0.4.0 收尾**改了口径**（如实记）：`presentWorkflow` 现在给每步 `params` —— 控制台的审批面板
+  // 必须显示「批的是什么」，所以 selector / op 出现是**预期**的；敏感值仍然一个字节都不回。
+  // 注意 `text` 会读回 fill 写入的同一个字符串、`cookie get` 会读回 cookie 值 ——
+  // 那是**页面/内核的产物**，不是任务原文；判据因此落在「params 里的 value 是占位符」+「没有 task 原对象」。
   const st1json = JSON.stringify(st1);
-  check('B1 status JSON 里没有 fill 任务原文（selector）', !st1json.includes('"selector":"#q"'));
-  // cookie get 会把值读回来（那是内核对页面数据的回答，属于「动作的产物」，结果里本来就带
-  // name/value）；这里验的是**任务原文**没被回吐：结果里不该出现任务键 `op`。
-  check('B1 status JSON 里没有 cookie 任务原文（op）', !st1json.includes('"op":"set"'));
+  const fillStep1 = st1.steps.find((s) => s.action === 'fill');
+  check('B1 参数摘要里 fill 的值打码（#q 可见，值不可见）',
+    fillStep1?.params?.value === '***' && fillStep1?.params?.selector === '#q'
+    && !JSON.stringify(fillStep1.params).includes(FILL),
+    JSON.stringify(fillStep1?.params));
+  // cookie get 会把值读回来（属于「动作的产物」）；这里验的是 cookie **set** 那一步的参数打了码。
+  const setParams = st1.steps.filter((s) => s.action === 'cookie').find((s) => s.params?.op === 'set')?.params;
+  check('B1 参数摘要里 cookie set 的值打码', setParams?.value === '***', JSON.stringify(setParams));
+  check('B1 没有把 task 原对象回吐（JSON 里没有 "task": 键）', !st1json.includes('"task":'));
   check('B1 fill 结果只有 ok/took_ms', JSON.stringify(Object.keys(st1.steps.find((s) => s.action === 'fill').result).sort()) === '["ok","took_ms"]');
   const setStep = st1.steps.filter((s) => s.action === 'cookie').find((s) => s.result?.ok === true);
   check('B1 cookie set 结果只有 ok/took_ms', !!setStep && JSON.stringify(Object.keys(setStep.result).sort()) === '["ok","took_ms"]', JSON.stringify(setStep?.result));
@@ -209,12 +225,59 @@ try {
   check('B3 后续步 result=null', st3.steps[2].result === null, JSON.stringify(st3.steps[2].result));
   check('B3 按注入的短预算收尾（<15s）', took < 15000, `${took}ms`);
   check('B3 没有重试（只有一步带 step_timeout）', st3.steps.filter((s) => s.reason === 'step_timeout').length === 1, JSON.stringify(st3.steps.map((s) => s.reason)));
+
+  /* ============================================================================
+   * B5 一句话目标 → 工作流 → 逐条批准 → 真跑（mock LLM，全程不联网）
+   *    只加这一条：B 层的活已经由 B1–B4 覆盖，这条补的是「生成入口」这条路。
+   * ==========================================================================*/
+  const llmKey = 'sk-smoke-0123456789abcdef';
+  llmSrv = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      const content = JSON.stringify([
+        { action: 'open', url: PAGE_URL },
+        { action: 'text', selector: 'body' },
+      ]);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+    });
+  });
+  await new Promise((r) => llmSrv.listen(0, '127.0.0.1', r));
+
+  const goalRes = await api('POST', '/api/v1/agent/workflow/create-from-goal', {
+    profile_id: profileId,
+    goal: '打开本地测试页，读出正文',
+    llm: { endpoint: `http://127.0.0.1:${llmSrv.address().port}`, key: llmKey, model: 'mock-model' },
+  });
+  const wf5 = goalRes.json.data || {};
+  check('B5 create-from-goal 返回两步、全部待批',
+    goalRes.json.code === 0 && wf5.steps?.length === 2 && wf5.steps.every((s) => s.status === 'pending_approval'),
+    JSON.stringify(goalRes.json).slice(0, 200));
+  check('B5 每步带 64 位 digest', (wf5.steps || []).length === 2 && wf5.steps.every((s) => /^[0-9a-f]{64}$/.test(s.digest || '')));
+  check('B5 goal 原样保存', wf5.goal === '打开本地测试页，读出正文', String(wf5.goal));
+  check('B5 生成响应里没有 key', !JSON.stringify(goalRes.json).includes(llmKey));
+
+  for (const s of wf5.steps || []) {
+    const a = await api('POST', `/api/v1/agent/workflow/${wf5.workflow_id}/approve`, {
+      step_id: s.step_id, decision: 'approve', digest: s.digest,
+    });
+    if (a.json.code !== 0) throw new Error(`B5 批 ${s.step_id} 失败：` + JSON.stringify(a.json));
+  }
+  const st5 = await runAndWait(wf5.workflow_id);
+  check('B5 两步都 completed',
+    st5.status === 'completed' && st5.steps.every((s) => s.status === 'completed'),
+    `${st5.status} ${JSON.stringify(st5.steps.map((s) => s.status))} ${JSON.stringify(st5.error)}`);
+  const text5 = st5.steps.find((s) => s.action === 'text');
+  check('B5 text 读到页面正文（含按钮文案 go）',
+    String(text5?.result?.value || '').includes('go'), JSON.stringify(text5?.result).slice(0, 120));
 } catch (e) {
   check('执行过程不抛异常', false, String(e?.stack || e).split('\n').slice(0, 4).join(' | '));
 } finally {
   try { await stopAll(); } catch { /* ignore */ }
   try { server.close(); } catch { /* ignore */ }
   try { pageSrv.close(); } catch { /* ignore */ }
+  try { if (llmSrv) { llmSrv.closeAllConnections?.(); llmSrv.close(); } } catch { /* ignore */ }
   await sleep(500);
   // Chrome 停完可能还占着 user-data-dir 的文件锁（Windows），删不掉不是测试失败：
   // 如实打出来，留下的是 .tmp 里的一次性目录，核对无进程引用后可手工删。
