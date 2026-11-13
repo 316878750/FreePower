@@ -38,8 +38,13 @@ export const COOKIE_VALUE_MAX_BYTES = 4 * 1024;
 /** 第一版支持的动作（不在表里的一律拒绝） */
 export const TASK_ACTIONS = ['open', 'click', 'fill', 'wait', 'text', 'screenshot', 'cookie'];
 
-/** 每个动作的字段表：required 缺一不可，optional 之外的键一律拒绝（防"写了不生效"） */
-const SPECS = {
+/**
+ * 每个动作的字段表：required 缺一不可，optional 之外的键一律拒绝（防"写了不生效"）。
+ *
+ * **导出给 LLM 提示词用**（`llm.js` 的 `buildSystemPrompt`）：模型拿到的动作/字段清单
+ * 必须就是这里这份 —— 另抄一份清单迟早和校验器漂移，模型产出的东西到解析层才被拒。
+ */
+export const TASK_SPECS = {
   open: { required: ['url'], optional: [] },
   click: { required: ['selector'], optional: [] },
   fill: { required: ['selector', 'value'], optional: [] },
@@ -105,7 +110,7 @@ export function parseBrowserTask(spec) {
   if (!TASK_ACTIONS.includes(action)) {
     throw new TaskError(`unsupported action "${action}"（第一版只支持 ${TASK_ACTIONS.join('/')}）`, { field: 'action' });
   }
-  const { required, optional } = SPECS[action];
+  const { required, optional } = TASK_SPECS[action];
   for (const k of required) {
     if (spec[k] === undefined || spec[k] === null || String(spec[k]).trim() === '') {
       throw new TaskError(`${action}: ${k} is required`, { field: k });
