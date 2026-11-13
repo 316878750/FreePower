@@ -278,8 +278,12 @@ async function withBudget(promise, ms, label) {
   }
 }
 
-/** 解析后的相对路径 → 绝对路径（调用方已保证相对、无 `..`；这里再兜一次） */
-function resolveShotPath(relOrName, dir, fallbackName) {
+/** 解析后的相对路径 → 绝对路径（调用方已保证相对、无 `..`；这里再兜一次）
+ *
+ *  导出只为判定门（`test/agent.test.mjs` A3）能直接打它：DSL 解析层已经把 `..`/绝对路径
+ *  挡掉了，但「解析层挡得住」不等于「执行层挡得住」—— 这一步是最后一道兜底，得单独可测。
+ */
+export function resolveShotPath(relOrName, dir, fallbackName) {
   const rel = String(relOrName || fallbackName || '').trim().replace(/\\/g, '/');
   const abs = path.resolve(dir, rel);
   const base = path.resolve(dir);

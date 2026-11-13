@@ -453,7 +453,7 @@ npm run test
 npm run smoke
 ```
 
-当前实测：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **73** + api **100** + ui **29** + desktop **54**（`package.json` 里那条脚本就是这八组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`），真 Chrome `157.0.8103.40`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的八组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **73** + agent **6** + api **100** + ui **29** + desktop **54**（`package.json` 里那条脚本就是这九组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **23/23**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核），真 Chrome `157.0.8103.40`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的九组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 > 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：
@@ -834,6 +834,8 @@ test/proxy-chain.test.mjs  多级代理链真机判据（37 项：两跳、断�
 test/ui.test.mjs       控制台契约测试（29 项：静态托管、schema、校验、删除清目录、限流额度）
 test/desktop.test.mjs  桌面壳契约测试（54 项：启动引导、票据、残留检查、安全姿势、打包配置）
 test/workers.test.mjs  双 Realm 真机验证（24 项：三类 worker + 嵌套 + AudioWorklet）
+test/agent.test.mjs    AI Agent 判定门 A 层（6 项，假 CDP / 纯函数，不启内核）
+test/agent-smoke.test.mjs  AI Agent 判定门 B 层（23 项，真内核：七动作 / 失败即停 / 超时 / 跑完不关浏览器）
 test/proxy-health.test.mjs  代理健康检查真机验证（15 项：四态 / 批量 / 只读 / 控制台）
 test/media-devices.test.mjs 媒体设备真机验证（P9-C，12 项：真实枚举 + 只改 label + toJSON + 按 kind 授权）
 test/speech.test.mjs   语音投影真机验证（P9-A，8 项）
@@ -916,6 +918,14 @@ docs/                  技术方案、阶段交付、curl 实测、截图（docs
 - **终态就地保留**：`completed` / `failed` / `rejected` / `aborted` 不移位置、不进归档目录（列表要能看到全部历史）；清理另开 `agent/workflow/purge`，思路同回收站 purge，现在只是 backlog。
 - **落盘失败不改内存结论**：只 `console.warn`、接口照常回。代价说清楚：重启后可能回退到上一版（比如审批丢了要重批），但不会静默变成「成功了」。
 
+### 判定门（断言清单由巡检出，分两层）
+
+**A 层 `test/agent.test.mjs`（6 项，进 `npm test`，不启内核）**：批完再改盘上任务 → `run` 当场 `100002` + `field=digest` 且状态仍 `approved`（配「盘上不动必须过」的反例）；没批完就 run → `100002` + `field=status`、不存在的 id → `100001`、approve 不存在的 step → `100001`；截图路径越界（解析层 + 执行层 `resolveShotPath` 的 Windows 大小写越界）；`fill.value` / `cookie set.value` 不进 status JSON（`digest` 仍在）；`text` 超 10KB / cookie value 超 4KB 的截断与 `truncated` + `original_len`（恰好 10240 / 4096 不带键、多字节字符不会被切坏）。
+
+**B 层 `test/agent-smoke.test.mjs`（23 项，进 `npm run smoke`，真内核）**：七动作 happy path（`text` 读回填入值、截图是 png 且只回相对路径、cookie get 能看到 set 的 name）；失败即停（`error.step_id` + 实际抛的 `selector_not_found`，后续步 `result=null`）；超时（注入短预算，`reason=step_timeout`、不重试）；**跑完浏览器仍 `Active`**（在 stop 清理之前取状态）。
+
+**不写成断言的三条**（属于上面的已知限制，别当判据）：`click` 的 `isTrusted=false`、`open` 重开同 URL 靠让半拍、Chrome 自己把 cookie 封顶在 ~4096 B。
+
 ### 配置
 
 ```
@@ -931,5 +941,5 @@ FREEPOWER_AGENT_STEP_TIMEOUT   单步执行超时（默认 30000 ms；`wait({ms}
 
 ### 现在做到哪 / 下一步
 
-- **已做**：7 个动作的解析与字段白名单（含 http(s)、CSS 选择器、`wait` 三选一、cookie get/set）、任务 `digest`、工作流状态机与审批、**工作流落盘**（`DATA_DIR/agent/workflows/<id>.json`，原子写、重启 `running → aborted`）、**CDP 执行器**（`runWorkflow`：起环境 / 每步核 digest / 单步超时 / 失败即停 / `steps[].result` / 跑完不关浏览器）、四条路由、`cli.js` 的 list/start/stop/active 与 `cdpUrl()`、`llm.js` 的配置解析与请求构造（**不发请求**）、`x-freepower-agent: 1` 来源标记；
+- **已做**：7 个动作的解析与字段白名单（含 http(s)、CSS 选择器、`wait` 三选一、cookie get/set）、任务 `digest`、工作流状态机与审批、**工作流落盘**（`DATA_DIR/agent/workflows/<id>.json`，原子写、重启 `running → aborted`）、**CDP 执行器**（`runWorkflow`：起环境 / 每步核 digest / 单步超时 / 失败即停 / `steps[].result` / 跑完不关浏览器）、四条路由、`cli.js` 的 list/start/stop/active 与 `cdpUrl()`、`llm.js` 的配置解析与请求构造（**不发请求**）、`x-freepower-agent: 1` 来源标记、**判定门**（A 层进 `npm test`、B 层进 `npm run smoke`，断言清单由巡检出）；
 - **未做（下一轮）**：`chat()` 真调用（模型层）、控制台审批弹窗（现在只有 API）、可信点击（`Input` 域）、`agent/workflow/purge`（清理历史）。
