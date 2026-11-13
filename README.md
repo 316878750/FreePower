@@ -21,7 +21,7 @@
 - 本地 API：`/status`、环境 CRUD、分组、标签、代理列表、浏览器启停、**批量启停（并发上限 + 失败清单 + 可中断）**、自检报告；返回值形状对齐 AdsPower（`ws.puppeteer` / `ws.selenium` / `debug_port` / `status: Active|Inactive` / `cookies` / `kernels`）
 - **Web 管理控制台**（`node:http` 直接托管，浏览器打开 `127.0.0.1:<端口>/` 即用）：环境列表（启动/停止/自检状态/批量操作）、环境编辑（11 组分栏表单，值域与必填来自后端注册表）、代理管理、自检报告、**AI Agent 面板**（一句话目标 → 动作清单 → 逐条批准 → 运行 → 每步结果）。五个页面全部只调自己的 Local API，没有私有通道
 - **AI Agent（0.4.0）**：`browser_task` 7 个动作、HITL 每步审批 + digest 绑定、工作流落盘与本地 CDP 执行、**模型真调用**（OpenAI 兼容，key 用户自填、不带内置 key）、控制台面板与截图票据取图 —— 细节见第十节
-- 未实现的云端透传接口（分享、成员、内核下载…）**明确报「不支持」**（`code:-1` + `data.supported:false`），不假成功、不留未知码。**现在这条清单实际是 15 条**（`src/api/routes.js` 的 `placeholders` 数组，2026-11-12 逐个数过）：原来这类有 46 条，回收站两条已本地实现，其余云端依赖的同类项合并后剩 15 条 —— 数字按实际数组算，不按历史回执抄（旧回执里写过的 44 / 17 都不再作为当前值）。
+- 未实现的云端透传接口（分享、成员体系…）**明确报「不支持」**（`code:-1` + `data.supported:false`），不假成功、不留未知码。**现在这条清单实际是 14 条**（`src/api/routes.js` 的 `placeholders` 数组，2026-11-13 逐个数过）：原来这类有 46 条，回收站两条已本地实现（2026-11-12），**内核下载已本地实现**（2026-11-13，走 Chrome for Testing，见第十一节），其余云端依赖的同类项合并后剩 14 条 —— 数字按实际数组算，不按历史回执抄（旧回执里写过的 44 / 17 / 15 都不再作为当前值）。
 - **桌面版**：Electron 壳（单实例 / 托盘 / 关窗不退出 / 开机自启开关 / 退出前必清残留内核）+ NSIS 安装包，不需要 VS 编译链
 
 ### 不做（已和 CEO 确认，写进范围外）
@@ -131,6 +131,7 @@ CORS：只放行 `127.0.0.1` / `localhost` 的 Origin，其他返回 `403` + 纯
 | GET | `/api/v1|v2/browser-profile/cookie/export` | **cookie 导出**（`format=json|netscape`）；**要求环境在跑**，没跑报 `800002`，不会为了导出偷偷起内核 |
 | POST | `/api/v1|v2/browser-profile/cookie/import` | **cookie 导入**：`cookies` 数组或 `{format:"netscape", content:"..."}`；要求环境在跑；`imported>0` 时回读校验 |
 | GET | `/api/v2/browser-profile/kernels` | `{list:[{kernel_type,kernel,is_downloaded}]}`（`kernel_type` 非法 → `100002`） |
+| POST | `/api/v2/browser-profile/download-kernel` | **下载内核（0.4.1 起真实现）**：`{kernel_type:"Chrome",kernel_version:"157"}` → `{code:0,data:{status[,progress]}}`，同步状态机、无 task id、无轮询端点；源是 Chrome for Testing，**不支持 Firefox**（有意差异），详见第十一节 |
 | POST | `/api/v2/browser-tags/list` / `create` / `update` / `delete` | 标签 CRUD（本地实现） |
 | POST | `/api/v2/proxy-list/create` / `update` / `list` / `delete` | 代理列表 CRUD（本地实现；create 的 body 是**顶层数组**） |
 | POST | `/api/v1/proxy/check` | 代理预检：先验一下代理再绑环境（`data.ok` 是检查结果，失败也 `code:0`） |
@@ -144,7 +145,7 @@ CORS：只放行 `127.0.0.1` / `localhost` 的 Origin，其他返回 `403` + 纯
 | GET | `/` | **Web 管理控制台**（静态页，注入本地 api_key；外站 Origin 403） |
 | GET | `/ui/*` | 控制台资源（`app.js` / `style.css` / `pages/*.js`），越权路径一律 404 |
 
-未实现的云端透传接口（分享、成员体系、内核下载、fb/*…）统一返回（**回收站两条已于 2026-11-12 本地实现，不在这个清单里**，见第八节「回收站」）：
+未实现的云端透传接口（分享、成员体系、fb/*…）统一返回（**回收站两条已于 2026-11-12 本地实现，内核下载已于 2026-11-13 本地实现，都不在这个清单里**，见第八节「回收站」与第十一节「内核下载」）：
 
 ```json
 {"code":-1,"msg":"FreePower 不支持该接口（AdsPower 依赖其云端，本地没有对应能力）：/api/v2/browser-profile/share","data":{"supported":false,"path":"..."}}
@@ -289,7 +290,7 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 10. **2D canvas 固定软件光栅化**（`--disable-accelerated-2d-canvas`）。GPU 2D 路径跨进程会产生不同像素，导致 canvas 哈希跨重启漂移；固定软件光栅化后四轮实测一致。代价：`chrome://gpu` 显示 Software only，canvas 密集页面略慢。
 11. **远程代理下的自检有盲区**：自检页走 `http://127.0.0.1` 安全上下文；若代理强制 loopback 也走代理（非 `--proxy-bypass-list=<-loopback>` 的配置），会回落到 `about:blank`，此时报告里 UA-CH / 媒体设备明确标「本次未验证」，不标通过。
 12. **轮换代理会把「出口 IP 与预检不一致」判为告警**（正常业务形态，只提示不阻断）；运行中没有代理健康检查，掉线时请求失败但不会回退直连。
-13. **云端依赖的接口一律不支持**：`cloud-active`、分享、成员体系、内核下载、`fb/*`、应用/分类等 17 条（对手 54 条路由里剩下的云端透传）返回 `-1` + `data.supported:false`，**不假成功**。`cloud-active` 尤其明确：脚本若以为"环境已开"会直接下错单。**2026-11-12 更正**：原清单里的**回收站两条已本地实现**（`recycle-bin/list`、`recycle-bin/restore`，见第八节），所以这条实际剩 15 条；数字保留原文只为对得上旧回执。
+13. **云端依赖的接口一律不支持**：`cloud-active`、分享、成员体系、`fb/*`、应用/分类等返回 `-1` + `data.supported:false`，**不假成功**。`cloud-active` 尤其明确：脚本若以为"环境已开"会直接下错单。**2026-11-12 更正**：原清单里的**回收站两条已本地实现**（`recycle-bin/list`、`recycle-bin/restore`，见第八节）。**2026-11-13 更正**：**内核下载也已本地实现**（`download-kernel` 走 Chrome for Testing，见第十一节），所以这条现在实际剩 **14 条**（`placeholders` 数组，逐个数过）；数字按实际数组算，历史回执里的 17 / 15 只作对照。
 14. **批量启停的并发默认 3**（`FREEPOWER_BATCH_CONCURRENCY` 可调，请求里 `concurrency` 覆盖，夹在 1..10）。批量启动**中途失败即中断**：已经起来的保留，剩下的不硬起，返回 `failed` + `skipped`。
 15. **`kernels` 的版本号区分「实测」与「猜」**：系统 Chrome 的 `Application\` 下可能同时有几个版本目录（本机实测有 156/157），而启动器实际跑哪个由注册表决定。启动过就报 `Browser.getVersion` 的真值（`probed:true`），没启动过则按目录名猜。**不要拿目录名当真实版本用。** 出参形状按对手收口（2026-11-12）：核心只有 `kernel_type` / `kernel` / `is_downloaded` 三个键；可执行文件路径、来源、以及「当前在用的是哪个」（`_path` / `_source` / `_in_use`）只在 `src/kernel/chrome.js` 内部用，**不序列化**，判据是 `test/api.test.mjs` 的字段白名单那条（多出 `path` / `source` / `in_use` 就是「API 形状不符」；`guessed_kernel` / `probed` 除外，它是本条的判据要用的）。
 16. **桌面壳没有代码签名、没有自动更新**：安装包和 exe 都未签名，SmartScreen 会提示「未知发布者」；要对外发版必须补证书。壳只做窗口/托盘/单实例/自启，不做增量更新与崩溃上报。
@@ -451,14 +452,14 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 ## 八、验证
 
 ```powershell
-# 不需要 Chrome：schema + 单元 + 本地 API 契约 + 控制台契约 + 桌面壳契约 + 代理链纯逻辑
+# 不需要 Chrome：schema + 单元 + 本地 API 契约 + 控制台契约 + 桌面壳契约 + 代理链纯逻辑 + 内核下载（本地假源）
 npm run test
 
 # 需要真实 Chrome + 完整权限（沙箱挡命名管道和进程查询）；含两跳代理链判据
 npm run smoke
 ```
 
-当前实测（2026-11-13，本机）：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **78** + agent **12** + api **100** + ui **46** + desktop **54**（`package.json` 里那条脚本就是这九组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **30/30**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的九组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测（2026-11-13，本机）：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **78** + agent **12** + api **100** + ui **46** + desktop **54** + kernel-download **23**（`package.json` 里那条脚本就是这十组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **30/30**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 > 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：
@@ -847,7 +848,7 @@ node --no-warnings test/proxy-chain.test.mjs   → 也行，单独跑同一套�
 - **自检**：启动后自动跑 19 项、覆盖度 7/10/2、四个哈希齐全、`rerun=1` 重跑、HTML 页可读且无外链
 - **双 Realm**（`test/workers.test.mjs`，已进 `npm run smoke`）：同一张页里起专用 worker / SharedWorker / ServiceWorker（**页面直接创建的**，嵌套 worker 另有三条断言，见已知限制第 6 条），断言三者的脚本首行已注入（`atTop === 'worker'`）、五处 canvas 哈希完全一致、硬件/语言/时区/UA 与主帧同值、`workerStats.injected === 3`；另断言 AudioWorklet 未被注入且可测表面只有 `sampleRate`/`currentTime`
 - **嵌套 worker**（同文件）：页面里起的 worker 再 `new Worker`，断言外层与嵌套层首行都已注入、主帧/外层/嵌套三者的 `hardwareConcurrency` 一致、两层都进注入计数 —— 防的是「同一台机器同时暴露伪装值与真实核数」
-- **本地 API 完整化**：`active` 的 Active/Inactive 形状、`local-active`、`cookies`、`kernels`、标签/代理列表 CRUD、占位接口明确不支持（`share` 之类）；**回收站两条已从占位变成真实现**，断言改成验「`code:0` + `data` 键全等 `limit,list,page` + 无 `total`」
+- **本地 API 完整化**：`active` 的 Active/Inactive 形状、`local-active`、`cookies`、`kernels`、标签/代理列表 CRUD、占位接口明确不支持（`share` 之类）；**回收站两条已从占位变成真实现**，断言改成验「`code:0` + `data` 键全等 `limit,list,page` + 无 `total`」；**内核下载也已从占位变成真实现**（`test/kernel-download.test.mjs` 23 项，本地假源，见第十一节）
 - **批量启停**：一次起 3 个、批量停、失败清单带 code/message、中途失败即中断、并发上限生效
 - **cloud-active 明确报错**（`-1` + `supported:false`，不假成功）
 - 停环境后进程树回收干净、重复 start 幂等、重复 stop 800002
@@ -877,6 +878,9 @@ src/
   store/proxies.js     代理列表 CRUD（本地实现）+ proxy_id → 启动配置
   fingerprint/         指纹生成（种子化，保证自洽）+ seeds.js（四维噪点种子入库）
   kernel/chrome.js     内核定位/清单、启动参数、DevToolsActivePort、进程树回收
+  kernel/download.js   内核下载 + 安装：状态机、content-length 校验、解压、`--version` 自检、原子改名
+  kernel/cft.js        Chrome for Testing 目录解析（版本 → 下载地址；CfT 无 sha256，如实标 none）
+  kernel/zip.js        自写 ZIP 解包（store/deflate + CRC32；ZIP64/加密/越界路径明确报错）
   kernel/launch-args.js launch_args 白名单合并（保护名单/feature 并集）
   kernel/version.js    UA / UA-CH / kernel_version 跟版
   kernel/cdp.js        CDP over WebSocket 客户端
@@ -920,6 +924,7 @@ test/desktop.test.mjs  桌面壳契约测试（54 项：启动引导、票据、
 test/workers.test.mjs  双 Realm 真机验证（24 项：三类 worker + 嵌套 + AudioWorklet）
 test/agent.test.mjs    AI Agent 判定门 A 层（12 项，假 CDP / 纯函数 / 本地 mock LLM，不启内核、不联网）
 test/agent-smoke.test.mjs  AI Agent 判定门 B 层（30 项，真内核：七动作 / 失败即停 / 超时 / 跑完不关浏览器 / 目标→工作流 e2e）
+test/kernel-download.test.mjs  内核下载判定门（23 项，本地假源，不联网：正常/长度不符/大小写/Firefox/幂等/断线/重试/并发/自检不一致/404）
 test/proxy-health.test.mjs  代理健康检查真机验证（15 项：四态 / 批量 / 只读 / 控制台）
 test/media-devices.test.mjs 媒体设备真机验证（P9-C，12 项：真实枚举 + 只改 label + toJSON + 按 kind 授权）
 test/speech.test.mjs   语音投影真机验证（P9-A，8 项）
@@ -1061,3 +1066,113 @@ FREEPOWER_AGENT_STEP_TIMEOUT   单步执行超时（默认 30000 ms；`wait({ms}
 
 - **已做**：7 个动作的解析与字段白名单（含 http(s)、CSS 选择器、`wait` 三选一、cookie get/set）、任务 `digest`、工作流状态机与审批、**工作流落盘**（`DATA_DIR/agent/workflows/<id>.json`，原子写、重启 `running → aborted`）、**CDP 执行器**（`runWorkflow`：起环境 / 每步核 digest / 单步超时 / 失败即停 / `steps[].result` / 跑完不关浏览器）、**模型调用**（`llm.js`：OpenAI 兼容真请求、围栏容错、错误分档、key 不外泄）、**目标→工作流路由**、**控制台 AI Agent 面板**（生成 / 逐条批准 / 运行 / 截图）、截图取图与短期票据、`cli.js` 的 list/start/stop/active 与 `cdpUrl()`、`x-freepower-agent: 1` 来源标记、**判定门**（A 层 12 项进 `npm test`、B 层 30 项进 `npm run smoke`）；
 - **未做（下一轮）**：多轮对话修改（现在一次生成就是最终提案）、自动批准、可信点击（`Input` 域）、`agent/workflow/purge`（清理历史）、流式输出、Anthropic 原生协议。
+
+## 十一、内核下载（Chrome for Testing，0.4.1）
+
+**这一节的状态**：`POST /api/v2/browser-profile/download-kernel` 从「占位明确不支持」变成**真实现** —— 用户/脚本点一次，FreePower 真的从 Google 官方渠道下几百 MB 的 Chrome 内核，解压、自检、装进自己的 kernels 目录，之后 `GET …/kernels` 就能看到、环境就能用它起来。本机原来 `kernels` 目录是空的（**0 个内核**），所以「界面点启动环境」一个都起不来 —— 这条路补的就是那个根因。
+
+### 源：Chrome for Testing，不是对手的 CDN
+
+| | 对手 | FreePower |
+|---|---|---|
+| 域名 | `https://version.adspower.net/software/browsers/chrome/...` | `https://storage.googleapis.com/chrome-for-testing-public/<版本>/win64/chrome-win64.zip` |
+| 产物 | 它自家分发的 `SunBrowser` 二进制 | Google 官方 CfT 构建 |
+| 元数据 | 远端 `client/sys-version/list`（要登录态） | `https://googlechromelabs.github.io/chrome-for-testing/` 下的公开 JSON |
+
+**为什么不转发对手的包**：那是它自己分发、自己签名的 SunBrowser 二进制（`SunBrowser.exe.sig` 是它私钥签的 PKCS#7），转发等于替它做分发，也违背「独立实现、不用对方二进制」这条。CfT 是 Google 给自动化测试发的官方构建，公开可下。
+
+**下多少**：一次 `chrome-win64.zip` 约 **150 MB 上下**（解压后 350 MB 左右），装完的目录就是几百 MB —— 用户点一次就是真下这么大，不是「下个几 KB 的配置」。默认整体预算 **10 分钟**（`FREEPOWER_KERNEL_DOWNLOAD_TIMEOUT`，默认 `600000` ms），慢网也不会被 30 秒那种步进超时误杀。
+
+### 接口形状（照 `23-内核下载契约.md`）
+
+```
+POST /api/v2/browser-profile/download-kernel
+{"kernel_type": "Chrome", "kernel_version": "157"}
+```
+
+- **同步状态机、没有 task id、没有轮询端点**：每次调用都重新算「已装 / 正在下 / 正在装 / 该下」，然后**立刻**回 `{code:0,data:{status[,progress]}}`。要进度就**再调同一个端点**。
+- `status` 只会是 `pending` / `downloading` / `installing` / `completed`。`progress` 只在 `pending` / `downloading` 出现，**单位我们定 0–100**（契约里对手是原样透传，单位无证据，见契约 §7）。
+- **三条响应分支，形状不同**（契约 §2.2）：
+  - **A. 什么都不做**（已装好 / 正在下 / 正在装）→ `{code:0,data:{status[,progress]},msg:"success"}` —— **只有这条带 `msg`**；
+  - **B. 触发了下载** → `{code:0,data:{status:"pending",progress:0}}` —— **没有 `msg`**；
+  - **C. 装完了**（本次调用推进到 `completed`）→ `{code:0,data:{status:"completed"}}`。
+- **幂等推进，不是「下载一次」**：已经装好的再调一次回 `completed` + `msg:"success"`，不会重下。
+- **失败不进响应**：真下载/解压/自检在后台跑，同步这一发只回 `pending`。失败后**状态表立刻清空**（不留 `installing` 僵尸），**下一次调用就是重试**（契约 §2.1 的 `FAIL → RE_DOWNLOAD`）—— 用户/脚本看到没变成 `completed`，就再打一次同一发请求。
+
+错误一律 `{code:-1,msg}`，**不带 `data`**（与 agent 那组路由的口径不同，这里是契约原样）：
+
+| 情况 | `msg` |
+|---|---|
+| 缺参 | `kernel_type and kernel_version are required` |
+| 类型不是严格 `Chrome`/`Firefox`（`"chrome"` 也拒，大小写敏感） | `Kernel type must be Chrome or Firefox.` |
+| 版本非数字 / `"0"` | `kernel_version is not a numeric strings` |
+| CfT 目录里没有该版本 | `No matching kernel version available.` |
+| **`Firefox`** | **`Firefox kernel download is not supported: ...`**（有意差异，见下） |
+
+### 落盘布局
+
+```
+<DATA_DIR>/kernels/
+  <完整版本号>/            ← 例如 157.0.8103.78
+    chrome.exe
+    chrome.dll  *.pak  locales/  …
+  .tmp-<版本>-<pid>-<时间>/   ← 下载+解压的临时目录，成功/失败都会被删掉
+```
+
+- CfT 的 zip 里多一层 `chrome-win64/`，解包时**剥掉**，落成 `<kernels>/<版本>/chrome.exe` —— 与 `listKernels` 认的三种 rel（`chrome.exe` / `chrome-win64\chrome.exe` / `chrome-win\chrome.exe`）的第一种一致，装完立刻能被 `GET …/kernels` 看到。
+- **原子改名**：先解到 `.tmp-*` 里，全部校验通过才 `rename` 成 `<版本>/`。要么整份出现，要么完全不出现 —— 没有「半个内核目录」。
+- **失败清理**：`.tmp-*`（zip + 半解压目录）一起删。`.tmp-*` 天然不被 `listKernels` 认（它只认 `^\d+\.\d+\.\d+\.\d+$` 目录），所以即使清理失败也不会被当成已装内核。
+- 请求短版本（`"157"`）时，目录名用**解析出来的完整版本号**（`157.0.8103.78`），不是 `157`。
+
+### 校验：CfT 没有 sha256，我们不裸奔
+
+- **CfT 的两个元数据 JSON 里都没有 sha256 / checksum 字段**（`last-known-good-versions-with-downloads.json` 与 `known-good-versions-with-downloads.json` 都实测过）。所以：**没有官方校验串**这件事如实写在这里，不假装有。
+- 实际判成功的三件套：
+  1. **content-length 比对** —— 声明多少字节就必须收到多少字节，少一个字节算失败（`download_length_mismatch`）；
+  2. **ZIP 结构校验** —— 中央目录/EOCD/条目 CRC32 都对得上（`src/kernel/zip.js`），截断的包在这里就红；
+  3. **解压后 `chrome.exe --version`** —— 退出码 0 且报出的版本与目录名/请求一致，否则失败（`kernel_version_mismatch`）。**「下完」不等于「装好」**：包完整但 exe 跑不起来（架构不对、被截断、压根不是 Chrome）都不算装好。
+- 元数据哪天真的带了 `sha256`（`cft.js` 留了 `pickChecksum` 的口子），下载层会自动核对并把 `checksum_source` 标成 `metadata`；现在恒为 `none`。
+- 反例钉在测试里：假源里那份 zip 的 `chrome.exe` 报 `156.0.0.0`，请求 `157.0.9003.3` → 必须失败且不留目录。
+
+### 重试
+
+没有「重试按钮」，也**不需要**：再打一次同一个请求就是重试。
+
+- 后台失败 → 状态表清空、临时目录删掉、失败原因只进日志与 `lastKernelFailure()`（诊断用，**不进响应**，契约对外没有 `failed` 状态）；
+- 再调一次 → 重新解析、重新下（**从头下，不做断点续传** —— 契约里对手的 `.zip.info` 分块账本属于它本地服务的实现，我们没证据也不照抄）；
+- 已经装好的版本不会被重下：先看盘上 `<kernels>/<版本>/chrome.exe`，有就直接 `completed`。
+
+### 与对手的有意差异（写清楚，不当 bug）
+
+1. **源不同**：Chrome for Testing，不是 `version.adspower.net` 的 SunBrowser 二进制（理由见上）。所以下到的是**原版 Chrome**，没有对手那套 `SunBrowser.exe` / `browser_key_<v>` / `components\` 布局。
+2. **只做 Chrome，Firefox 明确不支持**：CfT 没有 Firefox 构建。我们**不拿** `No matching kernel version available.` 糊过去 —— 那句在契约里是「目录里没有这个版本」的语义，拿它回答「我们不支持这个类型」是骗调用方。所以 Firefox 回的是独立文案（`Firefox kernel download is not supported: ...`），并且**一条网络请求都不发**。
+3. **版本号放宽到 1–4 段**：对手用 `Number(kernel_version)` 判真假，`"157.0.8103.78"` 会算出 `NaN` 被它自己拒掉；但 CfT 是按**完整四段**发版的，不放宽就等于下不了任何内核。所以 `157` / `157.0` / `157.0.8103` / `157.0.8103.78` 都收（`"0"` 仍按契约拒）。短版本按前缀匹配 CfT 目录里最新的那条。
+4. **`progress` 单位定 0–100**（契约无证据，见 §7）。
+5. **没有 `update-patch`**：对手那套增量补丁仍不在范围（`placeholders` 里那条保留）。
+
+### 配置
+
+```
+FREEPOWER_CFT_META_URL      CfT 元数据（默认 googlechromelabs.github.io/.../last-known-good-versions-with-downloads.json）
+FREEPOWER_CFT_VERSIONS_URL  历史版本目录（默认 .../known-good-versions-with-downloads.json）
+FREEPOWER_CFT_ZIP_BASE      包体基地址（默认 https://storage.googleapis.com/chrome-for-testing-public）
+FREEPOWER_KERNEL_DOWNLOAD_TIMEOUT  下载+安装整体预算（默认 600000 ms）
+```
+
+三个地址都可覆盖：内网镜像、离线自测都改这三个（`test/kernel-download.test.mjs` 就是把它指到本地 `node:http` 假源）。
+
+### 判定门（`test/kernel-download.test.mjs`，23 项，**不联网**）
+
+假源是本地 `node:http`，zip 由测试自己造（store 方法 + 真 CRC32），走的是**真**解包/校验/改名路径。唯一替换的是「解压后跑 `chrome.exe --version`」这一步（`hooks.verifyExe`）—— 假源里那个 exe 是几字节文本，不是 PE、跑不起来；换掉它只为在不联网的前提下走完整条路，**不改下载/解压/改名任何逻辑**。
+
+覆盖 CEO 点的六条：正常下载→解压→completed（含盘上布局、`kernels` 认账、无 `.tmp-*` 残留）/ content-length 不符 → 失败 / `kernel_type` 大小写错 → 契约文案且无 `data` 键 / `Firefox` → 明确不支持 / 同名已装 → 幂等 `completed` / 中途断线 → 失败且不留 `installing` 僵尸。
+另加：缺参、`"0"`、非数字、目录里没有该版本、失败后重试能装好、自检版本不一致、包体 404、并发两次调用只下一次（假源只收到 1 次 zip 请求）。
+
+**B 层没做**：没有为了跑测试真去下 150 MB（CEO 明确说除非先问）。要真验一次，就是对本机 `POST /api/v2/browser-profile/download-kernel` 打一发 `{"kernel_type":"Chrome","kernel_version":"157"}`，然后 `GET …/kernels` 看 `is_downloaded:true`、`<kernels>/157.x.x.x/chrome.exe --version` 能报版本。
+
+### 已知限制
+
+- **不续传**：断了下一次从头下（理由见「重试」）；
+- **不支持 ZIP64 / 加密 / 非 store·deflate 的压缩方法**：遇到就明确报错，不静默跳过（CfT 的包是普通 deflate，不会碰到）；
+- **没有下载队列/并发上限**：不同版本可以同时下（各占一个 `.tmp-*`），同一版本并发调用会并到同一个任务上（测试钉住了「假源只收到 1 次请求」）；
+- **下到的是原版 Chrome**：它的 `--version`、`chrome://version` 显示的就是 Google Chrome 本体，不是「FreePower 内核」—— 这是有意为之（见「有意差异」第 1 条）。
