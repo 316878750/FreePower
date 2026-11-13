@@ -193,6 +193,23 @@ export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, use
   const disableFeatures = ['Translate', 'OptimizationHints', 'MediaRouter', 'CalculateNativeWinOcclusion'];
   if (fp.webgl_config?.webgpu?.webgpu_switch === '0') disableFeatures.push('WebGPU', 'WebGPUService');
 
+  /**
+   * P2 · 禁用保存密码。**对手机制不同**：对手把 `DisableSavePassword=true` 塞进自家
+   * `--extended-parameters` 的 base64 JSON，由自编译内核渲成 `--protected-disablesavepassword=1`
+   * —— 那条路我们没有（不自编译内核）。逆向核过：对手客户端 17 处 `--disable-features`
+   * 里没有一处含 `PasswordManager`（那个名字大概率不是有效 feature，写进去会被静默忽略），
+   * `AutofillServerCommunication` 也无证据；对手实际带的是 `--password-store=basic` 与
+   * `--disable-features=EnablePasswordsAccountStorage`。
+   *
+   * 所以这里用**行为最接近的 Chrome 原生参数**（不是复刻）：`"1"` 时加
+   * `--password-store=basic`（不用系统钥匙串后端）+ 关掉 `EnablePasswordsAccountStorage`
+   * （账号级密码存储）。coverage 标 `partial`：参数进了内核命令行，但「保存密码条不再出现」
+   * 是浏览器 UI 层行为，本机没有能稳定观测到它出现/消失的手段（见 README 该条的说明）。
+   */
+  if (String(profile.disable_save_password) === '1') {
+    disableFeatures.push('EnablePasswordsAccountStorage');
+  }
+
   const args = [
     `--user-data-dir=${userDataDir}`,
     '--remote-debugging-port=0',
@@ -213,6 +230,9 @@ export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, use
     // 代价：chrome://gpu 里 Canvas 显示 Software only，重 canvas 场景略慢。见 README 已知限制。
     '--disable-accelerated-2d-canvas',
   ];
+
+  // P2 · 禁用保存密码：与上面 disableFeatures 里那条配套，不走系统钥匙串后端
+  if (String(profile.disable_save_password) === '1') args.push('--password-store=basic');
 
   // WebRTC：只放浏览器真实支持的策略位
   if (view.webrtc === 'disabled') {

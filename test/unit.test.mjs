@@ -116,6 +116,43 @@ test('代理字段：AdsPower 形状（proxy_host/proxy_port/proxy_user/proxy_pa
   assert.throws(() => buildArgs({ webgl_config: {} }, { userDataDir: 'C:\\fp\\udd', proxy: { proxy_type: 'http' }, proxyBound: true }), /不完整|直连/);
 });
 
+test('P2 disable_save_password：只有 "1" 才加两个参数，且不冲掉基线特性', () => {
+  const built = (profile, userArgs = []) => buildArgs(profile, { userDataDir: 'C:\\fp\\udd', userArgs });
+  const featsOf = (r) => {
+    const line = r.args.find((a) => a.startsWith('--disable-features='));
+    return { line, feats: line.slice('--disable-features='.length).split(',') };
+  };
+
+  const on = built({ webgl_config: {}, disable_save_password: '1' });
+  assert.ok(on.args.includes('--password-store=basic'), on.args.join(' '));
+  const onFeats = featsOf(on);
+  assert.ok(onFeats.feats.includes('EnablePasswordsAccountStorage'), onFeats.line);
+  // 这两个是 CEO 核过的「无证据」名字：不许再写进来（写进去只会被内核静默忽略）
+  assert.equal(onFeats.feats.includes('PasswordManager'), false, onFeats.line);
+  assert.equal(onFeats.feats.includes('AutofillServerCommunication'), false, onFeats.line);
+  // 基线那几项不许被冲掉（合并在同一条 --disable-features 里）
+  for (const f of ['Translate', 'OptimizationHints', 'MediaRouter', 'CalculateNativeWinOcclusion']) {
+    assert.ok(onFeats.feats.includes(f), `${f} 被冲掉了：${onFeats.line}`);
+  }
+
+  // 其余写法一律不加（0 / 空串 / 缺省 / 非 "1" 字符串）
+  for (const v of ['0', '', undefined, 'false', '2']) {
+    const off = built({ webgl_config: {}, disable_save_password: v });
+    assert.equal(off.args.includes('--password-store=basic'), false, `"${v}" 不该加 password-store`);
+    assert.equal(featsOf(off).feats.includes('EnablePasswordsAccountStorage'), false, `"${v}" 不该关账号密码存储`);
+  }
+
+  // 用户 launch_args 里的 --disable-features 是并集，不是覆盖
+  const merged = built({ webgl_config: {}, disable_save_password: '1' }, ['--disable-features=SmokeKeep']);
+  const mergedFeats = featsOf(merged).feats;
+  assert.ok(mergedFeats.includes('EnablePasswordsAccountStorage') && mergedFeats.includes('SmokeKeep'), featsOf(merged).line);
+
+  // 落库前归一成字符串：对手是 `"1" === value` 的严格比较，数字 1 落成整数再读出来会被当成「关」
+  assert.equal(normalizeValue('disable_save_password', 1), '1');
+  assert.equal(normalizeValue('disable_save_password', 0), '0');
+  assert.equal(normalizeValue('disable_save_password', '1'), '1');
+});
+
 test('httpGetViaProxy：非 200 也完整返回，交给上层判断', async () => {
   const fake = await startFakeProxy();
   try {
@@ -1329,7 +1366,7 @@ const BASIC_NOT_IDLE = new Set([
   'media_devices', 'media_devices_num', 'speech_switch', 'speech_voices',
   'webrtc', 'bypass_proxy_check',
   'location', 'location_switch', 'longitude', 'latitude', 'accuracy',
-  'automation_controlled', 'disable_image', 'disable_video',
+  'automation_controlled', 'disable_image', 'disable_video', 'disable_save_password',
   'blacklist', 'whitelist',
   'launch_args', 'headless', 'new_startup_page', 'window_position', 'win_x', 'win_y',
   'clear_cache_after_closing',
@@ -1359,9 +1396,9 @@ test('空转字段：标了必须说清原因，BASIC 里一个都不许漏标',
   const names = new Set(fields.map((f) => f.name));
   assert.deepEqual([...BASIC_NOT_IDLE].filter((n) => !names.has(n)), [], '清单里有字段表已经不存在的字段');
 
-  // ⑥ 数量对得上（0.3.3 巡检那批 22 个 + 0.4.0 追加 `device_name_switch` / `disable_save_password` /
-  //    `disable_password_filling` 三个零消费字段 = 25），少一个或多一个都要先问清楚
-  assert.equal(idle.length, 25, `idle 字段 ${idle.length} 个：${idle.map((f) => f.name).join(',')}`);
+  // ⑥ 数量对得上（0.3.3 巡检那批 22 个 + `device_name_switch` / `disable_password_filling` 两个零消费
+  //    字段；`disable_save_password` 已在 P2 接了启动参数、摘掉 idle = 24），少一个或多一个都要先问清楚
+  assert.equal(idle.length, 24, `idle 字段 ${idle.length} 个：${idle.map((f) => f.name).join(',')}`);
   // ⑦ 单独钉一条：hidden_notification 的原因是「基线已覆盖」，不是「还没做」
   const hn = idle.find((f) => f.name === 'hidden_notification');
   assert.match(hn.idle_reason, /基线/, 'hidden_notification 的原因是「基线已覆盖」，不是「还没做」');

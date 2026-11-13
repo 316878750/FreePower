@@ -209,6 +209,9 @@ export function normalizeValue(name, value) {
   // csv 入参统一落成 JSON 数组（存储形状不跟着对手的落盘格式走）
   if (CSV_ARRAY_FIELDS.has(name) && typeof value === 'string') return csvToArray(value);
   if (['webgl', 'canvas', 'audio', 'webgl_image', 'client_rects', 'media_devices'].includes(name) && typeof value === 'number') return String(value);
+  // 开关型字段统一落成字符串：对手在自家客户端里是 `"1" === value` 的严格比较，
+  // 数字 1 进了库再读出来会被当成「关」。落库前归一，执行侧才不用猜类型。
+  if (name === 'disable_save_password' && (value === 0 || value === 1)) return String(value);
   return value;
 }
 

@@ -2616,7 +2616,7 @@
       "default": null,
       "defaultSource": null,
       "domainNote": null,
-      "coverage": "none",
+      "coverage": "partial",
       "note": null,
       "evidence": "实测"
     },

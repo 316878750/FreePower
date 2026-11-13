@@ -137,10 +137,14 @@ export const COVERAGE = {
   disable_video: 'partial',
   image_size: 'n/a',
   disable_console: 'partial',
-  // 这两个原标 full 是误标：src 里没有任何启动参数/注入点消费它们（只有 API 边界归一 + 落库）。
-  // 标 full 会让 UI 显示「能做」，比标 none 更坏。P2 批次真要接：
-  // --disable-features=PasswordManager,AutofillServerCommunication。
-  disable_save_password: 'none',
+  // disable_save_password：P2 起真接了启动参数（--password-store=basic +
+  // --disable-features=EnablePasswordsAccountStorage；对手是自家内核的
+  // --protected-disablesavepassword=1，我们没有那条路）。标 partial 的理由：参数进了命令行、
+  // 启动与 CDP 都正常，但「保存密码条不再出现」是浏览器 UI 层行为，本机没有稳定可观测量 ——
+  // 不把「参数进去了」写成「行为验证过」。同类启动参数开关
+  // （disable_image / disable_video / disable_console）也都 partial。
+  disable_save_password: 'partial',
+  // disable_password_filling：仍无消费点（API 边界归一 + 落库，chrome.js 里没有对应参数）。
   disable_password_filling: 'none',
   sync_password: 'n/a',
   fb_cloud_password_manager: 'n/a',

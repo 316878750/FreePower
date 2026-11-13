@@ -106,7 +106,6 @@ const IDLE = new Map([
   ['device_name', 'device_name_switch 有默认值，但 device_name 本身没有被消费'],
   ['device_name_switch', '字段表登记但 src 零消费，连开关本身都没搭生效路径'],
   ['hidden_notification', '基线不带 --enable-automation，本来就没有「受自动化控制」横幅可消（基线已覆盖）'],
-  ['disable_save_password', 'overrides.mjs 原标 full 系误标，src 零读取；P2 批次会接 --disable-features=PasswordManager,AutofillServerCommunication'],
   ['disable_password_filling', 'API 边界有归一与落库，chrome.js 零消费'],
   ['gyroscope', '零读取'],
   ['virtual_camera', '零读取'],
