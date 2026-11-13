@@ -104,6 +104,14 @@ export function ensureRestoreOnStartup(userDataDir, { log = () => {}, now = new 
 
   const tmp = `${file}.fp-tmp`;
   fs.writeFileSync(tmp, `${JSON.stringify(merged)}\n`, 'utf8');
-  fs.renameSync(tmp, file);
+  try {
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    // 改名失败（文件被杀毒/另一个句柄占着、权限没了）：**先把临时文件清掉再原样抛**。
+    // 不清的话目录里会永久躺一个 `Preferences.fp-tmp`，下次启动没人管它 —— 复盘时看到的是垃圾，
+    // 不是原因。原文件此时一个字节都没动（rename 是原子的，失败就是没发生）。
+    try { fs.unlinkSync(tmp); } catch { /* 临时文件可能压根没写成，删不掉也不影响原错误 */ }
+    throw e;
+  }
   return { path: file, changed: true, backed_up: backedUp, created };
 }

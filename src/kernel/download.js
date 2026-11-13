@@ -344,6 +344,9 @@ function startJob(entry, resolved, ctx) {
         at: Date.now(),
         reason: e?.reason || 'kernel_error',
         message: e?.message || String(e),
+        // 因果也带出去（巡检 S3）：最后一个源失败时官方那次的原因在 `previous_error` 上，
+        // 只进 console 的话脚本还是判不到「官方先卡死了、镜像才 404」。
+        previous_error: e?.previous_error || null,
       });
       try {
         console.warn(`[kernel] 内核 ${entry.version} 下载/安装失败（${e?.reason || 'kernel_error'}）：${e?.message || e}`);
@@ -604,12 +607,19 @@ export async function downloadFromSources(sources, zipPath, {
  *
  * 两段 message **不拼成一坨**：字段分开（`previous_error.reason` / `.message`），脚本要能判；
  * 只在本条 message 后面接一句短的「官方源此前失败：<reason>」，让人一眼看到因果。
+ *
+ * 2026-11-13 补（巡检 S3）：原来只对 `KernelError` 生效，fs 级错误（ENOSPC / EPERM / ENOTDIR…）
+ * 逃出去时把前一个源的原因丢了 —— 那也是「因果」，不该因为错误类型不同就消失。
+ * 现在**任何 Error 都挂字段**；message 后缀仍只给 `KernelError` 接（fs 原文一个字都不动）。
  */
-function withPreviousError(err, prev) {
+export function withPreviousError(err, prev) {
   if (!prev || prev === err) return err;
-  if (!(err instanceof KernelError)) return err;
-  err.previous_error = { reason: prev.reason || 'kernel_error', message: prev.message || String(prev) };
-  if (!String(err.message).includes('此前失败')) {
+  try {
+    err.previous_error = { reason: prev.reason || 'kernel_error', message: prev.message || String(prev) };
+  } catch {
+    return err; // 冻结/不可扩展的错误对象：宁可少个诊断字段，也不要让诊断把主错误顶掉
+  }
+  if (err instanceof KernelError && !String(err.message).includes('此前失败')) {
     err.message = `${err.message}（官方源此前失败：${err.previous_error.reason}）`;
   }
   return err;

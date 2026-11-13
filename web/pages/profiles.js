@@ -199,6 +199,12 @@ export default async function renderProfiles({ head, page }) {
       if (what === 'start') {
         const r = await api.start(id);
         toast(`已启动，调试端口 ${r.debug_port}${r.already_running ? '（本来就在跑）' : ''}`, 'ok');
+        // 启动告警要让用户看见（巡检 2026-11-13 S3）：prefs 写失败时后端把原因放进 `warnings`，
+        // 前端原来一个字都不读 —— 用户看到的是「设置页写着 5、行为却在恢复上次会话」。
+        const warns = (r.warnings || []).map((w) => (w && w.message) || String(w)).filter(Boolean);
+        if (warns.length) {
+          toast(`注意：${warns.slice(0, 2).join('；')}${warns.length > 2 ? `（共 ${warns.length} 条，详见自检）` : ''}`, 'warn');
+        }
         // 启动会跑一次自检，把摘要取回来
         if (r.selfcheck) { state.checks[id] = { ...r.selfcheck, stale: false }; }
       } else {

@@ -173,6 +173,8 @@ details.advanced .form-grid { margin-top: 12px; }
 }
 .toast.bad { background: #8f2626; }
 .toast.ok { background: #17603a; }
+/* 告警：不是失败（启动成功但有些项没生效），所以不用红 —— 红色会被当成「起不来」 */
+.toast.warn { background: #8a5a12; }
 
 .overlay {
   position: fixed; inset: 0; background: rgba(20, 23, 28, .45);

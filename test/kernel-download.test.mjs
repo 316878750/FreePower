@@ -297,6 +297,12 @@ const server = http.createServer((req, res) => {
   }
 
   /* ---------- 镜像侧 ---------- */
+  // 镜像一直 500：用来打「最后一个源失败时，前一个源的原因要带走」（因果不能丢）
+  if (/^\/mirror-500\//.test(p)) {
+    res.writeHead(500, { 'content-type': 'text/plain' });
+    res.end('boom');
+    return;
+  }
   const mirror = /^\/mirror-(ok|badlen|badhash)\/([\d.]+)\/win64\/chrome-win64\.zip$/.exec(p);
   if (mirror) {
     const [, kind, version] = mirror;
@@ -1005,6 +1011,31 @@ try {
     rgs19.every((r) => Number.isInteger(r.start) && Number.isInteger(r.length)
       && /^[0-9a-f]{64}$/.test(String(r.sha256))),
     JSON.stringify(rgs19.map((r) => [r.start, r.length, String(r.sha256).slice(0, 8)])));
+
+  /* ④b 因果不只给 KernelError：fs 级错误（ENOTDIR 建不了临时目录）也要带走前一个源的原因 */
+  // 旧实现 `if (!(err instanceof KernelError)) return err;` 会把 fs 级失败的前因丢掉 ——
+  // 用户看到「建不了目录」，看不到「官方先 500 了」，两者都成立但只报一半。
+  const { withPreviousError } = await import('../src/kernel/download.js');
+  const prevK = Object.assign(new Error('官方 500'), { reason: 'download_http_500' });
+  const fsErr = Object.assign(new Error('ENOTDIR: 建不了临时目录'), { code: 'ENOTDIR' });
+  const tagged = withPreviousError(fsErr, prevK);
+  check('因果：非 KernelError（fs 级 ENOTDIR）也挂 previous_error，且 message 原文一个字不改',
+    tagged === fsErr && tagged.previous_error?.reason === 'download_http_500'
+      && tagged.code === 'ENOTDIR' && tagged.message === 'ENOTDIR: 建不了临时目录',
+    `${tagged?.previous_error?.reason} / ${tagged.message}`);
+
+  /* ④c 因果要能「出得去」：lastKernelFailure 里也带 previous_error（否则只有 console 看得到） */
+  const V22 = '157.0.9023.23';
+  const r22 = await runKernelDownload(
+    { kernel_type: 'Chrome', kernel_version: V22 },
+    { zipBase: `${BASE}/missing404`, mirrorBase: `${BASE}/mirror-500`, stallMs: 700, maxAttempts: 2 },
+  );
+  const f22 = await waitFailure(V22, 25000);
+  check('因果：最后一个源（镜像 500）失败时，官方 404 的原因进 lastKernelFailure.previous_error',
+    r22.code === 0 && f22?.reason === 'download_http_500'
+      && f22?.previous_error?.reason === 'download_http_404'
+      && /此前失败：download_http_404/.test(String(f22?.message)),
+    `${f22?.reason} prev=${f22?.previous_error?.reason} msg=${String(f22?.message || '').slice(0, 80)}`);
 
   /* ① 最后一个源失败 → 前一个源的原因带走（官方的 500 不能因为镜像也挂了就消失） */
   const fakeTwo = async (url, init = {}) => {

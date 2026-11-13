@@ -1871,6 +1871,34 @@ test('会话恢复：原子写 —— 先写 .fp-tmp 再改名，成功后不留
 });
 
 
+test('会话恢复：改名失败时先把 .fp-tmp 清掉、原文件一个字节不动', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fp-prefs-renamefail-'));
+  try {
+    const file = prefsPathOf(dir);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const before = JSON.stringify({ session: { restore_on_startup: 4 }, keep: { a: 1 } });
+    fs.writeFileSync(file, before, 'utf8');
+    const saved = fs.renameSync;
+    let err = null;
+    try {
+      fs.renameSync = () => {
+        const e = new Error('EPERM: 模拟改名失败（文件被占用）');
+        e.code = 'EPERM';
+        throw e;
+      };
+      try { ensureRestoreOnStartup(dir); } catch (e) { err = e; }
+    } finally {
+      fs.renameSync = saved;
+    }
+    assert.equal(err?.code, 'EPERM', '改名失败必须原样抛出，不许吞');
+    assert.equal(fs.readFileSync(file, 'utf8'), before, '原文件必须一个字节都不动');
+    assert.deepEqual(fs.readdirSync(path.dirname(file)), ['Preferences'], '目录里不许留 .fp-tmp');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+
 /* ============================================================================
  * 判据⑨：字段表产物必须是最新生成的结果
  * ==========================================================================*/

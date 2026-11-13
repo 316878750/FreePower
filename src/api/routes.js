@@ -220,7 +220,10 @@ export function buildRoutes() {
       return await runKernelDownload(ctx.body || {});
     } catch (e) {
       if (e instanceof ApiError) throw e;
-      throw new ApiError(Number.isFinite(e?.code) ? e.code : ERR.GENERIC, e?.message || 'kernel download failed');
+      // `previous_error`（前一个源为什么失败）跟着错误走：只塞 msg 的话，脚本看得到「镜像 404」，
+      // 看不到「官方先卡死了」。没有这个字段时**不加键**，形状与契约 §4 一致。
+      const extra = e?.previous_error ? { previous_error: e.previous_error } : {};
+      throw new ApiError(Number.isFinite(e?.code) ? e.code : ERR.GENERIC, e?.message || 'kernel download failed', 200, extra);
     }
   });
 

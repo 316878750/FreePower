@@ -463,7 +463,7 @@ npm run test
 npm run smoke
 ```
 
-当前实测（2026-11-13，本机）：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **84** + agent **15** + api **100** + ui **46** + desktop **54** + kernel-download **47**（`package.json` 里那条脚本就是这十组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **30/30**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核）+ **4/4**（`test/session-restore.test.mjs`，会话恢复：真内核真重启），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测（2026-11-13，本机）：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **85** + agent **15** + api **100** + ui **46** + desktop **54** + kernel-download **54**（`package.json` 里那条脚本就是这十组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **30/30**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核）+ **4/4**（`test/session-restore.test.mjs`，会话恢复：真内核真重启），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 > 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：
@@ -808,10 +808,10 @@ node --no-warnings test/proxy-chain.test.mjs   → 也行，单独跑同一套�
 
 **强制开启的语义（照实说）**：每次启动都会把值顶成 1。用户在 Chrome 里手动改回「打开新标签页」，下次启动会被改回来 —— 和对手强制写内核配置是同一个语义。不想这样的话，只能等以后加开关（本轮不做）。
 
-**判据**（A 层 4 条进 `npm test`，B 层 4 条进 `npm run smoke`）：
+**判据**（A 层 5 条进 `npm test`，B 层 4 条进 `npm run smoke`）：
 
 ```
-npm test        → unit 84（会话恢复 4 条：合并只动一个键且未知键一个不少 / 坏 JSON 先备份再写 / 幂等不写盘（mtime 不变） / 原子写不留 .fp-tmp）
+npm test        → unit 85（会话恢复 5 条：合并只动一个键且未知键一个不少 / 坏 JSON 先备份再写 / 幂等不写盘（mtime 不变） / 原子写不留 .fp-tmp / 改名失败先清 .fp-tmp 且原文件不动）
 npm run smoke   → session-restore 4/4（真内核真重启）
 ```
 
@@ -1329,4 +1329,4 @@ FREEPOWER_KERNEL_DOWNLOAD_ATTEMPTS   续传最多重连几次（默认 12）
 
 - **强制的、没有开关**：每次启动都把 `session.restore_on_startup` 顶成 1，用户手动改回去下次也会被改回来（和对手强制写内核配置同一语义）。想「让用户自己选」得另加字段，本轮不做；
 - **只恢复标签页，不恢复标签内的历史**：Chrome 的「继续浏览上次打开的网页」恢复的是上次开着的那些 URL，单个标签的前进/后退历史不在保证范围内；
-- **`Preferences` 写不上时不阻断启动**：写失败（权限、盘满）只在 `warnings` 里点名 `session`，内核照样起 —— 代价是那一轮不保证「继续上次会话」，不假装成功。
+- **`Preferences` 写不上时不阻断启动**：写失败（权限、盘满）只在 `warnings` 里点名 `session`，内核照样起 —— 代价是那一轮不保证「继续上次会话」，不假装成功。0.4.1 起控制台在启动成功后会把这条告警弹出来（黄色 toast，最多显示前两条），不再只躺在自检报告里等人翻。
