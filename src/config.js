@@ -55,8 +55,28 @@ export const CFT_ZIP_BASE = String(
     || 'https://storage.googleapis.com/chrome-for-testing-public',
 ).trim().replace(/\/+$/, '');
 
-/** 下载+安装的整体预算（默认 10 分钟；150 MB 在慢网上也可能要几分钟，别用 30s 那种步进超时） */
-export const KERNEL_DOWNLOAD_TIMEOUT_MS = Number(process.env.FREEPOWER_KERNEL_DOWNLOAD_TIMEOUT || 600000);
+/**
+ * 下载+安装的整体预算（默认 **60 分钟**）。
+ *
+ * 为什么这么长：本机实测到 `storage.googleapis.com` 只有 **50–160 KB/s**（同一时刻
+ * Cloudflare 有 860 KB/s），一个 `chrome-win64.zip` 是 **209,854,321 B**，慢网要几十分钟。
+ * 而且这不是「挂住请求」——`download-kernel` 立刻回 `pending`，下载在后台跑，用户/脚本轮询。
+ * 原来默认 10 分钟，在这条链路上必然超时（实测 10 分钟只下到 85 MB 左右）。
+ */
+export const KERNEL_DOWNLOAD_TIMEOUT_MS = Number(process.env.FREEPOWER_KERNEL_DOWNLOAD_TIMEOUT || 3600000);
+
+/**
+ * 单次连接「多久没收到字节」就判定卡死并重连续传（默认 120 s）。
+ * 与上面的总预算分工不同：总预算管「这次下载一共允许多久」，
+ * 这个管「连接是不是已经不动了」—— 不动就断开重连，用 `Range` 从断点接着下。
+ */
+export const KERNEL_DOWNLOAD_STALL_MS = Number(process.env.FREEPOWER_KERNEL_DOWNLOAD_STALL || 120000);
+
+/**
+ * 续传最多重连几次（默认 12）。每次重连都用 `Range: bytes=<已收>-` 接着下，
+ * 不从头再来；连满还下不完就明确失败，不留半成品。
+ */
+export const KERNEL_DOWNLOAD_ATTEMPTS = Number(process.env.FREEPOWER_KERNEL_DOWNLOAD_ATTEMPTS || 12);
 
 /** 环境启动后保持的调试端口随机分配；外部脚本通过返回的 ws 地址接入 */
 export const START_TIMEOUT_MS = Number(process.env.FREEPOWER_START_TIMEOUT || 20000);

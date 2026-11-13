@@ -112,7 +112,7 @@ const server = http.createServer((req, res) => {
   }
   if (p === '/meta/known-good-versions-with-downloads.json') return sendJson({ versions: [] });
 
-  const m = /^\/(ok|cut|mismatch|missing404)\/([\d.]+)\/win64\/chrome-win64\.zip$/.exec(p);
+  const m = /^\/(ok|cut|mismatch|missing404|resume|stall)\/([\d.]+)\/win64\/chrome-win64\.zip$/.exec(p);
   if (!m) { res.writeHead(404); res.end('nope'); return; }
   const [, mode, version] = m;
   if (mode === 'missing404') { res.writeHead(404); res.end('not here'); return; }
@@ -123,9 +123,39 @@ const server = http.createServer((req, res) => {
   if (mode === 'cut') {
     res.writeHead(200, { 'content-type': 'application/zip', 'content-length': zip.length });
     res.write(zip.subarray(0, Math.floor(zip.length / 3)));
-    setTimeout(() => res.destroy(), 30); // 中途断线
+    setTimeout(() => res.destroy(), 30); // 中途断线，且**不认 Range**（不响应续传）
     return;
   }
+
+  // resume / stall：认 Range，用来打「断点续传」这条路（2026-11-13 真机测出 GCS 单连接越下越慢后加的）
+  if (mode === 'resume' || mode === 'stall') {
+    const range = req.headers.range;
+    const start = range ? Number((/bytes=(\d+)-/.exec(range) || [])[1] || 0) : 0;
+    const body = zip.subarray(start);
+    const headers = { 'content-type': 'application/zip', 'accept-ranges': 'bytes' };
+    if (range) {
+      res.writeHead(206, {
+        ...headers,
+        'content-length': body.length,
+        'content-range': `bytes ${start}-${zip.length - 1}/${zip.length}`,
+      });
+    } else {
+      res.writeHead(200, { ...headers, 'content-length': zip.length });
+    }
+    if (mode === 'stall' && !range) {
+      // 发一小截然后**永不结束**：客户端靠 stall 检测主动断开，重连时带 Range 续上
+      res.write(body.subarray(0, 100));
+      return;
+    }
+    if (mode === 'resume' && start === 0) {
+      res.write(body.subarray(0, Math.floor(body.length * 0.4)));
+      setTimeout(() => res.destroy(), 20); // 第一次只给 40% 就断
+      return;
+    }
+    res.end(body);
+    return;
+  }
+
   res.writeHead(200, { 'content-type': 'application/zip', 'content-length': zip.length });
   res.end(zip);
 });
@@ -325,6 +355,52 @@ try {
   const nfFail = await waitFailure(V5);
   check('包体 404 → 后台失败 download_http_404（同步只回 pending，不假成功）',
     nf.code === 0 && nf.data?.status === 'pending' && nfFail?.reason === 'download_http_404', String(nfFail?.reason));
+
+  /* -------------------- 断点续传 + 停顿重连（2026-11-13 真机测速后加） -------------------- */
+  // 背景：本机到 storage.googleapis.com 只有 50–160 KB/s 且**单连接越下越慢**
+  // （前 15s 138 KB/s，两分钟掉到 47 KB/s），209 MB 的包一条连接下不完。
+  // 所以下载层改成「停顿检测 + Range 续传」；这两条钉住它真的会续、且续完的包是完整的。
+  const resumeBase = `${BASE}/resume`;
+  const V7 = '157.0.9006.6';
+  const dl7 = await runKernelDownload(
+    { kernel_type: 'Chrome', kernel_version: V7 },
+    { zipBase: resumeBase },
+  );
+  const ok7 = await pollUntilSettled(V7, 20000);
+  const hits7 = hits.get(`/resume/${V7}/win64/chrome-win64.zip`) || 0;
+  const res7 = lastKernelFailure(V7);
+  check('断点续传：第一次只给 40% 就断 → 带 Range 续上 → 装好（假源收到 2 次请求）',
+    dl7.code === 0 && ok7?.data?.status === 'completed' && hits7 === 2 && !res7
+      && fs.existsSync(path.join(KERNELS_DIR, V7, 'chrome.exe')),
+    `${ok7?.data?.status} hits=${hits7} fail=${res7?.reason || 'none'}`);
+  // 续出来的包必须与「一次给完的同一个包」解出来逐字节相同（不是「拼起来的坏包」）
+  const expect7 = makeZip({
+    'chrome-win64/chrome.exe': `FAKE_CHROME ${V7}\n`,
+    'chrome-win64/chrome.dll': Buffer.alloc(2048, 7),
+    'chrome-win64/locales/en-US.pak': 'pak',
+  });
+  const oneShot = path.join(dataDir, 'oneshot-7');
+  fs.mkdirSync(oneShot, { recursive: true });
+  const { extractZipBuffer } = await import('../src/kernel/zip.js');
+  extractZipBuffer(expect7, oneShot, { flatten: true });
+  check('续传出来的内核与「一次给完的同一个包」解出来逐字节一致（不是「拼起来的坏包」）',
+    fs.readFileSync(path.join(KERNELS_DIR, V7, 'chrome.exe'))
+      .equals(fs.readFileSync(path.join(oneShot, 'chrome.exe')))
+    && fs.readFileSync(path.join(KERNELS_DIR, V7, 'chrome.dll'))
+      .equals(fs.readFileSync(path.join(oneShot, 'chrome.dll'))));
+
+  // 停顿：第一次发 100 字节后永不结束，客户端必须自己判卡死、断开、带 Range 重连
+  const V8 = '157.0.9007.7';
+  const dl8 = await runKernelDownload(
+    { kernel_type: 'Chrome', kernel_version: V8 },
+    { zipBase: `${BASE}/stall`, stallMs: 600, maxAttempts: 5 },
+  );
+  const ok8 = await pollUntilSettled(V8, 20000);
+  const hits8 = hits.get(`/stall/${V8}/win64/chrome-win64.zip`) || 0;
+  check('停顿检测：连接不动了主动断开重连（stall=600ms），不干等到总超时',
+    dl8.code === 0 && ok8?.data?.status === 'completed' && hits8 >= 2
+      && fs.existsSync(path.join(KERNELS_DIR, V8, 'chrome.exe')),
+    `${ok8?.data?.status} hits=${hits8}`);
 
   /* -------------------- 并发只下一次 -------------------- */
   clearKernelDownloadCache();

@@ -28,7 +28,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import {
-  KERNELS_DIR, CFT_META_URL, CFT_VERSIONS_URL, CFT_ZIP_BASE, KERNEL_DOWNLOAD_TIMEOUT_MS,
+  KERNELS_DIR, CFT_META_URL, CFT_VERSIONS_URL, CFT_ZIP_BASE,
+  KERNEL_DOWNLOAD_TIMEOUT_MS, KERNEL_DOWNLOAD_STALL_MS, KERNEL_DOWNLOAD_ATTEMPTS,
 } from '../config.js';
 import { cftPlatform, resolveCftKernel } from './cft.js';
 import { extractZipFile } from './zip.js';
@@ -183,6 +184,8 @@ export async function runKernelDownload(body = {}, opts = {}) {
     metaUrl: opts.metaUrl || CFT_META_URL,
     versionsUrl: opts.versionsUrl || CFT_VERSIONS_URL,
     timeoutMs: opts.timeoutMs || KERNEL_DOWNLOAD_TIMEOUT_MS,
+    stallMs: opts.stallMs || KERNEL_DOWNLOAD_STALL_MS,
+    maxAttempts: opts.maxAttempts || KERNEL_DOWNLOAD_ATTEMPTS,
   };
 
   // ① 已装：幂等 completed（分支 A，带 msg）
@@ -244,6 +247,8 @@ function startJob(entry, resolved, ctx) {
         fetchImpl: ctx.fetchImpl,
         verifyExe: ctx.verifyExe,
         timeoutMs: ctx.timeoutMs,
+        stallMs: ctx.stallMs,
+        maxAttempts: ctx.maxAttempts,
         onPhase: (ph) => { entry.status = ph; },
         onProgress: (p) => { entry.progress = p; },
       });
@@ -286,17 +291,150 @@ function sha256File(p) {
 }
 
 /**
+ * 下载到文件，**断了就带 `Range` 接着下**（2026-11-13 实测后加的，理由见下）。
+ *
+ * 为什么要续传：本机实测 `storage.googleapis.com` 的**单条连接会越下越慢** ——
+ * 前 15 秒 138 KB/s，两分钟掉到 47 KB/s；而同一个包另开一条连接又能跑 100 KB/s 以上。
+ * 209,854,321 B 的包在「一条连接下到底」的策略下要一两个小时，中途一断还得从头再来。
+ * 所以这里做两件事，都不改「包必须完整」这条底线：
+ *   1. **停顿检测**：`stallMs` 内一个字节都没收到 → 主动断开这条连接，重连；
+ *   2. **断点续传**：重连时带 `Range: bytes=<已收>-`，服务端回 206 就接着写；
+ *      服务端不认 Range（回 200 整包）就老老实实从头写（`truncate` 到 0）。
+ *
+ * 不续传的情况（明确报错，不硬凑）：4xx 除 408/429 之外一律不重试（404 重试一万次还是 404）；
+ * 重连次数用尽仍不完整 → 失败，由调用方删掉 `.tmp-*`。
+ *
+ * @returns {Promise<{bytes: number, total: number, attempts: number, resumed: boolean}>}
+ */
+export async function downloadToFile(url, zipPath, {
+  fetchImpl = fetch,
+  timeoutMs = KERNEL_DOWNLOAD_TIMEOUT_MS,
+  stallMs = KERNEL_DOWNLOAD_STALL_MS,
+  maxAttempts = KERNEL_DOWNLOAD_ATTEMPTS,
+  onProgress = () => {},
+} = {}) {
+  fs.mkdirSync(path.dirname(zipPath), { recursive: true });
+  const deadline = Date.now() + timeoutMs;
+  let received = 0;
+  let total = 0;
+  let attempts = 0;
+  let resumed = false;
+  let lastErr = null;
+
+  while (attempts < maxAttempts) {
+    if (Date.now() > deadline) {
+      throw new KernelError(`内核包下载超时（总预算 ${timeoutMs} ms 用完，已收 ${received}/${total || '?'} 字节）`, {
+        reason: 'download_timeout',
+        cause: lastErr,
+      });
+    }
+    attempts += 1;
+    const ac = new AbortController();
+    let stallTimer = null;
+    const bump = () => {
+      if (stallTimer) clearTimeout(stallTimer);
+      const left = Math.max(0, deadline - Date.now());
+      stallTimer = setTimeout(() => ac.abort(), Math.min(stallMs, left || 1));
+    };
+    bump();
+
+    try {
+      const headers = {};
+      if (received > 0) headers.range = `bytes=${received}-`;
+      const res = await fetchImpl(url, { signal: ac.signal, redirect: 'follow', headers });
+
+      if (res.status === 416 && received > 0) {
+        // 服务端说「这个区间没有」：要么我们已经下完，要么本地长度不对 —— 交给后面的长度校验判
+        total = received;
+        break;
+      }
+      if (!res.ok) {
+        const retryable = res.status === 408 || res.status === 429 || res.status >= 500;
+        const err = new KernelError(`内核包下载失败：HTTP ${res.status}（${url}）`, { reason: `download_http_${res.status}` });
+        if (!retryable) throw err;
+        lastErr = err;
+        continue;
+      }
+
+      // 206 的 `content-range: bytes 100-999/1000` 才带全长；200 就是整包
+      const cr = String(res.headers.get('content-range') || '');
+      const crStart = Number((/^bytes\s+(\d+)-/i.exec(cr) || [])[1] || -1);
+      const crTotal = Number((/\/\s*(\d+)\s*$/.exec(cr) || [])[1] || 0);
+      if (crTotal > 0) total = crTotal;
+      else total = Number(res.headers.get('content-length') || 0) + (res.status === 206 ? received : 0);
+
+      let fh;
+      if (res.status === 206 && received > 0) {
+        // 续传的起点必须正好是本地已有的字节数，否则拼出来的包是坏的 —— 明确报错，不硬拼
+        if (crStart >= 0 && crStart !== received) {
+          throw new KernelError(
+            `内核包续传位置不对：本地已收 ${received} 字节，服务端从 ${crStart} 开始给`,
+            { reason: 'download_resume_mismatch' },
+          );
+        }
+        resumed = true;
+        fh = fs.openSync(zipPath, 'a');
+      } else {
+        // 200：整包重来（服务端不认 Range，或这是第一次请求）
+        received = 0;
+        fh = fs.openSync(zipPath, 'w');
+      }
+      try {
+        for await (const chunk of res.body) {
+          bump();
+          const buf = Buffer.from(chunk);
+          fs.writeSync(fh, buf);
+          received += buf.length;
+          if (total > 0) onProgress(Math.min(99, Math.floor((received / total) * 100)));
+        }
+      } finally {
+        fs.closeSync(fh);
+      }
+
+      if (total > 0 && received >= total) break;
+      if (total === 0) break; // 服务端没给长度：靠后面的结构校验兜（解包时会红）
+      // 流干净结束但没下完：当作一次中断，接着续
+      lastErr = new KernelError(`内核包不完整：content-length 声明 ${total} 字节，实收 ${received} 字节`, { reason: 'download_length_mismatch' });
+    } catch (e) {
+      if (e instanceof KernelError && !/^download_http_(408|429|5\d\d)$/.test(String(e.reason))) throw e;
+      lastErr = e instanceof KernelError
+        ? e
+        : new KernelError(
+          ac.signal.aborted
+            ? `内核包下载卡住：${Math.min(stallMs, timeoutMs)} ms 没收到数据（第 ${attempts} 次，已收 ${received} 字节）`
+            : `内核包下载中断：${e?.cause?.code || e?.message || e}`,
+          { reason: ac.signal.aborted ? 'download_stalled' : 'download_interrupted', cause: e },
+        );
+    } finally {
+      if (stallTimer) clearTimeout(stallTimer);
+    }
+  }
+
+  if (total > 0 && received < total) {
+    const reason = lastErr?.reason === 'download_stalled' ? 'download_timeout' : (lastErr?.reason || 'download_interrupted');
+    throw new KernelError(
+      `内核包下载失败（重连 ${attempts} 次，已收 ${received}/${total} 字节）：${lastErr?.message || '未知原因'}`,
+      { reason, cause: lastErr },
+    );
+  }
+  return { bytes: received, total, attempts, resumed };
+}
+
+/**
  * 下载 → 校验 → 解压 → 自检 → 原子改名。**await 到「真装好」才返回**。
  *
  * 失败：`.tmp-*` 整个删掉（zip、半解压目录一起），目标版本目录不会出现半个。
  * @returns {Promise<{version: string, path: string, bytes: number, files: number,
- *                    checksum_source: 'metadata'|'none', verified_by: string}>}
+ *                    checksum_source: 'metadata'|'none', verified_by: string,
+ *                    download_attempts: number, resumed: boolean}>}
  */
 export async function installKernel(resolved, {
   root = KERNELS_DIR,
   fetchImpl = fetch,
   verifyExe = null,
   timeoutMs = KERNEL_DOWNLOAD_TIMEOUT_MS,
+  stallMs = KERNEL_DOWNLOAD_STALL_MS,
+  maxAttempts = KERNEL_DOWNLOAD_ATTEMPTS,
   onPhase = () => {},
   onProgress = () => {},
 } = {}) {
@@ -311,47 +449,17 @@ export async function installKernel(resolved, {
   const tmp = path.join(root, `.tmp-${version}-${process.pid}-${Date.now().toString(36)}`);
   const zipPath = path.join(tmp, `chrome-${platform}.zip`);
   const xDir = path.join(tmp, 'x');
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), timeoutMs);
-  let received = 0;
   try {
     onPhase('downloading');
-    let res;
-    try {
-      res = await fetchImpl(url, { signal: ac.signal, redirect: 'follow' });
-    } catch (e) {
-      throw new KernelError(
-        ac.signal.aborted ? `内核包下载超时（>${timeoutMs} ms）` : `内核包下载失败：${e?.cause?.code || e?.message || e}`,
-        { reason: ac.signal.aborted ? 'download_timeout' : 'download_unreachable', cause: e },
-      );
-    }
-    if (!res.ok) {
-      throw new KernelError(`内核包下载失败：HTTP ${res.status}（${url}）`, { reason: `download_http_${res.status}` });
-    }
-    const total = Number(res.headers.get('content-length') || 0);
-
-    fs.mkdirSync(tmp, { recursive: true });
-    const fh = fs.openSync(zipPath, 'w');
-    try {
-      for await (const chunk of res.body) {
-        const buf = Buffer.from(chunk);
-        fs.writeSync(fh, buf);
-        received += buf.length;
-        if (total > 0) onProgress(Math.min(99, Math.floor((received / total) * 100)));
-      }
-    } catch (e) {
-      throw new KernelError(
-        ac.signal.aborted ? `内核包下载超时（>${timeoutMs} ms）` : `内核包下载中断：${e?.cause?.code || e?.message || e}`,
-        { reason: ac.signal.aborted ? 'download_timeout' : 'download_interrupted', cause: e },
-      );
-    } finally {
-      fs.closeSync(fh);
-    }
+    const dl = await downloadToFile(url, zipPath, {
+      fetchImpl, timeoutMs, stallMs, maxAttempts, onProgress,
+    });
+    const received = dl.bytes;
 
     // ① content-length 比对（CfT 没有 sha256，这是能拿到的最硬的完整性信号）
-    if (total > 0 && received !== total) {
+    if (dl.total > 0 && received !== dl.total) {
       throw new KernelError(
-        `内核包不完整：content-length 声明 ${total} 字节，实收 ${received} 字节`,
+        `内核包不完整：content-length 声明 ${dl.total} 字节，实收 ${received} 字节`,
         { reason: 'download_length_mismatch' },
       );
     }
@@ -391,9 +499,10 @@ export async function installKernel(resolved, {
       files: ex.files.length,
       checksum_source: checksumSource,
       verified_by: 'chrome.exe --version',
+      download_attempts: dl.attempts,
+      resumed: dl.resumed,
     };
   } finally {
-    clearTimeout(timer);
     // 成功路径：xDir 已被改名走，这里只剩 zip 和空壳；失败路径：zip + 半解压目录一起删
     try {
       fs.rmSync(tmp, { recursive: true, force: true });
