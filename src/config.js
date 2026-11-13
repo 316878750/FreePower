@@ -37,6 +37,27 @@ export const RATE_LIMIT_UI = Number(process.env.FREEPOWER_RATE_LIMIT_UI || 60);
 /** 内核：优先环境变量指定的可执行文件，其次内核矩阵目录，最后系统 Chrome */
 export const CHROME_BIN = process.env.FREEPOWER_CHROME || '';
 
+/**
+ * 内核下载（`POST /api/v2/browser-profile/download-kernel`）—— 源是 **Chrome for Testing**，
+ * 不是对手的 CDN（那是它自家分发的 SunBrowser 二进制，我们不转发别人的构建）。
+ * 三个地址都可覆盖：内网镜像 / 离线自测时改 `FREEPOWER_CFT_*` 即可，测试用它指本地假源。
+ */
+export const CFT_META_URL = String(
+  process.env.FREEPOWER_CFT_META_URL
+    || 'https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json',
+).trim();
+export const CFT_VERSIONS_URL = String(
+  process.env.FREEPOWER_CFT_VERSIONS_URL
+    || 'https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json',
+).trim();
+export const CFT_ZIP_BASE = String(
+  process.env.FREEPOWER_CFT_ZIP_BASE
+    || 'https://storage.googleapis.com/chrome-for-testing-public',
+).trim().replace(/\/+$/, '');
+
+/** 下载+安装的整体预算（默认 10 分钟；150 MB 在慢网上也可能要几分钟，别用 30s 那种步进超时） */
+export const KERNEL_DOWNLOAD_TIMEOUT_MS = Number(process.env.FREEPOWER_KERNEL_DOWNLOAD_TIMEOUT || 600000);
+
 /** 环境启动后保持的调试端口随机分配；外部脚本通过返回的 ws 地址接入 */
 export const START_TIMEOUT_MS = Number(process.env.FREEPOWER_START_TIMEOUT || 20000);
 
