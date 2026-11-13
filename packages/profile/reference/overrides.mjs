@@ -257,41 +257,41 @@ export const EFFECT = {
   gpu_switch: { effect: 'none', inert: '零读取：--disable-gpu 只能由用户在 launch_args 里手填，开关字段本身没有读取点' },
   cdp_mask: { effect: 'none', inert: '零读取：--remote-debugging-port 是启动必需，没有「隐藏 CDP 特征」的分支读它' },
   ban_dev_tools: { effect: 'none', inert: '零读取：禁用 DevTools 是内核级能力（对手自编译内核），我们没有对应参数' },
-  device_scale: { effect: 'cdp', sites: ['src/fingerprint/view.js#p.device_scale', 'src/runtime/manager.js#deviceScaleFactor'] },
+  device_scale: { effect: 'cdp', sites: ['src/fingerprint/view.js#p.device_scale', 'src/runtime/manager.js#deviceScaleFactor: view.device_scale_factor'] },
 
   // 杂项：明确不做
   virtual_camera: { effect: 'none', inert: '零读取（虚拟摄像头是内核级特性，CDP/启动参数做不到）' },
 
   // UA / 语言
-  ua: { effect: ['inject', 'cdp'], sites: ['src/kernel/inject.js#CFG.ua', 'src/runtime/manager.js#setUserAgentOverride'] },
-  client_hints: { effect: 'cdp', sites: ['src/fingerprint/view.js#p.client_hints', 'src/runtime/manager.js#ua_metadata'] },
+  ua: { effect: ['inject', 'cdp'], sites: ['src/kernel/inject.js#CFG.ua', 'src/runtime/manager.js#Emulation.setUserAgentOverride'] },
+  client_hints: { effect: 'cdp', sites: ['src/fingerprint/view.js#p.client_hints', 'src/runtime/manager.js#userAgentMetadata: view.ua_metadata'] },
   language: { effect: ['args', 'inject'], sites: ['src/kernel/chrome.js#--accept-lang', 'src/kernel/inject.js#CFG.language'] },
   language_switch: { effect: 'none', inert: '零读取：生成器只把 "0" 写进默认值，没有任何分支按它选语言（语言由 country/geo 表生成）' },
-  page_language: { effect: ['args', 'cdp'], sites: ['src/fingerprint/view.js#p.page_language', 'src/kernel/chrome.js#view.locale', 'src/runtime/manager.js#setLocaleOverride'] },
+  page_language: { effect: ['args', 'cdp'], sites: ['src/fingerprint/view.js#p.page_language', 'src/kernel/chrome.js#view.locale', 'src/runtime/manager.js#Emulation.setLocaleOverride'] },
   page_language_switch: { effect: 'none', inert: '零读取：生成器只写默认值，页面语言由 country/geo 表直接生成' },
-  timezone: { effect: 'cdp', sites: ['src/runtime/manager.js#setTimezoneOverride'] },
+  timezone: { effect: 'cdp', sites: ['src/runtime/manager.js#Emulation.setTimezoneOverride'] },
   automatic_timezone: { effect: 'none', inert: '零读取：生成器只写默认值，时区由 country/geo 表直接生成' },
 
   // 噪点四件套 + WebGL
   canvas: { effect: 'inject', sites: ['src/kernel/inject.js#CFG.canvas'] },
   webgl_image: { effect: 'inject', sites: ['src/kernel/inject.js#CFG.webgl_image'] },
   webgl: { effect: 'inject', sites: ['src/fingerprint/view.js#p.webgl', 'src/kernel/inject.js#CFG.webgl'] },
-  webgl_config: { effect: ['args', 'inject'], sites: ['src/kernel/chrome.js#webgpu_switch', 'src/fingerprint/view.js#p.webgl_config'] },
+  webgl_config: { effect: ['args', 'inject'], sites: ['src/kernel/chrome.js#webgl_config?.webgpu?.webgpu_switch', 'src/fingerprint/view.js#p.webgl_config'] },
   audio: { effect: 'inject', sites: ['src/kernel/inject.js#CFG.audio'] },
   client_rects: { effect: 'inject', sites: ['src/kernel/inject.js#CFG.client_rects'] },
 
   // 字体：CDP 路线的结构性硬伤
   fonts: {
     effect: 'inject',
-    sites: ['src/kernel/inject.js#__fpFontsDeclared'],
+    sites: ['src/kernel/inject.js#Object.defineProperty(window, \'__fpFontsDeclared\''],
     inert: '注入层只把列表挂成 window.__fpFontsDeclared（自检页拿它比对「声明的字体」），没有禁用/过滤；页面能枚举到的字体一条不变',
   },
   disabled_fonts: { effect: 'none', inert: '全 src 零读取（只在校验与详情视图里出现）' },
 
   // 屏幕 / 硬件
-  screen_resolution: { effect: ['cdp', 'inject'], sites: ['src/fingerprint/view.js#p.screen_resolution', 'src/runtime/manager.js#screenWidth', 'src/kernel/inject.js#CFG.screen'] },
-  hardware_concurrency: { effect: ['cdp', 'inject'], sites: ['src/runtime/manager.js#setHardwareConcurrencyOverride', 'src/kernel/inject.js#hardwareConcurrency'] },
-  device_memory: { effect: 'inject', sites: ['src/fingerprint/view.js#p.device_memory', 'src/kernel/inject.js#deviceMemory'] },
+  screen_resolution: { effect: ['cdp', 'inject'], sites: ['src/fingerprint/view.js#p.screen_resolution', 'src/runtime/manager.js#screenWidth: view.screen.width', 'src/kernel/inject.js#CFG.screen'] },
+  hardware_concurrency: { effect: ['cdp', 'inject'], sites: ['src/runtime/manager.js#Emulation.setHardwareConcurrencyOverride', 'src/kernel/inject.js#hardwareConcurrency: fp.hardware_concurrency'] },
+  device_memory: { effect: 'inject', sites: ['src/fingerprint/view.js#p.device_memory', 'src/kernel/inject.js#deviceMemory: fp.device_memory'] },
   device_name: { effect: 'none', inert: '零读取：device_name_switch 有默认值，device_name 本身没有任何读取点' },
   mac_address_config: { effect: 'none', inert: '零读取（storage=fp，只存不注入）' },
   gyroscope: { effect: 'none', inert: '零读取：传感器是内核级设备面，CDP 没有对应域，页面注入也改不了' },
@@ -318,14 +318,18 @@ export const EFFECT = {
   allow_scan_ports: { effect: 'none', inert: '零读取；同上' },
 
   // 地理
-  location: { effect: 'cdp', sites: ['src/fingerprint/view.js#profile.location', 'src/runtime/manager.js#geoPolicy'] },
+  // `location` 的第二条锚原来是 `#geoPolicy` —— 那个词在 manager.js 里首先命中的是第 12 行的
+  // **import 行**，把 `:292` / `:941` 两处调用全删掉它照样绿（巡检④）。改成真正决定权限分支的
+  // 读取表达式：`geoMode.permission`。`latitude/longitude/accuracy` 那三条锚的是 `geo.*`
+  // 读取点（`:942` 的 `if (geo.override)` 一带），本来就是真读取。
+  location: { effect: 'cdp', sites: ['src/fingerprint/view.js#profile.location', 'src/runtime/manager.js#geoMode.permission'] },
   location_switch: { effect: 'none', inert: '对手客户端不消费此字段："1"=按 IP 是服务端填充坐标，无本地生效路径；真正的拒绝定位是 location="block"' },
   longitude: { effect: 'cdp', sites: ['src/fingerprint/view.js#profile.longitude', 'src/runtime/manager.js#geo.longitude'] },
   latitude: { effect: 'cdp', sites: ['src/fingerprint/view.js#profile.latitude', 'src/runtime/manager.js#geo.latitude'] },
   accuracy: { effect: 'cdp', sites: ['src/fingerprint/view.js#profile.accuracy', 'src/runtime/manager.js#geo.accuracy'] },
 
   // 隐私开关
-  do_not_track: { effect: ['inject', 'cdp'], sites: ['src/fingerprint/view.js#p.do_not_track', 'src/kernel/inject.js#CFG.doNotTrack', 'src/runtime/manager.js#setExtraHTTPHeaders'] },
+  do_not_track: { effect: ['inject', 'cdp'], sites: ['src/fingerprint/view.js#p.do_not_track', 'src/kernel/inject.js#CFG.doNotTrack', 'src/runtime/manager.js#Network.setExtraHTTPHeaders'] },
   tls: { effect: 'none', inert: '零读取（同名 tls 在代理代码里是协议名 node:tls，不是这个字段）' },
   tls_switch: { effect: 'none', inert: '零读取：只有生成器写默认值，没有分支读它' },
   automation_controlled: { effect: ['args', 'inject'], sites: ['src/kernel/chrome.js#profile.automation_controlled', 'src/fingerprint/view.js#p.automation_controlled', 'src/kernel/inject.js#CFG.automationControlled'] },
@@ -341,7 +345,7 @@ export const EFFECT = {
   domain_https: { effect: 'none', inert: '零读取：HTTPS 强制跳转是请求级规则，我们没有实现（黑白名单只做阻断）' },
 
   // 启动 / 缓存
-  launch_args: { effect: 'args', sites: ['src/runtime/manager.js#effective.launch_args', 'src/kernel/launch-args.js#mergeLaunchArgs'] },
+  launch_args: { effect: 'args', sites: ['src/runtime/manager.js#effective.launch_args', 'src/kernel/launch-args.js#WHITELIST.get(key)'] },
   browser_run_args: { effect: 'none', inert: '零读取：v1 的旧别名，合并参数用的是 launch_args' },
   no_args: { effect: 'none', inert: '零读取（v1 的参数开关，启动链路没有对应分支）' },
   cover_args: { effect: 'none', inert: '零读取（同上，启动链路没有对应分支）' },

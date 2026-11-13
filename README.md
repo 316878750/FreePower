@@ -704,14 +704,18 @@ P2 这批是「字段表里有名字、`src/` 里零消费」的第二轮补漏�
 | `effect: 'inject'` | 走页面注入（`src/kernel/inject.js` 生成的源码） |
 | `effect: 'none'` | 内核层没有任何代码读它（必须配 `inert` 说明为什么） |
 | `effect: ['inject','cdp']` | 两条路一起走（如 `do_not_track`）；`none` 不许混写 |
-| `sites: ['src/…js#锚']` | 读取点证据：unit 去注释后逐条核「这个文件里还有这串」——代码删了/改名了而注册表没跟上就红 |
+| `sites: ['src/…js#锚']` | 读取点证据：unit 去注释后逐条核「这个文件里还有这串」——代码删了/改名了而注册表没跟上就红；**锚还必须是读取表达式**（见下面判定 ③′） |
 | `inert: '…'` | **读了但不改变行为**的理由（诊断变量、只喂自检的「声明值」对比、生成器只写默认值）。有 `inert` = 空转 = `idle` |
 
 **分布（138 个字段）**：`coverage` = 20 full / 36 partial / 22 none / 60 n/a；`effect` = 39 none / 11 inject / 10 args / 10 cdp / 8 多路（78 个「指纹/隐私字段」全覆盖，60 个 n/a 不登记）。44 个字段带 `inert`（= 空转）。
 
 **这一批顺带纠出来的假标签（都写成 `idle`，见已知限制第 41 条）**：`browser_kernel_config` / `cdp_mask` / `ban_dev_tools` / `gpu` / `gpu_switch` / `language_switch` / `page_language_switch` / `automatic_timezone` / `speech_voices` / `media_devices_config_v2` / `browser_run_args` / `no_args` / `cover_args` / `open_tabs` / `new_startup_page` / `win_x` / `win_y` / `clear_cache_after_closing` / `browser_security_lock`（这 19 个以前标 `full`/`partial`，实际内核层零读取 —— `coverage` 同步改成 `none`），外加 `media_devices_num`（P9-C 起数量字段不再造设备，只喂自检的「声明值」对比）。**代价**：控制台里这 20 个字段从此灰显 —— 以前它们看着能配、其实改了没用，灰着才是实话。
 
-**判定（`test/unit.test.mjs`「effect 注册表」那条，红即代表登记与代码脱节）**：① coverage ≠ n/a 的字段一个不许漏、n/a 一个不许进；② 取值合法、`none` 必须写 `inert`、非 none 必须至少一条锚；③ 每条锚在文件里真的存在；④ 反向：登记 `none` 的字段**内核层零读取**（属性读取扫描，注释不算；`tls` 这种同名协议名不会被误算），登记了生效层的字段内核层/派生层至少读一处；⑤ `inert` ⇔ `idle`，且生成物与注册表一致（判据⑨ 会逼重跑 `node tools/gen-schema.mjs`）；⑥ 各档数量钉死（改一个字段就得改数字）。
+**判定（`test/unit.test.mjs`「effect 注册表」那条，红即代表登记与代码脱节）**：① coverage ≠ n/a 的字段一个不许漏、n/a 一个不许进；② 取值合法、`none` 必须写 `inert`、非 none 必须至少一条锚；③ 每条锚在文件里真的存在；③′ **锚的形状**：锚必须是读取表达式，含属性访问（`.` 或 `[`），纯标识符直接红；④ 反向：登记 `none` 的字段**内核层 + 派生层零读取**（属性读取扫描，注释不算；`tls` 这种同名协议名不会被误算），登记了生效层的字段同一批文件里至少读一处；⑤ `inert` ⇔ `idle`，且生成物与注册表一致（判据⑨ 会逼重跑 `node tools/gen-schema.mjs`）；⑥ 各档数量钉死（改一个字段就得改数字）。
+
+**③′ 和 ④ 是为什么加的（2026-11-13 巡检）**：
+- **③′**：`location` 原来的第二条锚是 `src/runtime/manager.js#geoPolicy`，而 `geoPolicy` 在该文件里**首先命中的是第 12 行的 import 行** —— 把 `:292` / `:941` 两处调用全删掉，这条锚照样绿。现在锚必须写真正的读取表达式（`location` → `geoMode.permission`），纯标识符不许当锚。**这是 fail-closed 启发式，不是语义证明**：它只保证「锚不是纯标识符」，能挡住「拿函数名 / import 名 / 类型名充数」，挡不住「两个属性访问恰好同名」这种巧合。真正的语义级证明要数据流分析，我们没做，也不假装做了。唯一例外是内核命令行 flag（`--proxy-server` / `--accept-lang`）：它本身就是 argv 里的字符串，没有「属性访问」这回事。
+- **④**：原来 `none` 那一半只扫内核层，另一半扫「内核层 + 派生层」，同一件事两个口径。而 `location` / `do_not_track` / `screen_resolution` / `longitude` / `latitude` / `accuracy` 这些字段的读取**只在派生层** `src/fingerprint/view.js`（`manager.js` 里只有 `geoPolicy(effective)` 这种调用，没有 `.location`）—— 只扫内核层的话，把它们伪标成 `none` 永远不会红。改成两边扫同一批文件之后，全量 39 个 `none` 字段里只有一条被抓出来：`media_devices_num`（`view.js:98` 读它算 `CFG.media.counts`）。查证结论是**它登记 `none` 是对的**（注入层从不读 `counts`，只有自检页拿它比「声明值」），所以判据里给它留了一张**只有一条**的例外表，并且例外自带可证伪断言：`inject.js` 一旦开始读 `counts`，这条先红。
 
 > 口径：`effect` 说的是**我们这一版代码**的取证结果，不是对手怎么实现；`coverage` 说的是技术路线的上限。两者不一致是正常的（例如 `fonts`：`effect: inject` 只因为注入层挂了 `window.__fpFontsDeclared` 诊断变量，`inert` 写明「没有禁用/过滤」，`coverage` 仍是 `none`）。
 

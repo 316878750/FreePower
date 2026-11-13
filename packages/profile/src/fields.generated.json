@@ -1026,7 +1026,7 @@
       "effect": "cdp",
       "effectSites": [
         "src/fingerprint/view.js#p.device_scale",
-        "src/runtime/manager.js#deviceScaleFactor"
+        "src/runtime/manager.js#deviceScaleFactor: view.device_scale_factor"
       ],
       "inert": null,
       "note": "0 < x < 2.1",
@@ -1092,7 +1092,7 @@
       ],
       "effectSites": [
         "src/kernel/inject.js#CFG.ua",
-        "src/runtime/manager.js#setUserAgentOverride"
+        "src/runtime/manager.js#Emulation.setUserAgentOverride"
       ],
       "inert": null,
       "note": null,
@@ -1131,7 +1131,7 @@
       "effect": "cdp",
       "effectSites": [
         "src/fingerprint/view.js#p.client_hints",
-        "src/runtime/manager.js#ua_metadata"
+        "src/runtime/manager.js#userAgentMetadata: view.ua_metadata"
       ],
       "inert": null,
       "note": null,
@@ -1258,7 +1258,7 @@
       "effectSites": [
         "src/fingerprint/view.js#p.page_language",
         "src/kernel/chrome.js#view.locale",
-        "src/runtime/manager.js#setLocaleOverride"
+        "src/runtime/manager.js#Emulation.setLocaleOverride"
       ],
       "inert": null,
       "note": null,
@@ -1317,7 +1317,7 @@
       "coverage": "full",
       "effect": "cdp",
       "effectSites": [
-        "src/runtime/manager.js#setTimezoneOverride"
+        "src/runtime/manager.js#Emulation.setTimezoneOverride"
       ],
       "inert": null,
       "note": "IANA 名，空格转下划线",
@@ -1536,7 +1536,7 @@
         "inject"
       ],
       "effectSites": [
-        "src/kernel/chrome.js#webgpu_switch",
+        "src/kernel/chrome.js#webgl_config?.webgpu?.webgpu_switch",
         "src/fingerprint/view.js#p.webgl_config"
       ],
       "inert": null,
@@ -1713,7 +1713,7 @@
       "coverage": "none",
       "effect": "inject",
       "effectSites": [
-        "src/kernel/inject.js#__fpFontsDeclared"
+        "src/kernel/inject.js#Object.defineProperty(window, '__fpFontsDeclared'"
       ],
       "inert": "注入层只把列表挂成 window.__fpFontsDeclared（自检页拿它比对「声明的字体」），没有禁用/过滤；页面能枚举到的字体一条不变",
       "note": "[\"all\"] 是特殊值（不过滤）；语义是黑名单 DisabledFonts",
@@ -1773,7 +1773,7 @@
       ],
       "effectSites": [
         "src/fingerprint/view.js#p.screen_resolution",
-        "src/runtime/manager.js#screenWidth",
+        "src/runtime/manager.js#screenWidth: view.screen.width",
         "src/kernel/inject.js#CFG.screen"
       ],
       "inert": null,
@@ -1818,8 +1818,8 @@
         "inject"
       ],
       "effectSites": [
-        "src/runtime/manager.js#setHardwareConcurrencyOverride",
-        "src/kernel/inject.js#hardwareConcurrency"
+        "src/runtime/manager.js#Emulation.setHardwareConcurrencyOverride",
+        "src/kernel/inject.js#hardwareConcurrency: fp.hardware_concurrency"
       ],
       "inert": null,
       "note": null,
@@ -1857,7 +1857,7 @@
       "effect": "inject",
       "effectSites": [
         "src/fingerprint/view.js#p.device_memory",
-        "src/kernel/inject.js#deviceMemory"
+        "src/kernel/inject.js#deviceMemory: fp.device_memory"
       ],
       "inert": null,
       "note": null,
@@ -2599,7 +2599,7 @@
       "effect": "cdp",
       "effectSites": [
         "src/fingerprint/view.js#profile.location",
-        "src/runtime/manager.js#geoPolicy"
+        "src/runtime/manager.js#geoMode.permission"
       ],
       "inert": null,
       "note": null,
@@ -2756,7 +2756,7 @@
       "effectSites": [
         "src/fingerprint/view.js#p.do_not_track",
         "src/kernel/inject.js#CFG.doNotTrack",
-        "src/runtime/manager.js#setExtraHTTPHeaders"
+        "src/runtime/manager.js#Network.setExtraHTTPHeaders"
       ],
       "inert": null,
       "note": null,
@@ -3414,7 +3414,7 @@
       "effect": "args",
       "effectSites": [
         "src/runtime/manager.js#effective.launch_args",
-        "src/kernel/launch-args.js#mergeLaunchArgs"
+        "src/kernel/launch-args.js#WHITELIST.get(key)"
       ],
       "inert": null,
       "note": null,

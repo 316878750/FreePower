@@ -1673,6 +1673,29 @@ test('effect 注册表：每个字段说清在哪一层生效，登记与代码�
   }
   assert.deepEqual(badAnchors, [], 'effect 锚点对不上代码');
 
+  // ③' 锚的**形状**：不许是纯标识符。
+  //     反例（巡检④）：`location` 原来第二条锚是 `src/runtime/manager.js#geoPolicy`，而
+  //     `geoPolicy` 在 manager.js 里**首先命中的是第 12 行的 import 行** —— 把 `:292` / `:941`
+  //     两处调用全删掉，这条锚照样绿。判据 ③ 只查「这个词在文件里出现过」，等于没查。
+  //     现在要求锚是真正的读取表达式（含 `.` 或 `[`），纯标识符直接红。
+  //
+  //     **这是 fail-closed 启发式，不是语义证明**：它只保证「锚不是纯标识符」，能挡住
+  //     「拿函数名 / import 名 / 类型名充数」，挡不住「两个属性访问恰好同名」那种巧合。
+  //     真正的语义级证明要数据流分析，我们没做，也不假装做了。
+  //     命令行 flag（`--proxy-server`）是唯一例外：它本身就是 argv 里的字符串，不是标识符，
+  //     也没有「属性访问」这回事。
+  const badAnchorForms = [];
+  for (const [n, e] of Object.entries(OVERRIDES_EFFECT)) {
+    for (const s of e.sites ?? []) {
+      const symbol = String(s).split('#')[1] ?? '';
+      if (/^--[\w-]+$/.test(symbol)) continue; // 内核命令行 flag
+      const bare = /^[A-Za-z_$][\w$]*$/.test(symbol);
+      if (bare || (!symbol.includes('.') && !symbol.includes('['))) badAnchorForms.push(`${n}: ${s}`);
+    }
+  }
+  assert.deepEqual(badAnchorForms, [],
+    'effect 锚是纯标识符 —— 改成真正的读取表达式（如 `geoMode.permission`），别拿函数名/import 名充数');
+
   // ④ 反向：登记 none 的字段，内核层 + 派生层**零读取**；登记了生效层的，至少读一处
   //    —— 两个方向都查，才是「既防假生效、也防假空转」
   //
