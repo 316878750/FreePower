@@ -1,6 +1,6 @@
 {
   "name": "freepower",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "type": "module",
   "description": "FreePower — 独立实现的指纹浏览器（多环境隔离 + 代理 + 指纹一致 + 本地 API + 桌面壳）",
