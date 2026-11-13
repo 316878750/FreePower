@@ -37,6 +37,21 @@ const LFH_SIG = 0x04034b50;
 /** 解压后总量上限：内核包约 350 MB，2 GB 足够，同时挡住 zip bomb */
 export const ZIP_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 
+/**
+ * **单条目**解压后的绝对上限（常量，**不读环境变量** —— 多一个可调项就多一条「用户调大之后又出问题」的路）。
+ *
+ * 为什么需要它：`declaredCap = usize + 1` 只能挡住**谎报小**的条目；一个「声明得大、也真的解压得大」
+ * 的条目仍会老实吃到声明值那么多内存（总预算 2 GB 只是最后兜底）。这一行在 **inflate 之前**就拒掉
+ * 「声明得超过上限」的条目，于是两个方向都堵死：
+ *   - 声明 ≤ 上限 → `declaredCap` 把 inflate 卡在 ≤ 上限 + 1 字节；
+ *   - 声明 > 上限 → 连 inflate 都不进，直接 `zip_entry_too_large`。
+ *
+ * 512 MB 的依据：本机真 CfT `157.0.8103.78` 里最大的单文件是 `chrome.dll` 296.1 MB，1.7 倍余量。
+ * 万一将来 CfT 单个文件涨过 512 MB，报的是 `zip_entry_too_large` + 明确数字 —— 一眼就知道该调，
+ * 不会静默装错。
+ */
+export const ZIP_ENTRY_MAX_BYTES = 512 * 1024 * 1024;
+
 function findEocd(buf) {
   const floor = Math.max(0, buf.length - (22 + 0xffff));
   for (let i = buf.length - 22; i >= floor; i--) {
@@ -207,6 +222,15 @@ export function extractZipBuffer(buf, destDir, { flatten = true, maxBytes = ZIP_
       const out = path.resolve(root, ...outRel.split('/'));
       if (out !== root && !out.startsWith(root + path.sep)) {
         throw new ZipError(`ZIP 条目越出解压目录：${rel}`, { reason: 'zip_unsafe_path' });
+      }
+      // **inflate 之前的单条目绝对上限**（巡检复审 2026-11-13）：`declaredCap` 只能挡「谎报小」，
+      // 挡不住「声明得大、也真的解压得大」—— 那种条目会老实吃到声明值那么多内存（总预算只是最后兜底）。
+      // 这一行拒的正是唯一能吃到大量内存的那条路，而且**连 inflate 都不进**。
+      if (entry.usize > ZIP_ENTRY_MAX_BYTES) {
+        throw new ZipError(
+          `条目声明长度超过单文件上限（声明 ${entry.usize} 字节，上限 ${ZIP_ENTRY_MAX_BYTES}）：${rel}`,
+          { reason: 'zip_entry_too_large' },
+        );
       }
       // 单条目解压上限 = min(剩余预算, 声明长度 + 1)。**不能只用剩余预算**：`maxBytes` 默认 2 GB，
       // 那等于「单条目没有上限」，炸弹会先长到真实大小再被判据抓到（判据绿、进程已经吃了 200 MB）。

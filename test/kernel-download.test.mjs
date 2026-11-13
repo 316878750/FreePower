@@ -162,6 +162,66 @@ function makeDeflatedZip(name, data, { declaredUsize = null } = {}) {
   return makeMultiDeflatedZip([{ name, data, declaredUsize }]);
 }
 
+/**
+ * 用**流式**压缩造一段「解压后是 totalBytes 个零字节」的 raw deflate 数据。
+ *
+ * 为什么要流式：判据里要造一个「实际解压 520 MB」的条目（证明新加的 512 MB 单条目上限
+ * 不会被误当成 `zip_entry_too_large`），但**不该为此在测试进程里先占 520 MB 内存**。
+ * 输入按 1 MB 分块喂进去，只把压缩结果（约 500 KB）留在内存里。
+ */
+async function rawDeflateOfZeros(totalBytes) {
+  const z = zlib.createDeflateRaw();
+  const out = [];
+  z.on('data', (c) => out.push(c));
+  const finished = new Promise((res, rej) => { z.on('end', res); z.on('error', rej); });
+  const block = Buffer.alloc(1024 * 1024, 0);
+  for (let n = 0; n < totalBytes; n += block.length) {
+    const take = Math.min(block.length, totalBytes - n);
+    const ok = z.write(take === block.length ? block : block.subarray(0, take));
+    if (!ok) await new Promise((r) => z.once('drain', r));
+  }
+  z.end();
+  await finished;
+  return Buffer.concat(out);
+}
+
+/** 用现成的 raw deflate 字节造单条目 zip（`usize` 想写多少写多少 —— 就是「中央目录撒谎」本身） */
+function makeZipFromRaw({ name, raw, declaredUsize, crc = 0 }) {
+  const nameBuf = Buffer.from(name, 'utf8');
+  const lfh = Buffer.alloc(30);
+  lfh.writeUInt32LE(0x04034b50, 0);
+  lfh.writeUInt16LE(20, 4);
+  lfh.writeUInt16LE(0, 6);
+  lfh.writeUInt16LE(8, 8);
+  lfh.writeUInt32LE(crc, 14);
+  lfh.writeUInt32LE(raw.length, 18);
+  lfh.writeUInt32LE(declaredUsize, 22);
+  lfh.writeUInt16LE(nameBuf.length, 26);
+  lfh.writeUInt16LE(0, 28);
+
+  const cd = Buffer.alloc(46);
+  cd.writeUInt32LE(0x02014b50, 0);
+  cd.writeUInt16LE(20, 4);
+  cd.writeUInt16LE(20, 6);
+  cd.writeUInt16LE(0, 8);
+  cd.writeUInt16LE(8, 10);
+  cd.writeUInt32LE(crc, 16);
+  cd.writeUInt32LE(raw.length, 20);
+  cd.writeUInt32LE(declaredUsize, 24);
+  cd.writeUInt16LE(nameBuf.length, 28);
+  cd.writeUInt32LE(0, 42);
+
+  const body = Buffer.concat([lfh, nameBuf, raw]);
+  const cdBuf = Buffer.concat([cd, nameBuf]);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(1, 8);
+  eocd.writeUInt16LE(1, 10);
+  eocd.writeUInt32LE(cdBuf.length, 12);
+  eocd.writeUInt32LE(body.length, 16);
+  return Buffer.concat([body, cdBuf, eocd]);
+}
+
 /* ------------------------------ 假源 ------------------------------ */
 
 const zips = new Map();
@@ -1037,6 +1097,70 @@ try {
   check('尺寸：10 条目各 20 MB、中央目录都写 1 KB → 第一条就 zip_size_mismatch，RSS 不累积',
     eLiar?.reason === 'zip_size_mismatch' && !fs.existsSync(dirLiar) && liarRssMb < 50 && liarMs < 1000,
     `${eLiar?.reason || '没抛'} 用时 ${liarMs}ms RSS +${liarRssMb}MB / ${String(eLiar?.message || '').slice(0, 60)}`);
+
+  /* ---------------------------------------------------------------------------
+   * 单条目绝对上限（巡检复审 2026-11-13，S2）：`declaredCap = usize + 1` 只能挡「谎报小」，
+   * 一个「声明得大、也真的解压得大」的条目仍会老实吃到声明值那么多内存（总预算只是最后兜底）。
+   * 现在多一条**inflate 之前**的绝对上限 `ZIP_ENTRY_MAX_BYTES`（512 MB，常量不读环境变量）：
+   * 声明超过上限直接 `zip_entry_too_large`，连 inflate 都不进。
+   * ------------------------------------------------------------------------- */
+  const { ZIP_ENTRY_MAX_BYTES } = await import('../src/kernel/zip.js');
+
+  // 判据 0：常量本身钉死（防止有人手滑改小把正常包误杀，或改大让上限形同虚设）
+  check('单条目上限常量 = 512 MB（钉死，不读环境变量）',
+    ZIP_ENTRY_MAX_BYTES === 512 * 1024 * 1024, String(ZIP_ENTRY_MAX_BYTES));
+
+  // 判据 1（核心）：默认 2 GB 预算 + 中央目录声明 600 MB 的条目 → inflate 之前就拒
+  const declared600 = makeZipFromRaw({
+    name: 'chrome-win64/chrome.dll',
+    raw: zlib.deflateRawSync(Buffer.from('tiny')),
+    declaredUsize: 600 * 1024 * 1024,
+  });
+  const dirDecl600 = path.join(dataDir, 'zip-entry-600mb');
+  const rssBeforeDecl = process.memoryUsage().rss;
+  let eDecl600 = null;
+  const tDecl600 = Date.now();
+  try { unzipOnly(declared600, dirDecl600, { flatten: true }); } catch (e) { eDecl600 = e; }
+  const decl600Ms = Date.now() - tDecl600;
+  const decl600RssMb = Math.round((process.memoryUsage().rss - rssBeforeDecl) / 1048576);
+  check('尺寸：声明 600 MB 的条目（默认 2 GB 预算）→ zip_entry_too_large，且根本没进 inflate（< 100 ms、RSS < 50 MB）',
+    eDecl600?.reason === 'zip_entry_too_large' && !fs.existsSync(dirDecl600)
+      && decl600Ms < 100 && decl600RssMb < 50,
+    `${eDecl600?.reason || '没抛'} 用时 ${decl600Ms}ms RSS +${decl600RssMb}MB / ${String(eDecl600?.message || '').slice(0, 70)}`);
+
+  // 判据 2：谎报**小**（声明 1 KB、实际解压 520 MB）→ 仍走 declaredCap，报 zip_size_mismatch，
+  //        **不能被新上限顺手接走**成 zip_entry_too_large（它挡的是「声明大」，不是「实际大」）
+  const bigRaw = await rawDeflateOfZeros(520 * 1024 * 1024);
+  const declared1k = makeZipFromRaw({ name: 'chrome-win64/chrome.dll', raw: bigRaw, declaredUsize: 1024 });
+  const dirDecl1k = path.join(dataDir, 'zip-entry-1k-lie');
+  let eDecl1k = null;
+  const tDecl1k = Date.now();
+  try { unzipOnly(declared1k, dirDecl1k, { flatten: true }); } catch (e) { eDecl1k = e; }
+  check('尺寸：声明 1 KB、实际解压 520 MB（谎报小）→ 仍是 zip_size_mismatch，不被 zip_entry_too_large 接走',
+    eDecl1k?.reason === 'zip_size_mismatch' && !fs.existsSync(dirDecl1k),
+    `${eDecl1k?.reason || '没抛'} 用时 ${Date.now() - tDecl1k}ms / ${String(eDecl1k?.message || '').slice(0, 70)}`);
+
+  // 判据 3a：诚实边界（声明 = 实际 = 64 KB，maxBytes 恰好等于它）→ 过
+  const honest64 = makeDeflatedZip('chrome-win64/honest.bin', Buffer.alloc(64 * 1024, 4));
+  const dirHonest = path.join(dataDir, 'zip-entry-honest');
+  let eHonest = null;
+  try { unzipOnly(honest64, dirHonest, { flatten: true, maxBytes: 64 * 1024 }); } catch (e) { eHonest = e; }
+  check('尺寸：诚实条目 声明=实际=64 KB 且 maxBytes 恰好 64 KB → 正常解出',
+    !eHonest && fs.existsSync(path.join(dirHonest, 'honest.bin')),
+    `${eHonest?.reason || 'ok'}`);
+
+  // 判据 3b：声明 512 MB（**恰好等于上限，不超**）但实际很小 → 不是 zip_entry_too_large，走等值校验
+  const declared512 = makeZipFromRaw({
+    name: 'chrome-win64/chrome.dll',
+    raw: zlib.deflateRawSync(Buffer.from('tiny')),
+    declaredUsize: 512 * 1024 * 1024,
+  });
+  const dirDecl512 = path.join(dataDir, 'zip-entry-512mb');
+  let eDecl512 = null;
+  try { unzipOnly(declared512, dirDecl512, { flatten: true }); } catch (e) { eDecl512 = e; }
+  check('尺寸：声明恰好 512 MB（不超上限）但实际很小 → 不报 zip_entry_too_large，走等值校验报 zip_size_mismatch',
+    eDecl512?.reason === 'zip_size_mismatch' && !fs.existsSync(dirDecl512),
+    `${eDecl512?.reason || '没抛'} / ${String(eDecl512?.message || '').slice(0, 70)}`);
 
   /* ---------------------------------------------------------------------------
    * 巡检五条（2026-11-13，CEO 核过）—— 判据钉在这里：
