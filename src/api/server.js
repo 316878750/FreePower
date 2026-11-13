@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { createRequire } from 'node:module';
 import { API_HOST, RATE_LIMIT_DEFAULT, RATE_LIMIT_MCP, RATE_LIMIT_UI, RATE_LIMIT_FBBIRD, API_PORT } from '../config.js';
 import { ensureApiKey } from '../store/db.js';
 import { stopAll } from '../runtime/manager.js';
@@ -8,7 +9,13 @@ import { buildRoutes } from './routes.js';
 import { redeemTicket } from './tickets.js';
 
 const MAX_BODY = 2 * 1024 * 1024;
-const VERSION = '0.3.2';
+
+// 版本号**从 package.json 读**，别再写死常量：0.3.2 那个常量让控制台一直显示 v0.3.2，
+// 升了版本看起来像没升（巡检在 0.4.1 上实测到过）。
+// 相对路径：本文件在 src/api/，应用根 = ../../package.json；打进 asar 后目录结构不变，
+// 所以 asar 内同样解析得到（0.4.1 在解包出来的 app.asar 上验过）。
+const require = createRequire(import.meta.url);
+const VERSION = require('../../package.json').version;
 
 /* ------------------------------- 限流 ------------------------------- */
 const buckets = new Map();;

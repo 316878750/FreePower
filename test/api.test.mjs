@@ -55,6 +55,21 @@ try {
   for (let i = 0; i < 5; i++) await fetch(base + '/status');
   check('/status 连打 5 次不被限流', (await api('GET', '/status', undefined, { key: null })).json.code === 0);
 
+  /* -------------------- 版本号：从 package.json 读，不是写死的常量 -------------------- */
+  // 0.4.0 之前 `server.js` 里是 `const VERSION = '0.3.2'`，升到 0.4.1 之后控制台还显示 v0.3.2
+  // （巡检实测）。这条判据盯的是「页面里的版本 = 包里 package.json 的 version」，
+  // 谁再把常量写回来，它立刻红。
+  {
+    const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+    const homeRes = await fetch(base + '/');
+    const html = await homeRes.text();
+    check('控制台首页的版本号 = package.json.version（不是写死的常量）',
+      homeRes.status === 200 && html.includes(`"version":"${pkg.version}"`),
+      `package.json=${pkg.version} 页面里${html.includes(`"version":"${pkg.version}"`) ? '一致' : '不一致'}`);
+    check('版本号不再是遗留的 0.3.2', !html.includes('"version":"0.3.2"'),
+      html.includes('"version":"0.3.2"') ? '页面里还是 0.3.2' : 'ok');
+  }
+
   const noauth = await fetch(base + '/api/v2/browser-profile/list', { method: 'POST' });
   const noauthJson = await noauth.json().catch(() => null);
   check('无 key 被拒', noauth.status === 401 && noauthJson?.code === -1);
