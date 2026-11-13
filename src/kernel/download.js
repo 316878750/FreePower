@@ -393,9 +393,14 @@ export async function downloadToFile(url, zipPath, {
   maxAttempts = KERNEL_DOWNLOAD_ATTEMPTS,
   onProgress = () => {},
   giveUpOn = null,
+  /** 总预算的截止时刻（毫秒时间戳）。传了就用它，**不再按本函数自己算** —— 见 `downloadFromSources` */
+  deadline: givenDeadline = 0,
 } = {}) {
   fs.mkdirSync(path.dirname(zipPath), { recursive: true });
-  const deadline = Date.now() + timeoutMs;
+  // 预算**跨源共享**：`downloadFromSources` 传同一个 deadline 给每个源，
+  // 切源只重置「已收字节数」，不重置时间。否则官方卡满 timeout 再切镜像又是 timeout，
+  // 最坏变成 2×timeout（默认 2h → 4h），用户等 4 小时等来一个失败。
+  const deadline = givenDeadline || (Date.now() + timeoutMs);
   let received = 0;
   let total = 0;
   let attempts = 0;
@@ -543,6 +548,10 @@ export async function downloadFromSources(sources, zipPath, {
   const list = (Array.isArray(sources) ? sources : []).filter((s) => s && s.url);
   if (!list.length) throw new KernelError('没有可用的内核包源', { reason: 'kernel_no_source' });
 
+  // **总预算在这里算一次**：所有源共用同一个 deadline。切源只重置「已收字节数」，
+  // 不重置时间 —— 否则「官方卡满 2h → 切镜像再卡 2h」= 最坏 4h（默认配置）。
+  const deadline = Date.now() + timeoutMs;
+
   let lastErr = null;
   for (let i = 0; i < list.length; i += 1) {
     const src = list[i];
@@ -554,7 +563,7 @@ export async function downloadFromSources(sources, zipPath, {
 
     try {
       const r = await downloadToFile(src.url, zipPath, {
-        fetchImpl, timeoutMs, stallMs, maxAttempts, onProgress,
+        fetchImpl, timeoutMs, stallMs, maxAttempts, onProgress, deadline,
         giveUpOn: isLast ? null : (err, received) => {
           // ① 零字节卡死；② 任何 HTTP 错误（404 也算 —— 官方没有这个包，镜像也许有，
           //    但反过来「官方 500、镜像好」正是要救的场面）。**字节还在流时绝不换源。**
@@ -565,11 +574,33 @@ export async function downloadFromSources(sources, zipPath, {
       });
       return { ...r, source: src.kind, url: src.url, switched: i > 0, previousError: lastErr };
     } catch (e) {
+      // 失败路径也要带走**上一个源**的原因：`lastErr` 此刻还是前一个源的错（本源的错是 `e`）。
+      // 最后一个源失败时把两件事分开给：`previous_error.{reason,message}` + message 末尾一句短因果。
+      if (isLast || !e?.sourceUnusable) throw withPreviousError(e, lastErr);
       lastErr = e;
-      if (isLast || !e?.sourceUnusable) throw e;
     }
   }
   throw lastErr || new KernelError('没有可用的内核包源', { reason: 'kernel_no_source' });
+}
+
+/**
+ * 把**前一个源**的失败原因挂到当前错误上（CEO 2026-11-13 巡检 ①）。
+ *
+ * 原来的写法 `if (isLast || !e?.sourceUnusable) throw e;` 在最后一个源失败时直接抛镜像的错，
+ * 官方那次 `lastErr` 留在局部变量里没人看见 —— 用户只看到「镜像 404」，看不到「官方先卡死了」。
+ * 成功路径反而记了 `switched_reason`，失败路径没有，正好反了。
+ *
+ * 两段 message **不拼成一坨**：字段分开（`previous_error.reason` / `.message`），脚本要能判；
+ * 只在本条 message 后面接一句短的「官方源此前失败：<reason>」，让人一眼看到因果。
+ */
+function withPreviousError(err, prev) {
+  if (!prev || prev === err) return err;
+  if (!(err instanceof KernelError)) return err;
+  err.previous_error = { reason: prev.reason || 'kernel_error', message: prev.message || String(prev) };
+  if (!String(err.message).includes('此前失败')) {
+    err.message = `${err.message}（官方源此前失败：${err.previous_error.reason}）`;
+  }
+  return err;
 }
 
 /* ------------------------------ 镜像字节核验 ------------------------------ */
@@ -692,11 +723,20 @@ export async function verifyMirrorBytes({
   const local = Buffer.alloc(Math.min(chunk, size));
   const checked = [];
   try {
-    const count = Math.max(1, Math.min(Number(segments) || 1, Math.floor(size / Math.max(1, chunk)) || 1));
-    const span = Math.max(1, size - local.length + 1);
+    // **每段 128 KB 各自独立随机会重叠**（巡检 2026-11-13 ④）：`randomInt(0, span)` 抽 5 次，
+    // 抽到相邻位置时两段就盖在一起，于是「5 段 = 640 KB」是虚的，README 那句 0.3% 也跟着高估。
+    // 改成**分桶**：把文件切成 `count` 个等宽桶，每桶里随机取一个起点。
+    // 桶宽 >= chunk（下面先按这个条件夹 count），所以桶内起点 + chunk 一定还在本桶内 →
+    // 段与段**必然不重叠**，合起来恰好 `count × chunk` 字节。
+    const len0 = local.length;
+    const maxSegs = Math.max(1, Math.floor(size / Math.max(1, len0)));
+    const count = Math.max(1, Math.min(Number(segments) || 1, maxSegs));
+    const bucket = Math.floor(size / count);
     for (let i = 0; i < count; i += 1) {
       // 抽样位置**只随机一次**：重试核的是同一段，不许「换个位置再试」（那是放宽判据）
-      const start = span > 1 ? randomInt(0, span) : 0;
+      const lo = i * bucket;
+      const hi = i === count - 1 ? size - len0 : (i + 1) * bucket - len0;
+      const start = hi > lo ? randomInt(lo, hi + 1) : Math.min(lo, size - len0);
       const len = Math.min(local.length, size - start);
       let got;
       try {
@@ -870,7 +910,15 @@ export async function installKernel(resolved, {
       mirror_verified,
       bytes: received,
       verified_at: new Date().toISOString(),
-      ...(mirrorVerify ? { mirror_segments: mirrorVerify.segments, mirror_chunk: mirrorVerify.chunk } : {}),
+      ...(mirrorVerify
+        ? {
+          mirror_segments: mirrorVerify.segments,
+          mirror_chunk: mirrorVerify.chunk,
+          // **抽样区间原样落盘**（巡检 2026-11-13 ③）：这是证据，不是日志，不截断。
+          // 只记「抽了 5 段」而不记抽哪 —— 事后出问题根本没法复核「那 640 KB 到底是哪 640 KB」。
+          mirror_ranges: mirrorVerify.ranges,
+        }
+        : {}),
       ...(dl.switched ? { switched_from: 'official', switched_reason: dl.previousError?.reason || null } : {}),
     };
     try {

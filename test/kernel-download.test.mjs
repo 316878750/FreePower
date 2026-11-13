@@ -750,10 +750,18 @@ try {
     r15.code === 0 && j15.ok && head15 === 2
       && ok15?.data?.source === 'mirror' && ok15?.data?.mirror_verified === true,
     `head=${head15} ${JSON.stringify(ok15?.data)}`);
-  check('核验重试：抽段被重置时**重试同一段**（4 段抽了 5 次，前两次偏移完全相同）',
-    JSON.stringify(ranges15) === JSON.stringify([
-      'bytes=0-511', 'bytes=0-511', 'bytes=400-911', 'bytes=800-1311', 'bytes=1200-1711',
-    ]),
+  check('核验重试：抽段被重置时**重试同一段**（4 段抽了 5 次，前两次偏移完全相同，4 段互不重叠）',
+    ranges15.length === 5 && ranges15[0] === ranges15[1] && (() => {
+      const uniq = [...new Set(ranges15)];
+      if (uniq.length !== 4) return false;
+      const spans = uniq.map((r) => {
+        const m = /^bytes=(\d+)-(\d+)$/.exec(r);
+        return m ? [Number(m[1]), Number(m[2])] : null;
+      });
+      if (spans.some((s) => !s || s[1] - s[0] + 1 !== 512)) return false;
+      const sorted = [...spans].sort((a, b) => a[0] - b[0]);
+      return sorted.every((s, i) => i === 0 || s[0] > sorted[i - 1][1]);
+    })(),
     JSON.stringify(ranges15));
 
   /* M9 官方核验端点**一直**连不上 → 重试用尽仍不装（没有证据就不装，绝不把镜像字节当官方字节） */
@@ -815,6 +823,96 @@ try {
   check('CRC：运行时没有 zlib.crc32 → 直接拒解（zip_crc_unavailable），不静默跳过',
     noCrc?.reason === 'zip_crc_unavailable' && typeof zlib.crc32 === 'function',
     `${noCrc?.reason || '没抛'} / 恢复后 crc32=${typeof zlib.crc32}`);
+
+  /* ---------------------------------------------------------------------------
+   * 巡检五条（2026-11-13，CEO 核过）—— 判据钉在这里：
+   *   ① 最后一个源失败时，**前一个源的原因必须带走**（`previous_error`）；
+   *   ② 总预算跨源共享（切源只重置字节数，不重置时间）；
+   *   ③ 抽样区间原样落盘（`mirror_ranges`，事后可复核）；
+   *   ④ 5 段互不重叠、合起来恰好 5 × chunk。
+   * ------------------------------------------------------------------------- */
+
+  /* ③ + ④ 用真流程打：小 zip + chunk=400 → 抽 5 段、每段 400 B、两两不重叠、合计 2000 B，且落盘 */
+  const V19 = '157.0.9020.20';
+  const r19 = await dlMirror(V19, { official: 'slow-official', mirror: 'mirror-ok', verifyChunk: 400 });
+  const j19 = await waitJob(V19);
+  const mk19 = readSourceMarker(V19, KERNELS_DIR);
+  const rgs19 = mk19?.mirror_ranges || [];
+  const spans19 = rgs19.map((r) => [r.start, r.start + r.length - 1]).sort((a, b) => a[0] - b[0]);
+  check('抽样区间：5 段两两不重叠、合起来恰好 5×chunk（不是「抽了 5 次可能重叠」）',
+    j19.ok && rgs19.length === 5
+      && rgs19.every((r) => r.length === 400)
+      && spans19.every((s, i) => i === 0 || s[0] > spans19[i - 1][1])
+      && rgs19.reduce((n, r) => n + r.length, 0) === 2000,
+    `${rgs19.length} 段 ${JSON.stringify(spans19)}`);
+  check('抽样区间：偏移 + 长度 + sha256 原样落进来源标记（证据，不截断）',
+    rgs19.every((r) => Number.isInteger(r.start) && Number.isInteger(r.length)
+      && /^[0-9a-f]{64}$/.test(String(r.sha256))),
+    JSON.stringify(rgs19.map((r) => [r.start, r.length, String(r.sha256).slice(0, 8)])));
+
+  /* ① 最后一个源失败 → 前一个源的原因带走（官方的 500 不能因为镜像也挂了就消失） */
+  const fakeTwo = async (url, init = {}) => {
+    const u = String(url);
+    if (u.includes('/x-official-500/')) return new Response('boom', { status: 500 });
+    return new Response('gone', { status: 404 });
+  };
+  const twoPath = path.join(dataDir, 'two-src.zip');
+  let twoErr = null;
+  try {
+    const { downloadFromSources } = await import('../src/kernel/download.js');
+    await downloadFromSources(
+      [
+        { kind: 'official', url: 'http://fake.test/x-official-500/a.zip' },
+        { kind: 'mirror', url: 'http://fake.test/x-mirror-404/a.zip' },
+      ],
+      twoPath,
+      { fetchImpl: fakeTwo, timeoutMs: 5000, stallMs: 2000, maxAttempts: 1 },
+    );
+  } catch (e) { twoErr = e; }
+  check('失败因果：最后一个源失败时，前一个源的原因挂在 previous_error 上（字段分开，不拼成一坨）',
+    twoErr?.reason === 'download_http_404'
+      && twoErr?.previous_error?.reason === 'download_http_500'
+      && /此前失败：download_http_500/.test(String(twoErr?.message))
+      && String(twoErr.message).includes('HTTP 404'),
+    `${twoErr?.reason} prev=${JSON.stringify(twoErr?.previous_error?.reason)} msg=${String(twoErr?.message || '').slice(0, 100)}`);
+
+  /* ② 总预算跨源共享：源 A 吃掉大半预算、源 B 只剩零头（旧实现会给 B 一整份新预算） */
+  const dripFetch = async (url, init = {}) => {
+    const u = String(url);
+    if (u.includes('/x-slow500/')) {
+      await sleep(800); // 先吃掉 800ms 预算再报 500（→ 判定这一源不可用，换源）
+      return new Response('boom', { status: 500 });
+    }
+    const signal = init?.signal;
+    const stream = new ReadableStream({
+      start(c) {
+        const timer = setInterval(() => {
+          if (signal?.aborted) { clearInterval(timer); try { c.error(new Error('aborted')); } catch { /* 已关 */ } return; }
+          try { c.enqueue(new Uint8Array(1)); } catch { clearInterval(timer); }
+        }, 40);
+        signal?.addEventListener?.('abort', () => { clearInterval(timer); try { c.error(new Error('aborted')); } catch { /* 已关 */ } });
+      },
+    });
+    return new Response(stream, { status: 200, headers: { 'content-length': '1000000' } });
+  };
+  const budgetPath = path.join(dataDir, 'budget.zip');
+  const t0 = Date.now();
+  let budgetErr = null;
+  try {
+    const { downloadFromSources } = await import('../src/kernel/download.js');
+    await downloadFromSources(
+      [
+        { kind: 'official', url: 'http://fake.test/x-slow500/a.zip' },
+        { kind: 'mirror', url: 'http://fake.test/x-drip/a.zip' },
+      ],
+      budgetPath,
+      { fetchImpl: dripFetch, timeoutMs: 1200, stallMs: 60000, maxAttempts: 3 },
+    );
+  } catch (e) { budgetErr = e; }
+  const budgetMs = Date.now() - t0;
+  check('总预算跨源共享：两个源共用 1200ms（旧实现会给第二个源再来一整份 → 约 2000ms）',
+    budgetErr?.reason === 'download_timeout' && budgetMs >= 1100 && budgetMs < 1750,
+    `${budgetErr?.reason} 用时 ${budgetMs}ms`);
 
   /* -------------------- 收尾：目录里只剩合法版本 -------------------- */
   const dirs = fs.readdirSync(KERNELS_DIR).sort();

@@ -463,7 +463,7 @@ npm run test
 npm run smoke
 ```
 
-当前实测（2026-11-13，本机）：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **84** + agent **15** + api **100** + ui **46** + desktop **54** + kernel-download **43**（`package.json` 里那条脚本就是这十组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **30/30**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核）+ **4/4**（`test/session-restore.test.mjs`，会话恢复：真内核真重启），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测（2026-11-13，本机）：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **84** + agent **15** + api **100** + ui **46** + desktop **54** + kernel-download **47**（`package.json` 里那条脚本就是这十组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **30/30**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核）+ **4/4**（`test/session-restore.test.mjs`，会话恢复：真内核真重启），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 > 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：
@@ -898,7 +898,7 @@ B 层那四条为什么必须真机：**`Preferences` 里写着 1 不等于恢�
 - **自检**：启动后自动跑 19 项、覆盖度 7/10/2、四个哈希齐全、`rerun=1` 重跑、HTML 页可读且无外链
 - **双 Realm**（`test/workers.test.mjs`，已进 `npm run smoke`）：同一张页里起专用 worker / SharedWorker / ServiceWorker（**页面直接创建的**，嵌套 worker 另有三条断言，见已知限制第 6 条），断言三者的脚本首行已注入（`atTop === 'worker'`）、五处 canvas 哈希完全一致、硬件/语言/时区/UA 与主帧同值、`workerStats.injected === 3`；另断言 AudioWorklet 未被注入且可测表面只有 `sampleRate`/`currentTime`
 - **嵌套 worker**（同文件）：页面里起的 worker 再 `new Worker`，断言外层与嵌套层首行都已注入、主帧/外层/嵌套三者的 `hardwareConcurrency` 一致、两层都进注入计数 —— 防的是「同一台机器同时暴露伪装值与真实核数」
-- **本地 API 完整化**：`active` 的 Active/Inactive 形状、`local-active`、`cookies`、`kernels`、标签/代理列表 CRUD、占位接口明确不支持（`share` 之类）；**回收站两条已从占位变成真实现**，断言改成验「`code:0` + `data` 键全等 `limit,list,page` + 无 `total`」；**内核下载也已从占位变成真实现**（`test/kernel-download.test.mjs` 43 项，本地假源，见第十一节）
+- **本地 API 完整化**：`active` 的 Active/Inactive 形状、`local-active`、`cookies`、`kernels`、标签/代理列表 CRUD、占位接口明确不支持（`share` 之类）；**回收站两条已从占位变成真实现**，断言改成验「`code:0` + `data` 键全等 `limit,list,page` + 无 `total`」；**内核下载也已从占位变成真实现**（`test/kernel-download.test.mjs` 47 项，本地假源，见第十一节）
 - **批量启停**：一次起 3 个、批量停、失败清单带 code/message、中途失败即中断、并发上限生效
 - **cloud-active 明确报错**（`-1` + `supported:false`，不假成功）
 - 停环境后进程树回收干净、重复 start 幂等、重复 stop 800002
@@ -974,7 +974,7 @@ test/desktop.test.mjs  桌面壳契约测试（54 项：启动引导、票据、
 test/workers.test.mjs  双 Realm 真机验证（24 项：三类 worker + 嵌套 + AudioWorklet）
 test/agent.test.mjs    AI Agent 判定门 A 层（15 项，假 CDP / 纯函数 / 本地 mock LLM，不启内核、不联网）
 test/agent-smoke.test.mjs  AI Agent 判定门 B 层（30 项，真内核：七动作 / 失败即停 / 超时 / 跑完不关浏览器 / 目标→工作流 e2e）
-test/kernel-download.test.mjs  内核下载判定门（43 项，本地假源，不联网：正常/长度不符/大小写/Firefox/幂等/断线/续传/停顿重连/并发/自检不一致/404 + 镜像回落 14 项 + CRC 3 项）
+test/kernel-download.test.mjs  内核下载判定门（47 项，本地假源，不联网：正常/长度不符/大小写/Firefox/幂等/断线/续传/停顿重连/并发/自检不一致/404 + 镜像回落 14 项 + CRC 3 项 + 巡检五条 4 项）
 test/session-restore.test.mjs  会话恢复真机判据（4 项：Preferences 落 1 / 两页都在 / 重启后按 URL 真恢复 / 用户改回 5 会被顶回 1）
 test/proxy-health.test.mjs  代理健康检查真机验证（15 项：四态 / 批量 / 只读 / 控制台）
 test/media-devices.test.mjs 媒体设备真机验证（P9-C，12 项：真实枚举 + 只改 label + toJSON + 按 kind 授权）
@@ -1220,6 +1220,8 @@ POST /api/v2/browser-profile/download-kernel
 
 ### 包体镜像回落（0.4.1，2026-11-13）
 
+> **默认行为（信任边界，先看这行）：官方优先，官方卡死时自动回落到 npmmirror；可用 `FREEPOWER_KERNEL_MIRROR=off` 彻底关闭。** 也就是说**开箱即用状态下，包体字节可能来自第三方 CDN**（`cdn.npmmirror.com`）—— 元数据（有哪些版本、包体 URL、总长）永远只从 Google 取，镜像只当传输层，且装之前必须通过抽样核验。
+
 **为什么要做**：本机实测到 `storage.googleapis.com` 只有 **34 KB/s**，200 MB 要 **90 分钟以上**；同一份 CfT 包在 `cdn.npmmirror.com` 的镜像上实测 **11.2 MB/s**（Content-Length 相同、抽两段 1 MB 逐字节 SHA256 相同）。不回落的话，「内核下载」在慢网下等于不可用。
 
 **为什么不能「一慢就切」**：34 KB/s 时字节还在流，切源反而丢掉已经下的进度。所以触发条件写死成**「这个源根本给不出字节」**。
@@ -1230,10 +1232,12 @@ POST /api/v2/browser-profile/download-kernel
 |---|---|
 | 1. 元数据只从官方取 | 版本列表 / 包体 URL / 总长全部来自 `googlechromelabs.github.io` 与官方包体地址；**镜像只用于包体字节**，没有「决定有哪些版本」的资格（镜像地址是按官方解析出的版本号拼出来的） |
 | 2. 触发条件写死 | 官方这一源**零字节卡死**（`FREEPOWER_KERNEL_DOWNLOAD_STALL` 内一个字节都没收到）**或任何 HTTP 错误**才切镜像。字节还在流时**绝不切** |
-| 3. 装之前交叉核验 | 先比总长（镜像自己的 `content-length` 与**官方端点**报的总长）；再从**官方 URL** 随机抽 **5 段 × 128 KB**（`Range`），逐段 sha256 与本地文件同偏移字节比对。**抽样位置每次随机**（`crypto.randomInt`），不是固定那 5 段。任一不符 → 删包、不装、报 `kernel_mirror_verify_failed` |
+| 3. 装之前交叉核验 | 先比总长（镜像自己的 `content-length` 与**官方端点**报的总长）；再从**官方 URL** 随机抽 **5 段 × 128 KB**（`Range`），逐段 sha256 与本地文件同偏移字节比对。**抽样位置每次随机**（`crypto.randomInt`）且**互不重叠**：把文件切成 5 个等宽桶、每桶随机取一个起点（桶宽 ≥ 128 KB 才这么分），所以「5 段」就是实打实的 640 KB，不是「抽了 5 次、可能重叠成 300 KB」。任一不符 → 删包、不装、报 `kernel_mirror_verify_failed`。抽到的偏移与哈希**原样落进来源标记**（`mirror_ranges`），事后可复核 |
 | 4. 续传不许跨源拼接 | 每次换源前**把半成品删掉、从 0 重下**。两个不同来源的字节拼在一起，长度对得上也可能内容错位 —— 测试里钉住「镜像收到的整包请求不带 `Range`」 |
-| 5. 如实标注 | 响应与盘上标记都带 `source: 'official'\|'mirror'` + `mirror_verified: true\|false`；走官方就是 `official` |
+| 5. 如实标注 | 响应与盘上标记都带 `source: 'official'\|'mirror'` + `mirror_verified: true\|false`；走官方就是 `official`。**失败时**也带因果：最后一个源失败的错误上有 `previous_error: {reason, message}`（前一个源为什么被放弃），message 末尾接一句「官方源此前失败：<reason>」—— 别让用户只看到「镜像 404」却不知道官方先卡死了 |
 | 6. 可关 | `FREEPOWER_KERNEL_MIRROR=off` 彻底禁用回落（一次镜像请求都不发）；给一个 URL 就只认那一个 |
+
+**总预算是跨源共享的**：`FREEPOWER_KERNEL_DOWNLOAD_TIMEOUT` 是整个任务的上限，**切源只重置「已收字节数」，不重置时间**。否则官方卡满 2 小时再切镜像又给 2 小时，最坏 4 小时等来一个失败 —— 判据里钉住了「两源各卡住时总耗时 ≈ 1×timeout」。超出预算就报 `download_timeout`，不再换源重来。
 
 **能证明什么、不能证明什么（必须原样读这句）**：**「抽样区间与官方一致 + 总长一致」不等于「全文件逐字节等同」**。5 段 × 128 KB 只覆盖 640 KB（209,854,321 B 的 0.3%），它挡的是「镜像给了另一个构建 / 被截断 / 内容被动过」这类整体性错误，**挡不住**「只改了我们没抽到的区间」这种定向篡改。真要做到逐字节，得 CfT 提供 sha256 —— 而它**没有**（见上一节）。
 
@@ -1274,7 +1278,7 @@ FREEPOWER_KERNEL_DOWNLOAD_ATTEMPTS   续传最多重连几次（默认 12）
 
 三个地址都可覆盖：内网镜像、离线自测都改这三个（`test/kernel-download.test.mjs` 就是把它指到本地 `node:http` 假源）。**`FREEPOWER_KERNEL_MIRROR` 在测试里被显式设成 `off`** —— 否则「官方断线 / 404 / 自检不一致」那几条判据会真的去请求公网。
 
-### 判定门（`test/kernel-download.test.mjs`，43 项，**不联网**）
+### 判定门（`test/kernel-download.test.mjs`，47 项，**不联网**）
 
 假源是本地 `node:http`，zip 由测试自己造（store 方法 + 真 CRC32），走的是**真**解包/校验/改名路径。唯一替换的是「解压后跑 `chrome.exe --version`」这一步（`hooks.verifyExe`）—— 假源里那个 exe 是几字节文本，不是 PE、跑不起来；换掉它只为在不联网的前提下走完整条路，**不改下载/解压/改名任何逻辑**。
 
@@ -1287,7 +1291,10 @@ FREEPOWER_KERNEL_DOWNLOAD_ATTEMPTS   续传最多重连几次（默认 12）
 
 > 一个测试自身的坑记在这：等后台任务**不能**用「再打一次 HTTP 路由」那个轮询（`pollUntilSettled`）—— 路由不带 `mirrorBase`，任务一失败它就再触发一次下载，而全局 `CFT_ZIP_BASE` 指在假源的 `/ok` 目录，重试那次会走 `/ok` 成功，把断言污染成 `source:official`。镜像那批统一用 `waitJob()`（只读进程内状态 + 盘上是否装好，不产生副作用）。
 
-**CRC 那三条（43 项里的最后 3 项）**：假源多两种坏包 —— 「store 条目数据区翻 1 个字节」（长度完全不变，只有 CRC 能抓）与「中央目录 CRC 字段写 0」（数据没动，打的是「拿 `0` 当没有 CRC」那个旧 bug）；第三条直接**把运行时的 `zlib.crc32` 摘掉**（`Object.defineProperty` 设成 `undefined`，测完恢复），断言解包必须抛 `zip_crc_unavailable` 而不是静默跳过。三条都做了**先红后绿**：把 `src/kernel/zip.js` 还原成旧写法（`typeof zlib.crc32 === 'function' && entry.crc` + 没有可用性守卫）→ `41/43`，红的正是「CRC 字段写 0」与「没有 zlib.crc32」这两条。
+**CRC 那三条（47 项里的一段）**：假源多两种坏包 —— 「store 条目数据区翻 1 个字节」（长度完全不变，只有 CRC 能抓）与「中央目录 CRC 字段写 0」（数据没动，打的是「拿 `0` 当没有 CRC」那个旧 bug）；第三条直接**把运行时的 `zlib.crc32` 摘掉**（`Object.defineProperty` 设成 `undefined`，测完恢复），断言解包必须抛 `zip_crc_unavailable` 而不是静默跳过。三条都做了**先红后绿**：把 `src/kernel/zip.js` 还原成旧写法（`typeof zlib.crc32 === 'function' && entry.crc` + 没有可用性守卫）→ `41/43`，红的正是「CRC 字段写 0」与「没有 zlib.crc32」这两条。
+
+**巡检五条（2026-11-13，最后 4 项）**：① **失败因果**（最后一个源失败时，前一个源的原因必须挂在 `previous_error` 上，`message` 里接一句「官方源此前失败：<reason>」）；② **总预算跨源共享**（两源各卡住时总耗时 ≈ 1×timeout，不是 2×）；③ **抽样区间落盘**（`mirror_ranges` 带 start/length/sha256，原样不截断）；④ **5 段互不重叠**（分桶抽样，合起来恰好 `5 × chunk`）。
+先红后绿验过：把 ②③④ 三处修复临时退回旧写法 → `44/47`，红的正是这三条，其中预算那条实测 **2017 ms**（旧实现 1200 ms × 2 源 = 2400 ms 量级），改成共享预算后 **≈1200 ms**。
 
 ### 真机端到端（一次性验收，**不进测试、不进判据**）
 
@@ -1304,13 +1311,14 @@ FREEPOWER_KERNEL_DOWNLOAD_ATTEMPTS   续传最多重连几次（默认 12）
 | `--user-data-dir` | `<DATA_DIR>/profiles/<id>_<hash>/userdata` |
 | `active` → 停后 | `Active` → `Inactive`，停后 chrome 进程 **0** |
 
-镜像那条只为验收省时间：**产品默认仍是 Google 官方地址**，要换源用 `FREEPOWER_CFT_ZIP_BASE` 覆盖。
+> 那次验收**故意**只用了镜像（`FREEPOWER_CFT_ZIP_BASE` 临时指到 npmmirror）省时间 —— 但产品默认行为不是「只用官方」，见本节开头那行：**官方优先，官方卡死才回落镜像**。
 
 ### 已知限制
 
-- **镜像核验只抽样、不是逐字节**：5 段 × 128 KB 只覆盖 0.3%，挡整体性错误（换了个构建 / 截断 / 内容被动过），挡不住「只改没抽到的区间」。要逐字节得有 CfT 的 sha256，而它没有。
+- **镜像核验只抽样、不是逐字节**：5 段 × 128 KB 只覆盖 0.3%（互不重叠，所以这 640 KB 是实打实的），挡整体性错误（换了个构建 / 截断 / 内容被动过），挡不住「只改没抽到的区间」。要逐字节得有 CfT 的 sha256，而它没有。**互补的另一半是解包时的 CRC32**：那个是全量逐字节，管「这个包自己完不完整」。
 - **官方整体不可用时装不上**：核验必须读官方端点报的总长，官方 404 / 全挂时连镜像也装不了（报 `kernel_mirror_verify_failed`）。这是故意的 fail-closed，见上面那一节；
 - **续传只在一次任务内部**：任务失败（重连 12 次还没下完）之后，下一次调用是**从头下**，不复用上次那半截（`.tmp-*` 已经被删了）。理由是「跨任务续」要维护一份下载账本，而 CfT 不给我们 ETag 之外的强校验，账本对不上反而更危险；
+- **总预算是整个任务的**（不是每个源一份）：官方把预算耗光就不会再给镜像机会，直接 `download_timeout`。这是故意的 —— 让用户 4 小时后拿到失败比 2 小时后拿到失败更糟；
 - **没有并行分片下载**：单连接 + 续传。真机实测同一条连接会衰减，理论上分片能更快，但那是另一件事（要处理合并、分片校验），没做；
 - **不支持 ZIP64 / 加密 / 非 store·deflate 的压缩方法**：遇到就明确报错，不静默跳过（CfT 的包是普通 deflate，不会碰到）；
 - **没有下载队列/并发上限**：不同版本可以同时下（各占一个 `.tmp-*`），同一版本并发调用会并到同一个任务上（测试钉住了「假源只收到 1 次请求」）；
