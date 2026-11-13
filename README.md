@@ -1234,7 +1234,7 @@ POST /api/v2/browser-profile/download-kernel
 | 2. 触发条件写死 | 官方这一源**零字节卡死**（`FREEPOWER_KERNEL_DOWNLOAD_STALL` 内一个字节都没收到）**或任何 HTTP 错误**才切镜像。字节还在流时**绝不切** |
 | 3. 装之前交叉核验 | 先比总长（镜像自己的 `content-length` 与**官方端点**报的总长）；再从**官方 URL** 随机抽 **5 段 × 128 KB**（`Range`），逐段 sha256 与本地文件同偏移字节比对。**抽样位置每次随机**（`crypto.randomInt`）且**互不重叠**：把文件切成 5 个等宽桶、每桶随机取一个起点（桶宽 ≥ 128 KB 才这么分），所以「5 段」就是实打实的 640 KB，不是「抽了 5 次、可能重叠成 300 KB」。任一不符 → 删包、不装、报 `kernel_mirror_verify_failed`。抽到的偏移与哈希**原样落进来源标记**（`mirror_ranges`），事后可复核 |
 | 4. 续传不许跨源拼接 | 每次换源前**把半成品删掉、从 0 重下**。两个不同来源的字节拼在一起，长度对得上也可能内容错位 —— 测试里钉住「镜像收到的整包请求不带 `Range`」 |
-| 5. 如实标注 | 响应与盘上标记都带 `source: 'official'\|'mirror'` + `mirror_verified: true\|false`；走官方就是 `official`。**失败时**也带因果：最后一个源失败的错误上有 `previous_error: {reason, message}`（前一个源为什么被放弃），message 末尾接一句「官方源此前失败：<reason>」—— 别让用户只看到「镜像 404」却不知道官方先卡死了 |
+| 5. 如实标注 | 响应与盘上标记都带 `source: 'official'\|'mirror'` + `mirror_verified: true\|false`；走官方就是 `official`。**失败因果**在进程内记录里：`lastKernelFailure(version)` 返回的 `{reason, message, previous_error}` 中，`previous_error` 是前一个源为什么被放弃（例：官方 404 后镜像也 500，则 `reason=download_http_500`、`previous_error.reason=download_http_404`）；`previous_error` 对**任何** Error 都挂（含 fs 级 ENOTDIR/EPERM），但 message 后缀只给 `KernelError` 接，fs 原文一个字不动。**HTTP 响应里没有这个字段**（`download-kernel` 是「同步状态机 + 后台跑」，失败不进响应，见下面那句）—— 别按响应判因果，那是判不到的，见已知限制 |
 | 6. 可关 | `FREEPOWER_KERNEL_MIRROR=off` 彻底禁用回落（一次镜像请求都不发）；给一个 URL 就只认那一个 |
 
 **总预算是跨源共享的**：`FREEPOWER_KERNEL_DOWNLOAD_TIMEOUT` 是整个任务的上限，**切源只重置「已收字节数」，不重置时间**。否则官方卡满 2 小时再切镜像又给 2 小时，最坏 4 小时等来一个失败 —— 判据里钉住了「两源各卡住时总耗时 ≈ 1×timeout」。超出预算就报 `download_timeout`，不再换源重来。
@@ -1293,8 +1293,12 @@ FREEPOWER_KERNEL_DOWNLOAD_ATTEMPTS   续传最多重连几次（默认 12）
 
 **CRC 那三条（47 项里的一段）**：假源多两种坏包 —— 「store 条目数据区翻 1 个字节」（长度完全不变，只有 CRC 能抓）与「中央目录 CRC 字段写 0」（数据没动，打的是「拿 `0` 当没有 CRC」那个旧 bug）；第三条直接**把运行时的 `zlib.crc32` 摘掉**（`Object.defineProperty` 设成 `undefined`，测完恢复），断言解包必须抛 `zip_crc_unavailable` 而不是静默跳过。三条都做了**先红后绿**：把 `src/kernel/zip.js` 还原成旧写法（`typeof zlib.crc32 === 'function' && entry.crc` + 没有可用性守卫）→ `41/43`，红的正是「CRC 字段写 0」与「没有 zlib.crc32」这两条。
 
-**巡检五条（2026-11-13，最后 4 项）**：① **失败因果**（最后一个源失败时，前一个源的原因必须挂在 `previous_error` 上，`message` 里接一句「官方源此前失败：<reason>」）；② **总预算跨源共享**（两源各卡住时总耗时 ≈ 1×timeout，不是 2×）；③ **抽样区间落盘**（`mirror_ranges` 带 start/length/sha256，原样不截断）；④ **5 段互不重叠**（分桶抽样，合起来恰好 `5 × chunk`）。
+**巡检五条（2026-11-13，最后 4 项）**：① **失败因果**（最后一个源失败时，前一个源的原因必须挂在进程内错误的 `previous_error` 上，`KernelError` 的 `message` 里再接一句「官方源此前失败：<reason>」）；② **总预算跨源共享**（两源各卡住时总耗时 ≈ 1×timeout，不是 2×）；③ **抽样区间落盘**（`mirror_ranges` 带 start/length/sha256，原样不截断）；④ **5 段互不重叠**（分桶抽样，合起来恰好 `5 × chunk`）。
 先红后绿验过：把 ②③④ 三处修复临时退回旧写法 → `44/47`，红的正是这三条，其中预算那条实测 **2017 ms**（旧实现 1200 ms × 2 源 = 2400 ms 量级），改成共享预算后 **≈1200 ms**。
+
+**尺寸三条（2026-11-13 补，`zip.js`）**：中央目录**声明** `usize=0` 而实际 1 MB → `zip_size_mismatch` 且盘上不留一个文件；声明=实际但单条目超 `maxBytes` → `zip_too_large`；200 MB 零字节炸弹（压成 ~200 KB、中央目录谎报 1 KB）→ **解压时**被 `maxOutputLength` 掐断。红：`48/50`（第一条「没抛」、炸弹那条 RSS **+206 MB** 且误报 `zip_size_mismatch`）→ 绿：`50/50`（炸弹 RSS **+1 MB**）。
+
+**零字节两条（2026-11-13 补，`download.js`）**：官方整包 GET 被 `ECONNREFUSED`（零字节）+ 镜像健康 → 切源装好（`source=mirror`）；镜像 `off` + 官方连接被拒 → `download_interrupted`，message 里没有 `ENOENT`。红：`50/52`（两条都红在 `ENOENT: …chrome-win64.zip`，正是巡检报的症状）→ 绿：`52/52`。同批把 `MIRROR=off` 那条**假绿改真绿**（只断言「失败 + 镜像 0 次」时，实际失败原因是 ENOENT 也照样绿；现在钉死 `reason ∈ {download_timeout, download_interrupted}`），红：`49/52` → 绿：`52/52`。
 
 ### 真机端到端（一次性验收，**不进测试、不进判据**）
 
@@ -1323,6 +1327,7 @@ FREEPOWER_KERNEL_DOWNLOAD_ATTEMPTS   续传最多重连几次（默认 12）
 - **不支持 ZIP64 / 加密 / 非 store·deflate 的压缩方法**：遇到就明确报错，不静默跳过（CfT 的包是普通 deflate，不会碰到）；
 - **没有下载队列/并发上限**：不同版本可以同时下（各占一个 `.tmp-*`），同一版本并发调用会并到同一个任务上（测试钉住了「假源只收到 1 次请求」）；
 - **下到的是原版 Chrome**：它的 `--version`、`chrome://version` 显示的就是 Google Chrome 本体，不是「FreePower 内核」—— 这是有意为之（见「有意差异」第 1 条）。
+- **失败因果脚本读不到（只有进程内能看到）**：`download-kernel` 是「同步状态机 + 后台下载」，失败**不进响应**（契约 §4 只回 `{code:-1,msg}`），所以 `previous_error` 这类因果字段今天只存在于两个地方：进程内抛出的错误对象，以及 `lastKernelFailure(version)` 的失败记录。**HTTP 响应里没有它** —— 想从脚本判因果，唯一文档化的读法是 `lastKernelFailure`（测试里就是这么判的）。路由里留了一行防御性透传（真有同步路径带上该字段时会原样带出 `data.previous_error`），但**今天没有可达路径**，别把它当契约。要把它做成对外可读，得加一个失败查询端点，那是新功能，0.4.0 不做。
 - **内核目录必须可写可删**：Chromium 的沙箱要求内核目录与用户数据目录能正常建/删文件。实测把 kernels 放在带 `Everyone … Deny` 受限 ACL 的目录下时，内核会以 `STATUS_BREAKPOINT`（`0x80000003`）**秒退**、从不写 `DevToolsActivePort`；`start` 现在直接报「启动后立即退出（exit code 2147483651 / 0x80000003）」并给出这条提示，不再死等 20 s 才报一个误导性的超时。默认的 `%APPDATA%\FreePower\kernels` 没有这个问题。
 
 **会话恢复（差距清单第 5 条）的三条限制**：
