@@ -448,6 +448,10 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 
 **`do_not_track` 已从 idle 摘出（P2 ④）**：只有 `"true"` 做两半 —— 注入把 `navigator.doNotTrack` 固定成 `"1"`，会话级 `Network.setExtraHTTPHeaders({DNT:"1"})` 让文档与子资源带 `DNT: 1`；`"false"` / `"default"` 什么都不做（对手那边两者不可区分，别发明第三种状态）。两个坑写在这：① 不先 `Network.enable` 时 `setExtraHTTPHeaders` 返回 ok、却**一个请求都没改**（静默空转）；② `--enable-do-not-track` 在 `157.0.8103.78` 上实测无效（`navigator.doNotTrack` 仍是 `null`、请求也没带 DNT），没用它。**DNT 请求头这半是对手未证实、我们补的**（它的内核开关可能顺带改头，逆向没抓到）。
 
+42. **`disable_save_password='1'` 带来的存储弱化，和 `location` 存量环境的行为变化 —— 两条都得主动告诉用户**：
+   - **密码库**：这条字段会加 `--password-store=basic`，让 Chromium 的密码库**不走系统钥匙串**，落盘加密明显弱于系统 keychain（profile 目录被整份拷走、或同机别的进程能读那个目录时，理论上可解）。**这不是安全加固**：它做到的是「不弹保存条、不进系统钥匙串」，不是「密码更安全」。另一半如实说：`--password-store` 在 Chromium 里是密码库**后端选择**（Linux 口径），本机是 Windows，我们**没有证据**它在 Windows 上也改变 `Login Data` 的加密方式，也**没做**「存一个密码 → 拷走 profile → 解开」的复现。详见第八节 P2 表格上方那段。
+   - **定位**：`generate.js` 一直给每个环境写经纬度，而 `geoPolicy` 对**没有 `location` 字段的老环境**兜底 `ask`、`ask` 也覆盖坐标 —— 所以 **P2 之后起存量环境，只要记录里有经纬度就会真的下发 `Emulation.setGeolocationOverride`**，不需要用户改任何开关。这是修 bug（以前「填了坐标却不生效」），但确实是**行为变化**，别当成新功能才引入的。详见第八节 `location` 那节第 3 条。
+
 
 ## 八、验证
 
@@ -459,7 +463,7 @@ npm run test
 npm run smoke
 ```
 
-当前实测（2026-11-13，本机）：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **78** + agent **15** + api **100** + ui **46** + desktop **54** + kernel-download **23**（`package.json` 里那条脚本就是这十组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **30/30**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测（2026-11-13，本机）：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **80** + agent **15** + api **100** + ui **46** + desktop **54** + kernel-download **26**（`package.json` 里那条脚本就是这十组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **30/30**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 > 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：
@@ -642,6 +646,19 @@ npm run test:switches    # 真机开/关对照，19 项，需要真实 Chrome（
 
 P2 这批是「字段表里有名字、`src/` 里零消费」的第二轮补漏，**一个字段一个提交**，四条落完再一起推。顺序：① `disable_save_password` ② `automation_controlled` ③ `location` ④ `do_not_track`。
 
+> **`--password-store=basic` 的代价必须写在最前面（`disable_save_password='1'`）**：
+> 这条 flag 让 Chromium 的密码库**不走系统钥匙串**（Windows 上是 DPAPI + 凭据管理器那套），改用
+> Chromium 自己的弱后端 —— 落盘加密强度明显低于系统 keychain，**profile 目录被整份拷走（或同机
+> 别的进程能读那个目录）时可以解开**。也就是说：这个字段做到的是「不弹保存密码条、不进系统
+> 钥匙串」，**不是**「密码更安全」，用户别把它当安全加固。
+> 另一半要说清：`--password-store` 在 Chromium 里是**密码库后端选择**（Linux 上选 basic /
+> gnome-libsecret / kwallet 那个开关）。本机是 Windows，我们**没有证据**证明它在 Windows 上同样
+> 改变 `Login Data` 的加密方式，也**没做**「存一个密码 → 拷走 profile → 解开」的复现。
+> 所以如实写成两句话：**能确认的是** `disable_save_password='1'` 时 argv 里确实多出
+> `--password-store=basic`、`--disable-features` 里确实多了 `EnablePasswordsAccountStorage`
+> （`src/kernel/chrome.js` 的 `buildArgs`，`test/unit.test.mjs` 有断言）；**未证实的是**这条 flag
+> 在 Windows 上的实际效果 —— 别拿它当「密码库一定变弱」的结论用（反过来也一样，别当「一定没影响」）。
+
 | 字段 | 取值 | 生效方式 | coverage | 落地位置 |
 |---|---|---|---|---|
 | `disable_save_password` | `'1'` | `--password-store=basic` + `--disable-features` 里加 `EnablePasswordsAccountStorage`；`'0'` / 缺省不加。对手是自编译内核的 `--protected-disablesavepassword=1`，那条路我们没有 | partial（参数进了命令行，「保存条不再出现」无本机证据，见已知限制第 41 条） | `src/kernel/chrome.js`（`buildArgs`） |
@@ -668,6 +685,7 @@ P2 这批是「字段表里有名字、`src/` 里零消费」的第二轮补漏�
 
 1. `block` 走**显式拒绝** `Browser.setPermission({setting:'denied'})`，不是「不 grant 就完事」。实测：不 grant 时 `navigator.permissions` 是 **`prompt`**（有头会弹提示 —— 那就是 `ask` 的语义），`setPermission denied` 才是 `denied`。「什么都不做」会让 `block` 与 `ask` 在无头下读数一样、有头下行为一样，等于这两个取值白写。
 2. `ask` 只做坐标覆盖、不做授权：无头环境下没有权限提示可弹，`getCurrentPosition` 直接 `code=1` 拒绝（有头时才会弹）。所以 `ask` 的坐标覆盖在无头下**观测不到**，不写成「ask 也能拿到坐标」。
+3. **存量环境的行为从 P2 起变了，这不是新开关才生效的**：`generate.js:142-146` 新建环境写 `location:'allow'` + 每个环境都生成经纬度；而 `geoPolicy` 对**没有 `location` 字段的老环境**兜底成 `ask`，`override = mode !== 'block' && hasCoords` —— `ask` 也算「覆盖」。所以只要老环境记录里存着经纬度（生成器一直在写），**P2 之后起这些环境就会真的下发 `Emulation.setGeolocationOverride`**，不需要用户改任何字段。影响面：老环境在 `ask` 下「有头会弹权限提示」没变，但页面一旦被授权（用户点允许、或站点已有授权记录），读到的就是**记录里的坐标**，而不是本机真实定位。这既是修复（以前「填了坐标却不生效」），也是行为变化 —— 写在这里，别让用户以为是新功能才引入的。
 
 **实测（2026-11-13，内核 `157.0.8103.78`，真内核、走 API 起环境、`headless=1`；读数取的是启动后**新建**的标签页，证明新 target 也被装配）**：
 
