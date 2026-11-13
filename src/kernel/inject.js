@@ -851,7 +851,15 @@ const WORKER_BODY = `
     const nativeLangs = self.navigator.languages ? Array.prototype.join.call(self.navigator.languages, ',') : '';
     if (nativeLangs !== CFG.language.join(',')) defGetter(NAV_PROTO, 'languages', langs);
   }
-  // automation_controlled="1"：原生就是 true，worker 这边同样不碰（与主帧口径一致）
+  /**
+   * automation_controlled="1"：原生就是 true，worker 这边同样不碰（与主帧口径一致）。
+   *
+   * **这一行在 worker 里不可达，留着只为与主帧对称**：WorkerNavigator 没有 webdriver
+   * 属性（实测两种配置下 self.navigator.webdriver 都是 undefined；webdriver 是 Navigator
+   * 独有的，不在 worker 的接口里）。所以条件恒假，不是一层真的防御。代码不删是因为主帧
+   * 那段写法一样、删掉反而容易让人以为「worker 漏了这条」；真要起作用只有一种情况：将来
+   * 内核给 WorkerNavigator 也加上 webdriver —— 那时这段会自己活过来。
+   */
   if (!CFG.automationControlled) { try { if (self.navigator && self.navigator.webdriver) defGetter(NAV_PROTO, 'webdriver', false); } catch (e) {} }
   // do_not_track 在 worker 里不用补：WorkerNavigator **没有** doNotTrack 属性（实测 has:false）
 
