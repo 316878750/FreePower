@@ -1082,7 +1082,7 @@ FREEPOWER_AGENT_STEP_TIMEOUT   单步执行超时（默认 30000 ms；`wait({ms}
 
 **为什么不转发对手的包**：那是它自己分发、自己签名的 SunBrowser 二进制（`SunBrowser.exe.sig` 是它私钥签的 PKCS#7），转发等于替它做分发，也违背「独立实现、不用对方二进制」这条。CfT 是 Google 给自动化测试发的官方构建，公开可下。
 
-**下多少**：一次 `chrome-win64.zip` 约 **150 MB 上下**（解压后 350 MB 左右），装完的目录就是几百 MB —— 用户点一次就是真下这么大，不是「下个几 KB 的配置」。默认整体预算 **10 分钟**（`FREEPOWER_KERNEL_DOWNLOAD_TIMEOUT`，默认 `600000` ms），慢网也不会被 30 秒那种步进超时误杀。
+**下多少**：一次 `chrome-win64.zip` 实测 **209,854,321 B**（约 200 MB；解压后 400 MB 上下），装完的目录就是几百 MB —— 用户点一次就是真下这么大，不是「下个几 KB 的配置」。**慢网要几十分钟**：本机实测到 `storage.googleapis.com` 只有 50–160 KB/s（同一时刻 Cloudflare 有 860 KB/s），所以默认整体预算 **60 分钟**（`FREEPOWER_KERNEL_DOWNLOAD_TIMEOUT`，默认 `3600000` ms），并且下载层做**停顿检测 + 断点续传**（见「重试与断点续传」）。这不等于请求会挂 60 分钟：接口立刻回 `pending`，下载在后台跑。
 
 ### 接口形状（照 `23-内核下载契约.md`）
 
@@ -1135,13 +1135,31 @@ POST /api/v2/browser-profile/download-kernel
 - 元数据哪天真的带了 `sha256`（`cft.js` 留了 `pickChecksum` 的口子），下载层会自动核对并把 `checksum_source` 标成 `metadata`；现在恒为 `none`。
 - 反例钉在测试里：假源里那份 zip 的 `chrome.exe` 报 `156.0.0.0`，请求 `157.0.9003.3` → 必须失败且不留目录。
 
-### 重试
+### 重试与断点续传
 
 没有「重试按钮」，也**不需要**：再打一次同一个请求就是重试。
 
 - 后台失败 → 状态表清空、临时目录删掉、失败原因只进日志与 `lastKernelFailure()`（诊断用，**不进响应**，契约对外没有 `failed` 状态）；
-- 再调一次 → 重新解析、重新下（**从头下，不做断点续传** —— 契约里对手的 `.zip.info` 分块账本属于它本地服务的实现，我们没证据也不照抄）；
+- 再调一次 → 重新解析、重新下，**从头开始**（见下：续传只在一次任务内部发生）；
 - 已经装好的版本不会被重下：先看盘上 `<kernels>/<版本>/chrome.exe`，有就直接 `completed`。
+
+**一次任务内部是断点续传的**（2026-11-13 真机测速后加的，不是预防性代码）：
+
+| 事实（本机实测） | 数值 |
+|---|---|
+| `chrome-win64.zip` 实际大小 | **209,854,321 B**（约 200 MB） |
+| 到 `storage.googleapis.com` 的带宽 | **50–160 KB/s**（同一时刻 `speed.cloudflare.com` 有 860 KB/s） |
+| 单条连接的衰减 | 前 15 s 138 KB/s → 60 s 60 KB/s → 120 s 47 KB/s |
+| 另开一条连接的速率 | 又回到 100 KB/s 以上 |
+
+→ 「一条连接下到底」在这条链路上必然失败（原策略实测 10 分钟只下到 85 MB 然后超时）。所以下载层做两件事：
+
+1. **停顿检测**：`FREEPOWER_KERNEL_DOWNLOAD_STALL`（默认 **120 s**）内一个字节都没收到 → 判定这条连接卡死，主动断开；
+2. **Range 续传**：重连时带 `Range: bytes=<已收>-`，服务端回 `206` 就 append 接着写；回 `200`（不认 Range）就 `truncate` 到 0 从头写。**续传起点必须等于本地已收字节数**，对不上就明确报 `download_resume_mismatch`，不硬拼（拼出来的包是坏的）。
+
+可重试：408 / 429 / 5xx / 网络中断 / 卡死。**不可重试**：404 这类 4xx 立刻失败（重试一万次还是 404）。重连上限 `FREEPOWER_KERNEL_DOWNLOAD_ATTEMPTS`（默认 **12**），用尽仍不完整 → 明确失败，`.tmp-*` 删掉。
+
+总预算 `FREEPOWER_KERNEL_DOWNLOAD_TIMEOUT` 默认 **60 分钟**（原来是 10 分钟，在这条链路上必然超时）。**注意这不等于请求会挂 60 分钟**：`download-kernel` 立刻回 `pending`，下载在后台跑，用户/脚本轮询同一个端点即可。
 
 ### 与对手的有意差异（写清楚，不当 bug）
 
@@ -1157,23 +1175,26 @@ POST /api/v2/browser-profile/download-kernel
 FREEPOWER_CFT_META_URL      CfT 元数据（默认 googlechromelabs.github.io/.../last-known-good-versions-with-downloads.json）
 FREEPOWER_CFT_VERSIONS_URL  历史版本目录（默认 .../known-good-versions-with-downloads.json）
 FREEPOWER_CFT_ZIP_BASE      包体基地址（默认 https://storage.googleapis.com/chrome-for-testing-public）
-FREEPOWER_KERNEL_DOWNLOAD_TIMEOUT  下载+安装整体预算（默认 600000 ms）
+FREEPOWER_KERNEL_DOWNLOAD_TIMEOUT    下载+安装整体预算（默认 3600000 ms = 60 分钟）
+FREEPOWER_KERNEL_DOWNLOAD_STALL      单条连接多久没字节就断开重连（默认 120000 ms）
+FREEPOWER_KERNEL_DOWNLOAD_ATTEMPTS   续传最多重连几次（默认 12）
 ```
 
 三个地址都可覆盖：内网镜像、离线自测都改这三个（`test/kernel-download.test.mjs` 就是把它指到本地 `node:http` 假源）。
 
-### 判定门（`test/kernel-download.test.mjs`，23 项，**不联网**）
+### 判定门（`test/kernel-download.test.mjs`，26 项，**不联网**）
 
 假源是本地 `node:http`，zip 由测试自己造（store 方法 + 真 CRC32），走的是**真**解包/校验/改名路径。唯一替换的是「解压后跑 `chrome.exe --version`」这一步（`hooks.verifyExe`）—— 假源里那个 exe 是几字节文本，不是 PE、跑不起来；换掉它只为在不联网的前提下走完整条路，**不改下载/解压/改名任何逻辑**。
 
 覆盖 CEO 点的六条：正常下载→解压→completed（含盘上布局、`kernels` 认账、无 `.tmp-*` 残留）/ content-length 不符 → 失败 / `kernel_type` 大小写错 → 契约文案且无 `data` 键 / `Firefox` → 明确不支持 / 同名已装 → 幂等 `completed` / 中途断线 → 失败且不留 `installing` 僵尸。
-另加：缺参、`"0"`、非数字、目录里没有该版本、失败后重试能装好、自检版本不一致、包体 404、并发两次调用只下一次（假源只收到 1 次 zip 请求）。
+另加：缺参、`"0"`、非数字、目录里没有该版本、失败后重试能装好、自检版本不一致、包体 404、并发两次调用只下一次（假源只收到 1 次 zip 请求）、**断点续传**（假源第一次只给 40% 就断 → 带 `Range` 续上 → 装好，且续出来的包与「一次给完的同一个包」解出来**逐字节一致**）、**停顿检测**（假源发 100 字节后永不结束 → `stall=600ms` 主动断开重连 → 装好）。
 
-**B 层没做**：没有为了跑测试真去下 150 MB（CEO 明确说除非先问）。要真验一次，就是对本机 `POST /api/v2/browser-profile/download-kernel` 打一发 `{"kernel_type":"Chrome","kernel_version":"157"}`，然后 `GET …/kernels` 看 `is_downloaded:true`、`<kernels>/157.x.x.x/chrome.exe --version` 能报版本。
+**B 层没做**：测试里没有真下 200 MB。真机端到端是一次性手工验收（CEO 一次性授权），**不进测试、不进判据** —— 判据仍是不联网。
 
 ### 已知限制
 
-- **不续传**：断了下一次从头下（理由见「重试」）；
+- **续传只在一次任务内部**：任务失败（重连 12 次还没下完）之后，下一次调用是**从头下**，不复用上次那半截（`.tmp-*` 已经被删了）。理由是「跨任务续」要维护一份下载账本，而 CfT 不给我们 ETag 之外的强校验，账本对不上反而更危险；
+- **没有并行分片下载**：单连接 + 续传。真机实测同一条连接会衰减，理论上分片能更快，但那是另一件事（要处理合并、分片校验），没做；
 - **不支持 ZIP64 / 加密 / 非 store·deflate 的压缩方法**：遇到就明确报错，不静默跳过（CfT 的包是普通 deflate，不会碰到）；
 - **没有下载队列/并发上限**：不同版本可以同时下（各占一个 `.tmp-*`），同一版本并发调用会并到同一个任务上（测试钉住了「假源只收到 1 次请求」）；
 - **下到的是原版 Chrome**：它的 `--version`、`chrome://version` 显示的就是 Google Chrome 本体，不是「FreePower 内核」—— 这是有意为之（见「有意差异」第 1 条）。
