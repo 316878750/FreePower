@@ -17,7 +17,7 @@
     "desktop": "node tools/run-desktop.mjs",
     "desktop:selftest": "node tools/run-desktop.mjs --selftest",
     "dist:win": "electron-builder --win --x64",
-    "smoke": "node --no-warnings test/smoke.mjs && node --no-warnings test/proxy-chain.test.mjs && node --no-warnings test/workers.test.mjs && node --no-warnings test/agent-smoke.test.mjs && node --no-warnings test/session-restore.test.mjs",
+    "smoke": "node --no-warnings test/smoke.mjs && node --no-warnings test/proxy-chain.test.mjs && node --no-warnings test/workers.test.mjs && node --no-warnings test/agent-smoke.test.mjs && node --no-warnings test/session-restore.test.mjs && node --no-warnings test/block-page.test.mjs",
     "test:unit": "node --no-warnings test/unit.test.mjs",
     "test:api": "node --no-warnings test/api.test.mjs",
     "test:ui": "node --no-warnings test/ui.test.mjs",
@@ -46,6 +46,7 @@
     "test:kernel-download": "node --no-warnings test/kernel-download.test.mjs",
     "test:proxy-chain": "node --no-warnings test/proxy-chain.test.mjs",
     "test:session-restore": "node --no-warnings test/session-restore.test.mjs",
+    "test:block-page": "node --no-warnings test/block-page.test.mjs",
     "test:p9c-judge": "node --no-warnings tools/p9c-judge.mjs"
   },
   "devDependencies": {

@@ -8,6 +8,9 @@
  * 跑法：npm run test:net-rules
  */
 import { toRuleList, compileNetRules, decideRequest, parseTarget } from '../src/kernel/net-rules.js';
+import {
+  BLOCK_PAGE_TITLE, BLOCK_PAGE_MAX_BYTES, blockPageHtml, blockPageResponse, blockReasonText, escapeHtml,
+} from '../src/kernel/block-page.js';
 
 const results = [];
 const check = (name, ok, detail = '') => {
@@ -119,6 +122,90 @@ check('无规则：active=false、任何请求都放行',
   none.active === false && block('https://a.com/x', 'Document', none).block === false);
 check('disable_image 不进 net-rules（它走内核开关，不在这里）',
   compileNetRules({ disable_image: '1' }).active === false);
+
+/* ------------------------------- 拦截页（A 层） ------------------------------- */
+/*
+ * 拦截页是「拦到之后给什么」，判定逻辑（上面那一堆）一行没动。这里钉四件事：
+ *   ① 转义：url 与 reason **两个入口**都不能把 `<` 漏进 HTML（否则拦截页自己是 XSS 面）；
+ *   ② 契约：`window.__fpBlock` 必须有 url / reason / host 三个字段，值是原样（转义不影响值）；
+ *   ③ 响应头：CSP `default-src 'none'` 钉死零外链、`Cache-Control: no-store` 防回放；
+ *   ④ 零外链 + 体积：这页不许长成第二个网站，也不许引用任何东西。
+ * 真内核那四条在 test/block-page.test.mjs（进 npm run smoke）。
+ */
+
+const DANGER_URL = 'http://a.com/x?q=<script>alert(1)</script>&y="onload=\'x\'';
+const DANGER_REASON = '</script><script>alert(1)</script>';
+
+check('拦截页：标题常量钉死（B 层按它认「是我们的页」）',
+  BLOCK_PAGE_TITLE === '已拦截 · FreePower', BLOCK_PAGE_TITLE);
+check('拦截页：是完整 HTML 文档（doctype + charset）',
+  blockPageHtml({ url: 'http://a.com/' }).html.startsWith('<!doctype html>')
+  && blockPageHtml({ url: 'http://a.com/' }).html.includes('<meta charset="utf-8">'));
+
+{
+  const { html } = blockPageHtml({ url: DANGER_URL, reason: 'blacklist' });
+  check('拦截页：url 里的 `<script>` 被转义（HTML 里不出现未转义的开标签）',
+    !html.includes('<script>alert(1)') && html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'),
+    html.includes('<script>alert(1)') ? '未转义' : 'ok');
+  check('拦截页：url 里的引号被转义（不会截断属性/文本节点）',
+    !html.includes('&y="onload='), html.includes('&amp;y=&quot;onload=') ? 'ok' : '未见转义后的引号');
+}
+
+{
+  // reason 是我们自己的枚举，但「将来加档位时最容易漏」的就是它 —— 所以单独打一次。
+  const { html } = blockPageHtml({ url: 'http://a.com/', reason: DANGER_REASON });
+  const opens = (html.match(/<script/g) || []).length;
+  check('拦截页：reason 里的 `</script><script>` 被转义（脚本块没被提前闭合）',
+    !html.includes('</script><script>alert(1)') && opens === 1, `script 开标签 ${opens} 个`);
+  check('拦截页：未登记的 reason 走兜底中文文案（不漏英文、不空着）',
+    html.includes('被此环境的网络规则拦截') && !html.includes('undefined'),
+    blockReasonText('whatever'));
+}
+
+{
+  // 转义不能把数据改坏：__fpBlock 里的值必须与传入完全一致（JSON 解析后逐字段比对）
+  const { html } = blockPageHtml({ url: DANGER_URL, reason: DANGER_REASON, host: 'a.com:8443' });
+  const m = html.match(/window\.__fpBlock = (\{.*\});<\/script>/);
+  const payload = m ? JSON.parse(m[1]) : null;
+  check('拦截页：`window.__fpBlock` 三字段 {url, reason, host} 齐全且值原样',
+    !!payload && payload.url === DANGER_URL && payload.reason === DANGER_REASON && payload.host === 'a.com:8443',
+    JSON.stringify(payload));
+  check('拦截页：不传 host 时从 url 推导（含端口）',
+    blockPageHtml({ url: 'https://b.example.com:8443/p' }).html.includes('b.example.com:8443'));
+}
+
+check('拦截页：reason 三种档位各有中文文案',
+  blockReasonText('blacklist').includes('黑名单')
+  && blockReasonText('not_in_whitelist').includes('白名单')
+  && blockReasonText('disable_video').includes('视频'));
+
+{
+  const res = blockPageResponse({ url: 'http://a.com/', reason: 'blacklist' });
+  const header = (n) => res.headers.find((h) => h.name.toLowerCase() === n.toLowerCase())?.value || '';
+  check('拦截页：CSP 是 `default-src \'none\'`（零外链靠它钉，不靠自觉）',
+    header('Content-Security-Policy').includes("default-src 'none'"), header('Content-Security-Policy'));
+  check('拦截页：CSP 只给脚本一个 nonce（不放开 unsafe-inline 给脚本）',
+    /script-src 'nonce-[^']+'/.test(header('Content-Security-Policy'))
+    && !/script-src[^;]*unsafe-inline/.test(header('Content-Security-Policy')));
+  check('拦截页：Cache-Control: no-store（不许被缓存后当正常页面回放）',
+    header('Cache-Control') === 'no-store', header('Cache-Control'));
+  check('拦截页：Content-Type 是 text/html + charset=utf-8',
+    /text\/html/.test(header('Content-Type')) && /charset=utf-8/.test(header('Content-Type')));
+  check('拦截页：CDP body 是 base64，解出来与 html 逐字节相同',
+    Buffer.from(res.bodyBase64, 'base64').toString('utf8') === res.html);
+  check('拦截页：状态 200（拦截是「给一张页」，不是网络错误）', res.status === 200, String(res.status));
+}
+
+{
+  const { html } = blockPageHtml({ url: 'http://a.com/', reason: 'blacklist' });
+  check('拦截页：零外链（没有 img/link/iframe，也没有 src/href 指向 http(s)）',
+    !/<img\b|<link\b|<iframe\b/i.test(html) && !/(?:src|href)\s*=\s*["']?https?:/i.test(html));
+  check(`拦截页：体积 < ${BLOCK_PAGE_MAX_BYTES} 字节（这页不该长成第二个网站）`,
+    Buffer.byteLength(html, 'utf8') < BLOCK_PAGE_MAX_BYTES, `${Buffer.byteLength(html, 'utf8')} B`);
+}
+
+check('escapeHtml：五种字符全覆盖',
+  escapeHtml(`<>&"'`) === '&lt;&gt;&amp;&quot;&#39;', escapeHtml(`<>&"'`));
 
 /* ---------------------------------- 汇总 ---------------------------------- */
 const fail = results.filter((r) => !r.ok).length;

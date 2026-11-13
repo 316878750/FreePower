@@ -98,6 +98,8 @@ npm run dist:win       # 打 Windows 安装包 → release\FreePower-<ver>-setup
 
 **已对齐（2026-11-12，原先列在这里的 backlog 已做掉）**：`/api/v1/fbbird/user/list` 对手是 **10 次/秒**（对手侧读数，见 `docs/reverse/07-LocalAPI路由全量清单.md` 的限流分桶：54 条路由除 `/status` 外全 1/s，只有这一条 10/s）。我们原来走默认档 1/s，现在给它**单独一桶 10/s**（`RATE_LIMIT_FBBIRD`，桶键 `apiKey|fbbird`），**默认档仍是 1/s**，没有顺手把全局限流抬上去。判据（`test/api.test.mjs`）：同一把 key 一次性打 10 发全过、第 11 发被限，紧接两发 std 路由第二发必被限 —— 两条对照缺一就是假绿。
 
+**档位只由本地决定，不拉远端配置（有意差异，明确不做）**：对手的限流档位可以被远端 `SHELL_CONFIG` 覆盖（`client/shell-config/get?key=SHELL_CONFIG`，键名形如 `"10_1"` = 10 次/1 秒，见 `docs/reverse/01-架构与LocalAPI.md:62`）。我们**不实现这条路**。理由一句话：**那要我们的产品向对手的服务器发请求** —— 一个本地单机产品，为了「档位可远程调」去连 adspower 的域名，等于把「这台机器上跑着什么」上报给对手；收益是零（档位我们发版就能改），代价是隐私和可用性（对方关站就没人能启动）。**档位只由 `FREEPOWER_RATE_LIMIT*` 这几个本地环境变量决定。**
+
 CORS：只放行 `127.0.0.1` / `localhost` 的 Origin，其他返回 `403` + 纯文本 `CORS ERROR`。
 
 ### 路由
@@ -456,6 +458,26 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
     另：`release\win-unpacked` 是给人当「安装包 payload 的参照物」用的，**每次打完包必须刷新成这一次 `--prepackaged` 用的那份**。0.4.0 出过一次它还是旧草稿、里面 `FreePower.exe` 的版本资源仍是 `Electron / 45.2.3` 的情况 —— 谁按「payload ↔ win-unpacked 逐文件比」去复核，比到的是错的参照物，还很可能会得出「版本资源没修好」的错结论。构建产物本体在 `%TEMP%\fp-rel3`，`release\` 下的这份是复制品。
 
 
+### 0.4.1 破坏性变更：被拦的顶层文档从「网络错误」变成「一张页面」
+
+- **0.4.0 及以前**：命中黑名单 / 白名单外的**顶层文档**走 `Fetch.failRequest`，浏览器显示的是 `net::ERR_BLOCKED_BY_CLIENT`（「无法访问此网站」），`page.goto(...)` 直接抛错。
+- **0.4.1 起**：同一个请求变成 **HTTP 200 + 我们自己的拦截页 HTML**，地址栏停在原 URL，`goto` 正常返回。
+
+**这是破坏性变更，不是修 bug。** 按「`goto` 抛 `ERR_BLOCKED_BY_CLIENT` 就说明被拦」写的脚本会**当场失效** —— 它再也等不到那个错。
+
+**唯一可靠的替代判据是 `window.__fpBlock`**：拦截页里必有 `{ url, reason, host }` 三个字段，`reason` 是封闭枚举 `blacklist` / `not_in_whitelist` / `disable_video`（未登记的值一律给兜底文案，但 `reason` 字段本身照原样带出）。
+
+```js
+const blocked = await page.evaluate(() => window.__fpBlock || null);
+// blocked && ['blacklist','not_in_whitelist','disable_video'].includes(blocked.reason) → 被拦
+```
+
+**没有开关**：不开 `FREEPOWER_BLOCK_PAGE=off` 这类退路 —— 对手本来就是给页面，多一个 off 等于我们自己造出第二种行为，两个分支都得测、都会腐化。要「不拦」，关黑名单 / 白名单本身即可（那才是管「拦不拦」的开关）。
+
+**没变的**：子资源（图片 / 脚本 / XHR）仍然 `failRequest`（`blockedReason: inspector`、`naturalWidth = 0`，CDP 侧看不出被换成了页面）；response 阶段（视频开关那条）仍然 fail；`decideRequest()` 的判定逻辑一行没改。
+
+**判据**：A 层 `test/net-rules.test.mjs`（转义 / CSP / no-store / `__fpBlock` 三字段，18 条）；B 层 `test/block-page.test.mjs`，真内核、全离线（17 条，进 `npm run smoke`）。
+
 ## 八、验证
 
 ```powershell
@@ -466,7 +488,7 @@ npm run test
 npm run smoke
 ```
 
-当前实测（2026-11-13，本机）：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **85** + agent **15** + api **100** + ui **46** + desktop **54** + kernel-download **62**（`package.json` 里那条脚本就是这十组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **30/30**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核）+ **4/4**（`test/session-restore.test.mjs`，会话恢复：真内核真重启），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测（2026-11-13，本机）：`npm run test` = schema **10** + net-rules **56** + chain-rules **31** + recycle **44** + unit **85** + agent **15** + api **100** + ui **46** + desktop **54** + kernel-download **62**（`package.json` 里那条脚本就是这十组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **30/30**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核）+ **4/4**（`test/session-restore.test.mjs`，会话恢复：真内核真重启）+ **17/17**（`test/block-page.test.mjs`，拦截页：真内核、全离线），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 > 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：
@@ -642,7 +664,7 @@ npm run test:switches    # 真机开/关对照，19 项，需要真实 Chrome（
 
 #### 与对手的两处「有意差异」（不是复刻，别当一样）
 
-1. **拦截的呈现不同**：对手命中后返回**它自己的拦截页 HTML**（`StaticConfig.BlockPage` 是 base64 的整页，页面脚本还用 `window.blockUrl` 再判一次子域）；我们走 `Fetch.failRequest` → 浏览器报 `net::ERR_BLOCKED_BY_CLIENT`。用户看到的东西不一样。**拦截页列 backlog，本轮不做。**
+1. **拦截的呈现曾经不同，0.4.1 起已对齐**：对手命中后返回**它自己的拦截页 HTML**（`StaticConfig.BlockPage` 是 base64 的整页，页面脚本还用 `window.blockUrl` 再判一次子域）。我们 0.4.0 及以前走 `Fetch.failRequest` → 浏览器报 `net::ERR_BLOCKED_BY_CLIENT`。**0.4.1 起改成 `Fetch.fulfillRequest` 返回一张自绘拦截页**：HTTP 200、`window.__fpBlock` 给脚本判据，语义与对手一致。**页面内容、CSS、素材全是我们自己写的，不是它的 `BlockPage`**（产物里没有它的 base64 页）。破坏性影响与替代判据见「0.4.1 破坏性变更」那节。
 2. **关图的机制不同**：对手**新内核**（`>20220901`）是在内核网络层按 MIME `image/` + 尺寸上限拦（`StaticConfig.NetFilters` 里 `{mimeType:"image/", maxSize:…}`），**请求已经发出、服务器能看到**；`--blink-settings=imagesEnabled=false` 在对手那边只是**老内核兜底**。我们用的是 `blink-settings`，所以「服务器侧零请求」—— 这条差异**对我们更彻底**，但它仍是差异：别以为我们复刻了对手的新内核路径（`test:switches` 里「img 命中 0」正是这条差异的读数）。
 
 ### 隐私开关：P2 四条（逐条接真行为，2026-11-13 起）

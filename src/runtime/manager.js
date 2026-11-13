@@ -8,6 +8,7 @@ import { findChrome, buildArgs, launchChrome, waitForDevToolsPort, killProcessTr
 import { CdpClient, fetchJson } from '../kernel/cdp.js';
 import { buildInjectionSource, buildWorkerInjectionSource } from '../kernel/inject.js';
 import { compileNetRules, decideRequest } from '../kernel/net-rules.js';
+import { blockPageResponse } from '../kernel/block-page.js';
 import { alignProfileToKernel } from '../kernel/version.js';
 import { fingerprintView, geoPolicy } from '../fingerprint/view.js';
 import { ensureNoiseSeeds } from '../fingerprint/seeds.js';
@@ -1038,6 +1039,27 @@ async function installRequestGating(client, sessionId, profile, proxy, { proxyAu
       rules,
     );
     if (verdict.block) {
+      // 顶层文档命中 → 给它一张**我们自己的拦截页**（200 + HTML），而不是让浏览器报
+      // `net::ERR_BLOCKED_BY_CLIENT`。对手是自编译内核塞 `StaticConfig.BlockPage`，
+      // 我们没那条路，走 `Fetch.fulfillRequest`，语义一样、落点不一样（见 kernel/block-page.js）。
+      //
+      // 只给 `Document`、只给 request 阶段，两条都是故意的：
+      //   - 子资源（图片/脚本/XHR）仍 `failRequest` —— 往 `<img>` 里塞 HTML 是垃圾，
+      //     站点自己的错误处理也会被搞乱；
+      //   - response 阶段（视频开关）不给页面 —— 响应已经在路上，换不掉。
+      // fulfill 失败（内核不支持 / 会话已断）退回老路径，别把一个请求永久挂住。
+      if (!atResponse && params.resourceType === 'Document') {
+        const page = blockPageResponse({ url: params.request?.url, reason: verdict.reason });
+        client.send('Fetch.fulfillRequest', {
+          requestId: params.requestId,
+          responseCode: page.status,
+          responseHeaders: page.headers,
+          body: page.bodyBase64,
+        }, sid).catch(() => {
+          client.send('Fetch.failRequest', { requestId: params.requestId, errorReason: 'BlockedByClient' }, sid).catch(() => {});
+        });
+        return;
+      }
       client.send('Fetch.failRequest', { requestId: params.requestId, errorReason: 'BlockedByClient' }, sid).catch(() => {});
       return;
     }
