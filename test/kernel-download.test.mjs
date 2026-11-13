@@ -92,6 +92,10 @@ const zips = new Map();
 const hits = new Map();
 /** 镜像侧收到的请求（断言「换源后整包请求不带 Range」用） */
 const mirrorHits = [];
+/** 官方「连接层抽风」源收到的 Range 请求（断言「重试核同一段，不换位置」用） */
+const connRanges = [];
+/** 每个 `模式:版本:HEAD|RANGE` 已经被问了几次 */
+const connHits = new Map();
 let BASE = '';
 
 const server = http.createServer((req, res) => {
@@ -176,6 +180,47 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'application/zip', 'content-length': z.length });
     res.write(z.subarray(0, Math.floor(z.length * 0.4)));
     setTimeout(() => res.destroy(), 20);
+    return;
+  }
+
+  /* ---------- 官方「连接层抽风」：整包 GET 零字节，HEAD/Range 按模式重置连接 ---------- */
+  // 2026-11-13 真机实测：到 GCS 的冷连接第一个 HEAD 会被 ECONNRESET 重置，第 2 次就好。
+  // 这里把那种场面造出来，验证「有限重试」这条路（**只对连接层重试，哈希不符不重试**）。
+  const connFlaky = /^\/(flaky-verify|reset-always)\/([\d.]+)\/win64\/chrome-win64\.zip$/.exec(p);
+  if (connFlaky) {
+    const [, mode, version] = connFlaky;
+    const z = zipFor(version);
+    const range = req.headers.range || '';
+    const isProbe = /^bytes=0-0$/.test(range);
+    const kind = req.method === 'HEAD' ? 'HEAD' : (range ? (isProbe ? 'PROBE' : 'RANGE') : 'GET');
+    if (kind === 'RANGE') connRanges.push({ mode, version, range });
+    if (kind === 'GET') {
+      // 整包 GET 一个字节都不给 → 客户端 stall 判定这一源不可用 → 换镜像
+      res.writeHead(200, { 'content-type': 'application/zip', 'content-length': z.length });
+      return;
+    }
+    const key = `${mode}:${version}:${kind}`;
+    const seen = (connHits.get(key) || 0) + 1;
+    connHits.set(key, seen);
+    if (mode === 'reset-always' || seen === 1) {
+      // 连接层重置（undici 会抛 `fetch failed` + `ECONNRESET`）
+      req.socket.destroy();
+      return;
+    }
+    if (kind === 'HEAD') {
+      res.writeHead(200, { 'content-type': 'application/zip', 'content-length': z.length });
+      res.end();
+      return;
+    }
+    const start = Number((/bytes=(\d+)-/.exec(range) || [])[1] || 0);
+    const end = Number((/bytes=\d+-(\d+)/.exec(range) || [])[1] || z.length - 1);
+    const body = z.subarray(start, Math.min(end + 1, z.length));
+    res.writeHead(206, {
+      'content-type': 'application/zip',
+      'content-length': body.length,
+      'content-range': `bytes ${start}-${start + body.length - 1}/${z.length}`,
+    });
+    res.end(body);
     return;
   }
 
@@ -555,7 +600,11 @@ try {
    *   - 换源必丢半成品（镜像收到的整包请求**不带 Range**）；
    *   - 装之前用官方 URL 随机抽 5 段 128 KB 逐段核 sha256，不符 → 删包、不装、报
    *     `kernel_mirror_verify_failed`；
-   *   - 响应/落盘标记如实给 `source` 与 `mirror_verified`。
+   *   - 响应/落盘标记如实给 `source` 与 `mirror_verified`；
+   *   - **核验这一步的有限重试**（M8/M9，2026-11-13 真机踩到 GCS 冷连接 `ECONNRESET` 后加）：
+   *     只对连接层（网络错误 / 5xx / 429）重试，`MIRROR_VERIFY_ATTEMPTS = 3`；
+   *     **哈希不符、404、不认 Range 一次就判失败**；重试核的是**同一段**（位置不重随机）；
+   *     重试用尽仍连不上官方 → 照样不装（`kernel_mirror_verify_failed`）。
    * ========================================================================== */
   const dlMirror = (version, { official, mirror, ...rest }) => runKernelDownload(
     { kernel_type: 'Chrome', kernel_version: version },
@@ -651,6 +700,45 @@ try {
   check('已装的再调一次：completed 仍如实报 source=mirror（读盘上标记，不猜成 official）',
     again9.json.data?.source === 'mirror' && again9.json.data?.mirror_verified === true,
     JSON.stringify(again9.json.data));
+
+  /* M8 官方核验端点**连接层偶发重置** → 有限重试后核验通过（2026-11-13 真机踩到的 ECONNRESET） */
+  // 假 zip 只有 ~2.4 KB，按默认 128 KB 一段只会抽 1 段；这里把段缩到 512 字节抽 4 段，
+  // 并用**确定性**的 randomInt 钉住偏移（0/400/800/1200）—— 这样「重试是否换位置」可断言。
+  const V15 = '157.0.9016.16';
+  let rnd15 = 0;
+  const det15 = (min, max) => Math.min(max - 1, min + ((rnd15++) * 400) % Math.max(1, max - min));
+  const r15 = await dlMirror(V15, {
+    official: 'flaky-verify', mirror: 'mirror-ok',
+    verifyAttempts: 3, verifyRetryMs: 50, verifyChunk: 512, randomInt: det15,
+  });
+  const j15 = await waitJob(V15);
+  const ok15 = (await api({ kernel_type: 'Chrome', kernel_version: V15 })).json;
+  const head15 = connHits.get(`flaky-verify:${V15}:HEAD`) || 0;
+  const ranges15 = connRanges.filter((r) => r.version === V15).map((r) => r.range);
+  check('核验重试：官方 HEAD 第一次被 ECONNRESET 重置 → 重试一次拿到总长，镜像照装（source=mirror）',
+    r15.code === 0 && j15.ok && head15 === 2
+      && ok15?.data?.source === 'mirror' && ok15?.data?.mirror_verified === true,
+    `head=${head15} ${JSON.stringify(ok15?.data)}`);
+  check('核验重试：抽段被重置时**重试同一段**（4 段抽了 5 次，前两次偏移完全相同）',
+    JSON.stringify(ranges15) === JSON.stringify([
+      'bytes=0-511', 'bytes=0-511', 'bytes=400-911', 'bytes=800-1311', 'bytes=1200-1711',
+    ]),
+    JSON.stringify(ranges15));
+
+  /* M9 官方核验端点**一直**连不上 → 重试用尽仍不装（没有证据就不装，绝不把镜像字节当官方字节） */
+  const V16 = '157.0.9017.17';
+  const r16 = await dlMirror(V16, {
+    official: 'reset-always', mirror: 'mirror-ok', verifyAttempts: 3, verifyRetryMs: 50,
+  });
+  const f16 = await waitFailure(V16, 25000);
+  const mh16 = mirrorHits.filter((h) => h.version === V16);
+  const head16 = connHits.get(`reset-always:${V16}:HEAD`) || 0;
+  const probe16 = connHits.get(`reset-always:${V16}:PROBE`) || 0;
+  check('核验重试：官方端点一直重置 → 重试用尽（HEAD 3 次 + Range 探测 3 次）→ kernel_mirror_verify_failed，不装',
+    r16.code === 0 && f16?.reason === 'kernel_mirror_verify_failed'
+      && head16 === 3 && probe16 === 3
+      && !fs.existsSync(path.join(KERNELS_DIR, V16)) && tmpLeftovers().length === 0,
+    `${f16?.reason} head=${head16} probe=${probe16} 镜像请求 ${mh16.length} 次 / ${(f16?.message || '').slice(0, 90)}`);
 
   /* -------------------- 收尾：目录里只剩合法版本 -------------------- */
   const dirs = fs.readdirSync(KERNELS_DIR).sort();

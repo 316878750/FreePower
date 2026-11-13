@@ -45,6 +45,18 @@ export const MIRROR_VERIFY_SEGMENTS = 5;
 export const MIRROR_VERIFY_CHUNK = 131072;
 
 /**
+ * 官方端点偶发**连接层**故障时的有限重试（2026-11-13 真机实测：冷连接首个 HEAD 被
+ * `ECONNRESET` 重置，第 2 次就 200；Range 抽段连打三次都 206）。
+ *
+ * 只对**网络错误 / 5xx / 429** 重试 —— 这些是「这一秒的连接」坏了，不是「这个包的答案」。
+ * **不重试**：404 之类 4xx、官方不认 Range、抽段长度不对、**sha256 不符**。
+ * 最后一条最要紧：重试一个「内容错了」的答案，只是把失败拖长，还会让人以为「多试几次就好了」。
+ * 重试也不换抽样位置（位置在重试之前就定死），否则等于放宽判据。
+ */
+export const MIRROR_VERIFY_ATTEMPTS = 3;
+export const MIRROR_VERIFY_RETRY_MS = 400;
+
+/**
  * 镜像基地址 → 可用值（`''` = 禁用）。
  * `off` / `0` / `false` / 空串都算「明确关掉」，**不做「配错就静默回落到默认镜像」**。
  */
@@ -239,6 +251,8 @@ export async function runKernelDownload(body = {}, opts = {}) {
     mirrorBase: opts.mirrorBase,
     verifySegments: opts.verifySegments,
     verifyChunk: opts.verifyChunk,
+    verifyAttempts: opts.verifyAttempts,
+    verifyRetryMs: opts.verifyRetryMs,
     randomInt: opts.randomInt,
   };
 
@@ -309,6 +323,8 @@ function startJob(entry, resolved, ctx) {
         mirrorBase: ctx.mirrorBase,
         verifySegments: ctx.verifySegments,
         verifyChunk: ctx.verifyChunk,
+        verifyAttempts: ctx.verifyAttempts,
+        verifyRetryMs: ctx.verifyRetryMs,
         randomInt: ctx.randomInt,
         onPhase: (ph) => { entry.status = ph; },
         onProgress: (p) => { entry.progress = p; },
@@ -558,23 +574,68 @@ export async function downloadFromSources(sources, zipPath, {
 
 /* ------------------------------ 镜像字节核验 ------------------------------ */
 
-/** 官方端点的包体总长：先 HEAD，服务端不认 HEAD 再用 `Range: bytes=0-0` 读 `content-range` */
-async function officialSize(url, { fetchImpl = fetch, timeoutMs = 60000 } = {}) {
-  const grab = async (init) => {
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 「再问一次」的通用壳：`fn` 抛 `KernelError` 就是**判据失败**，直接往外扔；
+ * 抛别的（连接层错误、被我们转成 Error 的 5xx/429）才按 `attempts` 重试。
+ */
+async function withRetry(fn, {
+  attempts = MIRROR_VERIFY_ATTEMPTS,
+  retryMs = MIRROR_VERIFY_RETRY_MS,
+  sleep = sleepMs,
+} = {}) {
+  const n = Math.max(1, Math.floor(Number(attempts) || 1));
+  let lastErr;
+  for (let i = 0; i < n; i += 1) {
+    if (i > 0 && retryMs > 0) await sleep(retryMs * i);
+    try {
+      return await fn(i);
+    } catch (e) {
+      if (e instanceof KernelError) throw e;
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('fetch failed');
+}
+
+/** 5xx / 429 是「服务器这一秒不行」，可以再问；其它状态码是「答案」，问几次都一样 */
+const retriableStatus = (s) => s === 429 || (s >= 500 && s <= 599);
+
+/**
+ * 官方端点的包体总长：先 HEAD，服务端不认 HEAD（或被连接层重置）再用 `Range: bytes=0-0`
+ * 读 `content-range`。两次都拿不到就返回 0 —— 调用方据此**拒绝装**（读不到总长 = 没法证明）。
+ */
+async function officialSize(url, {
+  fetchImpl = fetch,
+  timeoutMs = 60000,
+  attempts = MIRROR_VERIFY_ATTEMPTS,
+  retryMs = MIRROR_VERIFY_RETRY_MS,
+  sleep = sleepMs,
+} = {}) {
+  const grab = (init) => withRetry(async () => {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeoutMs);
     try {
-      return await fetchImpl(url, { ...init, signal: ac.signal, redirect: 'follow' });
+      const res = await fetchImpl(url, { ...init, signal: ac.signal, redirect: 'follow' });
+      if (res && retriableStatus(res.status)) {
+        try { await res.body?.cancel?.(); } catch { /* 关不掉就算了，反正要重试 */ }
+        throw new Error(`HTTP ${res.status}`);
+      }
+      return res;
     } finally {
       clearTimeout(timer);
     }
-  };
+  }, { attempts, retryMs, sleep });
+
   try {
     const head = await grab({ method: 'HEAD' });
     if (head?.ok) {
       const n = Number(head.headers?.get?.('content-length') || 0);
       if (n > 0) return n;
     }
+  } catch { /* HEAD 被重置 / 5xx 用尽：下面用 Range 再问一次总长 */ }
+  try {
     const probe = await grab({ headers: { range: 'bytes=0-0' } });
     const cr = /\/\s*(\d+)\s*$/.exec(String(probe?.headers?.get?.('content-range') || ''));
     return Number(cr?.[1] || 0);
@@ -594,6 +655,11 @@ async function officialSize(url, { fetchImpl = fetch, timeoutMs = 60000 } = {}) 
  * 任一不符（长度、任一段哈希、官方端点不认 Range）→ 抛 `kernel_mirror_verify_failed`，
  * 调用方负责删包、不装。
  *
+ * **重试只在连接层**（见 `MIRROR_VERIFY_ATTEMPTS` 的注释）：网络错误 / 5xx / 429 会再问
+ * `attempts` 次（同一段、同一位置）；**哈希不符、404、不认 Range 一次就判失败**。
+ * 重试用尽仍连不上官方 → 同样报 `kernel_mirror_verify_failed`：**没有证据就不装**，
+ * 不因为「这次没连上」就把镜像的字节当成官方字节放过去。
+ *
  * **能证明什么、不能证明什么（README 原样写）**：「抽样区间与官方一致 + 总长一致」
  * **不等于**「全文件逐字节等同」。
  */
@@ -603,6 +669,9 @@ export async function verifyMirrorBytes({
   segments = MIRROR_VERIFY_SEGMENTS,
   chunk = MIRROR_VERIFY_CHUNK,
   timeoutMs = 60000,
+  attempts = MIRROR_VERIFY_ATTEMPTS,
+  retryMs = MIRROR_VERIFY_RETRY_MS,
+  sleep = sleepMs,
   randomInt = crypto.randomInt,
 } = {}) {
   const fail = (message, cause) => new KernelError(message, { reason: 'kernel_mirror_verify_failed', cause });
@@ -611,7 +680,7 @@ export async function verifyMirrorBytes({
   if (total > 0 && size !== total) {
     throw fail(`镜像包长度与它自己声明的 content-length 不符（声明 ${total}，实收 ${size}）`);
   }
-  const officialTotal = await officialSize(officialUrl, { fetchImpl, timeoutMs });
+  const officialTotal = await officialSize(officialUrl, { fetchImpl, timeoutMs, attempts, retryMs, sleep });
   if (!officialTotal) {
     throw fail(`读不到官方包体总长，无法核验镜像（${officialUrl}）`);
   }
@@ -626,27 +695,17 @@ export async function verifyMirrorBytes({
     const count = Math.max(1, Math.min(Number(segments) || 1, Math.floor(size / Math.max(1, chunk)) || 1));
     const span = Math.max(1, size - local.length + 1);
     for (let i = 0; i < count; i += 1) {
+      // 抽样位置**只随机一次**：重试核的是同一段，不许「换个位置再试」（那是放宽判据）
       const start = span > 1 ? randomInt(0, span) : 0;
       const len = Math.min(local.length, size - start);
-      const ac = new AbortController();
-      const timer = setTimeout(() => ac.abort(), timeoutMs);
-      let res;
+      let got;
       try {
-        res = await fetchImpl(officialUrl, {
-          signal: ac.signal,
-          redirect: 'follow',
-          headers: { range: `bytes=${start}-${start + len - 1}` },
-        });
-      } finally {
-        clearTimeout(timer);
+        got = await withRetry(() => readOfficialRange({ start, len }), { attempts, retryMs, sleep });
+      } catch (e) {
+        if (e instanceof KernelError) throw e;
+        // 连接层怎么都问不到官方：**没有证据就不能装**，仍按 `kernel_mirror_verify_failed` 报
+        throw fail(`从官方 URL 抽段失败：网络错误（偏移 ${start}）：${e?.message || e}`, e);
       }
-      if (!res?.ok) throw fail(`从官方 URL 抽段失败：HTTP ${res?.status}（偏移 ${start}）`);
-      if (res.status !== 206) {
-        // 官方端点不认 Range 就退回整包 —— 那等于没法「只核一段」，宁可失败也不瞎猜
-        throw fail(`官方 URL 不认 Range（偏移 ${start} 返回 ${res.status}），无法核验镜像`);
-      }
-      const got = Buffer.concat(await collectBody(res, len));
-      if (got.length !== len) throw fail(`官方抽段长度不对：要 ${len} 字节，实收 ${got.length}（偏移 ${start}）`);
       fs.readSync(fd, local, 0, len, start);
       const a = crypto.createHash('sha256').update(got).digest('hex');
       const b = crypto.createHash('sha256').update(local.subarray(0, len)).digest('hex');
@@ -656,6 +715,33 @@ export async function verifyMirrorBytes({
   } finally {
     fs.closeSync(fd);
   }
+
+  /** 读官方的一段：网络层错误原样抛（交给 `withRetry`），判据不符抛 `KernelError`（不重试） */
+  async function readOfficialRange({ start, len }) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      const res = await fetchImpl(officialUrl, {
+        signal: ac.signal,
+        redirect: 'follow',
+        headers: { range: `bytes=${start}-${start + len - 1}` },
+      });
+      if (!res?.ok) {
+        if (retriableStatus(res?.status)) throw new Error(`HTTP ${res?.status}`);
+        throw fail(`从官方 URL 抽段失败：HTTP ${res?.status}（偏移 ${start}）`);
+      }
+      if (res.status !== 206) {
+        // 官方端点不认 Range 就退回整包 —— 那等于没法「只核一段」，宁可失败也不瞎猜
+        throw fail(`官方 URL 不认 Range（偏移 ${start} 返回 ${res.status}），无法核验镜像`);
+      }
+      const buf = Buffer.concat(await collectBody(res, len));
+      if (buf.length !== len) throw fail(`官方抽段长度不对：要 ${len} 字节，实收 ${buf.length}（偏移 ${start}）`);
+      return buf;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   return { size, official_total: officialTotal, segments: checked.length, chunk: local.length, ranges: checked };
 }
 
@@ -691,6 +777,8 @@ export async function installKernel(resolved, {
   mirrorBase = undefined,
   verifySegments = MIRROR_VERIFY_SEGMENTS,
   verifyChunk = MIRROR_VERIFY_CHUNK,
+  verifyAttempts = MIRROR_VERIFY_ATTEMPTS,
+  verifyRetryMs = MIRROR_VERIFY_RETRY_MS,
   randomInt = undefined,
   onPhase = () => {},
   onProgress = () => {},
@@ -747,6 +835,8 @@ export async function installKernel(resolved, {
         fetchImpl,
         segments: verifySegments,
         chunk: verifyChunk,
+        attempts: verifyAttempts,
+        retryMs: verifyRetryMs,
         ...(randomInt ? { randomInt } : {}),
       });
     }
