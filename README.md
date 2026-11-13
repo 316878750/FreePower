@@ -255,6 +255,8 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 
 装完：`%LOCALAPPDATA%\Programs\FreePower`，**357.4MB / 77 文件**，安装包 109.9MB；数据在 `%APPDATA%\FreePower\data`。
 
+**控制台显示的版本号来自 `package.json`**：`src/api/server.js` 用 `createRequire(import.meta.url)` 读 `../../package.json`（asar 里目录结构不变，路径同样成立）。0.4.0 及以前那里是个写死的 `const VERSION = '0.3.2'`，升了版本控制台还显示 v0.3.2 —— 那类「常量与 `package.json` 各说一套」的问题在 0.4.1 一起收掉了，判据在 `test/api.test.mjs`（首页 HTML 里的版本必须等于 `package.json.version`，且不许还是 `0.3.2`）。
+
 顺带收掉一个 P5 尾巴：HTML 自检报告不再把 master `api_key` 拼进 URL，改成 **120 秒、绑定 profile 的一次性票据**
 （`POST /api/v2/browser-profile/selfcheck-ticket`）；`api_key` 走 query 的老用法保留，老脚本不受影响。
 
@@ -488,7 +490,7 @@ npm run test
 npm run smoke
 ```
 
-当前实测（2026-11-13，本机）：`npm run test` = schema **10** + net-rules **56** + chain-rules **31** + recycle **44** + unit **85** + agent **15** + api **100** + ui **46** + desktop **54** + kernel-download **62**（`package.json` 里那条脚本就是这十组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **30/30**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核）+ **4/4**（`test/session-restore.test.mjs`，会话恢复：真内核真重启）+ **17/17**（`test/block-page.test.mjs`，拦截页：真内核、全离线），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测（2026-11-13，本机）：`npm run test` = schema **10** + net-rules **56** + chain-rules **31** + recycle **44** + unit **85** + agent **15** + api **102** + ui **46** + desktop **54** + kernel-download **62**（`package.json` 里那条脚本就是这十组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **30/30**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核）+ **9/9**（`test/session-restore.test.mjs`，会话恢复 + 启动标签不累积：真内核真重启）+ **17/17**（`test/block-page.test.mjs`，拦截页：真内核、全离线），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 > 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：
@@ -1373,3 +1375,4 @@ FREEPOWER_KERNEL_DOWNLOAD_ATTEMPTS   续传最多重连几次（默认 12）
 - **强制的、没有开关**：每次启动都把 `session.restore_on_startup` 顶成 1，用户手动改回去下次也会被改回来（和对手强制写内核配置同一语义）。想「让用户自己选」得另加字段，本轮不做；
 - **只恢复标签页，不恢复标签内的历史**：Chrome 的「继续浏览上次打开的网页」恢复的是上次开着的那些 URL，单个标签的前进/后退历史不在保证范围内；
 - **`Preferences` 写不上时不阻断启动**：写失败（权限、盘满）只在 `warnings` 里点名 `session`，内核照样起 —— 代价是那一轮不保证「继续上次会话」，不假装成功。0.4.1 起控制台在启动成功后会把这条告警弹出来（黄色 toast，最多显示前两条），不再只躺在自检报告里等人翻。
+- **恢复成功时 `open_urls` 不生效**（0.4.1 起）：上次的标签已经回来了，再按 `open_urls` 新建就是「每次启动多一张」—— 0.4.0 的回归，`334ac5d` 带进来的。与 Chrome 自己的语义一致：「继续浏览上次打开的网页」时启动页本来就不生效。判定只看**真页面**（`about:blank` / `chrome://newtab` 不算恢复）：**首次启动**、**会话恢复失败**（内核没带 flag、session 损坏）、**用户上次把标签全关了** 这三种情况都会退回按 `open_urls` 开页 —— 宁可多开一次，也不要「恢复了却什么都不开」。判据在 `test/session-restore.test.mjs`：同一环境连起三次，`/a` 每次都只能有 1 张。
