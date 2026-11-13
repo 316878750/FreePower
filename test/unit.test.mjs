@@ -32,6 +32,9 @@ import vm from 'node:vm';
 import fs from 'node:fs';
 import { buildArtifacts } from '../tools/gen-schema.mjs';
 import { buildInjectionSource, buildWorkerInjectionSource, sharedNoiseCoreSource } from '../src/kernel/inject.js';
+import { mergeRestoreOnStartup, ensureRestoreOnStartup, prefsPathOf, RESTORE_ON_STARTUP } from '../src/runtime/prefs.js';
+import os from 'node:os';
+import path from 'node:path';
 
 /** 找一个当前没人监听的端口（起一个 server 再关掉） */
 async function deadPort() {
@@ -1770,6 +1773,101 @@ test('effect 注册表：每个字段说清在哪一层生效，登记与代码�
   assert.deepEqual(census, { none: 39, args: 10, cdp: 10, inject: 11, multi: 8 },
     `生效层分布变了：${JSON.stringify(census)} —— 新增/删除字段时同步这条与 README 第 41 条`);
   assert.equal(scoped.length, 78, `指纹/隐私字段 ${scoped.length} 个`);
+});
+
+
+/* ============================================================================
+ * 会话恢复（差距清单第 5 条）：`session.restore_on_startup = 1`
+ * 对手塞内核配置 `StaticConfig.RestoreLastSession`，我们走 Chrome 自己的 Preferences。
+ * 四条 A 层判据：合并只碰一个键 / 坏 JSON 先备份 / 幂等不重写 / 原子写不留半截文件。
+ * ==========================================================================*/
+
+test('会话恢复：合并只动 session.restore_on_startup，未知键与其他 session.* 一个不少', () => {
+  const before = {
+    profile: { name: 'keep-me', exit_type: 'Normal' },
+    session: { restore_on_startup: 5, startup_urls: ['https://a.example/'], other: { deep: [1, 2, 3] } },
+    extensions: { settings: { abc: { state: 1 } } },
+    unknown_top_level: ['x', null, true],
+  };
+  const snapshot = JSON.parse(JSON.stringify(before));
+  const { prefs, changed } = mergeRestoreOnStartup(before);
+
+  assert.equal(changed, true);
+  assert.equal(prefs.session.restore_on_startup, RESTORE_ON_STARTUP);
+  assert.equal(RESTORE_ON_STARTUP, 1);
+  // 未知键一个不少（顶层 + session 内层都比）
+  for (const k of Object.keys(snapshot)) {
+    if (k === 'session') continue;
+    assert.deepEqual(prefs[k], snapshot[k], `顶层键 ${k} 被改动了`);
+  }
+  assert.deepEqual(prefs.session.startup_urls, snapshot.session.startup_urls);
+  assert.deepEqual(prefs.session.other, snapshot.session.other);
+  // 原对象没被就地改写（纯函数：调用方传进来的那份保持原样）
+  assert.deepEqual(before, snapshot);
+  // 没有 session 键的环境也要能建出来
+  assert.deepEqual(mergeRestoreOnStartup({ profile: { name: 'x' } }).prefs,
+    { profile: { name: 'x' }, session: { restore_on_startup: 1 } });
+});
+
+test('会话恢复：坏 JSON → 备份成 .corrupt-* + 写回合法文件（不吞用户文件）', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fp-prefs-bad-'));
+  try {
+    const file = prefsPathOf(dir);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '{"session": {"restore_on_startup": 1},  <<< 半截 JSON', 'utf8');
+
+    const r = ensureRestoreOnStartup(dir, { now: new Date('2026-11-13T09:30:00Z') });
+    assert.equal(r.changed, true);
+    assert.ok(r.backed_up, '必须留下备份文件');
+    assert.match(path.basename(r.backed_up), /^Preferences\.corrupt-2026-11-13T09-30-00/);
+    // 备份里是原来那份坏内容（没有被覆盖成新内容）
+    assert.match(fs.readFileSync(r.backed_up, 'utf8'), /半截 JSON/);
+    // 新文件是合法 JSON 且值为 1
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).session.restore_on_startup, 1);
+    // 没有残留 tmp
+    assert.equal(fs.existsSync(`${file}.fp-tmp`), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('会话恢复：幂等 —— 已经是 1 就一个字节都不写（mtime 与内容都不变）', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fp-prefs-idem-'));
+  try {
+    const first = ensureRestoreOnStartup(dir);
+    assert.equal(first.changed, true);
+    assert.equal(first.created, true, '第一次是新建');
+    const file = prefsPathOf(dir);
+    const content = fs.readFileSync(file, 'utf8');
+    const mtime = fs.statSync(file).mtimeMs;
+
+    const second = ensureRestoreOnStartup(dir);
+    assert.equal(second.changed, false);
+    assert.equal(second.created, false);
+    assert.equal(fs.readFileSync(file, 'utf8'), content);
+    assert.equal(fs.statSync(file).mtimeMs, mtime, '第二次不该写盘（mtime 变了就是写了）');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('会话恢复：原子写 —— 先写 .fp-tmp 再改名，成功后不留 tmp；坏值会改写成 1', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fp-prefs-atomic-'));
+  try {
+    const file = prefsPathOf(dir);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ session: { restore_on_startup: 4 }, keep: { a: 1 } }), 'utf8');
+    const r = ensureRestoreOnStartup(dir);
+    assert.equal(r.changed, true);
+    const after = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(after.session.restore_on_startup, 1);
+    assert.deepEqual(after.keep, { a: 1 }, '别的键必须原样留着');
+    assert.equal(fs.existsSync(`${file}.fp-tmp`), false);
+    // 目录里不该有别的垃圾（备份、tmp 都不该有）
+    assert.deepEqual(fs.readdirSync(path.dirname(file)), ['Preferences']);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 

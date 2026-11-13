@@ -463,7 +463,7 @@ npm run test
 npm run smoke
 ```
 
-当前实测（2026-11-13，本机）：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **80** + agent **15** + api **100** + ui **46** + desktop **54** + kernel-download **43**（`package.json` 里那条脚本就是这十组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **30/30**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测（2026-11-13，本机）：`npm run test` = schema **10** + net-rules **38** + chain-rules **31** + recycle **44** + unit **84** + agent **15** + api **100** + ui **46** + desktop **54** + kernel-download **43**（`package.json` 里那条脚本就是这十组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **30/30**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核）+ **4/4**（`test/session-restore.test.mjs`，会话恢复：真内核真重启），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 > 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：
@@ -788,6 +788,35 @@ node --no-warnings test/proxy-chain.test.mjs   → 也行，单独跑同一套�
 
 `test/proxy-chain.test.mjs` 覆盖：两跳都有命中且「hop0 的上游 = hop1、hop1 的 client 源端口 = hop0 出站 socket 本地端口」；无系统代理时 hop0 命中 0 而 hop1 有命中；hop1 不可达 / 系统代理要认证时 fail-closed + 零内核（按 `--user-data-dir` 归类数进程）+ 目标命中 0；运行中关掉 hop0 后目标命中**不增加**（防回落直连）；凭据不串层；argv 只有本地中继；`stop` 后端口查不到 LISTEN；单跳认证回归。测试**不读也不写用户注册表**（`readSystemProxy(overrides)` 注入）。
 
+### 会话恢复（差距清单第 5 条，0.4.1）
+
+**要什么**：环境重启后，上次开着的那些标签**自己回来**。对手是往自家内核配置 `StaticConfig.RestoreLastSession = true` 塞（逆向 `03b` L236）；我们**没有内核改造能力**，走 Chrome 自己的两样东西。这是**我们的实现、不是复刻**：语义一样（对用户强制开启），落点不一样。
+
+| 落点 | 干什么 | 代码 |
+|---|---|---|
+| `<userdata>/Default/Preferences` 的 `session.restore_on_startup = 1` | 语义载体：「继续浏览上次打开的网页」。用户打开设置页看到的就是这一项 | `src/runtime/prefs.js`（`ensureRestoreOnStartup`） |
+| 命令行 `--restore-last-session` | **真正让它执行的那一半**（见下面实测） | `src/kernel/chrome.js`（`buildArgs`） |
+
+**为什么要两样（实测，不是猜）**：2026-11-13 用**裸 Chrome 157.0.8103.78 + 同一套 argv** 跑了两次独立探针 —— 只写 Preferences 的 `restore_on_startup=1`，重启后**不恢复**：`Default/Sessions/Session_*`、`Tabs_*` 都在，`profile.exit_type` 是 `Normal`，Preferences 里那个值也还是 1，但页面就是没回来；加上 `--restore-last-session` 之后，两个页**按 URL 回来了**。所以两个都留着：删 flag 就不恢复，删 prefs 就变成「命令行偷偷恢复、设置页里却写着打开新标签页」。
+
+**Preferences 的四条硬规矩**（都是会毁用户数据的坑）：
+
+1. **读-改-写，绝不整体覆盖**：`Preferences` 是 Chrome 自己的大 JSON（几十个顶层键），整份盖掉等于清掉用户的设置、扩展状态、实验开关。这里只碰 `session.restore_on_startup`，其它键**原样保留**（连顺序都不动）。
+2. **原子写**：先写 `Preferences.fp-tmp` 再 `rename`。崩在写一半，正式文件要么是旧版、要么是新版，不可能是半截 JSON。
+3. **坏文件先备份再写**：不是合法 JSON（或顶层不是对象）时，先改名成 `Preferences.corrupt-<时间戳>`，**不吞掉**用户的文件，再写新文件 —— 同时在 `warnings` 里点名。
+4. **幂等**：已经是 1 就**一个字节都不动**（不写、mtime 不变）。
+
+**强制开启的语义（照实说）**：每次启动都会把值顶成 1。用户在 Chrome 里手动改回「打开新标签页」，下次启动会被改回来 —— 和对手强制写内核配置是同一个语义。不想这样的话，只能等以后加开关（本轮不做）。
+
+**判据**（A 层 4 条进 `npm test`，B 层 4 条进 `npm run smoke`）：
+
+```
+npm test        → unit 84（会话恢复 4 条：合并只动一个键且未知键一个不少 / 坏 JSON 先备份再写 / 幂等不写盘（mtime 不变） / 原子写不留 .fp-tmp）
+npm run smoke   → session-restore 4/4（真内核真重启）
+```
+
+B 层那四条为什么必须真机：**`Preferences` 里写着 1 不等于恢复成功**，它只是「告诉了 Chrome 要恢复」。所以 `test/session-restore.test.mjs` 走的是完整链路 —— 起环境 → 用 CDP 开两个不同 URL 的页 → 正常 `stop`（优雅 `Browser.close`，让 Chrome 把 session 落盘）→ 再 `start` → 用 `Target.getTargets` **按 URL** 认那两个页回没回来。**不数标签个数**：新标签页本身就能凑够 2，那样是假绿。另外三条：启动前 Preferences 真的落了 1、第一次启动两个页都在（正例，防「本来就打不开」）、用户手动改回 5 后下次启动被顶回 1。
+
 ### 回收站：软删除 + 两条路由（2026-11-12 第一批 ②）
 
 **语义**：`browser-profile/delete` 从「停内核 + 删盘 + 删记录」改成**软删除** —— 只写 `deleted_at`，**user-data 目录原样留在盘上**。理由一句话：回收站里的环境恢复后必须是**能直接启动的原环境**，删了盘就恢复出一个空壳，「回收站」三个字也就成了骗人。彻底清理是另一套语义（`purge`），**本轮不实现、也不出现在这两条路由里**。
@@ -934,7 +963,7 @@ web/
   pages/selfcheck.js   自检报告
   pages/agent.js       AI Agent 面板：选环境 → 目标 → 生成 → 逐条批准 → 运行 → 每步结果（含截图票据链接）
 test/smoke.mjs         端到端冒烟（152 项，需真实 Chrome）
-test/unit.test.mjs     零 Chrome 单元测试（78 项）
+test/unit.test.mjs     零 Chrome 单元测试（84 项）
 test/api.test.mjs      本地 API 契约测试（100 项，不需要 Chrome）
 test/net-rules.test.mjs  网络规则匹配逻辑单测（38 项，不需要 Chrome）
 test/recycle.test.mjs  回收站数据层 + 两条路由（44 项，含重启读库）
@@ -946,6 +975,7 @@ test/workers.test.mjs  双 Realm 真机验证（24 项：三类 worker + 嵌套 
 test/agent.test.mjs    AI Agent 判定门 A 层（15 项，假 CDP / 纯函数 / 本地 mock LLM，不启内核、不联网）
 test/agent-smoke.test.mjs  AI Agent 判定门 B 层（30 项，真内核：七动作 / 失败即停 / 超时 / 跑完不关浏览器 / 目标→工作流 e2e）
 test/kernel-download.test.mjs  内核下载判定门（43 项，本地假源，不联网：正常/长度不符/大小写/Firefox/幂等/断线/续传/停顿重连/并发/自检不一致/404 + 镜像回落 14 项 + CRC 3 项）
+test/session-restore.test.mjs  会话恢复真机判据（4 项：Preferences 落 1 / 两页都在 / 重启后按 URL 真恢复 / 用户改回 5 会被顶回 1）
 test/proxy-health.test.mjs  代理健康检查真机验证（15 项：四态 / 批量 / 只读 / 控制台）
 test/media-devices.test.mjs 媒体设备真机验证（P9-C，12 项：真实枚举 + 只改 label + toJSON + 按 kind 授权）
 test/speech.test.mjs   语音投影真机验证（P9-A，8 项）
@@ -1286,3 +1316,9 @@ FREEPOWER_KERNEL_DOWNLOAD_ATTEMPTS   续传最多重连几次（默认 12）
 - **没有下载队列/并发上限**：不同版本可以同时下（各占一个 `.tmp-*`），同一版本并发调用会并到同一个任务上（测试钉住了「假源只收到 1 次请求」）；
 - **下到的是原版 Chrome**：它的 `--version`、`chrome://version` 显示的就是 Google Chrome 本体，不是「FreePower 内核」—— 这是有意为之（见「有意差异」第 1 条）。
 - **内核目录必须可写可删**：Chromium 的沙箱要求内核目录与用户数据目录能正常建/删文件。实测把 kernels 放在带 `Everyone … Deny` 受限 ACL 的目录下时，内核会以 `STATUS_BREAKPOINT`（`0x80000003`）**秒退**、从不写 `DevToolsActivePort`；`start` 现在直接报「启动后立即退出（exit code 2147483651 / 0x80000003）」并给出这条提示，不再死等 20 s 才报一个误导性的超时。默认的 `%APPDATA%\FreePower\kernels` 没有这个问题。
+
+**会话恢复（差距清单第 5 条）的三条限制**：
+
+- **强制的、没有开关**：每次启动都把 `session.restore_on_startup` 顶成 1，用户手动改回去下次也会被改回来（和对手强制写内核配置同一语义）。想「让用户自己选」得另加字段，本轮不做；
+- **只恢复标签页，不恢复标签内的历史**：Chrome 的「继续浏览上次打开的网页」恢复的是上次开着的那些 URL，单个标签的前进/后退历史不在保证范围内；
+- **`Preferences` 写不上时不阻断启动**：写失败（权限、盘满）只在 `warnings` 里点名 `session`，内核照样起 —— 代价是那一轮不保证「继续上次会话」，不假装成功。

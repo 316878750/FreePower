@@ -19,6 +19,7 @@ import { probeEgressInBrowser } from '../proxy/egress.js';
 import { runSelfCheck } from '../selfcheck/index.js';
 import { summarize } from '../selfcheck/store.js';
 import { checkEgress } from '../../packages/profile/src/validate.js';
+import { ensureRestoreOnStartup, RESTORE_ON_STARTUP } from './prefs.js';
 
 /** profile_id -> instance */
 const running = new Map();
@@ -236,6 +237,20 @@ export async function startProfile(profile, { force = false, systemProxy = null 
       // 上一次运行留下的 DevToolsActivePort 会让本轮读到旧端口 → 连到一个已经死掉的端口。
       // 必须在新内核写文件之前删掉（重启同一环境的常见坑）。
       try { fs.rmSync(path.join(udd, 'DevToolsActivePort'), { force: true }); } catch { /* ignore */ }
+
+      // 3.0) 会话恢复（差距清单第 5 条）：每次启动都把 `session.restore_on_startup` 顶成 1。
+      //      **必须在起内核之前写** —— 内核一启动就会读 Preferences，写完再写就晚一轮。
+      //      读-改-写 + 原子写 + 坏文件先备份，幂等（已经是 1 就一个字节都不动）。
+      try {
+        const restored = ensureRestoreOnStartup(udd, { log: (m) => log(id, m) });
+        if (restored.backed_up) {
+          warnings.push(soft('session', `Preferences 不是合法 JSON，已备份为 ${path.basename(restored.backed_up)} 并重建（会话恢复已重新写入）`));
+        }
+        if (restored.changed) log(id, '会话恢复', `session.restore_on_startup=${RESTORE_ON_STARTUP}`, restored.created ? '（新建）' : '（改写）');
+      } catch (e) {
+        // 写不上不阻断启动：内核自己会建 Preferences，只是这轮不保证「继续上次会话」
+        warnings.push(soft('session', `会话恢复设置失败：${e.message}`));
+      }
 
       built = buildArgs(effective, {
         userDataDir: udd,

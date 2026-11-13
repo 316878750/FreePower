@@ -223,6 +223,15 @@ export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, use
     `--disable-features=${[...new Set(disableFeatures)].join(',')}`,
     '--disable-search-engine-choice-screen',
     '--hide-crash-restore-bubble',
+    // 会话恢复（差距清单第 5 条）：这条 flag 是**真正起作用的那一半**。
+    // 实测（2026-11-13，Chrome 157.0.8103.78，裸 Chrome + 同一套 argv，两次独立探针）：
+    // 只把 `Default/Preferences` 的 `session.restore_on_startup` 写成 1 → 重启后**不恢复**
+    // （`Sessions/Session_*`/`Tabs_*` 都在、`profile.exit_type` 是 `Normal`、Preferences 里值仍是 1）；
+    // 加上 `--restore-last-session` → 两个页**按 URL 回来了**。
+    // 所以两件一起做：`src/runtime/prefs.js` 负责把设置项写成 1（语义载体、用户看得见），
+    // 这条 flag 负责让 157 真的执行。别删其中任何一个 —— 删 flag 就不恢复，删 prefs 就变成
+    // 「命令行偷偷恢复、设置页里却写着打开新标签页」。
+    '--restore-last-session',
     // 2D canvas 固定走软件光栅化：GPU 2D canvas 在「全新 profile 首次启动」和之后的启动之间
     // 会给出不同的抗锯齿/渐变像素（实测 raw PNG 都不同），跨会话就是「你换了设备」。
     // 代价：chrome://gpu 里 Canvas 显示 Software only，重 canvas 场景略慢。见 README 已知限制。
