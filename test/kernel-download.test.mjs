@@ -193,9 +193,9 @@ const server = http.createServer((req, res) => {
   /* ---------- 镜像那批用的端点（官方侧） ---------- */
   // 官方「卡死」：整包 GET **一个字节都不给**（客户端靠 stall 检测断开 → 判定这一源不可用 → 换镜像）；
   // 但 HEAD 与 Range 正常 —— 因为装之前的交叉核验要用官方 URL 抽段比对。
-  const officialSlow = /^\/slow-official\/([\d.]+)\/win64\/chrome-win64\.zip$/.exec(p);
+  const officialSlow = /^\/(slow-official|refused-official)\/([\d.]+)\/win64\/chrome-win64\.zip$/.exec(p);
   if (officialSlow) {
-    const z = zipFor(officialSlow[1]);
+    const z = zipFor(officialSlow[2]);
     if (req.method === 'HEAD') {
       res.writeHead(200, { 'content-type': 'application/zip', 'content-length': z.length });
       res.end();
@@ -770,6 +770,64 @@ try {
   check('FREEPOWER_KERNEL_MIRROR=off：官方卡死 → 失败，且**一次镜像请求都没发**',
     r14.code === 0 && !!f14 && mh14.length === 0 && !fs.existsSync(path.join(KERNELS_DIR, V14)),
     `${f14?.reason} 镜像请求 ${mh14.length} 次`);
+
+  /* ---------------------------------------------------------------------------
+   * 零字节不算成功（巡检 2026-11-13 ②）—— 两条：
+   *   ① 官方**整包 GET** 在连接层被拒（ECONNREFUSED、零字节）+ 镜像健康 → 必须切源装好；
+   *      旧代码 `giveUpOn` 只认 `download_stalled`，这条路永远不换源。
+   *   ② 镜像关掉 + 官方连接层全挂 → 失败原因必须是下载层的 `download_interrupted`，
+   *      **不许**退化成「文件不存在」（旧代码 0 字节当成功，最后 `ENOENT: …chrome-win64.zip`）。
+   * 官方 HEAD / Range 仍走真本地假源：装之前还得拿官方字节核验镜像，这是设计（没有证据不装）。
+   * ------------------------------------------------------------------------- */
+  const refuseWholeGet = (realFetch) => async (url, init = {}) => {
+    const u = String(url);
+    const isRange = !!init?.headers?.range;
+    const isHead = String(init?.method || 'GET').toUpperCase() === 'HEAD';
+    if (u.includes('/refused-official/') && !isRange && !isHead) {
+      const e = new TypeError('fetch failed');
+      e.cause = { code: 'ECONNREFUSED' };
+      throw e;
+    }
+    return realFetch(url, init);
+  };
+  const V20 = '157.0.9021.21';
+  let inst20 = null;
+  let err20 = null;
+  try {
+    inst20 = await installKernel(
+      { version: V20, url: `${BASE}/refused-official/${V20}/win64/chrome-win64.zip`, platform: 'win64' },
+      {
+        root: KERNELS_DIR, fetchImpl: refuseWholeGet(fetch), verifyExe: hooks.verifyExe,
+        mirrorBase: `${BASE}/mirror-ok`, stallMs: 700, maxAttempts: 2, verifyChunk: 400,
+      },
+    );
+  } catch (e) { err20 = e; }
+  check('零字节：官方整包 GET 连接被拒（ECONNREFUSED）+ 镜像健康 → 切源装好（source=mirror）',
+    !err20 && inst20?.source === 'mirror' && inst20?.mirror_verified === true
+      && fs.existsSync(path.join(KERNELS_DIR, V20, 'chrome.exe')),
+    `${err20?.reason || inst20?.source} ${String(err20?.message || '').slice(0, 90)}`);
+
+  const allRefused = async (url, init) => {
+    if (String(url).includes('/dead-official/')) {
+      const e = new TypeError('fetch failed');
+      e.cause = { code: 'ECONNREFUSED' };
+      throw e;
+    }
+    return fetch(url, init);
+  };
+  const V21 = '157.0.9022.22';
+  let err21 = null;
+  try {
+    await installKernel(
+      { version: V21, url: `${BASE}/dead-official/${V21}/win64/chrome-win64.zip`, platform: 'win64' },
+      { root: KERNELS_DIR, fetchImpl: allRefused, verifyExe: hooks.verifyExe, mirrorBase: 'off', stallMs: 700, maxAttempts: 2 },
+    );
+  } catch (e) { err21 = e; }
+  check('零字节：镜像关 + 官方连接被拒 → 失败原因是 download_interrupted（不是 kernel_error、不是 ENOENT）',
+    /^download_(interrupted|timeout)$/.test(String(err21?.reason))
+      && !/ENOENT/.test(String(err21?.message))
+      && !fs.existsSync(path.join(KERNELS_DIR, V21)) && tmpLeftovers().length === 0,
+    `${err21?.reason} ${String(err21?.message || '').slice(0, 110)}`);
 
   /* M7 走官方时不带 mirror_verified，且 source=official（标记写进盘上） */
   const { readSourceMarker } = await import('../src/kernel/download.js');

@@ -512,10 +512,20 @@ export async function downloadToFile(url, zipPath, {
     }
   }
 
-  if (total > 0 && received < total) {
+  // **0 字节绝不算成功**（巡检 2026-11-13 ②）：原来是 `if (total > 0 && received < total) throw`，
+  // `total === 0`（连接层就挂了、从没拿到响应头）时直接走到 `return`，把「一个字节都没下到」当成功。
+  // 调用方随即拿着一个不存在的 zip 去解包，用户看到的是 `ENOENT: …chrome-win64.zip` ——
+  // 真正的原因（连接被拒 / 中断）被「文件不存在」盖掉了。
+  // 现在只有**真收到字节**且（没声明总长 | 收满）才算成功。
+  const complete = received > 0 && (total === 0 || received >= total);
+  if (!complete) {
+    // reason 用 `lastErr` 的，不要吞成 `kernel_error`：脚本要靠它区分超时 / 中断 / HTTP 错误
     const reason = lastErr?.reason === 'download_stalled' ? 'download_timeout' : (lastErr?.reason || 'download_interrupted');
+    const detail = received === 0
+      ? `一个字节都没收到（重连 ${attempts} 次）`
+      : `已收 ${received}/${total} 字节（重连 ${attempts} 次）`;
     throw new KernelError(
-      `内核包下载失败（重连 ${attempts} 次，已收 ${received}/${total} 字节）：${lastErr?.message || '未知原因'}`,
+      `内核包下载失败：${detail}：${lastErr?.message || '未知原因'}`,
       { reason, cause: lastErr },
     );
   }
@@ -565,9 +575,11 @@ export async function downloadFromSources(sources, zipPath, {
       const r = await downloadToFile(src.url, zipPath, {
         fetchImpl, timeoutMs, stallMs, maxAttempts, onProgress, deadline,
         giveUpOn: isLast ? null : (err, received) => {
-          // ① 零字节卡死；② 任何 HTTP 错误（404 也算 —— 官方没有这个包，镜像也许有，
+          // ① 零字节卡死 / 零字节中断（巡检 2026-11-13 ②：原来只认 `download_stalled`，
+          //    于是「官方 DNS/TLS/连接被拒」这种最常见的场面从来不换源）；
+          //    ② 任何 HTTP 错误（404 也算 —— 官方没有这个包，镜像也许有，
           //    但反过来「官方 500、镜像好」正是要救的场面）。**字节还在流时绝不换源。**
-          if (received === 0 && err?.reason === 'download_stalled') return true;
+          if (received === 0 && /^download_(stalled|interrupted)$/.test(String(err?.reason))) return true;
           if (/^download_http_\d+$/.test(String(err?.reason))) return true;
           return false;
         },
