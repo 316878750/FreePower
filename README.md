@@ -449,7 +449,7 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 **`do_not_track` 已从 idle 摘出（P2 ④）**：只有 `"true"` 做两半 —— 注入把 `navigator.doNotTrack` 固定成 `"1"`，会话级 `Network.setExtraHTTPHeaders({DNT:"1"})` 让文档与子资源带 `DNT: 1`；`"false"` / `"default"` 什么都不做（对手那边两者不可区分，别发明第三种状态）。两个坑写在这：① 不先 `Network.enable` 时 `setExtraHTTPHeaders` 返回 ok、却**一个请求都没改**（静默空转）；② `--enable-do-not-track` 在 `157.0.8103.78` 上实测无效（`navigator.doNotTrack` 仍是 `null`、请求也没带 DNT），没用它。**DNT 请求头这半是对手未证实、我们补的**（它的内核开关可能顺带改头，逆向没抓到）。
 
 42. **`disable_save_password='1'` 带来的存储弱化，和 `location` 存量环境的行为变化 —— 两条都得主动告诉用户**：
-   - **密码库**：这条字段会加 `--password-store=basic`，让 Chromium 的密码库**不走系统钥匙串**，落盘加密明显弱于系统 keychain（profile 目录被整份拷走、或同机别的进程能读那个目录时，理论上可解）。**这不是安全加固**：它做到的是「不弹保存条、不进系统钥匙串」，不是「密码更安全」。另一半如实说：`--password-store` 在 Chromium 里是密码库**后端选择**（Linux 口径），本机是 Windows，我们**没有证据**它在 Windows 上也改变 `Login Data` 的加密方式，也**没做**「存一个密码 → 拷走 profile → 解开」的复现。详见第八节 P2 表格上方那段。
+   - **密码库**：这条字段会加 `--password-store=basic`。**它是否让密码库变弱，我们在 Windows 上没有证据**（`--password-store` 是 Linux 那套后端选择，Windows 的 `Login Data` 走 DPAPI；也**没做**「存一个密码 → 拷走 profile → 解开」的复现）。**这不是安全加固**：它做到的是「不弹保存条、不走账号同步的密码存储」，不是「密码更安全」；反过来也别对用户保证「一定没影响」。详见第八节 P2 表格上方那段。
    - **定位**：`generate.js` 一直给每个环境写经纬度，而 `geoPolicy` 对**没有 `location` 字段的老环境**兜底 `ask`、`ask` 也覆盖坐标 —— 所以 **P2 之后起存量环境，只要记录里有经纬度就会真的下发 `Emulation.setGeolocationOverride`**，不需要用户改任何开关。这是修 bug（以前「填了坐标却不生效」），但确实是**行为变化**，别当成新功能才引入的。详见第八节 `location` 那节第 3 条。
 
 
@@ -646,11 +646,10 @@ npm run test:switches    # 真机开/关对照，19 项，需要真实 Chrome（
 
 P2 这批是「字段表里有名字、`src/` 里零消费」的第二轮补漏，**一个字段一个提交**，四条落完再一起推。顺序：① `disable_save_password` ② `automation_controlled` ③ `location` ④ `do_not_track`。
 
-> **`--password-store=basic` 的代价必须写在最前面（`disable_save_password='1'`）**：
-> 这条 flag 让 Chromium 的密码库**不走系统钥匙串**（Windows 上是 DPAPI + 凭据管理器那套），改用
-> Chromium 自己的弱后端 —— 落盘加密强度明显低于系统 keychain，**profile 目录被整份拷走（或同机
-> 别的进程能读那个目录）时可以解开**。也就是说：这个字段做到的是「不弹保存密码条、不进系统
-> 钥匙串」，**不是**「密码更安全」，用户别把它当安全加固。
+> **`--password-store=basic` 这条 flag 的定位（`disable_save_password='1'`）—— 先说不确定的那一半**：
+> 这个字段做到的是「不弹保存密码条、不走账号同步的密码存储」，**不是**「密码更安全」，
+> 用户别把它当安全加固。至于它会不会让密码库变弱，见下面这段 —— 我们在 Windows 上**没有证据**，
+> 所以两种说法都不写死。
 > 另一半要说清：`--password-store` 在 Chromium 里是**密码库后端选择**（Linux 上选 basic /
 > gnome-libsecret / kwallet 那个开关）。本机是 Windows，我们**没有证据**证明它在 Windows 上同样
 > 改变 `Login Data` 的加密方式，也**没做**「存一个密码 → 拷走 profile → 解开」的复现。
