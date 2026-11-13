@@ -452,6 +452,9 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
    - **密码库**：这条字段会加 `--password-store=basic`。**它是否让密码库变弱，我们在 Windows 上没有证据**（`--password-store` 是 Linux 那套后端选择，Windows 的 `Login Data` 走 DPAPI；也**没做**「存一个密码 → 拷走 profile → 解开」的复现）。**这不是安全加固**：它做到的是「不弹保存条、不走账号同步的密码存储」，不是「密码更安全」；反过来也别对用户保证「一定没影响」。详见第八节 P2 表格上方那段。
    - **定位**：`generate.js` 一直给每个环境写经纬度，而 `geoPolicy` 对**没有 `location` 字段的老环境**兜底 `ask`、`ask` 也覆盖坐标 —— 所以 **P2 之后起存量环境，只要记录里有经纬度就会真的下发 `Emulation.setGeolocationOverride`**，不需要用户改任何开关。这是修 bug（以前「填了坐标却不生效」），但确实是**行为变化**，别当成新功能才引入的。详见第八节 `location` 那节第 3 条。
 
+43. **打包后的 `FreePower.exe` 里带一个 `INTEGRITY/ELECTRONASAR` 资源，我们没开 fuse，所以它今天空转**：electron-builder 写进去的内容是 `[{"file":"resources\\app.asar","alg":"SHA256","value":"ba006f55…"}]`。0.4.0 实测这个值**不等于** `app.asar` 的 sha256 —— 全文件、`8+头长`、头 JSON、正文四种切法、共 6 种算法都对不上（rcedit 改版本资源前后该字符串逐字节一致，所以不是我们改坏的，是 electron-builder 自己的算法）。我们没有设 `electronFuses`，`EmbeddedAsarIntegrityValidation` 走 Electron 默认（**关**），所以**不影响启动**。**将来谁要开 asar 完整性 fuse，先把那个值和 `app.asar` 的 sha256 验到真的相等再开**，否则一开就是「启动即崩」。
+    另：`release\win-unpacked` 是给人当「安装包 payload 的参照物」用的，**每次打完包必须刷新成这一次 `--prepackaged` 用的那份**。0.4.0 出过一次它还是旧草稿、里面 `FreePower.exe` 的版本资源仍是 `Electron / 45.2.3` 的情况 —— 谁按「payload ↔ win-unpacked 逐文件比」去复核，比到的是错的参照物，还很可能会得出「版本资源没修好」的错结论。构建产物本体在 `%TEMP%\fp-rel3`，`release\` 下的这份是复制品。
+
 
 ## 八、验证
 
