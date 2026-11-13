@@ -5,6 +5,9 @@
  * 而 Node 内置只有 zlib、没有 zip 容器解析。这里只实现内核包真的会用到的那一小撮：
  *   中央目录 → 本地头 → `store`(0) / `deflate`(8) 两种方法 + CRC32 校验。
  *
+ * **只认中央目录那一份**：CRC / 压缩前尺寸都从中央目录读；本地头（LFH）里的 CRC 与尺寸**从不读**
+ * （LFH 在流式写出的包里常常是 0，读它等于给自己造假信号）。所以「校验」在这一层只有一处，别以为两处都查。
+ *
  * **明确不做（遇到就红，别静默糊过去）**：
  *   - 运行时没有 `zlib.crc32`（Node < 22.5）→ `zip_crc_unavailable`（**不跳过校验**）；
  *   - ZIP64（条目数 / 偏移 / 尺寸溢出 0xFFFF / 0xFFFFFFFF）→ `zip_zip64_unsupported`；
@@ -94,7 +97,14 @@ function safeRel(name) {
   return segs.join('/');
 }
 
-function entryData(buf, e) {
+/**
+ * 取一个条目的解压数据。
+ *
+ * `maxOutputLength`（**解压时**的输出上限）不是可选项：没有它，一个 200 MB 的零字节炸弹
+ * 会先老老实实在内存里长到 200 MB，再被尺寸/CRC 判据抓到 —— 判据对了，进程已经炸了。
+ * 传进 `zlib.inflateRawSync` 后，超限在**灌数据的过程中**就抛 `ERR_BUFFER_TOO_LARGE`。
+ */
+function entryData(buf, e, { maxOutputLength } = {}) {
   if (e.flags & 0x1) throw new ZipError(`ZIP 条目被加密：${e.name}`, { reason: 'zip_encrypted' });
   const p = e.localOffset;
   if (p + 30 > buf.length || buf.readUInt32LE(p) !== LFH_SIG) {
@@ -109,8 +119,15 @@ function entryData(buf, e) {
   if (e.method === 0) return Buffer.from(raw);
   if (e.method === 8) {
     try {
-      return zlib.inflateRawSync(raw);
+      return zlib.inflateRawSync(raw, { maxOutputLength });
     } catch (err) {
+      // 超上限在**解压时**就抛（不是解完再比长度）
+      if (err?.code === 'ERR_BUFFER_TOO_LARGE' || /larger than|maxOutputLength/i.test(String(err?.message))) {
+        throw new ZipError(
+          `条目解压后超过上限（上限 ${maxOutputLength} 字节）：${e.name}`,
+          { reason: 'zip_too_large' },
+        );
+      }
       throw new ZipError(`解压失败（${e.name}）：${err.message}`, { reason: 'zip_inflate_failed' });
     }
   }
@@ -132,13 +149,15 @@ export function extractZipBuffer(buf, destDir, { flatten = true, maxBytes = ZIP_
   const entries = readZipEntries(buf);
   const files = [];
   const dirs = new Set();
+  // `total` 只是**按中央目录声明值**算的预检（便宜、能在写盘前就拦住一份明显超标的包）；
+  // 真正的上限在下面按**实际解压出来的字节**再算一次 —— 声明值是包自己写的，不能当预算依据。
   let total = 0;
   for (const e of entries) {
     const rel = safeRel(e.name);
     if (!rel) { dirs.add(e.name); continue; }
     total += e.usize;
     if (total > maxBytes) {
-      throw new ZipError(`解压后总量超过上限（${maxBytes} 字节），拒绝继续`, { reason: 'zip_too_large' });
+      throw new ZipError(`解压后总量超过上限（${maxBytes} 字节，按中央目录声明值预检），拒绝继续`, { reason: 'zip_too_large' });
     }
     files.push({ rel, entry: e });
   }
@@ -166,26 +185,49 @@ export function extractZipBuffer(buf, destDir, { flatten = true, maxBytes = ZIP_
   }
 
   const root = path.resolve(destDir);
+  const existedBefore = fs.existsSync(root);
   fs.mkdirSync(root, { recursive: true });
   const written = [];
-  for (const { rel, entry } of files) {
-    const outRel = stripped ? rel.slice(stripped.length + 1) : rel;
-    const out = path.resolve(root, ...outRel.split('/'));
-    if (out !== root && !out.startsWith(root + path.sep)) {
-      throw new ZipError(`ZIP 条目越出解压目录：${rel}`, { reason: 'zip_unsafe_path' });
+  let actualBytes = 0;
+  try {
+    for (const { rel, entry } of files) {
+      const outRel = stripped ? rel.slice(stripped.length + 1) : rel;
+      const out = path.resolve(root, ...outRel.split('/'));
+      if (out !== root && !out.startsWith(root + path.sep)) {
+        throw new ZipError(`ZIP 条目越出解压目录：${rel}`, { reason: 'zip_unsafe_path' });
+      }
+      // 单条目解压上限 = 剩余预算；压缩炸弹在 inflate 过程中就被掐断，不会先长到 GB 级再判
+      const data = entryData(buf, entry, { maxOutputLength: Math.max(1, maxBytes - actualBytes) });
+      // **无条件比对**（巡检 2026-11-13 ①）：原来的 `entry.usize !== 0 &&` 等于「声明 0 就豁免」，
+      // 一个声明 `usize=0`、实际 1 MB 的条目能整条跳过长度校验 —— 典型的 fail-open。
+      if (data.length !== entry.usize) {
+        throw new ZipError(`条目长度不符：${rel}（中央目录写 ${entry.usize}，实际 ${data.length}）`, { reason: 'zip_size_mismatch' });
+      }
+      // 上限按**真实解压量**算（`:139` 那个只是按声明值的预检，声明可以撒谎）
+      actualBytes += data.length;
+      if (actualBytes > maxBytes) {
+        throw new ZipError(`解压后实际总量超过上限（${maxBytes} 字节），拒绝继续`, { reason: 'zip_too_large' });
+      }
+      // CRC32：**每个条目都校验**（可用性在上面统一把过关，这里不再静默跳过）
+      const got = zlib.crc32(data) >>> 0;
+      if (got !== (entry.crc >>> 0)) throw new ZipError(`CRC 不符：${rel}`, { reason: 'zip_crc_mismatch' });
+      fs.mkdirSync(path.dirname(out), { recursive: true });
+      fs.writeFileSync(out, data);
+      written.push(outRel);
     }
-    const data = entryData(buf, entry);
-    if (entry.usize !== 0 && data.length !== entry.usize) {
-      throw new ZipError(`条目长度不符：${rel}（头写 ${entry.usize}，实际 ${data.length}）`, { reason: 'zip_size_mismatch' });
+  } catch (e) {
+    // 失败时把这一次已经写出去的清掉：**盘上不留半个包**（内核安装本来就该「要么整份，要么没有」）
+    for (const rel of written) {
+      try { fs.rmSync(path.resolve(root, ...rel.split('/')), { force: true }); } catch { /* 清不掉就留给调用方 */ }
     }
-    // CRC32：**每个条目都校验**（可用性在上面统一把过关，这里不再静默跳过）
-    const got = zlib.crc32(data) >>> 0;
-    if (got !== (entry.crc >>> 0)) throw new ZipError(`CRC 不符：${rel}`, { reason: 'zip_crc_mismatch' });
-    fs.mkdirSync(path.dirname(out), { recursive: true });
-    fs.writeFileSync(out, data);
-    written.push(outRel);
+    // 目录是我们建的就连目录一起删（调用方传进来的已有目录不动）
+    if (!existedBefore) {
+      try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* 同上 */ }
+    }
+    throw e;
   }
-  return { files: written, bytes: total, stripped };
+  // 返回**实际解压量**，不是中央目录声明的那个数
+  return { files: written, bytes: actualBytes, stripped };
 }
 
 /** 从磁盘上的 zip 文件解包（内核下载用这个） */

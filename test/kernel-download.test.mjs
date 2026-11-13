@@ -106,6 +106,58 @@ function zeroCdCrc(buf) {
   return out;
 }
 
+/** 把中央目录里第一条的**压缩前尺寸**改写成给定值（数据、CRC、压缩后长度都不动） */
+function setCdUsize(buf, usize) {
+  const out = Buffer.from(buf);
+  let i = out.length - 22;
+  for (; i >= 0; i -= 1) if (out.readUInt32LE(i) === 0x06054b50) break;
+  const cdOffset = out.readUInt32LE(i + 16);
+  out.writeUInt32LE(usize, cdOffset + 24);
+  return out;
+}
+
+/**
+ * 造**单个 deflate 条目**的 zip（`makeZip` 只会 store）。
+ * `declaredUsize` 用来让「中央目录声明的尺寸」和「真解出来多大」不一致 —— 压缩炸弹就是这么来的。
+ */
+function makeDeflatedZip(name, data, { declaredUsize = null } = {}) {
+  const raw = zlib.deflateRawSync(data);
+  const nameBuf = Buffer.from(name, 'utf8');
+  const crc = zlib.crc32(data) >>> 0;
+  const lfh = Buffer.alloc(30);
+  lfh.writeUInt32LE(0x04034b50, 0);
+  lfh.writeUInt16LE(20, 4);
+  lfh.writeUInt16LE(0, 6);
+  lfh.writeUInt16LE(8, 8); // method：deflate
+  lfh.writeUInt32LE(crc, 14);
+  lfh.writeUInt32LE(raw.length, 18);
+  lfh.writeUInt32LE(data.length, 22);
+  lfh.writeUInt16LE(nameBuf.length, 26);
+  lfh.writeUInt16LE(0, 28);
+
+  const cd = Buffer.alloc(46);
+  cd.writeUInt32LE(0x02014b50, 0);
+  cd.writeUInt16LE(20, 4);
+  cd.writeUInt16LE(20, 6);
+  cd.writeUInt16LE(0, 8);
+  cd.writeUInt16LE(8, 10);
+  cd.writeUInt32LE(crc, 16);
+  cd.writeUInt32LE(raw.length, 20);
+  cd.writeUInt32LE(declaredUsize == null ? data.length : declaredUsize, 24);
+  cd.writeUInt16LE(nameBuf.length, 28);
+  cd.writeUInt32LE(0, 42);
+
+  const cdBuf = Buffer.concat([cd, nameBuf]);
+  const body = Buffer.concat([lfh, nameBuf, raw]);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(1, 8);
+  eocd.writeUInt16LE(1, 10);
+  eocd.writeUInt32LE(cdBuf.length, 12);
+  eocd.writeUInt32LE(body.length, 16);
+  return Buffer.concat([body, cdBuf, eocd]);
+}
+
 /* ------------------------------ 假源 ------------------------------ */
 
 const zips = new Map();
@@ -823,6 +875,47 @@ try {
   check('CRC：运行时没有 zlib.crc32 → 直接拒解（zip_crc_unavailable），不静默跳过',
     noCrc?.reason === 'zip_crc_unavailable' && typeof zlib.crc32 === 'function',
     `${noCrc?.reason || '没抛'} / 恢复后 crc32=${typeof zlib.crc32}`);
+
+  /* ---------------------------------------------------------------------------
+   * 尺寸三条（0.4.1 补，CEO 2026-11-13 授权加）：`src/kernel/zip.js` 原先
+   *   `:178 if (entry.usize !== 0 && data.length !== entry.usize)`  —— 声明 0 就**豁免长度校验**；
+   *   `:139 total += e.usize`                                       —— 上限按**声明值**累加，可以撒谎绕过；
+   *   `:112 zlib.inflateRawSync(raw)`                               —— 解压时没有输出上限，炸弹先涨满内存。
+   * 三条判据分别打这三个洞，全部用本地现造的 zip，不走网络。
+   * ------------------------------------------------------------------------- */
+  const { extractZipBuffer: unzipOnly } = await import('../src/kernel/zip.js');
+
+  // ① 声明 usize=0、实际 1 MB：旧代码因为 `!== 0` 豁免直接放行
+  const zeroUsizeZip = setCdUsize(makeZip({ 'chrome-win64/chrome.exe': Buffer.alloc(1024 * 1024, 9) }), 0);
+  const dirZero = path.join(dataDir, 'zip-usize0');
+  let eZero = null;
+  try { unzipOnly(zeroUsizeZip, dirZero, { flatten: true }); } catch (e) { eZero = e; }
+  check('尺寸：中央目录声明 usize=0、实际 1 MB → zip_size_mismatch，且盘上一个文件都不留',
+    eZero?.reason === 'zip_size_mismatch' && !fs.existsSync(dirZero)
+      && fs.readdirSync(dataDir).every((n) => n !== 'zip-usize0'),
+    `${eZero?.reason || '没抛'} ${(eZero?.message || '').slice(0, 80)}`);
+
+  // ② 声明 = 实际，但单个条目就超过 maxBytes：上限不是只看声明，实际量也要算
+  const bigZip = makeZip({ 'chrome-win64/chrome.exe': Buffer.alloc(300 * 1024, 5) });
+  const dirBig = path.join(dataDir, 'zip-toolarge');
+  let eBig = null;
+  try { unzipOnly(bigZip, dirBig, { flatten: true, maxBytes: 200 * 1024 }); } catch (e) { eBig = e; }
+  check('尺寸：单个条目声明=实际=300 KB、maxBytes=200 KB → zip_too_large，不留目录',
+    eBig?.reason === 'zip_too_large' && !fs.existsSync(dirBig),
+    `${eBig?.reason || '没抛'} ${(eBig?.message || '').slice(0, 80)}`);
+
+  // ③ 压缩炸弹：200 MB 零字节压成 ~200 KB，且中央目录**撒谎**说只有 1 KB（绕开按声明值的预检）
+  const bombZip = makeDeflatedZip('chrome-win64/chrome.exe', Buffer.alloc(200 * 1024 * 1024, 0), { declaredUsize: 1024 });
+  const dirBomb = path.join(dataDir, 'zip-bomb');
+  const rssBefore = process.memoryUsage().rss;
+  let eBomb = null;
+  const tBomb = Date.now();
+  try { unzipOnly(bombZip, dirBomb, { flatten: true, maxBytes: 1024 * 1024 }); } catch (e) { eBomb = e; }
+  const rssDeltaMb = Math.round((process.memoryUsage().rss - rssBefore) / 1048576);
+  const bombMs = Date.now() - tBomb;
+  check('尺寸：200 MB 零字节炸弹（压成 ~200 KB、中央目录谎报 1 KB）→ 解压时被 maxOutputLength 掐断，内存不炸',
+    eBomb?.reason === 'zip_too_large' && !fs.existsSync(dirBomb) && rssDeltaMb < 96,
+    `${eBomb?.reason || '没抛'} 用时 ${bombMs}ms RSS +${rssDeltaMb}MB`);
 
   /* ---------------------------------------------------------------------------
    * 巡检五条（2026-11-13，CEO 核过）—— 判据钉在这里：
