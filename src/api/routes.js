@@ -38,6 +38,7 @@ import { renderHtml } from '../selfcheck/html.js';
 import { issueTicket } from './tickets.js';
 import { listKernels } from '../kernel/chrome.js';
 import { createWorkflow, getWorkflow, approveStep, presentWorkflow, runWorkflow, assertWorkflowRunnable } from '../agent/workflow.js';
+import { planTasksFromGoal } from '../agent/llm.js';
 import { createCli } from '../agent/cli.js';
 import { API_PORT } from '../config.js';
 import { toCanonical, toV2 } from '../../packages/profile/src/aliases.js';
@@ -685,19 +686,38 @@ export function buildRoutes() {
    * 三条路由都是**我们自己的契约**（对手没有可抄的本地 REST：它是 5.3 MB Agent Core 子进程
    * + `ws://127.0.0.1:<port>/agent/socket` 的 4 条 WS 指令，逆向 `24-` §3.2）。
    * 所以这里的形状不定"对齐对手"，定"脚本能编排 + 人能在控制台批"：
+   *   POST create-from-goal  一句话目标 → 调用户自己的模型 → 建工作流（不启动浏览器）
    *   POST run      建工作流（解析 DSL、算每步审批 digest），**不启动浏览器**
-   *   GET  status   读状态（骨架版永远到不了 completed，因为执行器未接）
+   *   GET  status   读状态与每步结果（执行器是本地 CDP，见 workflow.js）
    *   POST approve  HITL 批/拒一步；**不给 decision 就是拒**（默认拒）
    */
 
-  /** 把 agent 层的错误（带数字 code / field）统一转成 ApiError，不发明新码 */
+  /**
+   * 把 agent 层的错误（带数字 code / field）统一转成 ApiError，不发明新码。
+   * `reason` 只在错误自带时透出（`llm_*` / `execution_*` 这类稳定标识），方便脚本/控制台定位
+   * —— 响应形状只增不改。
+   */
+  const agentFail = (e) => {
+    if (e instanceof ApiError) return e;
+    const code = Number.isFinite(e?.code) ? e.code : ERR.GENERIC;
+    const extra = {};
+    if (e?.field) extra.field = e.field;
+    if (e?.reason) extra.reason = String(e.reason);
+    return new ApiError(code, e?.message || 'agent error', 200, extra);
+  };
   const agentCall = (fn) => {
     try {
       return fn();
     } catch (e) {
-      if (e instanceof ApiError) throw e;
-      const code = Number.isFinite(e?.code) ? e.code : ERR.GENERIC;
-      throw new ApiError(code, e?.message || 'agent error', 200, e?.field ? { field: e.field } : {});
+      throw agentFail(e);
+    }
+  };
+  /** 异步版（LLM 调用要等网络）：错误映射与 `agentCall` 完全一致，别写两套口径 */
+  const agentCallAsync = async (fn) => {
+    try {
+      return await fn();
+    } catch (e) {
+      throw agentFail(e);
     }
   };
 
@@ -720,6 +740,32 @@ export function buildRoutes() {
   add(['POST'], ['/api/v1/agent/workflow/:id/approve'], (ctx) => {
     const b = ctx.body || {};
     const wf = agentCall(() => approveStep(ctx.params?.id, { step_id: b.step_id, decision: b.decision, digest: b.digest }));
+    return ok(presentWorkflow(wf));
+  });
+
+  /**
+   * 一句话目标 → 工作流：调**用户自己配的**模型，把 goal 拆成 `browser_task` 数组，
+   * 直接落成全部 `pending_approval` 的工作流（每步 digest 生成即算，见 `createWorkflow`）。
+   *
+   * 与 `POST run` 的区别：那个收**已写好的 tasks**，这个收**一句话目标**。
+   * LLM 三样（endpoint/key/model）显式参数优先，否则走 `AGENT_LLM_*`；配不齐 = 100002 field=llm。
+   * **不在这里执行、不启动浏览器**：生成只是提案，跑不跑由人一步步批。
+   * 环境存在性先查：别让工作流挂在不存在的环境上（模型调用也不该为它花钱）。
+   */
+  add(['POST'], ['/api/v1/agent/workflow/create-from-goal'], async (ctx) => {
+    const b = ctx.body || {};
+    const pid = String(b.profile_id ?? '').trim();
+    if (!pid) throw new ApiError(ERR.INVALID, 'profile_id is required', 200, { field: 'profile_id' });
+    if (b.llm !== undefined && (!b.llm || typeof b.llm !== 'object' || Array.isArray(b.llm))) {
+      throw new ApiError(ERR.INVALID, 'llm must be an object {endpoint,key,model}', 200, { field: 'llm' });
+    }
+    const goal = String(b.goal ?? '').trim();
+    if (!goal) throw new ApiError(ERR.INVALID, 'goal is required', 200, { field: 'goal' });
+    if (!getProfile(pid)) throw new ApiError(ERR.NOT_FOUND, 'Profile does not exist');
+
+    // 模型产出 → 校验后的 tasks（未知动作/字段在这里就 100002，带 tasks[i].x）
+    const plan = await agentCallAsync(() => planTasksFromGoal(b.llm || {}, { goal }));
+    const wf = agentCall(() => createWorkflow({ profile_id: pid, goal, tasks: plan.tasks }));
     return ok(presentWorkflow(wf));
   });
 
