@@ -733,9 +733,12 @@ async function injectAndOpen(instance, profile, view) {
    * 启动时 Chrome 自带的那张空白页在 setAutoAttach 之前就存在，脚本已经跑过一轮。
    * 对这类「已有页面」：先装配，再重载一次让 addScriptToEvaluateOnNewDocument 生效。
    * 不处理它就是「首帧原始指纹」的漏点。
+   *
+   * 入参是**启动那一刻抓的** page 目标（见下面 initialTargets）：只抓一次，两处复用 ——
+   *   ① 本函数装已有页面；
+   *   ② 判断「这次是不是从上次会话恢复回来的」。
    */
-  async function prepareExistingTabs() {
-    const { targetInfos } = await client.send('Target.getTargets').catch(() => ({ targetInfos: [] }));
+  async function prepareExistingTabs(targetInfos) {
     for (const t of targetInfos.filter((x) => x.type === 'page')) {
       const entry = pageReady.get(t.targetId) || await waitFor(() => pageReady.get(t.targetId), 3000);
       if (!entry) continue;
@@ -745,22 +748,39 @@ async function injectAndOpen(instance, profile, view) {
       }
     }
   }
-  await prepareExistingTabs();
+  const initialTargets = (await client.send('Target.getTargets').catch(() => ({ targetInfos: [] }))).targetInfos || [];
+  await prepareExistingTabs(initialTargets);
 
-  const urls = Array.isArray(profile.open_urls) && profile.open_urls.length ? profile.open_urls : ['about:blank'];
-  for (const url of urls) {
-    const { targetId } = await client.send('Target.createTarget', { url: 'about:blank' });
-    const entry = pageReady.get(targetId) || await waitFor(() => pageReady.get(targetId), 5000);
-    if (entry) await entry.prep.catch(() => {});
-    if (url && url !== 'about:blank') {
-      const sessionId = entry?.sessionId || await sessionForTarget(client, targetId);
-      if (sessionId) {
-        await client.send('Page.navigate', { url }, sessionId)
-          .catch((e) => log(profileId, 'navigate 失败', url, e.message));
+  // 会话恢复（0.4.1 起每次启动强制开，见 runtime/prefs.js）会把上次的标签带回来。
+  // 这时候再按 open_urls 新建，就是「每次启动 = 恢复 N 张 + 新建 M 张」，越积越多（0.4.0 的回归）。
+  // 与 Chrome 自己的语义一致：「继续浏览上次打开的网页」时启动页本来就不生效。
+  //
+  // 判定只认**真页面**：about:blank 与 chrome://newtab 不算恢复（那是「上次把标签全关了」或者
+  // 「内核没恢复出东西」的情况）—— 那两种都退回按 open_urls 开页。取舍写在 README：
+  // 宁可多开一次，也不要「恢复了却什么都不开」。
+  const restored = initialTargets.filter((t) => t.type === 'page'
+    && t.url
+    && !t.url.startsWith('about:blank')
+    && !t.url.startsWith('chrome://newtab'));
+
+  if (restored.length > 0) {
+    log(profileId, '会话已恢复', `${restored.length} 个页面，跳过 open_urls（否则每次启动多一张）`);
+  } else {
+    const urls = Array.isArray(profile.open_urls) && profile.open_urls.length ? profile.open_urls : ['about:blank'];
+    for (const url of urls) {
+      const { targetId } = await client.send('Target.createTarget', { url: 'about:blank' });
+      const entry = pageReady.get(targetId) || await waitFor(() => pageReady.get(targetId), 5000);
+      if (entry) await entry.prep.catch(() => {});
+      if (url && url !== 'about:blank') {
+        const sessionId = entry?.sessionId || await sessionForTarget(client, targetId);
+        if (sessionId) {
+          await client.send('Page.navigate', { url }, sessionId)
+            .catch((e) => log(profileId, 'navigate 失败', url, e.message));
+        }
+      } else if (entry) {
+        // 空白页不会再有新文档，补一次重载让注入脚本跑上
+        await ensureInjected(client, entry.sessionId);
       }
-    } else if (entry) {
-      // 空白页不会再有新文档，补一次重载让注入脚本跑上
-      await ensureInjected(client, entry.sessionId);
     }
   }
 

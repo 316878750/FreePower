@@ -37,7 +37,7 @@ function check(name, ok, detail = '') {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const { startProfile, stopProfile, getInstance } = await import('../src/runtime/manager.js');
-const { createProfile, getProfile } = await import('../src/store/profiles.js');
+const { createProfile, getProfile, deleteProfiles } = await import('../src/store/profiles.js');
 const { findChrome, killProcessTree } = await import('../src/kernel/chrome.js');
 const { prefsPathOf } = await import('../src/runtime/prefs.js');
 const { closeDb } = await import('../src/store/db.js');
@@ -133,6 +133,51 @@ try {
     `改前 5 → 启动后 ${JSON.stringify(prefs3?.session?.restore_on_startup)}`);
 
   await stopProfile(id);
+
+  /* ---------- 启动标签不累积（0.4.1 修的是 0.4.0 的回归） ---------- */
+  /*
+   * 一句话判据：`open_urls` 里那个地址，**连起三次都只能有 1 张**。
+   * 改动前（334ac5d 带进来的）：会话恢复把上次的标签带回来，启动流程又无条件按 open_urls
+   * 新建一张，于是第 2 次启动 2 张、第 3 次 3 张，越积越多。
+   *
+   * 三条边界都在这条判据里：
+   *   - 第 1 轮 = **首次启动（没有 session）** → 会话恢复不出东西 → open_urls 必须照常生效（对照）；
+   *   - 第 2/3 轮 = 恢复成功的路径 → 不能再按 open_urls 新建；
+   *   - 「恢复失败退回老行为」不单独造场景（造不出来也验不准），由第 1 轮同一个代码分支覆盖。
+   */
+  const staged = createProfile({
+    name: `p-tabs-${Date.now()}`, group_id: '0', open_urls: [`${origin}/a`], remark: '启动标签不累积',
+  });
+  const stagedId = staged.profile_id;
+  const counts = [];
+  try {
+    for (let round = 1; round <= 3; round++) {
+      await startProfile(getProfile(stagedId));
+      const sInst = getInstance(stagedId);
+      const countA = async () => (await pageUrls(sInst).catch(() => [])).filter((u) => u.endsWith('/a')).length;
+      const dl = Date.now() + 12000;
+      while (Date.now() < dl) {
+        if ((await countA()) >= 1) break;
+        await sleep(300);
+      }
+      // 多出来的那几张是「恢复 + 新建」里新建的，给它们一点时间出现，别抢跑
+      await sleep(900);
+      const n = await countA();
+      counts.push(n);
+      check(`启动标签不累积：第 ${round} 次启动后 /a 正好 1 张`, n === 1, `实际 ${n} 张`);
+      if (round === 1) {
+        check('对照：首次启动（没有 session）open_urls 照常生效 —— /a 在', n >= 1, `实际 ${n} 张`);
+      }
+      await stopProfile(stagedId);
+      await sleep(1000);
+    }
+    check('连起三次都是 1 张（恢复之后不再按 open_urls 新建）',
+      counts.join(',') === '1,1,1', counts.join(','));
+  } finally {
+    try { await stopProfile(stagedId); } catch { /* ignore */ }
+    try { killProcessTree(getInstance(stagedId)?.pid || 0); } catch { /* ignore */ }
+    try { deleteProfiles([stagedId]); } catch { /* ignore */ }
+  }
 } catch (e) {
   check('会话恢复测试异常', false, e.stack || e.message);
 } finally {
