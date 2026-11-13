@@ -947,6 +947,16 @@ async function applyToSession(client, sessionId, profile, view, { proxyAuth = tr
     }, s).catch((e) => log(instance_profile(profile), 'WARN 定位覆盖失败', e.message));
   }
 
+  // P2 · DNT 请求头：只有 `do_not_track === "true"` 才加，会话级一次调用。
+  // **必须先 `Network.enable`**：实测未 enable 时 `Network.setExtraHTTPHeaders` 返回 ok、
+  // 但一个请求都没被改（静默空转的典型）。不走 `Fetch.requestPaused` —— 那条是拦截用的，
+  // 拿来逐请求改头会把 installRequestGating 的职责搅混。
+  if (view.doNotTrack === '1') {
+    await client.send('Network.enable', {}, s).catch(() => {});
+    await client.send('Network.setExtraHTTPHeaders', { headers: { DNT: '1' } }, s)
+      .catch((e) => log(instance_profile(profile), 'WARN DNT 头设置失败', e.message));
+  }
+
   // 与预检 / --proxy-server 同源：AdsPower 形状（proxy_user / proxy_password）也要认，
   // 否则账号密码挂不上，内核收到 407 后页面直接空白。
   const proxy = normalizeProxyConfig(profile.user_proxy_config || profile.proxy_config || {});

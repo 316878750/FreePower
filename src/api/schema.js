@@ -99,7 +99,6 @@ const CLOUD_ONLY = new Set([
 const IDLE = new Map([
   ['fonts', '注入层只把它挂成 window.__fpFontsDeclared（诊断用），没有禁用过滤；改它不影响渲染'],
   ['disabled_fonts', '全 src 零读取（只在校验与详情视图里出现）'],
-  ['do_not_track', '零读取（指纹生成里只写默认值，没有消费点）'],
   ['scan_port_type', '零读取；端口扫描是内核级特性，我们走 CDP/启动参数做不了'],
   ['allow_scan_ports', '零读取；同上'],
   ['disable_console', '零读取；禁用控制台是内核级特性，我们走 CDP/启动参数做不了'],

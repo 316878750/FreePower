@@ -132,6 +132,10 @@ export const COVERAGE = {
   accuracy: 'full',
 
   // 隐私开关
+  // do_not_track（P2 ④）：只有 "true" 做两半 —— 注入固定 navigator.doNotTrack="1" + 会话级
+  // `Network.setExtraHTTPHeaders({DNT:'1'})`。"false" / "default" 什么都不做（对手那边两者不可区分）。
+  // 标 partial：navigator 那半是 JS getter（虽然做了 native 伪装），DNT 头是**对手未证实、我们补的**；
+  // `--enable-do-not-track` 在 157 上实测无效，没用它。
   do_not_track: 'partial',
   tls: 'partial',
   tls_switch: 'partial',

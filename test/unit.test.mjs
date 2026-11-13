@@ -224,6 +224,24 @@ test('P2 location：block/allow/ask 三档语义（权限 + 坐标覆盖）', ()
   assert.equal(geoPolicy({ ...coords }).permission, 'prompt');
 });
 
+test('P2 do_not_track：只有 "true" 才做两半，其余写法一个字节都不改', () => {
+  // 视图：只有字符串 "true" 才是 '1'；"false" / "default" 在对手那边不可区分，都是不下发
+  assert.equal(fingerprintView({ do_not_track: 'true' }).doNotTrack, '1');
+  for (const v of ['false', 'default', '', undefined, '1', 'yes', 1]) {
+    assert.equal(fingerprintView({ do_not_track: v }).doNotTrack, null, `"${v}" 不该做任何事`);
+  }
+
+  // 注入源：CFG 里带这个值，且固定 navigator.doNotTrack 的那段只认 CFG.doNotTrack === '1'
+  const on = buildInjectionSource({ seed: 'x', doNotTrack: '1' });
+  const off = buildInjectionSource({ seed: 'x', doNotTrack: null });
+  assert.match(on, /"doNotTrack":"1"/);
+  assert.match(on, /CFG\.doNotTrack === '1'/);
+  assert.match(off, /"doNotTrack":null/);
+  // 不许发明第三种状态：两版源码里都不许出现把 doNotTrack 固定成 '0' 的写法
+  assert.equal(on.includes("defGetter(Navigator.prototype, 'doNotTrack', '0')"), false);
+  assert.equal(off.includes("defGetter(Navigator.prototype, 'doNotTrack', '0')"), false);
+});
+
 test('httpGetViaProxy：非 200 也完整返回，交给上层判断', async () => {
   const fake = await startFakeProxy();
   try {
@@ -1437,7 +1455,7 @@ const BASIC_NOT_IDLE = new Set([
   'media_devices', 'media_devices_num', 'speech_switch', 'speech_voices',
   'webrtc', 'bypass_proxy_check',
   'location', 'longitude', 'latitude', 'accuracy',
-  'automation_controlled', 'disable_image', 'disable_video', 'disable_save_password',
+  'automation_controlled', 'disable_image', 'disable_video', 'disable_save_password', 'do_not_track',
   'blacklist', 'whitelist',
   'launch_args', 'headless', 'new_startup_page', 'window_position', 'win_x', 'win_y',
   'clear_cache_after_closing',
@@ -1469,8 +1487,8 @@ test('空转字段：标了必须说清原因，BASIC 里一个都不许漏标',
 
   // ⑥ 数量对得上（0.3.3 巡检那批 22 个 + `device_name_switch` / `disable_password_filling` 两个零消费
   //    字段 + P2 ③ 的 `location_switch`（对手客户端不消费）= 25；`disable_save_password` 已在 P2
-  //    接了启动参数、摘掉 idle。少一个或多一个都要先问清楚
-  assert.equal(idle.length, 25, `idle 字段 ${idle.length} 个：${idle.map((f) => f.name).join(',')}`);
+  //    接了启动参数、摘掉 idle；`do_not_track` 在 P2 ④ 接了真行为、也摘掉 = 24）。少一个或多一个都要先问清楚
+  assert.equal(idle.length, 24, `idle 字段 ${idle.length} 个：${idle.map((f) => f.name).join(',')}`);
   // ⑦ 单独钉一条：hidden_notification 的原因是「基线已覆盖」，不是「还没做」
   const hn = idle.find((f) => f.name === 'hidden_notification');
   assert.match(hn.idle_reason, /基线/, 'hidden_notification 的原因是「基线已覆盖」，不是「还没做」');

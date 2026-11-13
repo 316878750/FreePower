@@ -168,6 +168,9 @@ export function fingerprintView(profile) {
     // P2 `automation_controlled`：'1' = 保留原生 navigator.webdriver=true（启动层不放
     // --disable-blink-features=AutomationControlled，注入层的 webdriver 兜底也让路）
     automationControlled: String(p.automation_controlled ?? '0') === '1',
+    // P2 `do_not_track`：只有 "true" 做两半（navigator.doNotTrack="1" + 请求头 DNT: 1）。
+    // "false" / "default" 在对手那边完全不可区分、都是不下发 —— 我们也什么都不做（不发明第三种状态）。
+    doNotTrack: String(p.do_not_track) === 'true' ? '1' : null,
     media: mediaView(p),
     speech: speechView(p),
     fonts: stringList(p.fonts, ['all']),
