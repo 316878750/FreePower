@@ -17,6 +17,9 @@ import { buildSyncPlan, enabledBySwitch } from './replay.js';
 import { makeTextResolver, textOf } from './text-input.js';
 import { SyncScheduler, makeRng } from './scheduler.js';
 import {
+  normalizeState, needsRestoreBeforeResize, summarizeResize, verifyBounds,
+} from './window.js';
+import {
   closeTabAt, isBlankUrl, listTabs, navigateAt, openTabFor,
   parseOpenUrls, planCloseBlank, planCloseOthers, planUnify, settle, targetIndex, visibleTabIndex,
 } from './tabs.js';
@@ -458,33 +461,90 @@ export function updateSettings(raw) {
  *
  * 为什么是**按钮**不是自动：改用户窗口是可见的操作，静默改会让人以为程序自己乱动。
  * 为什么不改视口：外框是用户能看见、能自己调的那个量；视口差几像素是滚动条造成的。
+ *
+ * 三条硬约束（2026-11-14 阶段 3，CEO 定）：
+ *   ① 先判窗口状态：**最大化 / 全屏 / 最小化下 `Browser.setWindowBounds` 的宽高会被静默忽略**，
+ *      必须先把窗口恢复成 normal 再设尺寸 —— 否则用户点一辈子没反应还不知道为什么。
+ *   ② 设完**回读校验**：重新读 `Browser.getWindowForTarget` 比对，不一致就如实报
+ *      「有 N 个窗口没能改成同尺寸」，**不静默当成功**（命令返回成功不等于窗口变了）。
+ *   ③ 不动显示器/系统设置，只动我们管的那几个浏览器窗口。
+ *
+ * 主窗口自己如果是最大化/全屏，也先恢复成 normal：不这么做的话「参考尺寸」是屏幕大小，
+ * 受控窗口会变成三个屏幕那么宽的普通窗口，视口照样对不上（而且用户看不出为什么）。
  */
 export async function unifySize() {
   if (!current) throw new Error('没有正在运行的同步会话');
   const s = current;
-  const ref = s.targets.get(s.master)?.window;
-  if (!ref?.width || !ref?.height) throw new Error('读不到主窗口尺寸');
+  const mt = s.targets.get(s.master);
+  if (!mt) throw new Error('主窗口连接已不在');
 
-  const done = [];
+  /** 读一张页所属窗口的当前状态 */
+  const readWin = async (t) => {
+    const w = await windowSizeOf(t.client, t.targetId);
+    if (!w?.windowId) throw new Error('读不到窗口 id');
+    return w;
+  };
+  /** 恢复到 normal（已 normal 就不发命令，少一次可见抖动） */
+  const toNormal = async (t, win) => {
+    if (!needsRestoreBeforeResize(win.state)) return win;
+    await t.client.send('Browser.setWindowBounds', { windowId: win.windowId, bounds: { windowState: 'normal' } });
+    await settle(120);
+    return readWin(t);
+  };
+
+  const masterBefore = await readWin(mt);
+  const masterRestored = needsRestoreBeforeResize(masterBefore.state);
+  if (masterRestored) {
+    await toNormal(mt, masterBefore);
+    // 回读确认它真的回到 normal 了（不确认的话「参考尺寸」可能是屏幕大小）
+    const check = await readWin(mt);
+    if (normalizeState(check.state) !== 'normal') throw new Error('主窗口恢复成 normal 失败，没法当参考尺寸');
+  }
+  // 恢复之后重新读一遍真实宽高（normal 尺寸和最大化尺寸不是一个东西）
+  const masterNow = await readWin(mt);
+  const ref = { width: Math.round(Number(masterNow.width)), height: Math.round(Number(masterNow.height)) };
+  if (!Number.isFinite(ref.width) || !Number.isFinite(ref.height) || ref.width <= 0 || ref.height <= 0) {
+    throw new Error('读不到主窗口尺寸');
+  }
+
+  const resized = [];
   for (const id of s.slaves) {
     const t = s.targets.get(id);
     if (!t) continue;
-    const win = await windowSizeOf(t.client, t.targetId);
-    if (!win?.windowId) { done.push({ profile_id: id, ok: false, reason: '读不到窗口 id' }); continue; }
+    const entry = { profile_id: id, role: 'slave', target_id: t.targetId, ok: false, expected: ref };
     try {
-      // 最大化 / 最小化下 setWindowBounds 会被忽略（实测）：必须先回 normal 再设宽高
-      await t.client.send('Browser.setWindowBounds', { windowId: win.windowId, bounds: { windowState: 'normal' } });
+      let win = await readWin(t);
+      entry.state_before = normalizeState(win.state);
+      win = await toNormal(t, win);
+      // 恢复之后重新读：normal 尺寸才是真正要改的那个基准
       await t.client.send('Browser.setWindowBounds', {
         windowId: win.windowId,
         bounds: { width: ref.width, height: ref.height },
       });
-      done.push({ profile_id: id, ok: true, width: ref.width, height: ref.height });
+      await settle(140);
+      // 回读校验（唯一可信的「成功」依据）
+      const after = await readWin(t);
+      entry.actual = { width: after.width, height: after.height, state: normalizeState(after.state) };
+      const v = verifyBounds(ref, after);
+      entry.ok = v.ok;
+      entry.mismatches = v.mismatches;
+      if (!v.ok) entry.reason = v.mismatches.map((m) => `${m.field} 期望 ${m.expected} 实际 ${m.actual}`).join('；');
     } catch (e) {
-      done.push({ profile_id: id, ok: false, reason: e?.message || String(e) });
+      entry.reason = e?.message || String(e);
     }
+    resized.push(entry);
   }
+
   await refreshAll();
-  return { resized: done, status: current.status() };
+  const summary = summarizeResize(resized);
+  return {
+    reference: ref,
+    master_restored: masterRestored,
+    master_state_before: normalizeState(masterBefore.state),
+    resized,
+    summary,
+    status: current.status(),
+  };
 }
 
 /**

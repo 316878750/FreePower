@@ -376,7 +376,8 @@ export default async function renderSync({ head, page }) {
               try {
                 const r = await api.syncUnifySize();
                 const bad = (r?.resized || []).filter((x) => !x.ok);
-                toast(bad.length ? `有 ${bad.length} 个窗口没改成（${bad[0].reason}）` : '已把受控窗口拉到主窗口尺寸', bad.length ? 'bad' : '');
+                const msg = r?.summary?.message || (bad.length ? `有 ${bad.length} 个窗口没能改成同尺寸` : '已把窗口改成同尺寸');
+                toast(bad.length ? `${msg}：${bad[0].reason}` : msg, bad.length ? 'bad' : '');
                 await reload(false);
               } catch (e) { toast(e.message, 'bad'); }
             },
