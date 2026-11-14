@@ -581,6 +581,31 @@ Object.getOwnPropertyNames(window).some(n => /^__fp/.test(n))   // true → 这�
   单独一笔提交（阶段 2 第一件事），见下面「已修：同步 binding 名的固定前缀」。
 - 拦截页自己的 `window.__fpBlock` **不在范围内**：那是我们自己渲染的拦截页，不是被检测的网站页面。
 
+### 已修：新环境启动开出两张白屏（2026-11-14）
+
+**修之前**：不带 URL 启动内核时 Chrome 自己开一张 `chrome://newtab`，`manager.js` 又按 `open_urls` 新建一张
+`about:blank` → 新环境一开就是**两张白页**。实测读数：`page` 目标 2 个 `["chrome://newtab/","about:blank"]`，
+等 2.5s 之后仍是 2 个；对照组系统 Chrome 同一套启动参数只有 1 个 page 目标。
+
+**修法**：`restored > 0` 不动（那是会话恢复，本来就对）。`restored = 0` 时**复用启动时那张空白页**当第一个标签：
+先装配（`pageReady` 那一拍已经把它 pause 住过），再 `exemptBlankReload` 摘掉它 400ms 后的那次补 reload，
+然后导航到 `open_urls[0]`；`open_urls` 有 N 条就只再新开 N-1 张（新开的仍走 about:blank → 装配 → navigate）。
+
+**明确不做的**：不是为了少一张就改成**命令行直接传 URL**。那样首个文档在建 target 之前就存在，
+`addScriptToEvaluateOnNewDocument` 赶不上，首帧就是原始指纹 —— 拿「少一张标签」换「首帧裸奔」是倒过来取值。
+
+**判据**（`test/startup-tabs.test.mjs`，真内核，12 条，进 `npm run smoke`）：
+- `open_urls` 空 → 启动后 `page` 目标**只有 1 个**；`open_urls` 两条 → **2 个**；
+- 目标列表里 `chrome://newtab` **0 条**（两个环境都断言）；
+- 那张页注入完成标记 `object`、`installed=true`、`realm=page`，且**种子快照等于本环境 `fp_seed` 派生值**
+  （实测 `canvas = -1268352466` 与环境一致）；
+- 复用页导航到第一条网址后 `navigation.type === navigate`，且**服务器每个路径只被请求 1 次**
+  （证明没有为了补注入再导航一遍）。
+
+**先红后绿**：把复用逻辑关掉（走老路径）→ **8/12，红 4 条**，读数正是那两张白屏：
+`① ["chrome://newtab/","about:blank"]`、`③ chrome://newtab = 1 条`、`② 3 个 page 目标`、`③ 环境 B 也有 chrome://newtab`。
+还原后 12/12（`src/runtime/manager.js` sha256 `9443F256…`）。
+
 ### 已修：同步 binding 名的固定前缀（阶段 2 第一件，2026-11-14）
 
 **修之前**：`__fpS_<8位hex>`。名字本身是随机的（每会话换新、抓到引用立刻 `delete`、
@@ -1748,4 +1773,4 @@ npm run test:sync-tabs-kernel → 39/39 （阶段 2 标签页 B 层：1 主 + 2 
 10. **随机数字的连击窗口固定 800ms，不开放配置**：调小了慢打字会变成两个数，调大了两次输入会被并成一次。
     真要做成可配，得先有「用户到底怎么打」的数据，现在先按一个保守值定死，写在这里免得以后当 bug 查。
 11. **「开」与「关」是两组独立参数、各自生效**（我们自己的语义）：对手的 `openTabList` 与 `closeTabList` 同时给时后者被前者覆盖、只有 `openTabList` 生效 —— 那是它的 bug，我们不复制。
-12. **每个环境启动时会有两张标签**（Chrome 自带的 New Tab + 我们按 `open_urls` 建的那张）：这是 `runtime/manager.js` 启动逻辑的老行为，不是标签同步引入的。两张都是真标签，两侧环境一致所以同步不受影响；但对用户来说「新环境开出来是两张页」不干净，**还没修**，定了怎么修再单独一笔。
+12. **每个环境启动时只开一张页**（2026-11-14 已修，见上面「已修：新环境启动开出两张白屏」）：老行为是「Chrome 自带的 New Tab + 我们按 `open_urls` 建的那张」两张白屏，现在复用启动那张空白页。

@@ -770,8 +770,52 @@ async function injectAndOpen(instance, profile, view) {
   if (restored.length > 0) {
     log(profileId, '会话已恢复', `${restored.length} 个页面，跳过 open_urls（否则每次启动多一张）`);
   } else {
-    const urls = Array.isArray(profile.open_urls) && profile.open_urls.length ? profile.open_urls : ['about:blank'];
-    for (const url of urls) {
+    /**
+     * 复用**启动时那一张空白页**当第一个标签（2026-11-14 修，CEO 实测确认的缺陷）。
+     *
+     * 老行为是「不管三七二十一按 open_urls 新建」，于是新环境开出来两张白屏：
+     * Chrome 自己开的 `chrome://newtab` + 我们建的 `about:blank`（实测 page 目标 2 个，
+     * 系统 Chrome 同一套参数只开 1 个）。用户看到的就是两个白页叠在一起。
+     *
+     * 现在：把初始目标里那张空白页拿来用（装配 → 导航），open_urls 有 N 条就只再新开 N-1 张。
+     *
+     * **不许为了少一张改成命令行直接传 URL**：那样首个文档在建 target 之前就存在，
+     * `addScriptToEvaluateOnNewDocument` 赶不上，首帧是原始指纹 —— 拿「少一张标签」换
+     * 「首帧裸奔」是倒过来取值。
+     */
+    const isBlankStartup = (t) => t.type === 'page'
+      && (!t.url || t.url === 'about:blank' || t.url.startsWith('chrome://newtab'));
+    const keeper = initialTargets.find(isBlankStartup) || null;
+    const urls = (Array.isArray(profile.open_urls) ? profile.open_urls : [])
+      .map((u) => String(u || '').trim())
+      .filter(Boolean);
+    const firstUrl = urls[0] || 'about:blank';
+
+    let reused = false;
+    if (keeper) {
+      const entry = pageReady.get(keeper.targetId) || await waitFor(() => pageReady.get(keeper.targetId), 3000);
+      if (entry) {
+        await entry.prep.catch(() => {});
+        /* 这张页我们接管了：先摘掉它身上挂着的 blank-reload。
+         * 它 400ms 后本该自己 reload 一次（首个文档早于脚本注册），但 prepareExistingTabs 已经
+         * 显式 reload 过了；现在我们要么导航走、要么就停在 about:blank，那一拍只会白顶一次。 */
+        instance.exemptBlankReload(keeper.targetId);
+        if (firstUrl !== keeper.url) {
+          await client.send('Page.navigate', { url: firstUrl }, entry.sessionId)
+            .catch((e) => log(profileId, 'navigate 失败', firstUrl, e.message));
+          // 导航之后确认注入真跑上了（新文档走的是已注册的脚本，正常情况下一次就好）
+          const ok = await ensureInjectedOrReload(client, entry.sessionId, markers).catch(() => false);
+          if (!ok) log(profileId, '启动页注入确认失败', firstUrl);
+        } else {
+          await ensureInjected(client, entry.sessionId, markers);
+        }
+        reused = true;
+      }
+    }
+
+    // 第一个网址由复用页承担；其余照常新开（新建的走 about:blank → 装配 → navigate）
+    const rest = reused ? urls.slice(1) : (urls.length ? urls : ['about:blank']);
+    for (const url of rest) {
       const { targetId } = await client.send('Target.createTarget', { url: 'about:blank' });
       const entry = pageReady.get(targetId) || await waitFor(() => pageReady.get(targetId), 5000);
       if (entry) await entry.prep.catch(() => {});
