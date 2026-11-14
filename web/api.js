@@ -120,6 +120,13 @@ export const api = {
   /* ---- 内核 ---- */
   kernels: () => call('/api/v2/browser-profile/kernels', { query: { kernel_type: 'chrome' } }),
 
+  /* ---- 本地 API 自述（0.4.2） ---- */
+  /** 地址 / key / 验证开关 / 请求计数 / 端点清单，一次拿完 */
+  apiInfo: () => call('/api/v2/api/info'),
+  /** 关掉 = 不校验 api_key（对齐对手的开关语义）；代价见 README 的安全边界 */
+  setVerify: (enabled) => call('/api/v2/api/verify', { method: 'POST', body: { enabled } }),
+  resetKey: () => call('/api/v2/api/key/reset', { method: 'POST', body: {} }),
+
   /* ---- AI Agent（0.4.0） ---- */
   /** 一句话目标 → 工作流：等服务端调模型（默认 60s 超时），所以给足本端等待时间 */
   agentCreateFromGoal: (body) => call('/api/v1/agent/workflow/create-from-goal', { method: 'POST', body }),

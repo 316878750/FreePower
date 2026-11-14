@@ -36,6 +36,8 @@ import { runSelfCheck } from '../selfcheck/index.js';
 import { readReportFile, summarize } from '../selfcheck/store.js';
 import { renderHtml } from '../selfcheck/html.js';
 import { issueTicket } from './tickets.js';
+import { apiInfoPayload, setApiVerify, resetStats } from './info.js';
+import { resetApiKey } from '../store/db.js';
 import { listKernels } from '../kernel/chrome.js';
 import { runKernelDownload } from '../kernel/download.js';
 import { createWorkflow, getWorkflow, approveStep, presentWorkflow, runWorkflow, assertWorkflowRunnable } from '../agent/workflow.js';
@@ -849,6 +851,37 @@ export function buildRoutes() {
     return ok(presentWorkflow(wf));
   });
 
+  /* ============================ 4.5 本地 API 自述（0.4.2） ============================ */
+  /**
+   * 「API & MCP」页要的全部状态，一次请求拿完。
+   * `endpoints` 直接从**这次 buildRoutes() 的结果**派生（见 catalog.js），
+   * 所以页面显示的条数永远等于真实路由数 —— 判据钉的就是这一点。
+   */
+  add(['GET'], ['/api/v2/api/info', '/api/v1/api/info'], (ctx) => ok(apiInfoPayload(ctx, routes)));
+
+  /**
+   * API 验证开关。**关掉 = 不校验 api_key**（对齐对手的开关语义，不是我们的发明）。
+   * 代价必须说清：关掉之后本机任何进程都能调 API，包括重置 key、改环境。
+   */
+  add(['POST'], ['/api/v2/api/verify', '/api/v1/api/verify'], (ctx) => {
+    const raw = ctx.body?.enabled ?? ctx.query?.enabled;
+    if (raw === undefined || raw === null || raw === '') throw new ApiError(ERR.INVALID, 'enabled is required');
+    const on = raw === true || raw === 1 || String(raw).toLowerCase() === 'true' || String(raw) === '1';
+    return ok({ verify: setApiVerify(on) });
+  });
+
+  /**
+   * 重置 API Key：库里换一把、`data/local_api` 一起换、**本进程立刻按新 key 校验**。
+   * 计数归零 —— 换了 key 等于换了一个使用阶段，旧读数没有参考价值。
+   */
+  add(['POST'], ['/api/v2/api/key/reset', '/api/v1/api/key/reset'], (ctx) => {
+    const port = Number(ctx.port || API_PORT);
+    const key = resetApiKey({ port });
+    if (typeof ctx.setApiKey === 'function') ctx.setApiKey(key);
+    resetStats();
+    return ok({ api_key: key });
+  });
+
   /* ============================ 5. 占位：明确不支持 ============================ */
   const placeholders = [
     '/api/v1/application/list', '/api/v2/category/list',
@@ -859,7 +892,9 @@ export function buildRoutes() {
     '/api/v2/user/delete', '/api/v2/user/list', '/api/v2/user-group/list',
     '/api/v2/proxy/dynamic-proxy-traffic',
   ];
-  for (const p of placeholders) add(['GET', 'POST'], [p], notImplemented(p));
+  // `unsupported: true` 让「API & MCP」页能把这些标成「明确不支持」——
+  // 标记只加在真的会抛 -1 的路由上，不靠路径猜。
+  for (const p of placeholders) add(['GET', 'POST'], [p], notImplemented(p), { unsupported: true });
 
   return routes;
 }

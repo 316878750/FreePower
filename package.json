@@ -1,6 +1,6 @@
 {
   "name": "freepower",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "private": true,
   "type": "module",
   "description": "FreePower — 独立实现的指纹浏览器（多环境隔离 + 代理 + 指纹一致 + 本地 API + 桌面壳）",
@@ -13,6 +13,7 @@
   },
   "scripts": {
     "start": "node --no-warnings src/main.js",
+    "mcp": "node --no-warnings mcp/server.mjs",
     "dev": "node --no-warnings --watch src/main.js",
     "desktop": "node tools/run-desktop.mjs",
     "desktop:selftest": "node tools/run-desktop.mjs --selftest",
@@ -20,10 +21,11 @@
     "smoke": "node --no-warnings test/smoke.mjs && node --no-warnings test/proxy-chain.test.mjs && node --no-warnings test/workers.test.mjs && node --no-warnings test/agent-smoke.test.mjs && node --no-warnings test/session-restore.test.mjs && node --no-warnings test/block-page.test.mjs",
     "test:unit": "node --no-warnings test/unit.test.mjs",
     "test:api": "node --no-warnings test/api.test.mjs",
+    "test:api-mcp": "node --no-warnings test/api-mcp.test.mjs",
     "test:ui": "node --no-warnings test/ui.test.mjs",
     "test:desktop": "node --no-warnings test/desktop.test.mjs",
     "test:profile": "node --no-warnings packages/profile/test/schema.test.mjs",
-    "test": "node --no-warnings packages/profile/test/schema.test.mjs && node --no-warnings test/net-rules.test.mjs && node --no-warnings test/chain-rules.test.mjs && node --no-warnings test/recycle.test.mjs && node --no-warnings test/unit.test.mjs && node --no-warnings test/agent.test.mjs && node --no-warnings test/api.test.mjs && node --no-warnings test/ui.test.mjs && node --no-warnings test/desktop.test.mjs && node --no-warnings test/kernel-download.test.mjs",
+    "test": "node --no-warnings packages/profile/test/schema.test.mjs && node --no-warnings test/net-rules.test.mjs && node --no-warnings test/chain-rules.test.mjs && node --no-warnings test/recycle.test.mjs && node --no-warnings test/unit.test.mjs && node --no-warnings test/agent.test.mjs && node --no-warnings test/api.test.mjs && node --no-warnings test/api-mcp.test.mjs && node --no-warnings test/ui.test.mjs && node --no-warnings test/desktop.test.mjs && node --no-warnings test/kernel-download.test.mjs",
     "gen": "node tools/gen-schema.mjs",
     "test:workers": "node --no-warnings test/workers.test.mjs",
     "test:all": "npm run test && npm run test:workers",
@@ -52,5 +54,8 @@
   "devDependencies": {
     "electron": "^45.2.3",
     "electron-builder": "^26.0.12"
+  },
+  "bin": {
+    "fp": "bin/fp.mjs"
   }
 }

@@ -2,6 +2,7 @@ import http from 'node:http';
 import { createRequire } from 'node:module';
 import { API_HOST, RATE_LIMIT_DEFAULT, RATE_LIMIT_MCP, RATE_LIMIT_UI, RATE_LIMIT_FBBIRD, API_PORT } from '../config.js';
 import { ensureApiKey } from '../store/db.js';
+import { apiVerifyEnabled, recordRequest } from './info.js';
 import { stopAll } from '../runtime/manager.js';
 import { ApiError, ERR, TOO_MANY_MSG } from './contract.js';
 import { isStaticPath, renderIndex, resolveStatic, sendStatic } from './static.js';
@@ -157,7 +158,13 @@ function sendBytes(res, bytes, type = 'application/octet-stream', extraHeaders =
 }
 
 export function createApiServer({ port } = {}) {
-  const apiKey = ensureApiKey({ port: port || API_PORT });
+  const initialKey = ensureApiKey({ port: port || API_PORT });
+  /**
+   * key 放在**可变引用**里：控制台能重置 key（`POST /api/v2/api/key/reset`），
+   * 重置之后这个进程必须立刻用新 key 校验。做成常量的话，重置完只有重启才生效 ——
+   * 用户点完「重置」，旧 key 还能用，那是安全缺陷。
+   */
+  const auth = { key: initialKey };
   const routes = buildRoutes();
 
   const server = http.createServer(async (req, res) => {
@@ -182,7 +189,7 @@ export function createApiServer({ port } = {}) {
     if (isStaticPath(url.pathname)) {
       if (url.pathname === '/' || url.pathname === '/index.html') {
         try {
-          return sendHtml(res, renderIndex({ apiKey, port: port || API_PORT, version: VERSION }));
+          return sendHtml(res, renderIndex({ apiKey: auth.key, port: port || API_PORT, version: VERSION }));
         } catch {
           return sendText(res, 500, 'web console not found: missing web/index.html');
         }
@@ -202,9 +209,19 @@ export function createApiServer({ port } = {}) {
       // 用短期票据代替 key（票据绑定 profile_id，泄露影响面只有一个环境的报告）
       const usesTicket = !!route.ticket
         && redeemTicket(url.searchParams.get('ticket'), url.searchParams.get('profile_id'));
-      if (!usesTicket) {
-        const key = extractKey(req, url);
-        if (!key || key !== apiKey) return send(res, 401, { code: ERR.GENERIC, msg: 'invalid api_key' }, corsHeaders);
+      if (usesTicket) {
+        recordRequest('allowed', url.pathname);
+      } else {
+        // 「API 验证」开关（控制台可关）：关掉就不校验 key，对齐对手的开关语义。
+        // 注意**限流照旧**：这个开关管的是「认不认人」，不是「能不能打爆本机」。
+        const verify = apiVerifyEnabled();
+        if (verify) {
+          const key = extractKey(req, url);
+          if (!key || key !== auth.key) {
+            recordRequest('rejected', url.pathname);
+            return send(res, 401, { code: ERR.GENERIC, msg: 'invalid api_key' }, corsHeaders);
+          }
+        }
         const client = String(req.headers['x-freepower-client'] || '').toLowerCase();
         const isMcp = ['mcp', '1'].includes(client)
           || String(req.headers['x-adspower-client'] || '').toLowerCase() === 'mcp';
@@ -216,11 +233,15 @@ export function createApiServer({ port } = {}) {
           : tier === 'ui' ? RATE_LIMIT_UI
           : tier === 'fbbird' ? RATE_LIMIT_FBBIRD
           : RATE_LIMIT_DEFAULT;
-        const bucket = `${key}|${tier}`;
+        // 桶键用**服务自己的 key**（不是请求带来的 key）：验证关掉时匿名请求没有 key，
+        // 用空串分桶会让所有匿名请求共用一个桶 —— 那正是想要的（它们本来就是同一批人）。
+        const bucket = `${auth.key}|${tier}`;
         if (!rateLimit(bucket, limit)) {
+          recordRequest('limited', url.pathname);
           // 超限报文逐字对齐对手（脚本按这句判断要不要重试）
           return send(res, 200, { code: ERR.GENERIC, msg: TOO_MANY_MSG }, corsHeaders);
         }
+        recordRequest(verify ? 'allowed' : 'open', url.pathname);
       }
     }
 
@@ -231,7 +252,11 @@ export function createApiServer({ port } = {}) {
       const ctx = {
         req,
         // 服务自己的 key：agent 执行器要拿它回调本地 API（同一进程，不经网络再查库）
-        apiKey,
+        apiKey: auth.key,
+        // 控制台重置 key 用：改完这个引用，后续请求立刻按新 key 校验
+        setApiKey: (k) => { auth.key = String(k || ''); },
+        // 这次请求实际落在的端口（端口被占会顺延，页面必须显示真地址）
+        port: req.socket?.localPort || port || API_PORT,
         path: url.pathname,
         query: Object.fromEntries(url.searchParams.entries()),
         body,
@@ -256,5 +281,6 @@ export function createApiServer({ port } = {}) {
   });
 
   server.on('close', () => { stopAll(); });
-  return { server, apiKey };
+  // 返回的 apiKey 是**启动时**那把；重置之后以 `ctx.apiKey` / `data/local_api` 为准。
+  return { server, apiKey: initialKey };
 }

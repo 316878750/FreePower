@@ -102,6 +102,62 @@ npm run dist:win       # 打 Windows 安装包 → release\FreePower-<ver>-setup
 
 CORS：只放行 `127.0.0.1` / `localhost` 的 Origin，其他返回 `403` + 纯文本 `CORS ERROR`。
 
+### API 验证开关（0.4.2）
+
+控制台「API & MCP」页有一个 **API 验证**开关，对齐对手同名开关的语义：**关掉 = 不校验 `api_key`**。
+
+- 存在 `meta.api_verify`，**只有明确写 `'0'` 才算关**；键不存在 / 写坏了 / 空串一律按「开」处理（`src/api/info.js` 的 `apiVerifyEnabled()`）。别做成「配错就放行」。
+- **关掉之后本机任何进程都能调 API** —— 包括改环境、重置 key。这是开关本身的语义，不是缺陷；页面上有一行警告，README 也写在这里。
+- **限流照旧生效**：这个开关管「认不认人」，不管「能不能打爆本机」。关掉验证后匿名请求共用同一把桶（桶键是**服务自己的 key**，不是请求带来的 key）。
+- 判据（`test/api-mcp.test.mjs`）：关掉 → 不带 key 返回 `200 + code 0`；开回来 → 不带 key 又回到 `401`。**两个方向都测**，只测一边等于没测。
+- 免验放行的请求单独计数（`stats.open`），用户能看出开关是不是真的生效了。
+
+### key 重置（0.4.2）
+
+`POST /api/v2/api/key/reset` 换一把新 key，**三件事必须同时做**，少一件都会留下「旧 key 还能用」或者「脚本拿旧 key 撞 401 但没人知道为什么」：
+
+1. 库里换（`meta.api_key`）；
+2. `data/local_api` 发现文件一起换（脚本、MCP server、CLI 都靠它）；
+3. **本进程立刻按新 key 校验** —— 所以 `server.js` 里的 key 是可变引用 `auth.key`，不是常量。做成常量的话，重置完只有重启才生效，那是安全缺陷。
+
+判据：重置后旧 key 立刻 401、新 key 立刻可用、发现文件同步、计数归零（换 key 等于换了一个使用阶段）。
+
+### MCP server（0.4.2）
+
+`mcp/server.mjs` —— **stdio 上的 JSON-RPC，零依赖**。没有引 `@modelcontextprotocol/sdk`：官方 SDK 不在我们的依赖里，为一个「把本地 API 包成 tools」的薄壳引一整套（含 zod 等传递依赖）不划算，而 MCP 的 stdio 传输就是一行一条 JSON-RPC 消息，`initialize` / `tools/list` / `tools/call` 三个方法手写比读 SDK 文档还短。
+
+- **只连 `127.0.0.1` 的本地 API**，不向外发任何请求。key 从 `FREEPOWER_API_KEY` 或 `data/local_api` 读。
+- 十个工具：`list_profiles` / `get_profile` / `start_profile` / `stop_profile` / `create_profile` / `update_profile` / `new_fingerprint` / `list_proxies` / `list_running` / `server_status`。
+- 工具失败走 `result.isError`（协议这么定），不占 JSON-RPC 的 `error` 通道 —— 客户端才能把「工具报错」和「协议坏了」分开处理。
+- **stdout 是协议通道**，一行日志混进去就废；所有诊断信息走 stderr。
+- 客户端配置（控制台里能直接复制，端口与 key 自动填当前值）：Claude Desktop `claude_desktop_config.json`、Cursor `.cursor/mcp.json`、Codex `~/.codex/config.toml`（TOML 段，反斜杠已转义）。
+
+判据（`test/api-mcp.test.mjs`，真起子进程、真走 stdio）：`initialize` 回协议版本与 serverInfo、`tools/list` 拿到十个工具、`tools/call list_profiles` 拿到**真实环境数据**（不是空壳）、未知工具回 `isError`、未知方法回 `-32601`。
+
+### CLI `fp`（0.4.2）
+
+`bin/fp.mjs`，`package.json` 的 `bin` 字段挂了 `fp`：
+
+```
+fp list                  列出环境
+fp start <id> [id...]    启动
+fp stop  <id> [id...]    停止
+fp status                服务状态 + 运行中的环境
+```
+
+- 选项：`-k/--key`、`-p/--port`、`--json`。key/端口优先级：命令行 > 环境变量 > `data/local_api` > 默认 `53380`。
+- 默认档位是 1 req/s，而一次操作可能连发几个请求（`fp stop a b c`）—— 撞到限流按报文提示退一步重试，**最多 3 次**，仍失败就如实报错。
+- 没读到 key 时**退出码非 0 并提示怎么给 key**，不静默成功。
+
+### 端点清单从路由表派生（0.4.2）
+
+「API & MCP」页要展示「方法 + 路径 + 一句话说明」。这份清单**不是手写的**：`src/api/catalog.js` 的 `routeCatalog(buildRoutes())` 直接遍历路由表，只维护一份**词表**（名词/动作 → 中文），路径永远来自路由表。手写一份清单第一周就会和路由表脱节 —— 加了路由页面不显示、删了路由页面还留着，用户按页面调接口拿到 404，然后没人知道该信哪个。
+
+- 词表漏了词就原样显示英文段，**不会说谎**。
+- 路由表里标了 `unsupported: true` 的那批（明确报不支持的占位）在页面上标成「不支持」，标记只加在真的会抛 `-1` 的路由上，不靠路径猜。
+- 判据：页面显示的条数 === **同一次** `buildRoutes().length`。变异检验（把 `routeCatalog` 截断成前 10 条）红 4 条：数量不符、缺自己那条、分组只剩 2 个、不支持变成 0 条。
+
+
 ### 路由
 
 | 方法 | 路径 | 说明 |
@@ -208,7 +264,7 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 
 `npm start` 之后浏览器直接打开 `http://127.0.0.1:<端口>/`（端口看 `data/local_api`）。不用装任何东西，也没有第二套进程。
 
-五个页面，范围就这些（CEO 定的，不扩）：
+六个页面，范围就这些（CEO 定的，不扩）：
 
 | 页面 | 做什么 |
 |---|---|
@@ -217,6 +273,7 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 | 代理管理 | 代理列表增删改、按 `proxy/check` 预检出口、显示最近一次出口 IP 与国家 |
 | 自检报告 | 评分、通过/告警/失败、覆盖度、四个噪声维度哈希与跨重启一致性、19 项逐条「声明值 vs 实测值」（含双 Realm 与 AudioWorklet） |
 | AI Agent（0.4.0） | 选环境 → 填目标 → 生成动作清单 → 逐步看动作/参数/digest 前 8 位 → 逐条批准或拒绝 → 运行 → 每步结果（`text` 结果、截图相对路径与图片、cookie 条数）；fill / cookie set 的值显示 `••••`，截图走 120 秒票据链接（master key 不进 URL） |
+| API & MCP（0.4.2） | 本地 API 状态（地址 / key 显示·复制·重置 / **验证开关** / 请求计数）、端点清单（从路由表派生，可搜可按分组筛，标出「不支持」那批）、MCP 配置（Claude Desktop / Cursor / Codex 三段，端口与 key 自动填，可一键复制） |
 
 三条设计约束（都不是口号，代码里能对得上）：
 
@@ -492,7 +549,7 @@ npm run test
 npm run smoke
 ```
 
-当前实测（2026-11-13，本机）：`npm run test` = schema **10** + net-rules **56** + chain-rules **31** + recycle **44** + unit **85** + agent **15** + api **102** + ui **46** + desktop **54** + kernel-download **62**（`package.json` 里那条脚本就是这十组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **30/30**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核）+ **9/9**（`test/session-restore.test.mjs`，会话恢复 + 启动标签不累积：真内核真重启）+ **17/17**（`test/block-page.test.mjs`，拦截页：真内核、全离线），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测（2026-11-14，本机）：`npm run test` = schema **10** + net-rules **56** + chain-rules **31** + recycle **44** + unit **85** + agent **15** + api **102** + **api-mcp 46**（0.4.2 新增）+ ui **46** + desktop **54** + kernel-download **62**（`package.json` 里那条脚本就是这十一组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **30/30**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核）+ **9/9**（`test/session-restore.test.mjs`，会话恢复 + 启动标签不累积：真内核真重启）+ **17/17**（`test/block-page.test.mjs`，拦截页：真内核、全离线），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 > 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：
@@ -951,7 +1008,9 @@ src/
   api/schema.js        编辑表单 schema（字段分组/值域/必填，来自 packages/profile 注册表）
   api/static.js        控制台静态托管（只放 web/，路径穿越一律 404）
   api/tickets.js       自检报告的一次性票据（120 秒、绑 profile、只在内存）
-  store/db.js          node:sqlite 建表、迁移补列、API Key
+  api/info.js          「API & MCP」页的状态：验证开关、请求计数、自述出参（0.4.2）
+  api/catalog.js       端点清单从路由表派生（名词/动作词表，不手写路由列表）（0.4.2）
+  store/db.js          node:sqlite 建表、迁移补列、API Key（含重置）
   store/profiles.js    环境 CRUD、分组、cookie 规范化、一致性校验
   store/tags.js        标签 CRUD（本地实现）
   store/proxies.js     代理列表 CRUD（本地实现）+ proxy_id → 启动配置
@@ -991,6 +1050,11 @@ web/
   pages/proxies.js     代理管理
   pages/selfcheck.js   自检报告
   pages/agent.js       AI Agent 面板：选环境 → 目标 → 生成 → 逐条批准 → 运行 → 每步结果（含截图票据链接）
+  pages/api.js         API & MCP：状态/验证开关/请求计数、端点清单（可搜可按分组筛）、三段 MCP 配置（0.4.2）
+mcp/
+  server.mjs           MCP server（stdio JSON-RPC，零依赖，十个工具，只连 127.0.0.1）（0.4.2）
+bin/
+  fp.mjs               CLI `fp list|start|stop|status`（key/端口从命令行或 data/local_api）（0.4.2）
 test/smoke.mjs         端到端冒烟（152 项，需真实 Chrome）
 test/unit.test.mjs     零 Chrome 单元测试（84 项）
 test/api.test.mjs      本地 API 契约测试（100 项，不需要 Chrome）
@@ -1002,6 +1066,7 @@ test/ui.test.mjs       控制台契约测试（46 项：静态托管、schema、
 test/desktop.test.mjs  桌面壳契约测试（54 项：启动引导、票据、残留检查、安全姿势、打包配置）
 test/workers.test.mjs  双 Realm 真机验证（24 项：三类 worker + 嵌套 + AudioWorklet）
 test/agent.test.mjs    AI Agent 判定门 A 层（15 项，假 CDP / 纯函数 / 本地 mock LLM，不启内核、不联网）
+test/api-mcp.test.mjs  API & MCP 判定门（46 项，起真服务 + 真起 MCP/CLI 子进程：端点自述 12 项 / MCP stdio 7 项 / CLI 3 项 / 验证开关 6 项 / key 重置 6 项 / 页面纯函数 9 项 / 静态入口 3 项；全离线）
 test/agent-smoke.test.mjs  AI Agent 判定门 B 层（30 项，真内核：七动作 / 失败即停 / 超时 / 跑完不关浏览器 / 目标→工作流 e2e）
 test/kernel-download.test.mjs  内核下载判定门（62 项，本地假源，不联网：正常/长度不符/大小写/Firefox/幂等/断线/续传/停顿重连/并发/自检不一致/404 + 镜像回落 14 项 + CRC 3 项 + 尺寸 11 项 + 巡检五条 4 项）
 test/session-restore.test.mjs  会话恢复真机判据（4 项：Preferences 落 1 / 两页都在 / 重启后按 URL 真恢复 / 用户改回 5 会被顶回 1）

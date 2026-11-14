@@ -6,6 +6,7 @@ import profileEdit from './pages/edit.js';
 import proxiesPage from './pages/proxies.js';
 import selfcheckPage from './pages/selfcheck.js';
 import agentPage from './pages/agent.js';
+import apiPage from './pages/api.js';
 
 const routes = [
   { re: /^\/profiles$/, nav: 'profiles', page: profilesList },
@@ -13,6 +14,7 @@ const routes = [
   { re: /^\/profiles\/([^/]+)$/, nav: 'profiles', page: profileEdit, params: (m) => ({ id: m[1] }) },
   { re: /^\/profiles\/([^/]+)\/selfcheck$/, nav: 'profiles', page: selfcheckPage, params: (m) => ({ id: m[1] }) },
   { re: /^\/proxies$/, nav: 'proxies', page: proxiesPage },
+  { re: /^\/api$/, nav: 'api', page: apiPage },
   // 可选带工作流 id：刷新页面 / 从地址栏打开时还能捞回同一条工作流
   { re: /^\/agent(?:\/([^/]+))?$/, nav: 'agent', page: agentPage, params: (m) => ({ id: m[1] || null }) },
 ];

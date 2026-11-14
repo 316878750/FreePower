@@ -218,17 +218,42 @@ export function setMeta(key, value) {
     .run(key, String(value));
 }
 
-/** 首次运行生成 API Key，并写出发现文件供本地脚本读取（不打印到日志） */
-export function ensureApiKey({ port } = {}) {
-  let key = getMeta('api_key');
-  if (!key) {
-    key = 'fp_' + Buffer.from(globalThis.crypto.getRandomValues(new Uint8Array(24))).toString('hex');
-    setMeta('api_key', key);
-  }
+function newApiKey() {
+  return 'fp_' + Buffer.from(globalThis.crypto.getRandomValues(new Uint8Array(24))).toString('hex');
+}
+
+/**
+ * 写发现文件 `data/local_api`：本地脚本 / MCP server / CLI 靠它拿到地址与 key，
+ * 用户不必去控制台抄。写不了不致命（服务本身照常跑）。
+ */
+export function writeDiscoveryFile(key, { port } = {}) {
   const file = path.join(DATA_DIR, 'local_api');
   const content = `http://127.0.0.1:${port || process.env.FREEPOWER_PORT || 53380}/\napi_key=${key}\n`;
   try {
     if (!fs.existsSync(file) || fs.readFileSync(file, 'utf8') !== content) fs.writeFileSync(file, content);
   } catch { /* 发现文件写不了不致命 */ }
+  return file;
+}
+
+/** 首次运行生成 API Key，并写出发现文件供本地脚本读取（不打印到日志） */
+export function ensureApiKey({ port } = {}) {
+  let key = getMeta('api_key');
+  if (!key) {
+    key = newApiKey();
+    setMeta('api_key', key);
+  }
+  writeDiscoveryFile(key, { port });
+  return key;
+}
+
+/**
+ * 重置 API Key（控制台「重置」按钮）。
+ * **发现文件要一起改**：只改库不改文件，脚本和 MCP 会继续拿着旧 key 撞 401，
+ * 而且用户看不出为什么 —— 这是最容易漏的一步。
+ */
+export function resetApiKey({ port } = {}) {
+  const key = newApiKey();
+  setMeta('api_key', key);
+  writeDiscoveryFile(key, { port });
   return key;
 }
