@@ -1,6 +1,7 @@
 /** 环境列表：启动/停止/自检状态/批量操作。所有动作都打 Local API，没有私有通道。 */
 import { h, mount, clear, toast, confirmDialog, promptDialog, downloadText, pickFile, pill, empty, fmtTime } from '../ui.js';
 import { api } from '../api.js';
+import { tabBar } from '../tabs.js';
 
 const state = {
   rows: [],
@@ -45,6 +46,7 @@ export default async function renderProfiles({ head, page }) {
     h('button', { class: 'btn', onClick: stopAll }, '全部停止'));
 
   mount(page,
+    tabBar('list'),
     h('div', { class: 'panel' },
       h('div', { class: 'panel-body' },
         toolbar,
@@ -364,13 +366,16 @@ export default async function renderProfiles({ head, page }) {
       body: h('div', { class: 'stack' },
         h('div', null, '即将删除 ', h('strong', null, r.name), `（#${r.profile_no}）`),
         live ? h('div', { class: 'notice warn' }, '该环境正在运行：会先停止浏览器，再删除。') : null,
-        h('div', { class: 'notice bad' }, '这是本地硬删，不可恢复。会连它的 user-data 目录（cookie、登录态、缓存）一起删掉。')),
-      okLabel: '删除', danger: true,
+        // 文案必须跟真实行为一致：这里是**软删除**（进回收站），user-data 目录留在盘上。
+        // 早先这里写的是「本地硬删，不可恢复」，那是错的 —— 用户会以为删了就找不回来。
+        h('div', { class: 'notice' }, '环境会移入回收站：可以随时恢复，user-data 目录（cookie、登录态）原样留在盘上。'),
+        h('div', { class: 'muted small' }, '回收站里的环境目前不会自动清理（对手写的是「保留 30 天」）。要腾磁盘，去回收站里彻底删除。')),
+      okLabel: '移入回收站', danger: true,
     });
     if (!yes) return;
     try {
       await api.remove([r.profile_id]);
-      toast(`已删除 ${r.name}`, 'ok');
+      toast(`已移入回收站：${r.name}（可在「回收站」里恢复）`, 'ok');
     } catch (e) { toast(`删除失败：${e.message}`, 'bad'); }
     state.selected.delete(r.profile_id);
     await load(false);

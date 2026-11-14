@@ -16,7 +16,7 @@ import path from 'node:path';
 import {
   createProfile, getProfile, getProfileByNo, listProfiles, updateProfile, deleteProfiles, regroupProfiles,
   newFingerprintFor, listGroups, createGroup, getGroup, updateGroup, deleteGroup, cookieText, cookieToStorage,
-  listRecycleBin, restoreProfiles, getRecycledProfile,
+  listRecycleBin, restoreProfiles, getRecycledProfile, purgeProfiles,
 } from '../store/profiles.js';
 import { listTags, createTags, updateTags, deleteTags, tagIdsOf } from '../store/tags.js';
 import {
@@ -715,6 +715,76 @@ export function buildRoutes() {
     return ok(null);
   });
 
+  /**
+   * recycle-bin/purge：**彻底删除**（我们自己的路由，对手没有）。
+   *
+   * 证据边界：逆向 22- 号文 §5.4 明确「只看到 check-hard-delete-list 服务于清缓存，
+   * 没看到从回收站永久删的路由」→ 对手客户端能不能从回收站彻底删，**无证据**。
+   * 我们加这条，是因为「只能恢复、不能清」的回收站等于磁盘只进不出：
+   * user-data 目录里是 cookie 和缓存，几十个环境就是几十 GB。
+   *
+   * 语义三条：
+   *   1. **只对回收站里的环境生效**。在用环境走这条一律 skipped，不给绕过软删除的口子。
+   *   2. 参数必须显式：`profile_id`（数组）或 `all: true`（清空）。
+   *      一个都没给就报错 —— 全量动作最怕「字段拼错被当成空/当成全清」。
+   *   3. 先停（理论上不该在跑）、再删盘、最后删库。盘删不掉就**不删库**：
+   *      留下一条记录让用户还能再点一次，比删了库留下一堆谁也管不着的目录强。
+   */
+  add(['POST'], ['/api/v2/browser-profile/recycle-bin/purge'], async (ctx) => {
+    const src = ctx.body || {};
+    const wantsAll = src.all === true;
+    const hasIds = src.profile_id !== undefined || src.profile_no !== undefined || src.ids !== undefined;
+    if (!wantsAll && !hasIds) {
+      throw new ApiError(ERR.INVALID, 'profile_id is required（清空回收站请显式传 all:true）', 200, { field: 'profile_id' });
+    }
+
+    let ids;
+    if (wantsAll) {
+      // 回收站可能超过一页（list 的 limit 上限 100），所以自己把所有 id 捞出来
+      ids = [];
+      for (let page = 1; page <= 1000; page++) {
+        const r = listRecycleBin({ page, page_size: 100 });
+        ids.push(...r.list.map((x) => x.profile_id));
+        if (r.list.length < 100) break;
+      }
+    } else {
+      const raw = src.profile_id ?? src.ids ?? src.profile_no;
+      const list = idList(raw, 'v2');
+      if (!list.length) throw new ApiError(ERR.INVALID, 'profile_id is required', 200, { field: 'profile_id' });
+      // profile_no 也能传（对齐 restore 的口径），换算成 id
+      ids = list.map((one) => {
+        const p = getProfile(one) || getRecycledProfile({ profile_id: one }) || getRecycledProfile({ profile_no: one });
+        return p ? p.id : one;
+      });
+    }
+
+    const purged = [];
+    const skipped = [];
+    let userdataRemoved = 0;
+    for (const id of ids) {
+      const target = getRecycledProfile({ profile_id: id });
+      if (!target) { skipped.push({ profile_id: String(id), reason: 'not_in_recycle_bin' }); continue; }
+      if (getRunning(target.id)) { try { await stopProfile(target.id); } catch { /* 停不掉就走下面删库失败分支 */ } }
+      // 目录：<profiles>/<no>_<id8>/userdata → 连它的上一级（同一个环境的目录）一起删
+      let dirGone = true;
+      try {
+        const udd = userDataDirFor(target);
+        const dir = path.dirname(udd);
+        if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+        dirGone = !fs.existsSync(dir);
+        if (dirGone) userdataRemoved++;
+      } catch (e) {
+        dirGone = false;
+        skipped.push({ profile_id: target.id, reason: `userdata_remove_failed: ${e.message}` });
+      }
+      if (!dirGone) continue; // 盘没删掉就不删库，留个还能再点的入口
+      const r = purgeProfiles([target.id]);
+      purged.push(...r.purged);
+      for (const s of r.skipped) skipped.push(s);
+    }
+    return ok({ purged, skipped, userdata_removed: userdataRemoved });
+  });
+
   /* ==================== 6. AI Agent（0.4.0 骨架；对手那套在云端，见 docs/reverse 24-） ====================
    *
    * 三条路由都是**我们自己的契约**（对手没有可抄的本地 REST：它是 5.3 MB Agent Core 子进程
@@ -1135,10 +1205,23 @@ export function buildRoutes() {
     });
   });
 
-  /** 全量替换某个环境启用的扩展。环境在跑时要重启才生效 —— 如实回 restart_required */
+  /**
+   * 全量替换某个环境启用的扩展。环境在跑时要重启才生效 —— 如实回 restart_required
+   *
+   * 这是**全量替换**语义，所以「字段没给」和「给了空数组」必须分开：
+   * 早先写成 `ctx.body.ext_ids ?? ctx.body.ids`，字段名拼错（比如 extension_ids）时取到 undefined
+   * → 被当成空数组 → **把用户勾选全清掉还回 code=0**。这就是静默截断那一类错：
+   * 用户/脚本写错了名字，东西没了，界面还显示成功。
+   * 现在两个字段都不存在就报错，**只有显式传 [] 才算清空**。
+   */
   add(['POST'], ['/api/v2/app/profile/set'], (ctx) => {
     const p = resolveProfile(ctx, 'v2');
-    const ids = idList(ctx.body.ext_ids ?? ctx.body.ids, 'v2');
+    const hasExtIds = ctx.body?.ext_ids !== undefined && ctx.body?.ext_ids !== null;
+    const hasIds = ctx.body?.ids !== undefined && ctx.body?.ids !== null;
+    if (!hasExtIds && !hasIds) {
+      throw new ApiError(ERR.INVALID, 'ext_ids is required（要清空请显式传 []）', 200, { field: 'ext_ids' });
+    }
+    const ids = idList(hasExtIds ? ctx.body.ext_ids : ctx.body.ids, 'v2');
     try {
       const saved = setProfileExtensions(p.id, ids);
       return ok({ profile_id: p.id, ext_ids: saved, restart_required: !!getRunning(p.id) });

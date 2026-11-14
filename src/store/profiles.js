@@ -405,8 +405,35 @@ export function restoreProfiles(ids = [], groupId) {
   return ids.map((id) => ({ id, restored: dbRestore(db, id, groupId) }));
 }
 
-export function regroupProfiles(ids = [], groupId = '0') {
+/**
+ * 彻底清理（purge）：**只对回收站里的环境生效**，删记录 + 清勾选。
+ * user-data 目录不在这里删 —— 那是文件系统的事，由路由层（它拿得到 userDataDirFor）做，
+ * 这样 store 仍然只碰库，测试也不用为了删目录去起内核。
+ *
+ * 为什么不在「删除」那一步做：删除是软删除，回收站里的环境必须还能原样启动；
+ * 真正不可逆的动作只能由用户显式点（回收站里的「彻底删除 / 清空」）。
+ * @returns {{purged:string[], skipped:{profile_id:string, reason:string}[]}}
+ */
+export function purgeProfiles(ids = []) {
   const db = getDb();
+  const purged = [];
+  const skipped = [];
+  for (const id of ids) {
+    const key = String(id);
+    // 只有回收站里的能彻底删：在用环境走 purge 就是绕过软删除的硬删，不给这个口子
+    const row = db.prepare('SELECT 1 AS ok FROM profiles WHERE id = ? AND deleted_at IS NOT NULL').get(key);
+    if (!row) { skipped.push({ profile_id: key, reason: 'not_in_recycle_bin' }); continue; }
+    // profile_extensions 故意没有外键（见 schema 注释），所以这里必须显式清；
+    // profile_tags 有 ON DELETE CASCADE，但删一次不费事，两边口径一致更不容易漏。
+    db.prepare('DELETE FROM profile_extensions WHERE profile_id = ?').run(key);
+    db.prepare('DELETE FROM profile_tags WHERE profile_id = ?').run(key);
+    db.prepare('DELETE FROM profiles WHERE id = ?').run(key);
+    purged.push(key);
+  }
+  return { purged, skipped };
+}
+
+export function regroupProfiles(ids = [], groupId = '0') {  const db = getDb();
   let changed = 0;
   for (const id of ids) {
     // 回收站里的环境不改分组：它现在不在任何列表里，改它等于给用户看一个「改成功了」的假象
@@ -424,8 +451,27 @@ export function newFingerprintFor(profileId) {
   return updateProfile(profileId, { random_fingerprint: '1' });
 }
 
+/**
+ * 分组列表。`profile_count` 只数**在用的**环境（回收站里的不算）——
+ * 界面上那个数字是给人看「这个组里有多少环境」的，把已删的算进去会误导。
+ * 对手这条是 B 类透传（07- 号文 §181「自己设计返回即可」），多给一个计数不算破坏契约。
+ */
 export function listGroups() {
-  return getDb().prepare('SELECT id AS group_id, name AS group_name, sort FROM groups ORDER BY sort ASC, created_at ASC').all();
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT g.id AS group_id, g.name AS group_name, g.sort,
+           (SELECT COUNT(*) FROM profiles p
+             WHERE p.group_id = g.id AND p.deleted_at IS NULL) AS profile_count
+      FROM groups g ORDER BY g.sort ASC, g.created_at ASC`).all();
+  // 备注存在 meta 表（groups 表没这一列，见 updateGroup）；meta 表不存在就一律空串
+  const hasMeta = !!db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'meta'").get();
+  const remarks = new Map();
+  if (hasMeta) {
+    for (const r of db.prepare("SELECT key, value FROM meta WHERE key LIKE 'group_remark:%'").all()) {
+      remarks.set(r.key.slice('group_remark:'.length), r.value);
+    }
+  }
+  return rows.map((r) => ({ ...r, remark: remarks.get(String(r.group_id)) ?? '' }));
 }
 
 export function createGroup(groupNameStr) {

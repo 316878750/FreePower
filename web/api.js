@@ -96,9 +96,20 @@ export const api = {
 
   /* ---- 分组 / 标签 ---- */
   groups: () => call('/api/v2/group/list'),
-  groupCreate: (name) => call('/api/v2/group/create', { method: 'POST', body: { group_name: name } }),
+  groupCreate: (name, remark) => call('/api/v2/group/create', { method: 'POST', body: { group_name: name, remark } }),
+  groupUpdate: (body) => call('/api/v2/group/update', { method: 'POST', body }),
+  groupDelete: (id) => call('/api/v2/group/delete', { method: 'POST', body: { group_id: id } }),
   tags: () => call('/api/v2/browser-tags/list', { method: 'POST', body: { limit: 200 } }),
   tagCreate: (tags) => call('/api/v2/browser-tags/create', { method: 'POST', body: { tags } }),
+
+  /* ---- 回收站（0.4.3 ②） ---- */
+  recycleList: (page = 1, limit = 100) => call('/api/v2/browser-profile/recycle-bin/list', { method: 'POST', body: { page, limit } }),
+  /** group_id 必填（对齐对手：恢复必须显式选一个分组） */
+  recycleRestore: (profileId, groupId) => call('/api/v2/browser-profile/recycle-bin/restore', {
+    method: 'POST', body: { profile_id: profileId, group_id: groupId },
+  }),
+  /** 彻底删除（我们自己的路由，对手没有）：删记录 + 删 user-data 目录，不可恢复 */
+  recyclePurge: (body) => call('/api/v2/browser-profile/recycle-bin/purge', { method: 'POST', body, timeoutMs: 120000 }),
 
   /* ---- 代理 ---- */
   proxies: () => call('/api/v2/proxy-list/list', { method: 'POST', body: { limit: 500 } }),

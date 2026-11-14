@@ -92,6 +92,10 @@ const VERB = new Map([
   ['tab-close', '关闭标签'],
   ['tab-copy', '复制标签到其它窗口'],
   ['tab-unify', '统一标签页'],
+  // 回收站（0.4.3 ②）：`restore` 一直都在、`purge` 是新加的，两个都得有中文，
+  // 否则「API & MCP」页会露出 `回收站 · restore` 这种半截英文
+  ['restore', '从回收站恢复'],
+  ['purge', '彻底删除（不可恢复）'],
 ]);
 
 /** `/api/v1/x/y` → ['x','y']；`api`、版本段、动态段（`:id`）都不是名词 */

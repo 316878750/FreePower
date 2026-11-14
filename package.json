@@ -28,7 +28,7 @@
     "test:markers-kernel": "node --no-warnings test/markers-kernel.test.mjs",
     "test:desktop": "node --no-warnings test/desktop.test.mjs",
     "test:profile": "node --no-warnings packages/profile/test/schema.test.mjs",
-    "test": "node --no-warnings packages/profile/test/schema.test.mjs && node --no-warnings test/net-rules.test.mjs && node --no-warnings test/chain-rules.test.mjs && node --no-warnings test/recycle.test.mjs && node --no-warnings test/apps.test.mjs && node --no-warnings test/unit.test.mjs && node --no-warnings test/agent.test.mjs && node --no-warnings test/api.test.mjs && node --no-warnings test/api-mcp.test.mjs && node --no-warnings test/sync-rules.test.mjs && node --no-warnings test/sync-text.test.mjs && node --no-warnings test/sync-tabs.test.mjs && node --no-warnings test/sync-window.test.mjs && node --no-warnings test/sync-arrange.test.mjs && node --no-warnings test/sync-show.test.mjs && node --no-warnings test/markers.test.mjs && node --no-warnings test/nav-fold.test.mjs && node --no-warnings test/ui.test.mjs && node --no-warnings test/desktop.test.mjs && node --no-warnings test/kernel-download.test.mjs",
+    "test": "node --no-warnings packages/profile/test/schema.test.mjs && node --no-warnings test/net-rules.test.mjs && node --no-warnings test/chain-rules.test.mjs && node --no-warnings test/recycle.test.mjs && node --no-warnings test/apps.test.mjs && node --no-warnings test/profiles-tabs.test.mjs && node --no-warnings test/unit.test.mjs && node --no-warnings test/agent.test.mjs && node --no-warnings test/api.test.mjs && node --no-warnings test/api-mcp.test.mjs && node --no-warnings test/sync-rules.test.mjs && node --no-warnings test/sync-text.test.mjs && node --no-warnings test/sync-tabs.test.mjs && node --no-warnings test/sync-window.test.mjs && node --no-warnings test/sync-arrange.test.mjs && node --no-warnings test/sync-show.test.mjs && node --no-warnings test/markers.test.mjs && node --no-warnings test/nav-fold.test.mjs && node --no-warnings test/ui.test.mjs && node --no-warnings test/desktop.test.mjs && node --no-warnings test/kernel-download.test.mjs",
     "gen": "node tools/gen-schema.mjs",
     "test:workers": "node --no-warnings test/workers.test.mjs",
     "test:all": "npm run test && npm run test:workers",
@@ -66,6 +66,7 @@
     "test:sync-show": "node --no-warnings test/sync-show.test.mjs",
     "test:sync-show-kernel": "node --no-warnings test/sync-show-kernel.test.mjs",
     "test:apps": "node --no-warnings test/apps.test.mjs",
+    "test:profiles-tabs": "node --no-warnings test/profiles-tabs.test.mjs",
     "test:apps-kernel": "node --no-warnings test/apps-kernel.test.mjs",
     "test:startup-tabs": "node --no-warnings test/startup-tabs.test.mjs"
   },

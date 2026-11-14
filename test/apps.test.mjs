@@ -322,6 +322,36 @@ try {
   check('app/profile/set 写了不存在的扩展：100002 报扩展不存在',
     setBad.json?.code === 100002 && /扩展不存在/.test(setBad.json.msg), setBad.json?.msg);
 
+  /**
+   * 全量替换语义的坑：字段名拼错/没给时绝不能当成「清空」。
+   * 早先这里取到 undefined → 空数组 → 勾选被无声清光还回 code=0。
+   */
+  const keep = await api('POST', '/api/v2/app/profile', { profile_id: pb.id });
+  const keepIds = keep.json?.data?.ext_ids || [];
+  const typo = await api('POST', '/api/v2/app/profile/set', { profile_id: pb.id, extension_ids: [importedId] });
+  check('app/profile/set 字段名拼错（extension_ids）：code 非 0，不当成清空',
+    typo.json?.code !== 0 && typo.json.code === 100002 && typo.json.data?.field === 'ext_ids',
+    JSON.stringify({ c: typo.json?.code, field: typo.json?.data?.field, msg: typo.json?.msg }));
+  const afterTypo = await api('POST', '/api/v2/app/profile', { profile_id: pb.id });
+  check('app/profile/set 拼错字段后：库里勾选一条不少（没被静默清空）',
+    JSON.stringify(afterTypo.json?.data?.ext_ids) === JSON.stringify(keepIds),
+    JSON.stringify({ before: keepIds, after: afterTypo.json?.data?.ext_ids }));
+
+  const noField = await api('POST', '/api/v2/app/profile/set', { profile_id: pb.id });
+  check('app/profile/set 一个字段都没给：100002 且 field=ext_ids',
+    noField.json?.code === 100002 && noField.json.data?.field === 'ext_ids', JSON.stringify(noField.json));
+  const afterNone = await api('POST', '/api/v2/app/profile', { profile_id: pb.id });
+  check('app/profile/set 缺字段后：勾选仍在', JSON.stringify(afterNone.json?.data?.ext_ids) === JSON.stringify(keepIds));
+
+  const explicitClear = await api('POST', '/api/v2/app/profile/set', { profile_id: pb.id, ext_ids: [] });
+  check('app/profile/set 显式传 []：才真的清空',
+    explicitClear.json?.code === 0 && explicitClear.json.data.ext_ids.length === 0,
+    JSON.stringify(explicitClear.json?.data));
+  const afterClear = await api('POST', '/api/v2/app/profile', { profile_id: pb.id });
+  check('app/profile/set 显式清空后：读回确实是空的', afterClear.json?.data?.ext_ids?.length === 0);
+  // 复位，后面的断言（页面/启动）还指望 pb 勾着东西
+  await api('POST', '/api/v2/app/profile/set', { profile_id: pb.id, ext_ids: keepIds });
+
   const one = await api('POST', '/api/v2/app/profile', { profile_id: pb.id });
   check('app/profile：回这个环境勾的扩展（含 enabled 标记）',
     one.json?.code === 0 && one.json.data.list.length === 2

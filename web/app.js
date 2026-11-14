@@ -2,6 +2,8 @@
 import { h, mount, toast } from './ui.js';
 import { api } from './api.js';
 import profilesList from './pages/profiles.js';
+import groupsPage from './pages/groups.js';
+import recyclePage from './pages/recycle.js';
 import profileEdit from './pages/edit.js';
 import proxiesPage from './pages/proxies.js';
 import appsPage from './pages/apps.js';
@@ -14,6 +16,10 @@ import { FOLD_KEY, parseFold, isFolded, toggleFold, writeFold } from './nav.js';
 
 const routes = [
   { re: /^\/profiles$/, nav: 'profiles', page: profilesList },
+  // 环境管理页内 tabs（0.4.3 ②）：这三块是同一页的三个 tab，侧栏仍然只有一个「环境管理」。
+  // **必须排在 /profiles/([^/]+) 前面**，否则 groups / recycle 会被当成环境 id 吃掉。
+  { re: /^\/profiles\/groups$/, nav: 'profiles', page: groupsPage },
+  { re: /^\/profiles\/recycle$/, nav: 'profiles', page: recyclePage },
   { re: /^\/profiles\/new$/, nav: 'profiles', page: profileEdit, params: () => ({ id: null }) },
   { re: /^\/profiles\/([^/]+)$/, nav: 'profiles', page: profileEdit, params: (m) => ({ id: m[1] }) },
   { re: /^\/profiles\/([^/]+)\/selfcheck$/, nav: 'profiles', page: selfcheckPage, params: (m) => ({ id: m[1] }) },
