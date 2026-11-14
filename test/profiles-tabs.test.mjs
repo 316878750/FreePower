@@ -193,31 +193,42 @@ try {
     && (purgedLive.json.data.skipped || []).some((s) => s.profile_id === p2.id && s.reason === 'not_in_recycle_bin')
     && !!prof.getProfile(p2.id), JSON.stringify(purgedLive.json?.data));
 
-  /* ---- 真实故障：盘删不掉时必须不删库（不用 mock） ---- */
+  /* ---- 真实故障：盘删不掉时数据必须一个字节不动、还必须能恢复（不用 mock） ---- */
   /**
    * 为什么必须用**真实**失败：mock 的失败等于没验。
-   * 本机探过四种「让 rmSync 真失败」的路子（`.tmp/rm-fail-probe.mjs` 的读数）：
-   *   A 独占打开文件 → 删掉了（Node 默认带 FILE_SHARE_DELETE）
-   *   B 子进程 cwd 在目录里 → **EPERM，删不掉**（Windows 不许删任何进程的当前目录）
-   *   C `attrib +R` 只读  → 删掉了（force 会重试）
-   *   D 子进程 cwd 在被删目录本身 → **EPERM，删不掉**
-   * 所以用 B：起一个真进程把 cwd 设在该环境的目录里，模拟「没退干净的浏览器进程占着目录」。
-   * 这不是人为构造的怪场景 —— 内核残留时 user-data 目录就是被占着的。
+   *
+   * 2026-11-14 CEO 复验抓到的真缺陷就藏在这一段里：老实现直接
+   * `fs.rmSync(dir,{recursive:true,force:true})`，它是**先删内容、再删目录**，
+   * 目录被占用时内容已经删光、最后抛 EPERM → 接口报「没删掉、还能恢复」，
+   * 用户点恢复却拿到一个空壳。所以这里必须放**三个真文件**进去数，不能只建一个占位。
+   *
+   * 本机实测「什么真能让删不掉」（`.tmp/rm-fail-probe.mjs`、`.tmp/rename-probe.mjs`）：
+   *   cwd 锁在 <dir> 本身            → rename EBUSY，一个字节没动
+   *   cwd 锁在 <dir>/userdata        → rename EPERM，一个字节没动
+   *   独占句柄（FileShare.None）锁文件 → rename EPERM，一个字节没动
+   *   fs.openSync 'r+' / attrib +R   → 删得掉（Node 带 FILE_SHARE_DELETE；force 会重试）
+   * 三种真占用都让 **rename 先失败**，这正是「先改名再删」要的：删不掉 = 什么都没变。
    */
-  console.log('\n— 4b. 真实故障：user-data 占着时 purge 不许删库 —');
+  console.log('\n— 4b. 真实故障：user-data 占着时数据必须一个字节不动、且还能恢复 —');
 
   const p3 = prof.createProfile({ name: 'purge-locked', group_id: '0' });
   const udd3 = userDataDirFor(prof.getProfile(p3.id));
   const lockDir = path.dirname(udd3);
+  /**
+   * 锁法：cwd 钉在**被删目录本身**（不是它下面的 userdata）——
+   * 这样 rename 一定会失败（Windows 不许给任何进程的当前目录改名），
+   * 正好覆盖「改名失败 = 什么都没动」这条路。
+   */
   fs.mkdirSync(udd3, { recursive: true });
-  fs.writeFileSync(path.join(udd3, 'Cookies'), 'locked-cookie-db');
+  const REAL_FILES = { Cookies: 'cookie-db-content', 'Login Data': 'logins-db-content', Preferences: '{"profile":{}}' };
+  for (const [name, content] of Object.entries(REAL_FILES)) fs.writeFileSync(path.join(udd3, name), content);
   await api('POST', '/api/v2/browser-profile/delete', { profile_id: [p3.id] });
 
   // 起一个真进程，cwd 钉在那个目录里并活着（stdio 'ignore'：沙箱里不收管道）
-  const locker = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 30000)'], {
+  const locker = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 60000)'], {
     cwd: lockDir, stdio: 'ignore', windowsHide: true,
   });
-  await new Promise((r) => setTimeout(r, 600));
+  await new Promise((r) => setTimeout(r, 700));
 
   const lockedPurge = await api('POST', '/api/v2/browser-profile/recycle-bin/purge', { profile_id: [p3.id] });
   const lockedSkip = (lockedPurge.json?.data?.skipped || []).find((s) => s.profile_id === p3.id);
@@ -226,28 +237,119 @@ try {
     && (lockedPurge.json.data.purged || []).length === 0
     && !!lockedSkip,
     JSON.stringify(lockedPurge.json?.data));
-  check('盘被占住：skipped.reason 是稳定的机器可读串 userdata_remove_failed',
-    lockedSkip?.reason === 'userdata_remove_failed', String(lockedSkip?.reason));
-  check('盘被占住：错误码与原文分开带出（EPERM + 原文非空）',
-    lockedSkip?.error_code === 'EPERM' && !!lockedSkip?.error_message?.length,
-    JSON.stringify({ code: lockedSkip?.error_code, msg: String(lockedSkip?.error_message || '').slice(0, 60) }));
-  check('盘被占住：库记录还在（还能再点一次，不会变成谁也管不着的目录）',
-    !!prof.getRecycledProfile({ profile_id: p3.id }));
+  check('盘被占住：skipped.reason 是稳定的机器可读串 userdata_remove_failed（不是 detached）',
+    lockedSkip?.reason === 'userdata_remove_failed' && lockedSkip?.data_detached !== true,
+    JSON.stringify({ reason: lockedSkip?.reason, detached: lockedSkip?.data_detached }));
+  check('盘被占住：错误码与原文分开带出（EBUSY/EPERM + 原文非空）',
+    ['EBUSY', 'EPERM'].includes(lockedSkip?.error_code) && !!lockedSkip?.error_message?.length,
+    JSON.stringify({ code: lockedSkip?.error_code, msg: String(lockedSkip?.error_message || '').slice(0, 50) }));
+
+  /* --- 这一组是本次修复的核心：数据必须一个字节没少 --- */
+  const filesNow = fs.existsSync(udd3) ? fs.readdirSync(udd3).sort() : [];
+  check('盘被占住：目录里的 3 个文件**一个不少**（rmSync 先删内容的老缺陷不会再发生）',
+    JSON.stringify(filesNow) === JSON.stringify(Object.keys(REAL_FILES).sort()),
+    JSON.stringify(filesNow));
+  check('盘被占住：每个文件内容逐字节没变（不是「还在但被清空」）',
+    Object.entries(REAL_FILES).every(([name, content]) => {
+      try { return fs.readFileSync(path.join(udd3, name), 'utf8') === content; } catch { return false; }
+    }));
+  check('盘被占住：Cookies 还在（登录态没丢）', fs.existsSync(path.join(udd3, 'Cookies')));
+  check('盘被占住：库记录还在（还能再点一次）', !!prof.getRecycledProfile({ profile_id: p3.id }));
   check('盘被占住：回收站里还列得出来', (await (async () => {
     const b = await api('POST', '/api/v2/browser-profile/recycle-bin/list', { page: 1, limit: 100 });
     return (b.json?.data?.list || []).some((x) => x.profile_id === p3.id);
   })()));
-  check('盘被占住：目录与 cookie 文件都还在', fs.existsSync(udd3) && fs.existsSync(path.join(udd3, 'Cookies')));
+  check('盘被占住：没有留下任何墓碑目录（rename 失败就不该有 .purge-*）',
+    fs.readdirSync(path.dirname(lockDir)).filter((n) => n.startsWith(`${path.basename(lockDir)}.purge-`)).length === 0,
+    JSON.stringify(fs.readdirSync(path.dirname(lockDir))));
 
-  // 放掉占用之后，同一条应该真的删得掉 —— 否则上面那些「还在」就只是功能坏了
+  // 放掉占用 → 恢复必须真的恢复成功（数据完整才谈得上「可恢复」）
   try { locker.kill(); } catch { /* 可能已经退了 */ }
-  await new Promise((r) => setTimeout(r, 800));
+  await new Promise((r) => setTimeout(r, 900));
+  const restored = await api('POST', '/api/v2/browser-profile/recycle-bin/restore', { profile_id: p3.id, group_id: '0' });
+  check('放掉占用后恢复：code=0，环境回到列表（数据完整所以恢复得出来）',
+    restored.json?.code === 0 && !!prof.getProfile(p3.id), JSON.stringify(restored.json));
+  check('恢复后 user-data 里 3 个文件还在、Cookies 内容没变（不是空壳环境）',
+    Object.entries(REAL_FILES).every(([name, content]) => {
+      try { return fs.readFileSync(path.join(udd3, name), 'utf8') === content; } catch { return false; }
+    }), JSON.stringify(fs.existsSync(udd3) ? fs.readdirSync(udd3) : []));
+
+  // 再删进回收站 → 这次能真删掉（第一次失败没留下残留卡住第二次）
+  await api('POST', '/api/v2/browser-profile/delete', { profile_id: [p3.id] });
   const retried = await api('POST', '/api/v2/browser-profile/recycle-bin/purge', { profile_id: [p3.id] });
-  check('放掉占用后重试：purged=1、userdata_removed=1（同一条能删掉，证明前面是真故障不是死路）',
+  check('放开后重试 purge：purged=1、userdata_removed=1（第二次必须成功）',
     retried.json?.code === 0 && (retried.json.data.purged || []).includes(p3.id) && retried.json.data.userdata_removed === 1,
     JSON.stringify(retried.json?.data));
-  check('放掉占用后重试：目录与库记录都没了',
+  check('放开后重试：目录与库记录都没了',
     !fs.existsSync(lockDir) && !prof.getRecycledProfile({ profile_id: p3.id }));
+
+  /* --- 第二支：rename 成功但删墓碑失败 → 改回原名，数据仍然完整 --- */
+  /**
+   * 这一支在真实世界里要「rename 成功但 rm 失败」同时发生（本机三类真实占用都会让 rename 先失败），
+   * 所以用**注入的 fs**只在这一支上验行为：先让 rename 成功、rm 抛 EPERM、rename 回来成功。
+   * 数据安全的两条主路（改名失败 / 正常删掉）上面都用真故障验过了。
+   */
+  const { purgeProfileData } = await import('../src/runtime/purge-data.js');
+  {
+    const p4 = prof.createProfile({ name: 'purge-tomb-rollback', group_id: '0' });
+    const udd4 = userDataDirFor(prof.getProfile(p4.id));
+    const dir4 = path.dirname(udd4);
+    fs.mkdirSync(udd4, { recursive: true });
+    fs.writeFileSync(path.join(udd4, 'Cookies'), 'keep-me');
+    let rmAttempts = 0;
+    const fsx = {
+      existsSync: (p) => fs.existsSync(p),
+      readdirSync: (p) => fs.readdirSync(p),
+      renameSync: (a, b) => fs.renameSync(a, b),
+      rmSync: (p, o) => {
+        rmAttempts++;
+        const err = new Error('EPERM: 注入的删除失败（只验回滚这一支）');
+        err.code = 'EPERM';
+        throw err;
+      },
+    };
+    const r = purgeProfileData(prof.getProfile(p4.id), { fsx });
+    check('删墓碑失败 → 改回原名：报 userdata_remove_failed + intact（不是 detached）',
+      r.ok === false && r.intact === true && r.reason === 'userdata_remove_failed' && r.data_detached !== true,
+      JSON.stringify(r));
+    check('删墓碑失败 → 改回原名后：目录回原位、Cookies 内容没变',
+      fs.existsSync(dir4) && fs.readFileSync(path.join(udd4, 'Cookies'), 'utf8') === 'keep-me',
+      JSON.stringify(fs.existsSync(dir4) ? fs.readdirSync(udd4) : null));
+    check('删墓碑失败 → 改回原名：没有残留墓碑', fs.readdirSync(path.dirname(dir4))
+      .filter((n) => n.startsWith(`${path.basename(dir4)}.purge-`)).length === 0);
+
+    /* --- 第三支：改名成功、墓碑删不掉、**连原名都改不回来** → 数据已脱离，必须报 detached --- */
+    const fsx2 = {
+      existsSync: (p) => fs.existsSync(p),
+      readdirSync: (p) => fs.readdirSync(p),
+      renameSync: (a, b) => {
+        // 第一次（去墓碑）真做；改名回来那次抛错，模拟「原名被重新占住」
+        if (a === dir4) return fs.renameSync(a, b);
+        const err = new Error('EPERM: 注入的改名回滚失败（双故障，真实环境难复现）');
+        err.code = 'EPERM';
+        throw err;
+      },
+      rmSync: (p, o) => {
+        const err = new Error('EPERM: 注入的删除失败');
+        err.code = 'EPERM';
+        throw err;
+      },
+    };
+    const r2 = purgeProfileData(prof.getProfile(p4.id), { fsx: fsx2 });
+    check('双故障（改名成功 + 删不掉 + 改不回）：报 userdata_remove_failed_after_rename + data_detached',
+      r2.ok === false && r2.data_detached === true && r2.reason === 'userdata_remove_failed_after_rename',
+      JSON.stringify(r2));
+    check('双故障：带出残留墓碑的相对路径（用户/脚本能自己去清）',
+      typeof r2.detached_path === 'string' && r2.detached_path.includes('.purge-'), String(r2.detached_path));
+    // 清场：把注入留下的墓碑删掉
+    const par = path.dirname(dir4);
+    for (const n of fs.readdirSync(par)) {
+      if (n.startsWith(`${path.basename(dir4)}.purge-`)) {
+        try { fs.rmSync(path.join(par, n), { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    }
+    fs.mkdirSync(udd4, { recursive: true });
+  }
 
   // 清空：all:true
   await api('POST', '/api/v2/browser-profile/delete', { profile_id: [p2.id] });

@@ -18,7 +18,7 @@
     "desktop": "node tools/run-desktop.mjs",
     "desktop:selftest": "node tools/run-desktop.mjs --selftest",
     "dist:win": "electron-builder --win --x64",
-    "smoke": "node --no-warnings test/smoke.mjs && node --no-warnings test/proxy-chain.test.mjs && node --no-warnings test/workers.test.mjs && node --no-warnings test/agent-smoke.test.mjs && node --no-warnings test/session-restore.test.mjs && node --no-warnings test/startup-tabs.test.mjs && node --no-warnings test/block-page.test.mjs && node --no-warnings test/markers-kernel.test.mjs && node --no-warnings test/sync-kernel.test.mjs && node --no-warnings test/sync-text-kernel.test.mjs && node --no-warnings test/sync-tabs-kernel.test.mjs && node --no-warnings test/sync-window-kernel.test.mjs && node --no-warnings test/sync-arrange-kernel.test.mjs && node --no-warnings test/sync-show-kernel.test.mjs && node --no-warnings test/apps-kernel.test.mjs",
+    "smoke": "node --no-warnings test/smoke.mjs && node --no-warnings test/proxy-chain.test.mjs && node --no-warnings test/workers.test.mjs && node --no-warnings test/agent-smoke.test.mjs && node --no-warnings test/session-restore.test.mjs && node --no-warnings test/startup-tabs.test.mjs && node --no-warnings test/block-page.test.mjs && node --no-warnings test/markers-kernel.test.mjs && node --no-warnings test/sync-kernel.test.mjs && node --no-warnings test/sync-text-kernel.test.mjs && node --no-warnings test/sync-tabs-kernel.test.mjs && node --no-warnings test/sync-window-kernel.test.mjs && node --no-warnings test/sync-arrange-kernel.test.mjs && node --no-warnings test/sync-show-kernel.test.mjs && node --no-warnings test/apps-kernel.test.mjs && node --no-warnings test/purge-lock-kernel.test.mjs",
     "test:unit": "node --no-warnings test/unit.test.mjs",
     "test:api": "node --no-warnings test/api.test.mjs",
     "test:api-mcp": "node --no-warnings test/api-mcp.test.mjs",
@@ -67,6 +67,7 @@
     "test:sync-show-kernel": "node --no-warnings test/sync-show-kernel.test.mjs",
     "test:apps": "node --no-warnings test/apps.test.mjs",
     "test:profiles-tabs": "node --no-warnings test/profiles-tabs.test.mjs",
+    "test:purge-lock-kernel": "node --no-warnings test/purge-lock-kernel.test.mjs",
     "test:apps-kernel": "node --no-warnings test/apps-kernel.test.mjs",
     "test:startup-tabs": "node --no-warnings test/startup-tabs.test.mjs"
   },

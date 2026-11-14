@@ -30,6 +30,7 @@ import {
   createProxies, updateProxy, listProxies, deleteProxies, rememberProxyCheck, getProxy,
 } from '../store/proxies.js';
 import { startProfile, stopProfile, listRunning, getRunning, getInstance, userDataDirFor } from '../runtime/manager.js';
+import { purgeProfileData } from '../runtime/purge-data.js';
 import { batchStart, batchStop } from '../runtime/batch.js';
 import { profileFormSchema } from './schema.js';
 import { validateProfile } from '../../packages/profile/src/validate.js';
@@ -765,33 +766,49 @@ export function buildRoutes() {
       const target = getRecycledProfile({ profile_id: id });
       if (!target) { skipped.push({ profile_id: String(id), reason: 'not_in_recycle_bin' }); continue; }
       if (getRunning(target.id)) { try { await stopProfile(target.id); } catch { /* 停不掉就走下面删库失败分支 */ } }
-      // 目录：<profiles>/<no>_<id8>/userdata → 连它的上一级（同一个环境的目录）一起删
-      let dirGone = true;
-      try {
-        const udd = userDataDirFor(target);
-        const dir = path.dirname(udd);
-        if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
-        dirGone = !fs.existsSync(dir);
-        if (dirGone) userdataRemoved++;
-      } catch (e) {
-        dirGone = false;
+      /**
+       * 删盘走 **先改名再删** 的两阶段（`src/runtime/purge-data.js` 有完整理由与实测读数）：
+       * 直接 `rmSync(recursive)` 是「先删内容、再删目录」，目录被占住时会**内容删光了才报错**，
+       * 于是接口说「没删掉、还能恢复」而实际已经空了 —— 报的和做的正好相反，比静默成功更糟。
+       *
+       * 改名失败 = 一个字节都没动，这时才允许回「还能恢复」。
+       */
+      const data = purgeProfileData(target);
+
+      if (data.ok) {
+        if (data.removed) userdataRemoved++;
+        const r = purgeProfiles([target.id]);
+        purged.push(...r.purged);
+        for (const s of r.skipped) skipped.push(s);
+        continue;
+      }
+
+      if (data.data_detached) {
         /**
-         * 这一步**真的会失败**，而且不是罕见情况：残留的内核进程把 user-data 目录当工作目录、
-         * 或某个文件被别的程序锁着时，Windows 给的是 `EPERM`（实测：子进程 cwd 在目录里就必现）。
-         * 所以 reason 用**稳定的机器可读串**，错误码与原文分开挂 —— 界面上要显示原因，
-         * 脚本要能按 reason/code 判断「等会儿再试」，两件事不能挤在一条中文串里。
+         * 目录改名成功、墓碑删不掉、又改不回来：数据已经不在原路径上了，**恢复不出东西**。
+         * 所以这条记录必须一起删掉 —— 不许它在回收站里还挂着「可恢复」。
+         * 磁盘没腾出来这件事如实报（`data_detached` + 路径），用户/脚本能自己去清。
          */
+        const r = purgeProfiles([target.id]);
+        purged.push(...r.purged);
         skipped.push({
           profile_id: target.id,
-          reason: 'userdata_remove_failed',
-          error_code: e.code || null,
-          error_message: e.message,
+          reason: data.reason,
+          data_detached: true,
+          error_code: data.error_code,
+          error_message: data.error_message,
+          detached_path: data.detached_path,
         });
+        continue;
       }
-      if (!dirGone) continue; // 盘没删掉就不删库，留个还能再点的入口
-      const r = purgeProfiles([target.id]);
-      purged.push(...r.purged);
-      for (const s of r.skipped) skipped.push(s);
+
+      // intact：什么都没动，库记录留着，可以再点一次
+      skipped.push({
+        profile_id: target.id,
+        reason: data.reason,
+        error_code: data.error_code,
+        error_message: data.error_message,
+      });
     }
     return ok({ purged, skipped, userdata_removed: userdataRemoved });
   });

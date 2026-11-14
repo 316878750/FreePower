@@ -183,8 +183,13 @@ export function skipReasonText(s) {
     case 'not_in_recycle_bin':
       return '不在回收站里（只有回收站里的环境能彻底删除）';
     case 'userdata_remove_failed':
-      return `user-data 目录删不掉${code}：可能有程序还占着它（比如没退干净的浏览器进程），`
-        + '关掉之后可以再试一次。记录已保留。';
+      // 这一支保证「一个字节都没动」（先改名再删，改名失败就没动过），所以能放心说「还能恢复」
+      return `user-data 目录删不掉${code}：可能有程序还占着它（比如没退干净的浏览器进程）。`
+        + '数据一点没动，关掉之后可以再试一次。';
+    case 'userdata_remove_failed_after_rename':
+      // 这一支数据已经不在原路径上了 —— 必须说清「不能恢复」，不能再让用户以为还能救回来
+      return '目录已被移走但删不掉（数据已不在原位置）：这条环境不能再恢复了。'
+        + `记录已清除，残留目录在 ${s.detached_path || '数据目录下'}，可手动删除${code}。`;
     default:
       return s.reason ? `${s.reason}${code}` : '未知原因';
   }
