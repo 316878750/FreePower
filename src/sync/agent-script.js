@@ -129,6 +129,16 @@ export function buildCaptureScript({ bindingName, moveIntervalMs = 30, flushMs =
     var d = e.data || '';
     if (d) push({ t: 'text', s: d });
   }
+  function onPaste(e) {
+    /* 粘贴：把剪贴板里的纯文本投出去。**不 preventDefault** —— 主窗口自己该怎么粘就怎么粘，
+       我们只是把「粘了什么」告诉主进程（受控窗口那边由主进程 insertText）。
+       剪贴板可能是图片/富文本，只取 text/plain，取不到就这条不发。 */
+    try {
+      var cd = e.clipboardData || window.clipboardData;
+      var s = cd && cd.getData ? cd.getData('text/plain') : '';
+      if (s) push({ t: 'paste', s: String(s) });
+    } catch (err) { /* 拿不到剪贴板就这条不发，不影响主窗口自己的粘贴 */ }
+  }
 
   var opts = { capture: true, passive: true };
   window.addEventListener('mousemove', onMove, opts);
@@ -138,6 +148,7 @@ export function buildCaptureScript({ bindingName, moveIntervalMs = 30, flushMs =
   window.addEventListener('keydown', onKey, opts);
   window.addEventListener('keyup', onKey, opts);
   window.addEventListener('compositionend', onCompositionEnd, opts);
+  window.addEventListener('paste', onPaste, opts);
 
   /* binding 是新文档里懒安装的：轮询等它（实测 4ms 内出现），最多 2 秒。
      但**先同步抓一次**：当前文档这条路径上 binding 在脚本跑之前就装好了，

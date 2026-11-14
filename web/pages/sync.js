@@ -1,5 +1,5 @@
 /**
- * 窗口同步（阶段 1）：选主窗口 + 受控窗口 → 开始 → 四个开关与延迟 → 状态。
+ * 窗口同步（阶段 1 + 阶段 2 文本输入）：选主窗口 + 受控窗口 → 开始 → 开关与延迟 → 状态。
  *
  * 这一页只做「配置 + 看读数」。真正的捕获与回放全在主进程（`src/sync/*`），
  * 界面通过 Local API 驱动 —— 关掉这个页面同步照样跑（这也是为什么面板是独立窗口）。
@@ -17,7 +17,12 @@ const state = {
   profiles: new Map(),
   masterId: '',
   slaveIds: new Set(),
-  settings: { input: true, click: true, scroll: true, move: true, delay_ms: 0, jitter_ms: 0 },
+  settings: {
+    input: true, click: true, scroll: true, move: true,
+    text_sync: true, typing: false, paste: true, random_number: false,
+    typing_min_ms: 30, typing_max_ms: 120, random_min: 1000, random_max: 9999,
+    delay_ms: 0, jitter_ms: 0,
+  },
   status: null,
   timer: null,
   busy: false,
@@ -162,24 +167,22 @@ export default async function renderSync({ head, page }) {
 
   function buildSettings() {
     const box = h('div');
-    const sw = (key, label, hint) => h('label', { class: 'check' },
+    const sw = (key, label, hint, dflt = true) => h('label', { class: 'check' },
       h('input', {
-        type: 'checkbox', checked: state.settings[key] !== false,
+        type: 'checkbox', checked: (state.settings[key] ?? dflt) === true,
         onChange: (e) => applySettings({ [key]: e.target.checked }),
       }),
       h('span', null, label),
       hint ? h('span', { class: 'muted small' }, `　${hint}`) : null);
 
-    const delayInput = h('input', {
-      type: 'number', min: 0, max: 5000, step: 10, value: state.settings.delay_ms ?? 0,
-      style: { width: '90px' },
-      onChange: (e) => applySettings({ delay_ms: Number(e.target.value) || 0 }),
+    const numBox = (key, min, max, step, width = '90px') => h('input', {
+      type: 'number', min, max, step, value: state.settings[key] ?? 0,
+      style: { width },
+      onChange: (e) => applySettings({ [key]: Number(e.target.value) || 0 }),
     });
-    const jitterInput = h('input', {
-      type: 'number', min: 0, max: 5000, step: 10, value: state.settings.jitter_ms ?? 0,
-      style: { width: '90px' },
-      onChange: (e) => applySettings({ jitter_ms: Number(e.target.value) || 0 }),
-    });
+
+    const delayInput = numBox('delay_ms', 0, 5000, 10);
+    const jitterInput = numBox('jitter_ms', 0, 5000, 10);
 
     mount(box,
       h('div', { class: 'row' },
@@ -188,12 +191,29 @@ export default async function renderSync({ head, page }) {
         sw('scroll', '滚动'),
         sw('input', '键盘输入')),
       h('div', { class: 'row', style: { marginTop: '10px' } },
+        h('span', { class: 'muted small', style: { width: '100%' } }, '文本输入')),
+      h('div', { class: 'row' },
+        sw('text_sync', '相同文本输入', '主窗口打的字原样同步（关掉只同步按键，不落字符）'),
+        sw('paste', '粘贴同步', '主窗口粘贴的内容也同步到受控窗口'),
+        sw('typing', '模拟人工输入', '逐字投递、字间随机间隔', false),
+        sw('random_number', '随机数字输入', '每个受控窗口各自一个随机数，替换原文', false)),
+      h('div', { class: 'row', style: { marginTop: '6px' } },
+        h('span', { class: 'muted small' }, '打字间隔'),
+        numBox('typing_min_ms', 0, 2000, 5, '70px'), h('span', { class: 'muted small' }, '–'),
+        numBox('typing_max_ms', 0, 2000, 5, '70px'), h('span', { class: 'muted small' }, 'ms'),
+        h('span', { class: 'muted small', style: { marginLeft: '16px' } }, '随机数字范围'),
+        numBox('random_min', 0, 1000000000, 1, '110px'), h('span', { class: 'muted small' }, '–'),
+        numBox('random_max', 0, 1000000000, 1, '110px')),
+      h('div', { class: 'row', style: { marginTop: '10px' } },
         h('span', { class: 'muted small' }, '延迟'),
         delayInput, h('span', { class: 'muted small' }, 'ms'),
         h('span', { class: 'muted small', style: { marginLeft: '16px' } }, '随机抖动'),
         jitterInput, h('span', { class: 'muted small' }, 'ms')),
       h('div', { class: 'muted small', style: { marginTop: '8px' } },
-        '延迟与抖动都在主进程做（受控窗口里没有任何我们的脚本）。抖动范围 = 0…该值，随机源按会话种子可复现。'));
+        '延迟与抖动都在主进程做（受控窗口里没有任何我们的脚本）。抖动范围 = 0…该值，随机源按会话种子可复现。'),
+      h('div', { class: 'muted small' },
+        '「相同文本输入」和「随机数字输入」是两个独立开关：都开时数字输入优先（随机数字替换原文）；'
+        + '随机数每个受控窗口各自抽，同一批环境不会写出相同的值。'));
     return box;
   }
 
@@ -231,6 +251,7 @@ export default async function renderSync({ head, page }) {
         h('span', { class: 'muted small' }, `会话 ${String(st.session_id || '').slice(0, 8)}`),
         h('span', { class: 'muted small' }, `已转发 ${st.events ?? 0} 条`),
         h('span', { class: 'muted small' }, `被开关拦下 ${st.dropped ?? 0} 条`),
+        h('span', { class: 'muted small' }, `文本已发 ${st.text_sent ?? 0} / 按策略吞掉 ${st.text_swallowed ?? 0}`),
         h('span', { class: 'muted small' }, `已发出 ${st.scheduler?.sent ?? 0} / 待发 ${st.scheduler?.pending ?? 0}`),
         h('span', { class: 'muted small' }, `binding ${st.binding_name || '—'}（每会话随机，抓完即删）`)),
       h('table', { class: 'grid', style: { marginTop: '10px' } },

@@ -130,13 +130,14 @@ export function randomNumber(min, max, { rng = Math.random } = {}) {
 
 /**
  * 逐字打散：模拟人工输入时每个字符之间带随机间隔。
+ * 按**码点**计数（`Array.from`），不是 UTF-16 码元 —— emoji 算一个字符，不能被拆成两半。
  * @returns {number[]} 每个字符的延迟（ms），长度 = 字符数
  */
 export function typingDelays(text, { minMs = 30, maxMs = 120, rng = Math.random } = {}) {
-  const s = String(text ?? '');
+  const chars = Array.from(String(text ?? ''));
   const lo = Math.max(0, Math.min(Number(minMs) || 0, Number(maxMs) || 0));
   const hi = Math.max(lo, Math.max(Number(minMs) || 0, Number(maxMs) || 0));
   const out = [];
-  for (let i = 0; i < s.length; i++) out.push(lo + Math.floor(rng() * (hi - lo + 1)));
+  for (let i = 0; i < chars.length; i++) out.push(lo + Math.floor(rng() * (hi - lo + 1)));
   return out;
 }

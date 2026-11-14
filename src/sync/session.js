@@ -13,7 +13,8 @@ import { CdpClient } from '../kernel/cdp.js';
 import { getInstance, getRunning } from '../runtime/manager.js';
 import { buildCaptureScript } from './agent-script.js';
 import { newBindingName } from './binding.js';
-import { buildInputPlan, enabledBySwitch } from './replay.js';
+import { buildSyncPlan, enabledBySwitch } from './replay.js';
+import { makeTextResolver, textOf } from './text-input.js';
 import { SyncScheduler, makeRng } from './scheduler.js';
 
 /** 一次只允许一个同步会话：两套同时往同一批窗口发输入必然是灾难 */
@@ -35,12 +36,21 @@ export function getSession() {
   return current;
 }
 
-/** 默认设置：四个开关全开、无延迟（用户开了「延迟」才加） */
+/** 默认设置：键鼠四开关全开、无延迟；文本三个开关按对手面板的默认（相同文本/粘贴开，人工输入/随机数字关） */
 export const DEFAULT_SETTINGS = Object.freeze({
   input: true,
   click: true,
   scroll: true,
   move: true,
+  /* ---- 文本输入：四个开关互相独立，别合并（语义见 text-input.js） ---- */
+  text_sync: true,        // 相同文本输入
+  typing: false,          // 模拟人工输入（逐字 + 随机间隔）
+  paste: true,            // 粘贴同步
+  random_number: false,   // 随机数字输入（每窗口各自一个数，替换原文）
+  typing_min_ms: 30,
+  typing_max_ms: 120,
+  random_min: 1000,
+  random_max: 9999,
   delay_ms: 0,
   jitter_ms: 0,
 });
@@ -51,11 +61,31 @@ export function normalizeSettings(raw = {}) {
     const n = Number(v);
     return Number.isFinite(n) && n >= 0 ? Math.min(n, 5000) : dflt;
   };
+  /* 文本相关的数值上限大得多（随机数可以到十亿位、打字间隔到 2 秒），
+   * 不能复用 num() 的 5000 上限 —— 否则「随机数 1–99999」会被静默改成 5000。 */
+  const int = (v, dflt, lo, hi) => {
+    const n = Math.round(Number(v));
+    return Number.isFinite(n) ? Math.min(Math.max(n, lo), hi) : dflt;
+  };
+  let typingMin = int(raw.typing_min_ms, DEFAULT_SETTINGS.typing_min_ms, 0, 2000);
+  let typingMax = int(raw.typing_max_ms, DEFAULT_SETTINGS.typing_max_ms, 0, 2000);
+  if (typingMin > typingMax) [typingMin, typingMax] = [typingMax, typingMin];
+  let randMin = int(raw.random_min, DEFAULT_SETTINGS.random_min, 0, 1e9);
+  let randMax = int(raw.random_max, DEFAULT_SETTINGS.random_max, 0, 1e9);
+  if (randMin > randMax) [randMin, randMax] = [randMax, randMin];
   return {
     input: bool(raw.input, true),
     click: bool(raw.click, true),
     scroll: bool(raw.scroll, true),
     move: bool(raw.move, true),
+    text_sync: bool(raw.text_sync, true),
+    typing: bool(raw.typing, false),
+    paste: bool(raw.paste, true),
+    random_number: bool(raw.random_number, false),
+    typing_min_ms: typingMin,
+    typing_max_ms: typingMax,
+    random_min: randMin,
+    random_max: randMax,
     delay_ms: num(raw.delay_ms, 0),
     jitter_ms: num(raw.jitter_ms, 0),
   };
@@ -136,8 +166,12 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
   const bindingName = newBindingName();
   const seed = rngSeed === null || rngSeed === undefined ? crypto.randomInt(1, 2 ** 31) : Number(rngSeed);
   const scheduler = new SyncScheduler({ delayMs: st.delay_ms, jitterMs: st.jitter_ms, rng: makeRng(seed) });
+  /* 文本的随机源单独一条流：随机数字、逐字间隔都从这里取。
+   * 与会话种子绑在一起 → 同一个 rngSeed 重放同一串数字，问题可复现（判据也靠这个）。 */
+  const textRng = makeRng((Number(seed) >>> 0) ^ 0x5f356495);
 
   const targets = new Map();   // profileId -> { client, sessionId, targetId, viewport, window }
+  const resolvers = new Map();  // profileId -> 文本解析器（每窗口一个：随机数字各抽各的、连击状态独立）
   const degraded = new Map();  // profileId -> reason
 
   const session = {
@@ -150,6 +184,8 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
     started_at: new Date().toISOString(),
     events: 0,
     dropped: 0,
+    text_sent: 0,
+    text_swallowed: 0,
     scheduler,
     targets,
     degraded,
@@ -209,18 +245,36 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
         // 开关必须读**会话当前的** settings：闭包里那个 `st` 是启动时的快照，
         // 用户运行中关掉「输入」时它会一直是旧值（B 层判据抓到的真 bug）。
         if (!enabledBySwitch(ev, session.settings)) { session.dropped += 1; continue; }
+        // 文本/键盘事件不需要视口；鼠标类没有视口就丢（宁可漏一次移动，也不要在 (0,0) 乱点）
+        const isText = ev?.t === 'key' || ev?.t === 'text' || ev?.t === 'paste';
+        let textEmitted = false;
         for (const id of session.slaves) {
           const t = targets.get(id);
           if (!t || degraded.has(id)) continue;
-          // 视口还没读到：丢这条（宁可漏一次移动，也不要在 (0,0) 乱点）
-          if (!t.viewport) continue;
-          const plan = buildInputPlan(ev, t.viewport);
+          if (!t.viewport && !isText) continue;
+          /* 每个受控窗口单独算一次计划：随机数字要「每窗口各自一个值」，
+           * 逐字间隔也要每个窗口各自随机（否则 N 个窗口节奏完全一致，反而像机器人）。 */
+          if (isText && !resolvers.has(id)) resolvers.set(id, makeTextResolver({ rng: textRng }));
+          const plan = buildSyncPlan(ev, t.viewport, session.settings, resolvers.get(id), textRng);
           if (!plan.length) continue;
+          /* 「这条事件里有没有文字真的落到受控窗口」：insertText，或者带 text 的 keyDown
+           * （打字走后者 —— keyDown 自己就把字符打进去了，不用再 insertText）。 */
+          if (plan.some((c) => c.method === 'Input.insertText'
+            || (c.params && typeof c.params.text === 'string' && c.params.text))) textEmitted = true;
           scheduler.push(id, async () => {
             for (const call of plan) {
+              // waitMs 是「发这一条之前等多久」：逐字投递的字符间隔在这里落地
+              if (call.waitMs) await sleep(call.waitMs);
               await t.client.send(call.method, call.params, t.sessionId);
             }
           });
+        }
+        /* 读数：带文字的事件里，**真的发出去了**多少条、被**内容策略**吞掉多少条。
+         * 与被开关拦下的 dropped 分开记 —— 「相同文本关掉」和「按键被丢掉」是两回事，
+         * 合成一个数字会让用户（和判据）分不清是开关没生效还是文本策略生效。
+         * 不带文字的按键（退格、方向键）不算在内：它们本来就该照发。 */
+        if (isText && textOf(ev)) {
+          if (textEmitted) session.text_sent += 1; else session.text_swallowed += 1;
         }
       }
     });
@@ -333,6 +387,8 @@ function statusOf(session) {
     started_at: session.started_at,
     events: session.events,
     dropped: session.dropped,
+    text_sent: session.text_sent,
+    text_swallowed: session.text_swallowed,
     abnormal: session.abnormal || null,
     scheduler: session.scheduler.stats(),
     windows,
