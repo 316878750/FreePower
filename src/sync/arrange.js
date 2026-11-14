@@ -35,6 +35,10 @@ import { needsRestoreBeforeResize, normalizeState } from './window.js';
  * 也就是说宽度低于 516 时，`Browser.setWindowBounds` **返回成功但宽度被系统夹到 516**。
  * 把下限设成 516 是为了让「计划」和「现实」一致：否则用户填 300，每个窗口都回读不符，
  * 面板每次都报「有 N 个窗口没能排到位」——那是实话，但根源在我们给了一个做不到的数。
+ *
+ * **高度 200 不是系统下限**：高度请求 150 实测回读 151，系统真实下限约 151。
+ * 200 是**我们自己选的下限**（窗口太扁没意义，也没法看网页）。数字来源要分清：
+ * 宽度是系统夹出来的，高度是我们定的。
  */
 export const MIN_WINDOW_WIDTH = 516;
 export const MIN_WINDOW_HEIGHT = 200;

@@ -23,6 +23,7 @@ import {
   autoFit, auditPlan, planArrange, placeOne, summarizeArrange,
 } from './arrange.js';
 import { screensForArrange } from './displays.js';
+import { planShow, summarizeShow, verifyShown } from './show.js';
 import {
   closeTabAt, isBlankUrl, listTabs, navigateAt, openTabFor,
   parseOpenUrls, planCloseBlank, planCloseOthers, planUnify, settle, targetIndex, visibleTabIndex,
@@ -652,6 +653,117 @@ export async function arrangeWindows(rawParams = {}) {
     summary: summarizeArrange(placed),
     status: current.status(),
   };
+}
+
+/**
+ * 显示窗口（对手的 `viewWin` / 行内 `displayWin`）：把窗口从最小化恢复出来并尽量放到前面。
+ *
+ * **零依赖实测读数决定实现**（`.tmp/foreground-probe*.mjs`，Chrome 157.0.8103.78，三层分开量）：
+ *
+ *   窗口**最小化**时：
+ *     `Browser.setWindowBounds({windowState:'normal'})` → Win32 前台 pid = 该内核、z 序 0
+ *     `Page.bringToFront`                              → 同样到前台、z 序 0
+ *     ⇒ 恢复这一步**真的把 OS 窗口抬到前台了**。
+ *
+ *   窗口**没最小化、只是被别的窗口盖住**时：
+ *     `Page.bringToFront` → 页面 `document.hasFocus()` 变 true，但 **Win32 前台仍不是它、z 序没动**
+ *     `Target.activateTarget` → 同上，不抬
+ *     `Browser.setWindowBounds(windowState:'normal')`（它本来就是 normal）→ 不抬
+ *     ⇒ 「页面拿到焦点」和「OS 窗口到前台」不是一回事，**绝不能拿前者冒充后者**。
+ *
+ * 所以这里分两档，逐条如实记在 `raise` 字段里：
+ *   `restored`   最小化 → 恢复并到前台（真的 ③）
+ *   `page_only`  只做了页面级激活，**可能仍被盖住**（只有 ②，不是 ③）
+ *   `none`       没动（用户主动全屏的窗口不该被我们缩回来）
+ *
+ * 为什么不给「被盖住」这种窗口也硬抬：零依赖唯一能做到的办法是「先最小化再恢复」
+ * （实测能到前台，约 600–1000ms，位置不变、最大化状态也不丢），但那会让任务栏闪一下 ——
+ * 是可见副作用，不在这一版里默认做（要不要引 Win32 依赖把它做成瞬间的，等定）。
+ */
+export async function showWindows(rawIds) {
+  if (!current) throw new Error('没有正在运行的同步会话');
+  const s = current;
+  const all = [s.master, ...s.slaves];
+  const want = rawIds === undefined || rawIds === null
+    ? all
+    : (Array.isArray(rawIds) ? rawIds : [rawIds]).map(String);
+  const ids = want.filter((id) => s.targets.get(id));
+  if (!ids.length) throw new Error('没有可显示的窗口');
+
+  const results = [];
+  for (const id of ids) {
+    const t = s.targets.get(id);
+    const entry = {
+      profile_id: id,
+      role: id === s.master ? 'master' : 'slave',
+      ok: false,
+      raise: 'none',
+      state_before: null,
+      state_after: null,
+      rect_before: null,
+      rect_after: null,
+    };
+    try {
+      const win = await windowSizeOf(t.client, t.targetId);
+      if (!win?.windowId) throw new Error('读不到窗口 id');
+      const before = await windowRectOf(t.client, t.targetId);
+      entry.state_before = normalizeState(win.state);
+      entry.rect_before = before;
+      const [plan] = planShow([{ profile_id: id, state: win.state }]);
+      entry.action = plan.action;
+
+      if (plan.action === 'restore') {
+        entry.raise = 'restored';
+        await t.client.send('Browser.setWindowBounds', { windowId: win.windowId, bounds: { windowState: 'normal' } });
+        await settle(160);
+      } else if (plan.action === 'page_only') {
+        entry.raise = 'page_only';
+        await t.client.send('Page.bringToFront', {}, t.sessionId);
+        await settle(160);
+      }
+
+      /* 回读：恢复成功只认状态 + 位置尺寸没被搬走（见 show.js 顶部） */
+      const after = await windowRectOf(t.client, t.targetId);
+      entry.rect_after = after;
+      entry.state_after = normalizeState(after?.state);
+      const v = verifyShown({ state_before: entry.state_before, rect_before: before }, after);
+      // page_only 那批同时记下「页面拿到焦点没有」—— 但**它不参与 ok**，只作读数
+      if (plan.action === 'page_only') {
+        entry.page_focused = await pageHasFocus(t.client, t.sessionId);
+      }
+      entry.ok = v.ok;
+      entry.problems = v.problems;
+      if (!v.ok) entry.reason = v.problems.map((m) => `${m.field} 期望 ${m.expected} 实际 ${m.actual}`).join('；');
+    } catch (e) {
+      entry.reason = e?.message || String(e);
+    }
+    results.push(entry);
+  }
+
+  await refreshAll();
+  return {
+    shown: results,
+    summary: summarizeShow(results),
+    /**
+     * 明确告诉调用方：这一版**只有最小化的窗口真到前台**。
+     * 面板据此显示一行提示，不让用户以为「点了就跑到最前面了」。
+     */
+    os_foreground: results.length > 0 && results.every((r) => r.raise === 'restored'),
+    status: current.status(),
+  };
+}
+
+/** 页面文档有没有焦点（只作读数，**不当作「窗口到前台」**） */
+async function pageHasFocus(client, sessionId) {
+  try {
+    const r = await client.send('Runtime.evaluate', {
+      expression: 'JSON.stringify({hasFocus: document.hasFocus(), visibility: document.visibilityState})',
+      returnByValue: true,
+    }, sessionId);
+    return JSON.parse(r?.result?.value || '{}');
+  } catch {
+    return null;
+  }
 }
 
 /**

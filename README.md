@@ -1747,6 +1747,10 @@ B 层 17 条：三个 normal 窗口设成 1000×700 / 800×600 / 900×650 → �
 不给用户一个做不到的数，也就不会每个窗口都回读不符、每点一次都报「有 N 个窗口没能排到位」。
 超范围一律夹到边界并带 warning，**不静默**。
 
+**高度下限 200 不是系统下限，是我们选的**（这条别混）：高度请求 150 实测回读 **151**，
+系统真实下限约 151；200 是我们自己定的（窗口太扁没意义，网页也没法看）。
+宽度是系统夹出来的、高度是我们定的，两个数的来源不同，写在一起容易看错。
+
 **判定只认回读，而且判定只有一处。** 摆窗口那步抽成了 `placeOne()`（`src/sync/arrange.js`），
 `setBounds` / `readRect` 是注入参数。理由是真内核**造不出**「命令成功但窗口没到位」
 （系统要么照做、要么连不上），所以 B 层只能证明「正常情况能摆对」，抓不住「相信命令返回值」这种坏实现
@@ -1790,7 +1794,93 @@ B 层实读（真机 3440×1440，假显示器 `workArea = 40,60 1400×820`）�
 
 ### 阶段 3 第 3 件：显示窗口 / 置前
 
-（待做）
+对手的 `viewWin`（行内叫 `displayWin`），按钮文案「显示窗口」，语义是「把窗口弄到看得见的地方」。
+
+**这件事的难点不是「发命令」，是「凭什么说它到前面了」。** 所以先把「到前面」拆成三层，分别量：
+
+| 层 | 怎么读 | 我们拿到了吗 |
+|---|---|---|
+| ① 页面文档有焦点 | `Runtime.evaluate: document.hasFocus()` | 拿到，但**它随时会撒谎** |
+| ② 该窗口是 Chrome 的活动窗口 | `Browser.getWindowForTarget` 的 `windowState` + CDP 里谁在收 `Page.bringToFront` | 只能间接看，`windowState` 根本不反映 z 序 |
+| ③ OS 前台窗口 | Win32 `GetForegroundWindow()` 的标题/pid + `EnumWindows` 的 z 序 | **拿到**（判据用 `tools/win-foreground.ps1`，只在测试里用，产品不带） |
+
+**零依赖实测读数**（`.tmp/fg-probe.mjs` + `foreground-probe{,2,3}.mjs`，Chrome 157.0.8103.78，
+Windows 11 双屏：主屏 3440×1440、扩展屏 x=-1080..0 竖屏）：
+
+```
+窗口最小化时（A 档）
+  Browser.setWindowBounds(windowState:normal)  → 回读 normal、hasFocus:false、visibility:visible
+                                                ★ Win32: foreground_is_this:true、z=0  ⇒ 真到 ③
+  Page.bringToFront                            → 同样到 ③（最小化时它顺带恢复）
+
+窗口没最小化、只是被记事本盖住（B 档）
+  Page.bringToFront          → hasFocus:true 但 Win32 foreground_is_this:false、z 仍是 1  ⇒ 只有 ①
+  Target.activateTarget      → 同上，不抬
+  Browser.setWindowBounds(normal)（本来就是 normal）→ 不抬
+  minimized → normal 组合      → foreground_is_this:true、z=0  ⇒ 零依赖唯一能抬 B 档的办法
+                                但有可见副作用（任务栏闪一下），耗时实测 634 / 967 / 968 / 1061ms
+
+两个 Chrome 窗口互盖（C0/C1）
+  A 连发三次 Page.bringToFront → A hasFocus:true，但 B 仍 z=5、A 的 z 序没动  ⇒ 不改变 z 序
+
+多屏 / 最大化
+  E 窗口放到 2400,200 900×600 后 bringToFront → 位置没被搬回主屏（仍 2400,200）
+  D0 最大化：state=maximized、bounds -8,-8 3456×1408（边框补偿 8px，比对尺寸时不能算失败）
+```
+
+**结论：`Page.bringToFront` 抬不动 OS 窗口，只把页面激活。拿 `document.hasFocus()` 当「已置前」是假的。**
+所以「显示窗口」分两档做，并且**把档位如实写进返回值和界面**：
+
+- `restored` —— 最小化 → 恢复，实测会同时成为 ③ OS 前台。真的到前面了。
+- `page_only` —— normal/maximized 只是被盖住：只能做到 ①，窗口**可能仍在后面**。界面明说
+  「有 N 个窗口只做了页面级激活（可能仍被其它窗口盖住）」。
+- `none` —— 全屏窗口不动（用户主动全屏的窗口不该被我们缩回来）。
+
+**不做的事**：不用「先最小化再恢复」去给 B 档伪造置前。那确实能到 ③，但每次点都闪一次任务栏、
+耗时 0.6–1 秒，是可见副作用；要做成瞬间的得引 Win32 依赖，这个决定留给上层，不自己引。
+判据里有一条静态扫描盯着：`showWindows` 里**不许出现 `windowState: 'minimized'`**。
+
+**判定只认回读，而且钉了三条容易漏的**：
+1. 最小化 → 恢复后**位置尺寸一个像素都不许变**。多屏时窗口在扩展屏上，一恢复就跳回主屏是最讨厌的毛病。
+   （这里踩过一个坑：原以为「拿最小化前读到的 state 当门槛」，但窗口最小化期间读到的 state 就是 `minimized`，
+   那样写等于永远不比位置 —— 判据里「被搬到 (0,0)」那条红过，改成只排除 maximized 才对。）
+2. 恢复成 `maximized` 时**不比尺寸**：它的 bounds 带 -8 这类系统边框补偿，比了必然假失败。
+3. 回读读不到（null）**一律判失败**：不能落进「状态没变所以没问题」那条路，否则内核崩了会被报成成功。
+
+**冷启动的 `page_focused` 只是读数，绝不参与 `ok`**：判据里断言 `entry.ok = v.ok;` 全函数只有一处赋值，
+并且 `os_foreground` 只在**全部**窗口都 `restored` 时才 true。
+
+接线：`POST /api/v2/sync/show`（`body.profile_ids` 可省 = 所有同步窗口）→ `showWindows()`（`src/sync/session.js`）
+→ 纯计算在 `src/sync/show.js`（`planShow` / `verifyShown` / `summarizeShow`）。面板多一块 `showBox`。
+
+判据：
+```
+npm run test:sync-show        → 39/39（A 层：分档 + 回读判定 + 文案 + 静态扫描，零 Chrome）
+npm run test:sync-show-kernel → 35/35（B 层：1 主 + 2 受控真内核 + Win32 ③ 层读数）
+```
+
+B 层实读（真机，3 个环境）：
+```
+A 受控 1 最小化（900,120 700×480 minimized）→ 显示后 900,120 700×480(normal)
+  位置尺寸一个像素没动；Win32 前台从「无标题 - Notepad」变成「fp-show-slave1 - Google Chrome」
+  raise=restored / os_foreground=true
+B 三窗口全量显示：主控 raise=page_only、page_focused={hasFocus:true,visibility:"visible"}
+  但 Win32 前台仍是刚才恢复的 slave1 ⇒ ① 变 true、③ 没变（这就是不能拿 ① 冒充 ③ 的证据）
+C 主控挪到 -1000,200（扩展屏侧）→ 最小化 → 显示，回读仍是 -1000,200 620×420(normal)
+  没被搬回主屏；同时也成了 ③ 前台
+D 受控 2 先最大化再最小化 → 显示后回 maximized(-8,-8 3456×1408)，回报 ok=true（不比尺寸）
+E profile_ids 只给一个 → 只恢复那一个，另一个仍 minimized；不传则两个都恢复
+F 杀掉一个内核 → 那条 ok=false（原因「读不到窗口 id」），另一条仍 restored，"有 1 个窗口没能显示出来"
+```
+
+**先红后绿**（改坏 → 复跑 → 还原）：
+```
+① 让 page_only 也去 minimize→restore 伪造置前 → A 层红 2（静态扫描逮住 windowState:'minimized'；
+                                                  另一条是「page_only 那档不许改窗口状态」）
+② 把 page_focused.hasFocus 并进 entry.ok      → A 层红 1（entry.ok 赋值处不唯一）
+③ 位置比对拿 rect_before.state==='normal' 当门槛 → A 层红 3（这就是真踩到的那个坑：(0,0)、尺寸、null 三条）
+④ 汇总把 page_only 也算进「已恢复」            → A 层红 2（混合那条、全部 page_only 那条）
+```
 
 ### 连接策略
 
@@ -1827,6 +1917,7 @@ Target.createTarget({ url: 'about:blank' })
 | POST | `/api/v2/sync/refresh` | 重读各窗口视口与外框尺寸 |
 | POST | `/api/v2/sync/unify-size` | 一键统一尺寸（只在用户点按钮时执行） |
 | POST | `/api/v2/sync/arrange` | 窗口排列：`{width,height,row,top,left,hs,vs,range,screenId,screenList}` 或 `{auto:true}`（一键排列）；摆完逐个回读，不一致如实报 |
+| POST | `/api/v2/sync/show` | 显示窗口：`{profile_ids?}`（省 = 所有同步窗口）；逐窗口回读，`raise` 分 `restored`（真到 OS 前台）/ `page_only`（只做页面级激活）/ `none`（全屏不动），`os_foreground` 只在全部 restored 时 true |
 | GET | `/api/v2/sync/displays` | 显示器列表（桌面壳写、服务进程读；`managed:false` = 没有桌面壳，不是失败） |
 | POST | `/api/v2/sync/tab` | 打开网址：`{urls}`（数组或多行文本），每行一个、最多 10 个，超了报「一键最多打开10个网址」；走上面那条 about:blank 姿势 |
 | GET | `/api/v2/sync/tabs` | 各窗口标签列表 + 当前可见序号（`visible_confident:false` = 这条是猜的） |
@@ -1848,6 +1939,8 @@ npm run test:sync-window      → 22/22 （阶段 3 统一尺寸 A 层：状态�
 npm run test:sync-window-kernel → 17/17（阶段 3 统一尺寸 B 层：3 个真环境，含最大化与「改不了」）
 npm run test:sync-arrange     → 67/67 （阶段 3 窗口排列 A 层：三段公式 + 假读数判定 + 显示器交接）
 npm run test:sync-arrange-kernel → 28/28（阶段 3 窗口排列 B 层：3 个真环境，含换行/最大化和内核已死）
+npm run test:sync-show        → 39/39 （阶段 3 显示窗口 A 层：分档 + 回读判定 + 文案 + 静态扫描）
+npm run test:sync-show-kernel → 35/35 （阶段 3 显示窗口 B 层：3 个真环境 + Win32 OS 前台读数）
 ```
 
 **标签页 A 层 59 条**覆盖：空白判定六种写法（含 `chrome://new-tab-page/` 子路径）、URL 归一（补 https、只收 http/https）、序号映射（`same_tab` 两方向、越界返回 `null` 不猜）、关其它从大到小、关空白只关空白、

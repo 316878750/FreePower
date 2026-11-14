@@ -142,6 +142,15 @@ export const api = {
   syncArrange: (body) => call('/api/v2/sync/arrange', { method: 'POST', body }),
   /** 显示器列表（桌面壳写、服务进程读）。没有桌面壳时 `managed:false`，不是错误 */
   syncDisplays: () => call('/api/v2/sync/displays'),
+  /**
+   * 显示窗口（`viewWin`）：最小化的恢复出来并放到前台。
+   * 返回值里 `raise` 逐窗口说明是真到前台（`restored`）还是只做了页面级激活（`page_only`），
+   * `os_foreground` 只有全部真到前台时才是 true —— 面板据此显示提示，不假装都到前面了。
+   */
+  syncShow: (profileIds) => call('/api/v2/sync/show', {
+    method: 'POST',
+    body: profileIds === undefined ? {} : { profile_ids: Array.isArray(profileIds) ? profileIds : [profileIds] },
+  }),
   /** 全局快捷键状态（managed=false 表示没有桌面壳在管，不是失败） */
   syncHotkey: () => call('/api/v2/sync/hotkey'),
   syncHotkeySet: (accelerator) => call('/api/v2/sync/hotkey', { method: 'POST', body: { accelerator } }),

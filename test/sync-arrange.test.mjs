@@ -63,7 +63,7 @@ t('默认值：1000×700，间距 0，网格，主屏', () => {
   assert.equal(p.row, -1);          // -1 = 没给（由 planArrange 按窗口数算）
   assert.deepEqual(p.warnings, []);
 });
-t('窗口尺寸下限就是系统下限：宽 516 / 高 200（实测读数，不是拍的）', () => {
+t('窗口尺寸下限：宽 516（系统夹出来的）/ 高 200（我们自己选的，系统能给到 151）', () => {
   assert.equal(MIN_WINDOW_WIDTH, 516, 'Chrome 157.0.8103.78 实测：请求 500 得 516、请求 520 得 520');
   assert.equal(MIN_WINDOW_HEIGHT, 200);
 });

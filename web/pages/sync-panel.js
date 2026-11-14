@@ -42,6 +42,7 @@ export default async function renderSyncPanel({ head, page }) {
   const pickBox = h('div');
   const statusBox = h('div');
   const arrangeBox = h('div');
+  const showBox = h('div');
   const hotkeyBox = h('div');
 
   mount(head, h('h1', null, '窗口同步'));
@@ -50,6 +51,7 @@ export default async function renderSyncPanel({ head, page }) {
     h('div', { class: 'panel' }, h('div', { class: 'panel-body' }, pickBox)),
     h('div', { class: 'panel' }, h('div', { class: 'panel-body' }, statusBox)),
     h('div', { class: 'panel' }, h('div', { class: 'panel-body' }, arrangeBox)),
+    h('div', { class: 'panel' }, h('div', { class: 'panel-body' }, showBox)),
     h('div', { class: 'panel' }, h('div', { class: 'panel-body' }, hotkeyBox)));
 
   if (shortcutFailed) {
@@ -61,6 +63,7 @@ export default async function renderSyncPanel({ head, page }) {
   await reload(true);
   await loadDisplays();
   paintArrange();
+  paintShow();
   await paintHotkey();
   state.timer = setInterval(() => { tick().catch(() => {}); }, 1000);
   window.addEventListener('hashchange', () => {
@@ -275,6 +278,47 @@ export default async function renderSyncPanel({ head, page }) {
             `已排列 ${r?.placed?.length ?? 0} 个窗口${r?.auto ? `（每行 ${r.auto.cols} 个，${r.auto.width}×${r.auto.height}）` : ''}`),
         warn.length
           ? h('div', { class: 'notice warn', style: { marginTop: '6px' } }, ...warn.map((w) => h('div', { class: 'muted small' }, w)))
+          : null);
+    } catch (e) {
+      toast(e.message, 'bad');
+      mount(resBox, h('div', { class: 'notice bad', style: { marginTop: '6px' } }, e.message));
+    }
+    await reload(false);
+  }
+
+  /**
+   * 显示窗口（对手的 `viewWin`，行内叫 `displayWin`）。
+   *
+   * **它的能力边界必须写在界面上**：最小化的窗口恢复后实测会真的到 OS 前台；
+   * 只是被别的窗口盖住（没最小化）的窗口，零依赖只能把**页面**激活，窗口可能仍在后面。
+   * 所以按钮下面那行小字是「恢复最小化并把窗口放到前面」，结果显示 `page_only` 时
+   * 明确写「有 N 个窗口只做了页面级激活（可能仍被其它窗口盖住）」，不假装都到前面了。
+   */
+  function paintShow() {
+    const resBox = h('div');
+    mount(showBox,
+      h('div', { class: 'row' },
+        h('button', { class: 'btn primary sm', onClick: () => showAll(resBox) }, '显示窗口'),
+        h('span', { class: 'muted small' }, '恢复最小化的窗口，并把它放到前面')),
+      resBox);
+  }
+
+  async function showAll(resBox) {
+    try {
+      const r = await api.syncShow();
+      const s = r?.summary || {};
+      toast(s.message || '已显示', s.failed ? 'bad' : '');
+      mount(resBox,
+        s.failed
+          ? h('div', { class: 'notice bad', style: { marginTop: '6px' } },
+            h('strong', null, s.message),
+            ...(s.details || []).map((x) => h('div', { class: 'muted small' },
+              `${nameOf(x.profile_id)}（${x.role === 'master' ? '主控' : '受控'}）：${x.reason || '没显示出来'}`)))
+          : h('div', { class: 'muted small', style: { marginTop: '6px' } }, s.message),
+        s.ok && s.page_only
+          ? h('div', { class: 'notice warn', style: { marginTop: '6px' } },
+            `有 ${s.page_only} 个窗口只做了页面级激活（可能仍被其它窗口盖住）。`
+            + '最小化的窗口会真的到前台；没最小化、只是被盖住的，当前版本抬不上来。')
           : null);
     } catch (e) {
       toast(e.message, 'bad');
