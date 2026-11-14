@@ -37,7 +37,7 @@ import { readReportFile, summarize } from '../selfcheck/store.js';
 import { renderHtml } from '../selfcheck/html.js';
 import { issueTicket } from './tickets.js';
 import { apiInfoPayload, setApiVerify, resetStats } from './info.js';
-import { startSync, stopSync, syncStatus, updateSettings, refreshAll, unifySize, openTabInAll } from '../sync/session.js';
+import { startSync, stopSync, syncStatus, updateSettings, refreshAll, unifySize, openTabInAll, tabState, closeTabs, copyTabToSlaves, unifyTabs } from '../sync/session.js';
 import { readHotkeyStatus, requestHotkey } from '../sync/hotkey.js';
 import { resetApiKey } from '../store/db.js';
 import { listKernels } from '../kernel/chrome.js';
@@ -951,11 +951,44 @@ export function buildRoutes() {
    * 内部走 about:blank → 登记豁免 → attach → navigate，避免首帧原始指纹。
    */
   add(['POST'], ['/api/v2/sync/tab'], async (ctx) => {
-    const url = ctx.body?.url ?? ctx.query?.url;
+    const url = ctx.body?.url ?? ctx.body?.urls ?? ctx.query?.url;
     try {
       return ok(await openTabInAll(url));
     } catch (e) {
       throw new ApiError(ERR.INVALID, e?.message || 'sync is not running', 200, { field: 'url' });
+    }
+  });
+
+  /** 各窗口的标签列表与当前可见序号（界面与判据都读这个，不靠猜） */
+  add(['GET'], ['/api/v2/sync/tabs'], async () => ok(await tabState()));
+
+  /** 关标签：which = current（当前）/ others（留当前，关其它）/ blank（关空白） */
+  add(['POST'], ['/api/v2/sync/tab-close'], async (ctx) => {
+    const which = ctx.body?.which ?? ctx.query?.which ?? 'current';
+    try {
+      return ok(await closeTabs(which));
+    } catch (e) {
+      throw new ApiError(ERR.INVALID, e?.message || 'sync is not running', 200, { field: 'which' });
+    }
+  });
+
+  /** 复制主窗口某标签到受控窗口（只往受控去，不动主窗口） */
+  add(['POST'], ['/api/v2/sync/tab-copy'], async (ctx) => {
+    const raw = ctx.body?.index ?? ctx.query?.index;
+    const index = raw === undefined || raw === null || raw === '' ? null : Number(raw);
+    try {
+      return ok(await copyTabToSlaves({ index }));
+    } catch (e) {
+      throw new ApiError(ERR.INVALID, e?.message || 'sync is not running', 200, { field: 'index' });
+    }
+  });
+
+  /** 统一标签页：受控窗口的标签数量与序号 URL 对齐主窗口 */
+  add(['POST'], ['/api/v2/sync/tab-unify'], async () => {
+    try {
+      return ok(await unifyTabs());
+    } catch (e) {
+      throw new ApiError(ERR.INVALID, e?.message || 'sync is not running');
     }
   });
 

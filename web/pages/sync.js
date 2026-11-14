@@ -21,9 +21,11 @@ const state = {
     input: true, click: true, scroll: true, move: true,
     text_sync: true, typing: false, paste: true, random_number: false,
     typing_min_ms: 30, typing_max_ms: 120, random_min: 1000, random_max: 9999,
+    same_tab: true, target_blank: true,
     delay_ms: 0, jitter_ms: 0,
   },
   status: null,
+  tabBox: null,
   timer: null,
   busy: false,
 };
@@ -49,6 +51,9 @@ export default async function renderSync({ head, page }) {
       h('div', { class: 'panel-head' }, h('h2', null, '同步设置'), h('span', { class: 'sub' }, '运行中改也立刻生效，不用重开')),
       h('div', { class: 'panel-body' }, buildSettings())),
     h('div', { class: 'panel' },
+      h('div', { class: 'panel-head' }, h('h2', null, '标签页管理'), h('span', { class: 'sub' }, '按序号对应主窗口的标签')),
+      h('div', { class: 'panel-body' }, buildTabs())),
+    h('div', { class: 'panel' },
       h('div', { class: 'panel-head' }, h('h2', null, '状态'), h('span', { class: 'sub' }, '每秒刷新')),
       statusBox));
 
@@ -73,6 +78,7 @@ export default async function renderSync({ head, page }) {
     paintPick();
     paintStatus();
     paintWarn();
+    paintTabs().catch(() => {});
   }
 
   async function tick() {
@@ -83,6 +89,7 @@ export default async function renderSync({ head, page }) {
     }
     paintStatus();
     paintWarn();
+    paintTabs().catch(() => {});
   }
 
   async function loadRunning() {
@@ -228,6 +235,77 @@ export default async function renderSync({ head, page }) {
       toast(e.message, 'bad');
       await reload(false);
     }
+  }
+
+  /* ------------------------------ 标签页管理 ------------------------------ */
+
+  function buildTabs() {
+    const box = h('div');
+    const sw = (key, label, hint) => h('label', { class: 'check' },
+      h('input', {
+        type: 'checkbox', checked: (state.settings[key] ?? true) === true,
+        onChange: (e) => applySettings({ [key]: e.target.checked }),
+      }),
+      h('span', null, label),
+      hint ? h('span', { class: 'muted small' }, `　${hint}`) : null);
+
+    const urlInput = h('input', {
+      type: 'text',
+      placeholder: 'https://example.com（一行一个，最多 10 个）',
+      style: { width: '360px' },
+    });
+
+    const act = (label, fn) => h('button', {
+      class: 'btn sm', disabled: !state.status?.running,
+      onClick: () => runTabAction(fn),
+    }, label);
+
+    state.tabBox = h('div', { class: 'muted small', style: { marginTop: '8px' } });
+
+    mount(box,
+      h('div', { class: 'row' },
+        sw('same_tab', '相同标签页', '动的是与主窗口同序号的那个标签；关掉只动当前可见标签'),
+        sw('target_blank', '目标空白', '新开标签先开空白页再导航（保证首帧指纹）；关掉在当前标签里跳')),
+      h('div', { class: 'row', style: { marginTop: '8px' } },
+        urlInput, act('打开网址', () => api.syncOpenTab(urlInput.value))),
+      h('div', { class: 'row', style: { marginTop: '8px' } },
+        act('关当前标签页', () => api.syncCloseTabs('current')),
+        act('关闭其他', () => api.syncCloseTabs('others')),
+        act('关闭空白标签页', () => api.syncCloseTabs('blank')),
+        act('复制当前标签到其它窗口', () => api.syncCopyTab()),
+        act('统一标签页', () => api.syncUnifyTabs())),
+      state.tabBox);
+    return box;
+  }
+
+  async function runTabAction(fn) {
+    if (!state.status?.running) { toast('先开始同步', 'bad'); return; }
+    try {
+      const r = await fn();
+      const n = (r?.opened || r?.closed || r?.copied || r?.windows || []).length;
+      toast(`完成（${n} 项）`);
+      await paintTabs();
+    } catch (e) {
+      toast(e.message, 'bad');
+    }
+  }
+
+  /** 各窗口标签数与可见序号（每秒跟着状态一起刷，按钮点完也刷一次） */
+  async function paintTabs() {
+    if (!state.tabBox) return;
+    if (!state.status?.running) { mount(state.tabBox, '同步没在跑。'); return; }
+    try {
+      const info = await api.syncTabs();
+      const rows = (info.windows || []).map((w) => {
+        const urls = (w.tabs || []).map((x) => (x.url || '').replace(/^https?:\/\//, '').slice(0, 40) || '(空白)');
+        return `${w.role === 'master' ? '主' : '受控'} ${nameOf(w.profile_id)}：${w.tabs?.length ?? 0} 个`
+          + `${w.visible_confident ? `（当前第 ${w.visible + 1} 个）` : '（当前标签读不到）'}`
+          + `　${urls.join(' | ')}`;
+      });
+      mount(state.tabBox,
+        h('div', null, `相同标签页 ${info.same_tab ? '开' : '关'} · 目标空白 ${info.target_blank ? '开' : '关'}`),
+        ...rows.map((t) => h('div', null, t)));
+    } catch { /* 状态刷新失败不弹错，下一秒会再试 */ }
   }
 
   /* ------------------------------ 状态区 ------------------------------ */

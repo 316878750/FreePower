@@ -16,6 +16,10 @@ import { newBindingName } from './binding.js';
 import { buildSyncPlan, enabledBySwitch } from './replay.js';
 import { makeTextResolver, textOf } from './text-input.js';
 import { SyncScheduler, makeRng } from './scheduler.js';
+import {
+  closeTabAt, isBlankUrl, listTabs, navigateAt, normalizeUrl, openTabFor,
+  planCloseBlank, planCloseOthers, planUnify, settle, targetIndex, visibleTabIndex,
+} from './tabs.js';
 
 /** 一次只允许一个同步会话：两套同时往同一批窗口发输入必然是灾难 */
 let current = null;
@@ -51,6 +55,9 @@ export const DEFAULT_SETTINGS = Object.freeze({
   typing_max_ms: 120,
   random_min: 1000,
   random_max: 9999,
+  /* ---- 标签页：两个开关独立（same_tab 管「动哪个」，target_blank 管「怎么开」） ---- */
+  same_tab: true,         // 相同标签页：按序号对应主窗口的那个标签
+  target_blank: true,     // 目标空白：新开标签先开空白页再导航
   delay_ms: 0,
   jitter_ms: 0,
 });
@@ -86,6 +93,8 @@ export function normalizeSettings(raw = {}) {
     typing_max_ms: typingMax,
     random_min: randMin,
     random_max: randMax,
+    same_tab: bool(raw.same_tab, true),
+    target_blank: bool(raw.target_blank, true),
     delay_ms: num(raw.delay_ms, 0),
     jitter_ms: num(raw.jitter_ms, 0),
   };
@@ -472,37 +481,222 @@ export async function unifySize() {
 }
 
 /**
- * 在所有同步窗口里新开一个标签并访问 URL（「访问指定网站 → 新标签」）。
+ * 在所有同步窗口里新开标签并访问网址（「打开网址」；最多 10 个，与对手的提示一致）。
  *
  * **姿势不能错**：`Target.createTarget({url})` 会在 attach 之前就把首个文档建好，
  * 注入脚本只对下一个文档生效 —— 那张标签的首帧就是原始指纹（`manager.js:807` 的实测）。
  * 所以一律 `about:blank` → 登记 blank-reload 豁免 → attach → `Page.navigate`。
- * 判据钉的就是这个：首个文档 `__fpApplied === 'object'` 且 `navigation.type === 'navigate'`。
+ * 判据钉的就是这个：首个文档的**注入完成标记**（按该环境 `fp_seed` 派生的名字，见 `kernel/markers.js`）
+ * 是 `object`，且 `navigation.type === 'navigate'`。
+ *
+ * 两个开关：
+ *   `target_blank` 关掉 → 不新开，直接在**同序号**（或当前）那个标签里跳（`navigateAt`）；
+ *   `same_tab` 关掉    → 不按序号对齐，只动各窗口**当前可见**的那个标签。
  */
 export async function openTabInAll(rawUrl) {
   if (!current) throw new Error('没有正在运行的同步会话');
-  const url = String(rawUrl || '').trim();
-  let parsed = null;
-  try { parsed = new URL(url); } catch { /* 下面统一报错 */ }
-  if (!parsed || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) {
-    throw new Error('url 必须是 http/https 地址');
+  const list = Array.isArray(rawUrl) ? rawUrl : [rawUrl];
+  const urls = [];
+  for (const item of list.slice(0, 10)) {
+    const u = normalizeUrl(item);
+    if (!u) throw new Error('url 必须是 http/https 地址');
+    urls.push(u);
   }
+  if (!urls.length) throw new Error('url 必须是 http/https 地址');
+
   const opened = [];
+  const masterTabs = await listTabs(current.targets.get(current.master).client);
+  const masterVis = await visibleTabIndex(current.targets.get(current.master).client, masterTabs);
   for (const id of [current.master, ...current.slaves]) {
     const t = current.targets.get(id);
     if (!t) continue;
+    const isMaster = id === current.master;
+    const inst = getInstance(id);
     try {
-      const { targetId } = await t.client.send('Target.createTarget', { url: 'about:blank' });
-      const inst = getInstance(id);
-      inst?.exemptBlankReload?.(targetId);   // 别让 blank-reload 抢先刷这张页
-      const { sessionId } = await t.client.send('Target.attachToTarget', { targetId, flatten: true });
-      await t.client.send('Page.navigate', { url }, sessionId);
-      opened.push({ profile_id: id, target_id: targetId, url });
+      const tabs = isMaster ? masterTabs : await listTabs(t.client);
+      const vis = isMaster ? masterVis : await visibleTabIndex(t.client, tabs);
+      for (const url of urls) {
+        if (current.settings.target_blank) {
+          const r = await openTabFor(t.client, { url, onTarget: (tid) => inst?.exemptBlankReload?.(tid) });
+          opened.push({ profile_id: id, role: isMaster ? 'master' : 'slave', target_id: r.targetId, url, mode: 'new_tab' });
+        } else {
+          const idx = isMaster ? vis.index : slaveAnchor(masterVis.index, vis.index, tabs.length, current.settings.same_tab);
+          const tab = tabs[idx];
+          if (!tab) { opened.push({ profile_id: id, target_id: null, url, mode: 'same_tab', error: '没有可导航的标签' }); continue; }
+          await navigateAt(t.client, tab.targetId, url);
+          opened.push({ profile_id: id, role: isMaster ? 'master' : 'slave', target_id: tab.targetId, url, mode: 'same_tab' });
+        }
+      }
     } catch (e) {
-      opened.push({ profile_id: id, target_id: null, url, error: e?.message || String(e) });
+      opened.push({ profile_id: id, target_id: null, urls, error: e?.message || String(e) });
     }
   }
-  return { opened };
+  return { opened, urls };
+}
+
+/* ------------------------------ 标签页：状态 / 关 / 复制 / 统一 ------------------------------ */
+
+/** 各窗口的标签列表 + 当前可见序号（界面与判据都读这个，不靠猜）。 */
+export async function tabState() {
+  if (!current) return { running: false, windows: [] };
+  const windows = [];
+  for (const id of [current.master, ...current.slaves]) {
+    const t = current.targets.get(id);
+    if (!t) continue;
+    const tabs = await listTabs(t.client).catch(() => []);
+    const vis = await visibleTabIndex(t.client, tabs).catch(() => ({ index: 0, confident: false }));
+    windows.push({
+      profile_id: id,
+      role: id === current.master ? 'master' : 'slave',
+      visible: vis.index,
+      visible_confident: vis.confident,   // false = CDP 读不到前台标签，这条是猜的（如实带出去）
+      tabs: tabs.map((x) => ({ index: x.index, url: x.url, title: x.title })),
+    });
+  }
+  return {
+    running: true,
+    same_tab: current.settings.same_tab,
+    target_blank: current.settings.target_blank,
+    windows,
+  };
+}
+
+/**
+ * 受控窗口该动第几个标签。
+ *   `same_tab` 开：跟**主窗口**的序号（主窗口动第 2 个，受控也动第 2 个）；
+ *   `same_tab` 关：各自动自己当前前台那个（`ownVisible`）。
+ * 主窗口序号越界（受控窗口标签更少）时退回自己的前台标签 —— 跳过并如实记，不猜着乱关。
+ */
+function slaveAnchor(masterIndex, ownVisible, slaveCount, sameTab) {
+  if (!sameTab || masterIndex === null || masterIndex === undefined) return ownVisible;
+  return targetIndex(masterIndex, slaveCount, true) ?? ownVisible;
+}
+
+/**
+ * 关标签：`current` 关当前 / `others` 关其它（留当前）/ `blank` 关空白。
+ * 返回每个窗口实际关了哪些序号 —— 界面和判据都看这个，不看「应该关什么」。
+ */
+export async function closeTabs(which = 'current') {
+  if (!current) throw new Error('没有正在运行的同步会话');
+  const mode = ['current', 'others', 'blank'].includes(which) ? which : 'current';
+  const closed = [];
+  // 「相同标签页」的锚点是**主窗口**的序号：受控窗口按主窗口那个序号动，
+  // 而不是拿自己的前台标签当锚（那样等于没开这个开关，2026-11-14 B 层判据抓到过）。
+  let masterAnchor = null;
+  const masterT = current.targets.get(current.master);
+  if (masterT) {
+    const mTabs = await listTabs(masterT.client).catch(() => []);
+    if (mTabs.length) {
+      masterAnchor = (await visibleTabIndex(masterT.client, mTabs).catch(() => ({ index: 0, confident: false }))).index;
+    }
+  }
+  for (const id of [current.master, ...current.slaves]) {
+    const t = current.targets.get(id);
+    if (!t) continue;
+    const tabs = await listTabs(t.client).catch(() => []);
+    if (!tabs.length) continue;
+    const vis = await visibleTabIndex(t.client, tabs).catch(() => ({ index: 0, confident: false }));
+    const isMaster = id === current.master;
+
+    let plan = [];
+    if (mode === 'others') {
+      const keep = isMaster ? vis.index : slaveAnchor(masterAnchor, vis.index, tabs.length, current.settings.same_tab);
+      plan = planCloseOthers(tabs.length, keep).map((i) => tabs[i]);
+    } else if (mode === 'blank') {
+      plan = planCloseBlank(tabs.map((x) => x.url)).map((i) => tabs[i]);
+    } else {
+      const idx = isMaster ? vis.index : slaveAnchor(masterAnchor, vis.index, tabs.length, current.settings.same_tab);
+      if (tabs[idx]) plan = [tabs[idx]];
+    }
+
+    for (const tab of plan) {
+      const ok = await closeTabAt(t.client, tab.targetId);
+      closed.push({ profile_id: id, role: isMaster ? 'master' : 'slave', index: tab.index, url: tab.url, ok });
+    }
+  }
+  await settle(150);
+  return { which: mode, closed };
+}
+
+/**
+ * 复制标签到其它窗口：把主窗口第 `index` 个标签的 URL 在受控窗口打开。
+ * 这是「复制」不是「同步」——只往受控窗口去，不会反过来动主窗口。
+ */
+export async function copyTabToSlaves({ index = null } = {}) {
+  if (!current) throw new Error('没有正在运行的同步会话');
+  const mt = current.targets.get(current.master);
+  if (!mt) throw new Error('主窗口连接已不在');
+  const masterTabs = await listTabs(mt.client);
+  const vis = await visibleTabIndex(mt.client, masterTabs).catch(() => ({ index: 0, confident: false }));
+  const idx = index === null || index === undefined ? vis.index : Math.floor(Number(index));
+  const src = masterTabs[idx];
+  if (!src) throw new Error(`主窗口没有第 ${idx} 个标签`);
+  if (!src.url || isBlankUrl(src.url)) throw new Error('主窗口这个标签是空白页，没有可复制的地址');
+
+  const copied = [];
+  for (const id of current.slaves) {
+    const t = current.targets.get(id);
+    if (!t) continue;
+    try {
+      const inst = getInstance(id);
+      if (current.settings.target_blank) {
+        const r = await openTabFor(t.client, { url: src.url, onTarget: (tid) => inst?.exemptBlankReload?.(tid) });
+        copied.push({ profile_id: id, target_id: r.targetId, url: src.url, mode: 'new_tab' });
+      } else {
+        const tabs = await listTabs(t.client);
+        const i = targetIndex(idx, tabs.length, current.settings.same_tab);
+        const dst = tabs[i ?? idx];
+        if (!dst) { copied.push({ profile_id: id, target_id: null, url: src.url, error: '受控窗口没有对应序号的标签' }); continue; }
+        await navigateAt(t.client, dst.targetId, src.url);
+        copied.push({ profile_id: id, target_id: dst.targetId, url: src.url, mode: 'same_tab' });
+      }
+    } catch (e) {
+      copied.push({ profile_id: id, target_id: null, url: src.url, error: e?.message || String(e) });
+    }
+  }
+  return { from_index: idx, url: src.url, copied };
+}
+
+/**
+ * 统一标签页：把受控窗口的标签弄成与主窗口一致（数量 + 每个序号的 URL）。
+ * 只做 CDP 真能做到的：多关尾部、缺开尾部、同序号 URL 不同就地跳。**不假装能插到中间**。
+ */
+export async function unifyTabs() {
+  if (!current) throw new Error('没有正在运行的同步会话');
+  const mt = current.targets.get(current.master);
+  if (!mt) throw new Error('主窗口连接已不在');
+  const masterTabs = await listTabs(mt.client);
+  const masterUrls = masterTabs.map((t) => t.url);
+  const result = [];
+  for (const id of current.slaves) {
+    const t = current.targets.get(id);
+    if (!t) continue;
+    const inst = getInstance(id);
+    const slaveTabs = await listTabs(t.client).catch(() => []);
+    const plan = planUnify(masterUrls, slaveTabs.map((x) => x.url));
+    const done = { profile_id: id, navigated: [], opened: [], closed: [], errors: [] };
+    for (const n of plan.navigate) {
+      const tab = slaveTabs[n.index];
+      if (!tab) continue;
+      try { await navigateAt(t.client, tab.targetId, n.url); done.navigated.push(n); } catch (e) { done.errors.push(String(e?.message || e)); }
+    }
+    for (const i of plan.close) {
+      const tab = slaveTabs[i];
+      if (!tab) continue;
+      const ok = await closeTabAt(t.client, tab.targetId);
+      done.closed.push({ index: i, url: tab.url, ok });
+    }
+    for (const url of plan.open) {
+      if (!url || isBlankUrl(url)) { done.opened.push({ url, skipped: 'blank' }); continue; }
+      try {
+        const r = await openTabFor(t.client, { url, onTarget: (tid) => inst?.exemptBlankReload?.(tid) });
+        done.opened.push({ url, target_id: r.targetId });
+      } catch (e) { done.errors.push(String(e?.message || e)); }
+    }
+    result.push(done);
+  }
+  await settle(150);
+  return { master_urls: masterUrls, windows: result };
 }
 
 /** 重读所有窗口的视口（用户改了窗口尺寸之后调；8b 判据也用它） */

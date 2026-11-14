@@ -137,6 +137,14 @@ export const api = {
   /** 全局快捷键状态（managed=false 表示没有桌面壳在管，不是失败） */
   syncHotkey: () => call('/api/v2/sync/hotkey'),
   syncHotkeySet: (accelerator) => call('/api/v2/sync/hotkey', { method: 'POST', body: { accelerator } }),
+  /* ---- 标签页管理（阶段 2） ---- */
+  syncTabs: () => call('/api/v2/sync/tabs'),
+  syncOpenTab: (url) => call('/api/v2/sync/tab', { method: 'POST', body: { url } }),
+  /** which: current（关当前）/ others（留当前，关其它）/ blank（关空白） */
+  syncCloseTabs: (which) => call('/api/v2/sync/tab-close', { method: 'POST', body: { which } }),
+  /** index 省略 = 复制主窗口当前可见那个标签 */
+  syncCopyTab: (index) => call('/api/v2/sync/tab-copy', { method: 'POST', body: index === undefined ? {} : { index } }),
+  syncUnifyTabs: () => call('/api/v2/sync/tab-unify', { method: 'POST', body: {} }),
 
   /* ---- AI Agent（0.4.0） ---- */
   /** 一句话目标 → 工作流：等服务端调模型（默认 60s 超时），所以给足本端等待时间 */
