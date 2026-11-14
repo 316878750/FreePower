@@ -459,6 +459,8 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 43. **打包后的 `FreePower.exe` 里带一个 `INTEGRITY/ELECTRONASAR` 资源，我们没开 fuse，所以它今天空转**：electron-builder 写进去的内容是 `[{"file":"resources\\app.asar","alg":"SHA256","value":"ba006f55…"}]`。0.4.0 实测这个值**不等于** `app.asar` 的 sha256 —— 全文件、`8+头长`、头 JSON、正文四种切法、共 6 种算法都对不上（rcedit 改版本资源前后该字符串逐字节一致，所以不是我们改坏的，是 electron-builder 自己的算法）。我们没有设 `electronFuses`，`EmbeddedAsarIntegrityValidation` 走 Electron 默认（**关**），所以**不影响启动**。**将来谁要开 asar 完整性 fuse，先把那个值和 `app.asar` 的 sha256 验到真的相等再开**，否则一开就是「启动即崩」。
     另：`release\win-unpacked` 是给人当「安装包 payload 的参照物」用的，**每次打完包必须刷新成这一次 `--prepackaged` 用的那份**。0.4.0 出过一次它还是旧草稿、里面 `FreePower.exe` 的版本资源仍是 `Electron / 45.2.3` 的情况 —— 谁按「payload ↔ win-unpacked 逐文件比」去复核，比到的是错的参照物，还很可能会得出「版本资源没修好」的错结论。构建产物本体在 `%TEMP%\fp-rel3`，`release\` 下的这份是复制品。
 
+44. **0.3.2 及更早的安装包没有 FreePower 的版本资源，`FreePower.exe` 在文件属性里显示的是 Electron**：【实】用户机器上现装的 0.3.2（`%LOCALAPPDATA%\Programs\freepower\FreePower.exe`，`249,831,936` B）的 `VersionInfo` 是 `ProductName=Electron` / `FileVersion=45.2.3` / `CompanyName=GitHub, Inc.` —— 说明那些包当年也是 `signAndEditExecutable=false` 打出来的（与 0.4.0 草稿同一个坑）。**0.4.1 起才由 rcedit 写进 `ProductName=FreePower` / `FileVersion=0.4.1` / `ProductVersion=0.4.1.0`**（0.4.0 的正式包 `4010CF47…` 是第一次修好的）。记这条的用处：将来有人拿老包的版本资源跟新包对比，**别以为是我们把版本资源改坏了 —— 老包本来就没有**；也解释了为什么用户装了两年没发现这件事。
+
 
 ### 0.4.1 破坏性变更：被拦的顶层文档从「网络错误」变成「一张页面」
 
