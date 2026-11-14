@@ -352,11 +352,14 @@ MV2 装得上但 Chrome 137+ 可能不给跑（导入时明确告警）。完整
 
 - **只删回收站里的**：在用环境走这条一律 `skipped: not_in_recycle_bin`，不给绕过软删除的口子；
 - **参数必须显式**：`profile_id`（数组）或 `all: true`，一个都没给就 `100002` —— 全量动作最怕字段拼错被当成「清空」；
-- **盘删不掉就不删库**：留一条记录让用户还能再点一次，比删了库留下一堆没人管得着的目录强。
-  这不是只写在注释里 —— 判据用**真实的 `EPERM`** 验过（起一个进程把 cwd 钉在该环境目录里，
-  Windows 必现「不许删任何进程的当前目录」），见 16 号文档那节与 `test/profiles-tabs.test.mjs` 的 4b 段。
-  失败时 `skipped` 给 `{reason:'userdata_remove_failed', error_code:'EPERM', error_message}` ——
-  原因要机器可读（脚本判断要不要重试），人看的中文由界面翻，不挤在一条串里。
+- **盘上删不掉就不删库**：留一条记录让用户还能再点一次，比删了库留下一堆没人管得着的目录强。
+  **做法是两阶段**（`rename` 成墓碑 → 删墓碑）：`rename` 失败 = **一个字节没动**，如实报
+  `{reason:'userdata_remove_failed', error_code:'EPERM', error_message}` 并保留记录；
+  `rename` 成功但删不掉 → 把墓碑改回原名；改不回来才 `data_detached: true` + `detached_path`，
+  这条连带删库、界面明说不能再恢复。原因要机器可读（脚本判断要不要重试），人看的中文由界面翻，不挤在一条串里。
+  这不是只写在注释里 —— 主路用**真实占用**验过（起一个进程把 cwd 钉在该环境目录里，Windows 必现
+  「不许删任何进程的当前目录」），见 16 号文档那节、`test/profiles-tabs.test.mjs` 4b 段与
+  `test/purge-lock-kernel.test.mjs`（恢复后真能启动）。
 
 顺手改掉一处**文案与行为不一致**：列表页的「删除」原来是「本地硬删，不可恢复」，
 实际从 2026-11-12 起就是软删除（进回收站、user-data 留在盘上）。现在文案跟着行为走。
@@ -808,7 +811,12 @@ Object.getOwnPropertyNames(window).some(n => /^__fp/.test(n))   // true → 这�
       我们加它是为了不让回收站变成只进不出的黑洞，但三条边界写死：**只对回收站里的生效**
       （在用环境一律 `skipped: not_in_recycle_bin`，不给绕过软删除做硬删的口子）、
       **参数必须显式**（`profile_id` 数组或 `all: true`，一个都没给就 `100002`，绝不当成「清空」）、
-      **盘删不掉就不删库**（留一条还能再点的记录，不留一堆没人管得着的目录；判据用真实 `EPERM` 验过）。
+      **盘上删不掉就毫不含糊地不删库**（留一条还能再点的记录，不留一堆没人管得着的目录）。
+      做法是两阶段：先 `rename` 成墓碑，失败就是**一个字节都没动**；rename 成功但删墓碑失败 →
+      把墓碑**改回原名**（回到「什么都没发生」）；改不回来 → `data_detached: true` + `detached_path`，
+      **这条连带删库**，界面明说「不能再恢复」，不许还挂着「可恢复」。
+      主路（rename 失败 / 正常删掉）是**真实占用**验的；「改回原名」与「detached」这两支是**注入 fs** 验的，
+      真实环境要两个故障同时发生才走得到，测试里已注明。
     - 回收站里恢复出来的是**同一个环境**：id、`profile_no`、user-data 目录都不变
       （因为删除是软删除，不是搬走再搬回）。
     - 删分组**不删环境**：组里的环境挪回 Default，`moved` 会如实回挪了几个；Default 不能删。
@@ -1253,16 +1261,22 @@ B 层那四条为什么必须真机：**`Preferences` 里写着 1 不等于恢�
 |---|---|
 | 入参 | `{profile_id: [...]}` 或 `{all: true}`（清空）。**两个都没有 → `100002`**，`data.field = 'profile_id'`；字段名拼错（`profile_ids`）同样 `100002` —— 全量动作最怕「拼错被当成空/当成全清」 |
 | 只删回收站里的 | 在用环境 → `skipped: [{profile_id, reason:'not_in_recycle_bin'}]`，环境原样还在。不给绕过软删除做硬删的口子 |
-| 顺序 | 先停（理论上不该在跑）→ 删 `data/profiles/<no>_<id8>/`（`userDataDirFor` 的上一级）→ 删记录 + 清 `profile_extensions` / `profile_tags` |
-| 盘删不掉 | **不删库**，`skipped: {reason:'userdata_remove_failed', error_code, error_message}`（reason 是机器可读串，界面翻成人话）；弹窗如实报「目录被占着，关掉之后再试，记录已保留」，不报成功。**这条被真实故障验过**：起一个真进程把 cwd 钉在目录里（Windows 必现 `EPERM`），purge 后库记录与目录都还在，放掉占用再试就删掉了 |
+| 顺序（两阶段） | 先停（理论上不该在跑）→ **先把 `data/profiles/<no>_<id8>/` 整个 `rename` 成墓碑 `<no>_<id8>.purge-<6hex>`**（`userDataDirFor` 的上一级；同盘 rename 是原子的，**rename 失败 = 一个字节都没动**）→ 删墓碑目录 → 删记录 + 清 `profile_extensions` / `profile_tags`。**为什么必须两阶段**：`rmSync` 是先删内容再删目录，目录被占用时内容已经没了、接口却报「没删掉、还能恢复」，用户点恢复拿回一个空壳 —— 报告的与实际相反，比静默成功更糟 |
+| 盘删不掉（rename 失败） | **不删库**，`skipped: {reason:'userdata_remove_failed', error_code, error_message}`（reason 是机器可读串，界面翻成人话），数据**一分没动**；弹窗如实报「目录被占着，关掉之后再试，记录已保留」，不报成功。**这条被真实故障验过**：起一个真进程把 cwd 钉在目录里（Windows 必现 `EBUSY`/`EPERM`），purge 后 3 个文件逐字节没变、库记录与回收站条目都在，放掉占用再试就删掉了 |
+| 删墓碑失败 | 先把墓碑 **`rename` 回原名**（尽力，回到「什么都没发生」）；真的改不回来 → `skipped: {reason:'userdata_remove_failed_after_rename', data_detached:true, detached_path, …}`，**这条连带删库记录** —— 数据已经不在原路径了，不许还挂着「可恢复」骗人去点 |
+| 残留墓碑 | `sweepTombstones(dir)`：每次 purge 先扫同目录下的 `.purge-*` 残留，别让上一次失败的墓碑卡住第二次（「先失败、放开、再 purge 必须成功」靠它） |
 | 出参 | `{purged:[…], skipped:[…], userdata_removed:N}` |
 
-**判据**：`node --no-warnings test/profiles-tabs.test.mjs` → **50 PASS / 0 FAIL**，已并入 `npm test`。六段：
+**判据**：`node --no-warnings test/profiles-tabs.test.mjs` → **60 PASS / 0 FAIL**，已并入 `npm test`。六段：
 tab 模型（三个 hash + `tabOf` 认末尾斜杠 + 编辑页不算 tab）、路由顺序（`groups`/`recycle` 必须在 `/profiles/:id` 之前）、
 分组（`profile_count` 只数在用的、改名/备注读得回、Default 不能删、删组挪回 Default 且 `moved=2`）、
 回收站（6 字段 + 无 total、restore 缺 `group_id` 报错、purge 三条边界、清空）、
-**4b 真实故障**（进程占住目录 → `EPERM` → 不删库；放掉重试 → 真删掉）、
+**4b 真实故障**（进程占住目录 → `EBUSY` → `userdata_remove_failed` 且不是 detached；目录里 3 个文件一个不少、内容逐字节没变、回收站里还列着、无墓碑残留；放开 → restore 成功且文件还在；再删再 purge → `purged=1`/`userdata_removed=1`，目录与记录都没了）、
 文案与 skipped 翻译（未知 reason 原样显示，不吞成「未知原因」）。
+
+**冒烟里的第二层**：`test/purge-lock-kernel.test.mjs` → **14/14**，已进 `npm run smoke`。
+它补 A 层验不了的那件事 —— **恢复之后真起得来**：真启动一次 → 锁住 → purge 失败且文件大小逐个没变 → 放开 → 恢复 → **再真启动**（内核版本、`user_data_dir` 原样）→ 再删再 purge 真删掉。
+**验法交代**：主路（rename 失败 / 正常删掉）用的是**真实占用**；「删墓碑失败 → 改回原名」与「双故障 → detached」这两支是**注入 fs 验的** —— 真实环境要 rename 成功、rm 失败、且改名回来也失败，得两个故障同时发生，本机三类真实占用都会让 rename 先失败、走不到那一步。测试里这处标了「注入验」，别当成真故障读数。
 
 **判据**：`node --no-warnings test/recycle.test.mjs` → **44 passed / 0 failed**，已并入 `npm test`。四段：
 

@@ -75,26 +75,43 @@ environmentManagement:{tabs:[{labelKey:"nav.environmentTab",routeName:"browserLi
 |---|---|
 | 只删回收站里的 | 在用环境 → `skipped: [{profile_id, reason:'not_in_recycle_bin'}]`，环境原样还在 |
 | 参数必须显式 | `{profile_id:[…]}` 或 `{all:true}`；两个都没有 → `100002`，`data.field='profile_id'`；拼错（`profile_ids`）同样 `100002` |
-| 顺序 | 先停（理论上不该在跑）→ 删 `data/profiles/<no>_<id8>/`（`userDataDirFor()` 的上一级，路径由系统算）→ 删记录 + 清 `profile_extensions` / `profile_tags` |
-| 盘删不掉 | **不删库**，进 `skipped: {reason:'userdata_remove_failed', error_code, error_message}`；界面翻成「目录被占着，关掉之后再试，记录已保留」，不报成功 |
+| 顺序（两阶段） | 先停（理论上不该在跑）→ 把 `data/profiles/<no>_<id8>/`（`userDataDirFor()` 的上一级，路径由系统算）**整个 `rename` 成墓碑 `<no>_<id8>.purge-<6hex>`** → 删墓碑 → 删记录 + 清 `profile_extensions` / `profile_tags` |
+| 盘删不掉（rename 失败） | **不删库**，一个字节没动，进 `skipped: {reason:'userdata_remove_failed', error_code, error_message}`；界面翻成「目录被占着，关掉之后再试，记录已保留」，不报成功 |
+| 删墓碑失败 | 先 `rename` 回原名（尽力，回到「什么都没发生」）；改不回来 → `{reason:'userdata_remove_failed_after_rename', data_detached:true, detached_path}`，**连带删库**，界面明说「这条不能再恢复了」 |
+| 残留墓碑 | `sweepTombstones()`：每次 purge 先扫 `.purge-*` 残留，不让上一次失败卡住第二次 |
 | 出参 | `{purged:[…], skipped:[…], userdata_removed:N}` |
 
-**「盘删不掉就不删库」是被真实故障验过的，不是只写在注释里。** 造真实失败要先知道
-Windows 上什么真能让 `fs.rmSync(dir,{recursive:true,force:true})` 抛错，本机探了四种：
+**为什么必须两阶段（这条是被 CEO 真缺陷打回来的）**：`fs.rmSync(dir,{recursive:true})`
+**先删内容、再删目录**。目录被占用删不掉时抛 `EPERM`、内容已经删光了 —— 我们如实报「没删掉、
+还能恢复」，用户点恢复拿回的是空壳，登录态全丢。**报告与实际相反，比静默成功更糟。**
+改成先 rename 之后：rename 是原子操作，失败就什么都没发生，这是唯一能让「报的和做的」一致的做法。
+
+**真实故障读数**（造失败前先探清楚，别拍脑袋）：
 
 ```
-A 独占打开文件（fs.openSync 'r+'）  → removed      删得掉（Node 默认带 FILE_SHARE_DELETE）
-B 子进程 cwd 设在该目录里            → EPERM  ✅    删不掉（Windows 不许删任何进程的当前目录）
-C attrib +R 只读                    → removed      删得掉（force 会重试）
-D 子进程 cwd 设在被删目录本身        → EPERM  ✅    同上
+delete 探针（谁会真的让删除失败）
+  A 独占打开文件（fs.openSync 'r+'）  → removed      删得掉（Node 默认带 FILE_SHARE_DELETE）
+  B 子进程 cwd 设在该目录里            → EPERM  ✅    删不掉
+  C attrib +R 只读                    → removed      删得掉（force 会重试）
+  D 子进程 cwd 设在被删目录本身        → EPERM  ✅   同上
+
+rename 探针（谁会让 rename 先失败）
+  cwd 锁在 <dir> 本身                 → EBUSY，一个字节没动  ✅
+  cwd 锁在 <dir>/userdata             → EPERM，一个字节没动  ✅
+  独占句柄 FileShare.None 锁里面文件   → EPERM，一个字节没动  ✅
+  fs.openSync 'r+' / attrib +R        → 删得掉（走不到这里）
 ```
 
-所以判据用 B：起一个真进程把 cwd 钉在那个环境的目录里（模拟「没退干净的内核进程占着
-user-data」），然后 purge。断言六条：`purged` 为空且 `skipped` 点名该环境 /
-`reason === 'userdata_remove_failed'` / `error_code === 'EPERM'` 且原文非空 /
-库记录还在 / 回收站里还列得出来 / 目录与 cookie 文件都还在。
-然后**杀掉占用进程再 purge 一次**，断言这次 `purged=1`、`userdata_removed=1`、目录与记录都没了
-—— 后半段是关键：不做这一步，「还在」有可能只是功能坏了。
+判据用 B：起一个真进程把 cwd 钉在那个环境的目录里（模拟「没退干净的内核进程占着 user-data」），
+然后 purge。断言：`purged` 为空且 `skipped` 点名该环境 / `reason === 'userdata_remove_failed'`
+（**不是** `data_detached`）/ `error_code === 'EBUSY'` / **目录里 3 个文件一个不少且内容逐字节没变** /
+回收站里还列着 / 没有墓碑残留。放开占用后**恢复成功**（文件还在），再删再 purge →
+`purged=1`、`userdata_removed=1`、目录与记录都没了 —— 后半段是关键：不做这一步，「还在」有可能只是功能坏了。
+
+**验法交代**：主路（rename 失败 / 正常删掉）用**真实占用**验；「删墓碑失败 → 改回原名」与
+「双故障 → detached」这两支是**注入 fs** 验的 —— 真实环境要 rename 成功、rm 失败、且改名回来也
+失败（两个故障同时发生），而本机三类真实占用都会让 rename 先失败、根本走不到那一步。
+测试里这处明确标了「注入验」，别当成真实故障读数。
 
 顺带把 skipped 的形状改了：原来是拼在一条中文串里（`userdata_remove_failed: EPERM…`），
 现在 `reason` 是**稳定的机器可读串**、`error_code` / `error_message` 分开挂，
@@ -140,11 +157,15 @@ user-data」），然后 purge。断言六条：`purged` 为空且 `skipped` 点
 ## 七、判据
 
 ```
-node --no-warnings test/profiles-tabs.test.mjs     # 50 PASS / 0 FAIL
-npm test                                            # 已并入链
+node --no-warnings test/profiles-tabs.test.mjs        # 60 PASS / 0 FAIL
+node --no-warnings test/purge-lock-kernel.test.mjs    # 14 PASS / 0 FAIL（已进 npm run smoke）
+npm test                                              # 已并入链
 ```
 
-五段：tab 模型（纯函数）→ 路由顺序/页面静态检查 → 分组（真 HTTP）→ 回收站（真 HTTP + 真删目录
+六段：tab 模型（纯函数）→ 路由顺序/页面静态检查 → 分组（真 HTTP）→ 回收站（真 HTTP + 真删目录
 + **真实占用的失败**）→ 文案与 skipped 翻译。回收站那段会真的建一个
-`data/profiles/<no>_<id8>/userdata/Cookies`，purge 之后断言目录没了、库记录没了、
-`profile_no` 不再被占；4b 那段起一个真进程占住目录，验「盘删不掉就不删库」，再放掉重试验能删掉。
+`data/profiles/<no>_<id8>/userdata/` 加 3 个文件（Cookies / Login Data / Preferences），
+purge 之后断言目录没了、库记录没了、`profile_no` 不再被占；4b 那段起一个真进程占住目录，
+验「**rename 失败 = 一个字节没动**」（3 个文件一个不少、内容逐字节没变、回收站里还列着、无墓碑残留），
+放开后能恢复、再 purge 能真删掉。`purge-lock-kernel` 补第二层：**恢复之后真起得来**
+（真启动 → 锁 → 失败 → 放开 → 恢复 → 再真启动 → 再 purge 真删掉）。
