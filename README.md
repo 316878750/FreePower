@@ -320,6 +320,78 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 
 完整设计、打包踩的坑、验收记录与操作清单：[P6 文档](docs/07-P6-桌面壳.md)。
 
+### 本机打包姿势（0.4.2 实测，2026-11-14）
+
+`npm run dist:win` 在这台机器上**直接跑会挂在三个地方**，三个都是本机环境问题，**不影响产品**：
+不进 asar、不进安装包、`src/` 与 `web/` 一个字节都不改。0.4.2 就是这样打出来的。
+
+**坑 1：electron 包从 github 下不下来。** `electron-builder` 会去下 `electron-v45.2.3-win32-x64.zip`，
+这里直连超时（`read tcp … wsarecv: A connection attempt failed`）。本机 `node_modules\electron\dist`
+是完整的，直接让它用这份：
+
+```powershell
+& node_modules\.bin\electron-builder.cmd --win --x64 "--config.electronDist=node_modules/electron/dist"
+```
+
+注意参数要**加引号**：`-c.electronDist=…` 会被 PowerShell 当成文件名（报
+`ENOENT …\.electronDist=node_modules\electron\dist`）。
+
+**坑 2：`winCodeSign` 解包要给符号链接特权，本机没有。** 那个包里带 darwin 的
+`libcrypto.dylib` / `libssl.dylib` 符号链接，7za 解它们要「创建符号链接」特权；
+本机 `mklink` 实测「权限不足」（也不该去改用户的系统设置），于是 7za 退出码 2、打包中止：
+
+```
+ERROR: Cannot create symbolic link : 客户端没有所需的特权 : …\darwin\10.12\lib\libcrypto.dylib
+```
+
+darwin 的链接文件在 Windows 打包里毫无用处（Windows 侧只用包里的 `rcedit-*.exe` / `signtool.exe`）。
+所以放了一个 **7za 包装器**，给每条命令补一个 `-snl-`（解包时不恢复符号链接），实测退出码 0、
+`windows-10\x64\signtool.exe` 与 `rcedit-x64.exe` 齐全：
+
+```
+node_modules\7zip-bin\win\x64\
+  7za.exe         ← 包装器（5120 字节，会转调下面这个，并补 -snl-）
+  7za-real.exe    ← 真正的 7-Zip 21.07（原 7za.exe 改名而来）
+```
+
+包装器源码在 `tools/7za-wrap.cs`，重建命令（本机没装 .NET SDK，用系统自带的 csc）：
+
+```powershell
+& "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:exe `
+    /out:"node_modules\7zip-bin\win\x64\7za.exe" "tools\7za-wrap.cs"
+```
+
+> **`npm ci` / 重装依赖会把这个包装器冲掉**（`node_modules` 整个重建）。冲掉之后打包会**突然挂在上面的符号链接错误上**，
+> 现象和代码完全无关，别去翻业务代码 —— 按上面那行命令重编一次就好。
+> 判断有没有被冲掉：`node_modules\7zip-bin\win\x64\7za.exe` 是 5120 字节（包装器）还是 1231360 字节（原版）。
+
+**坑 3：缓存目录和临时目录不能落在工作区外面。** 本机下 7za 和 makensis 在工作区外写不进去
+（同一个 7za 在 `.tmp` 里退出 0、在 `%LOCALAPPDATA%` 里退出 2；makensis 报
+`Internal compiler error #12345: error creating mmap the size of 131780169`）。把两个目录都指到工作区里：
+
+```powershell
+$env:ELECTRON_BUILDER_CACHE = "C:\Users\1\.dsh\bot\workspace\freepower\.tmp\eb-cache"
+$env:TMP  = "C:\Users\1\.dsh\bot\workspace\freepower\.tmp\sys-tmp"
+$env:TEMP = $env:TMP
+```
+
+**网络到 github 不通时的补一刀**：`winCodeSign` / `nsis` 这些二进制也要从 github 下，
+可以指到国内镜像（`$env:ELECTRON_BUILDER_BINARIES_MIRROR = "https://npmmirror.com/mirrors/electron-builder-binaries/"`）。
+注意 app-builder 对 `winCodeSign-2.6.0.7z` **会校 sha512**（期望值烧在二进制里），
+所以给它的必须是原包 —— 自己重打的包（哪怕内容等价）会因为 sha512 不符直接拒掉。
+
+合起来，0.4.2 实际用的就是这一串（`EXIT=0`，产物 `release\FreePower-0.4.2-setup.exe`）：
+
+```powershell
+$env:ELECTRON_BUILDER_CACHE = "$PWD\.tmp\eb-cache"
+$env:TMP  = "$PWD\.tmp\sys-tmp"; $env:TEMP = $env:TMP
+& node_modules\.bin\electron-builder.cmd --win --x64 "--config.electronDist=node_modules/electron/dist"
+```
+
+打完之后**别从 `release\` 里装**：那里的 exe 带 Windows 的低完整性标签（`icacls` 有 `S-1-4-…`），
+双击会「看着装完了、其实没装」（文件照拷、注册项和快捷方式静默丢失）。拷到桌面等普通目录再装，
+拷过去标签就没了（0.4.1 起一直这么做）。
+
 ## 七、已知限制（必须如实告知用户，不藏着）
 
 1. **Canvas / Audio / WebGL 标识 / 字体是 JS 注入，不是内核级。**
