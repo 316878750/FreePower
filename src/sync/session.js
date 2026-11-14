@@ -20,6 +20,10 @@ import {
   normalizeState, needsRestoreBeforeResize, summarizeResize, verifyBounds,
 } from './window.js';
 import {
+  autoFit, auditPlan, planArrange, placeOne, summarizeArrange,
+} from './arrange.js';
+import { screensForArrange } from './displays.js';
+import {
   closeTabAt, isBlankUrl, listTabs, navigateAt, openTabFor,
   parseOpenUrls, planCloseBlank, planCloseOthers, planUnify, settle, targetIndex, visibleTabIndex,
 } from './tabs.js';
@@ -156,6 +160,22 @@ async function windowSizeOf(client, targetId) {
   try {
     const { windowId, bounds } = await client.send('Browser.getWindowForTarget', { targetId });
     return { windowId, width: bounds?.width ?? null, height: bounds?.height ?? null, state: bounds?.windowState || null };
+  } catch {
+    return null;
+  }
+}
+
+/** 窗口的完整矩形（位置 + 尺寸 + 状态）：「窗口排列」的回读比对读它 */
+async function windowRectOf(client, targetId) {
+  try {
+    const { bounds } = await client.send('Browser.getWindowForTarget', { targetId });
+    return {
+      x: bounds?.left ?? null,
+      y: bounds?.top ?? null,
+      width: bounds?.width ?? null,
+      height: bounds?.height ?? null,
+      state: bounds?.windowState || null,
+    };
   } catch {
     return null;
   }
@@ -543,6 +563,93 @@ export async function unifySize() {
     master_state_before: normalizeState(masterBefore.state),
     resized,
     summary,
+    status: current.status(),
+  };
+}
+
+/**
+ * 窗口排列（`tileWin`）：把参与同步的窗口按网格摆好。
+ *
+ * 参数与对手对齐（见 `src/sync/arrange.js` 顶部）：`row` 每行几个、`hs` 列间距、`vs` 行间距、
+ * `left`/`top` 起始偏移、`width`/`height` 窗口尺寸、`range` 重叠式、`screenId` / `screenList` 多屏。
+ * `auto: true`（对手的「一键排列」`sync90`）→ 按目标屏幕可用区自动算尺寸与每行个数。
+ *
+ * 三条硬约束：
+ *   ① 原点加**目标屏幕的 workArea 偏移**（不是 bounds —— bounds 含任务栏，窗口会被压在下面）；
+ *   ② 非 normal 的窗口先恢复 normal 再摆（最大化/全屏下 setWindowBounds 的宽高会被静默忽略，
+ *      实测读数见 README「阶段 3 第 1 件」）；
+ *   ③ 摆完**回读**每个窗口的 left/top/width/height 比对，不一致如实报「有 N 个窗口没能排到位」。
+ */
+export async function arrangeWindows(rawParams = {}) {
+  if (!current) throw new Error('没有正在运行的同步会话');
+  const s = current;
+  const ids = [s.master, ...s.slaves].filter((id) => s.targets.get(id));
+  if (!ids.length) throw new Error('没有可排列的窗口');
+
+  const screens = screensForArrange();
+  const params = { ...rawParams };
+  let autoInfo = null;
+
+  /* 一键排列：按目标屏幕可用区自动算「每行几个 + 每个多大」 */
+  if (rawParams.auto === true || rawParams.auto === 'true' || rawParams.auto === 1) {
+    const targetId = params.screenId === undefined || params.screenId === null || params.screenId === -1
+      ? (screens.find((x) => x.primary)?.id ?? screens[0]?.id ?? null)
+      : params.screenId;
+    const area = screens.find((x) => String(x.id) === String(targetId))?.workArea
+      || screens.find((x) => x.primary)?.workArea
+      || screens[0]?.workArea
+      || { x: 0, y: 0, width: 0, height: 0 };
+    const fitted = autoFit(ids.length, area, { gap: Number(params.hs) || 0 });
+    params.row = fitted.cols;
+    params.width = fitted.width;
+    params.height = fitted.height;
+    // 自动模式下从可用区原点开始，偏移由用户额外给的 top/left 叠加
+    params.left = Math.max(0, Number(params.left) || 0);
+    params.top = Math.max(0, Number(params.top) || 0);
+    autoInfo = { ...fitted, area };
+  }
+
+  const plan = planArrange({ count: ids.length, params, screens });
+  const audit = auditPlan(plan.windows, screens.find((x) => String(x.id) === String(plan.screen_id))?.workArea || null);
+
+  const placed = [];
+  for (let i = 0; i < ids.length; i++) {
+    const id = ids[i];
+    const t = s.targets.get(id);
+    const want = plan.windows[i];
+    const entry = { profile_id: id, role: id === s.master ? 'master' : 'slave', index: i, ok: false };
+    try {
+      const win = await windowSizeOf(t.client, t.targetId);
+      if (!win?.windowId) throw new Error('读不到窗口 id');
+      entry.state_before = normalizeState(win.state);
+      /* 摆动 + 判定都在 placeOne 里：它只用回读说话。
+       * 抽出去的理由见 arrange.js 顶部 —— 真内核造不出「命令成功但没到位」，
+       * 那条只能靠注入假读数在 A 层测，所以判定必须只有一处、且可注入。 */
+      const r = await placeOne({
+        windowId: win.windowId,
+        want,
+        stateBefore: win.state,
+        setBounds: (windowId, bounds) => t.client.send('Browser.setWindowBounds', { windowId, bounds }),
+        readRect: () => windowRectOf(t.client, t.targetId),
+        wait: settle,
+      });
+      Object.assign(entry, r);
+    } catch (e) {
+      entry.reason = e?.message || String(e);
+    }
+    placed.push(entry);
+  }
+
+  await refreshAll();
+  return {
+    screen_id: plan.screen_id,
+    plan: plan.windows,
+    audit,
+    warnings: plan.warnings,
+    auto: autoInfo,
+    displays_managed: screens.length > 0,
+    placed,
+    summary: summarizeArrange(placed),
     status: current.status(),
   };
 }

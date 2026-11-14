@@ -134,6 +134,14 @@ export const api = {
   syncSettings: (body) => call('/api/v2/sync/settings', { method: 'POST', body }),
   syncRefresh: () => call('/api/v2/sync/refresh', { method: 'POST', body: {} }),
   syncUnifySize: () => call('/api/v2/sync/unify-size', { method: 'POST', body: {} }),
+  /**
+   * 窗口排列（`tileWin`）。参数照对手 `toRangeBrowser`：
+   * `{width,height,row,top,left,hs,vs,range,screenId,screenList}`，`auto:true` = 一键排列。
+   * 服务端摆完会回读每个窗口，`summary.failed>0` 就是「有 N 个窗口没能排到位」，必须显示出来。
+   */
+  syncArrange: (body) => call('/api/v2/sync/arrange', { method: 'POST', body }),
+  /** 显示器列表（桌面壳写、服务进程读）。没有桌面壳时 `managed:false`，不是错误 */
+  syncDisplays: () => call('/api/v2/sync/displays'),
   /** 全局快捷键状态（managed=false 表示没有桌面壳在管，不是失败） */
   syncHotkey: () => call('/api/v2/sync/hotkey'),
   syncHotkeySet: (accelerator) => call('/api/v2/sync/hotkey', { method: 'POST', body: { accelerator } }),

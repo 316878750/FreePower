@@ -12,7 +12,9 @@
 // electron 是 CJS 包，ESM 下拿不到具名导出，只能整体引入再解构
 import electron from 'electron';
 
-const { app, BrowserWindow, Menu, Tray, nativeImage, shell, dialog, session, globalShortcut } = electron;
+const {
+  app, BrowserWindow, Menu, Tray, nativeImage, shell, dialog, session, globalShortcut, screen,
+} = electron;
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -86,6 +88,7 @@ async function main() {
   runtime = await import('../src/runtime/manager.js');
   syncSession = await import('../src/sync/session.js');
   hotkeyMod = await import('../src/sync/hotkey.js');
+  displaysMod = await import('../src/sync/displays.js');
 
   await app.whenReady();
 
@@ -99,6 +102,12 @@ async function main() {
 
   createTray();
   createWindow();
+  // 显示器布局交给服务进程（窗口排列要用 `workArea`，只有主进程拿得到）
+  publishDisplays('startup');
+  // 用户插拔显示器、改缩放、任务栏移位都要跟着更新，否则排列会算到旧布局上
+  for (const ev of ['display-added', 'display-removed', 'display-metrics-changed']) {
+    try { screen.on(ev, () => publishDisplays(ev)); } catch { /* ignore */ }
+  }
   // 用上次保存的快捷键（用户改过就用改过的），没有就用默认
   const storedHotkey = hotkeyMod.readHotkeyStatus();
   registerSyncHotkey(storedHotkey.managed ? storedHotkey.accelerator : SYNC_HOTKEY_DEFAULT);
@@ -235,6 +244,7 @@ function showWindow() {
 const SYNC_HOTKEY_DEFAULT = process.env.FREEPOWER_SYNC_HOTKEY || 'CommandOrControl+Alt+S';
 let syncHotkey = SYNC_HOTKEY_DEFAULT;
 let hotkeyMod = null;
+let displaysMod = null;
 let hotkeyPoll = null;
 let lastHotkeyRequestAt = null;
 
@@ -291,6 +301,39 @@ function showSyncPanel(extra = '') {
   syncPanel.showInactive();
   syncPanel.setAlwaysOnTop(true, 'floating');
   return syncPanel;
+}
+
+/**
+ * 把显示器布局写给服务进程（跨进程走文件，理由见 `src/sync/displays.js`）。
+ *
+ * **只写 `workArea` 那一份**：`bounds` 含任务栏，拿它当原点排窗口会把窗口压在任务栏底下
+ * （CEO 明确要求过）。插拔显示器 / 改缩放时会连着触发好几个事件，这里合并 300ms 再写一次，
+ * 免得同一个瞬间写五遍。
+ */
+let displayTimer = null;
+function publishDisplays(reason) {
+  if (displayTimer) return;
+  displayTimer = setTimeout(() => {
+    displayTimer = null;
+    try {
+      const list = screen.getAllDisplays();
+      const okWrite = displaysMod?.writeDisplays?.(list);
+      log(`displays ${reason} → ${list.length} 块屏 ${okWrite ? 'ok' : 'FAILED'}`
+        + ` ${list.map((d) => `${d.id}:${d.workArea.width}x${d.workArea.height}@${d.workArea.x},${d.workArea.y}${d.primary ? '*' : ''}`).join(' ')}`);
+    } catch (e) {
+      log('displays 写入失败', e && e.message ? e.message : String(e));
+    }
+  }, 300);
+  displayTimer.unref?.();
+}
+
+/**
+ * 自检读数：服务进程到底读到了几块屏（不是「我写了没」，是「对面读到了没」）。
+ * 两边对不上就说明文件交接坏了，窗口排列会退化成按原点算。
+ */
+function displayModuleStatus() {
+  const r = displaysMod?.readDisplays?.() || { managed: false, displays: [] };
+  return { managed: r.managed === true, count: (r.displays || []).length };
 }
 
 /**
@@ -550,6 +593,14 @@ async function runSelfTest() {
   // 无头/远程会话里窗口焦点语义不稳定，拿它当硬闸会造出假失败。
   steps.sync_hotkey = syncHotkey;
   steps.sync_hotkey_ok = syncHotkeyOk;
+  try {
+    // 窗口排列要用显示器可用区：这条读数证明服务进程真拿到了桌面壳写的布局
+    const r = displayModuleStatus();
+    steps.displays_managed = r.managed;
+    steps.displays_count = r.count;
+  } catch (e) {
+    steps.displays_error = e && e.message ? e.message : String(e);
+  }
   try {
     const p = showSyncPanel(syncHotkeyOk === false ? 'shortcut=failed' : '');
     await new Promise((r) => setTimeout(r, 600));

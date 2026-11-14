@@ -121,8 +121,24 @@ console.log('\n— 4. 路由与界面（静态扫描）—');
   check('统一尺寸走「先回 normal 再设宽高」', /windowState: 'normal'/.test(sessionCode) && /bounds: \{ width: ref\.width, height: ref\.height \}/.test(sessionCode));
   check('统一尺寸设完**回读**校验（调 verifyBounds）', /verifyBounds\(/.test(sessionCode));
   check('统一尺寸不静默成功：失败带 summary', /summarizeResize\(/.test(sessionCode));
+  /**
+   * 「统一尺寸不碰显示器/系统设置」这条要**按函数扫**：同一个文件里现在还有窗口排列，
+   * 排列确实要用 `workArea`（那是从桌面壳的显示器交接里读的，不是改系统设置）。
+   * 所以把断言收紧到 `unifySize` 函数体：它里面**一个字都不许提**显示器相关的东西。
+   */
+  const bodyOf = (src, name) => {
+    const at = src.indexOf(`export async function ${name}`);
+    if (at < 0) return null;
+    const rest = src.slice(at + 10);
+    const end = rest.indexOf('export ');
+    return end < 0 ? rest : rest.slice(0, end);
+  };
+  const unifyBody = bodyOf(sessionCode, 'unifySize');
   check('统一尺寸不碰显示器/系统设置（不 import electron / 不调 display API）',
-    !/electron/.test(sessionCode) && !/getAllDisplays/.test(sessionCode) && !/workArea/.test(sessionCode));
+    !/electron/.test(sessionCode) && !/getAllDisplays/.test(sessionCode));
+  check('统一尺寸函数体里不出现显示器相关调用（workArea / getAllDisplays / screen.）',
+    !!unifyBody && unifyBody.length > 200 && !/workArea|getAllDisplays|screen\./.test(unifyBody),
+    unifyBody ? '' : '找不到 unifySize 函数体');
 }
 
 const fail = results.filter((r) => !r.ok).length;

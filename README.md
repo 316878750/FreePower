@@ -1686,7 +1686,7 @@ C) 全屏后 3440×1440(fullscreen) → 只发 {width:800,height:600} → ok
 
 判据：
 ```
-npm run test:sync-window        → 21/21（A 层：状态归一 + 回读比对 + 汇总文案 + 静态扫描）
+npm run test:sync-window        → 22/22（A 层：状态归一 + 回读比对 + 汇总文案 + 静态扫描）
 npm run test:sync-window-kernel → 17/17（B 层：3 个真环境，1 主 2 受控）
 ```
 
@@ -1707,9 +1707,86 @@ B 层 17 条：三个 normal 窗口设成 1000×700 / 800×600 / 900×650 → �
 于是「没先回 normal」的坏实现恢复出来的旧尺寸**刚好等于目标尺寸**，17 条全绿 —— **假绿**。
 修法是先把受控窗口设成 850×620（≠ 主控），再最大化；现在漏做恢复就会停在 850×620，跑不掉。
 
-### 阶段 3 第 2 件：窗口排列
+### 阶段 3 第 2 件：窗口排列（2026-11-14）
 
-（待做）
+参数逐项对齐对手 `/sync/toRangeBrowser` 的入参（拆解 `26-窗口同步实现细节.md` §5）：
+`width` / `height` / `row`（每行几个）/ `top` / `left`（起始位置）/ `hs`（列间距）/ `vs`（行间距）/
+`range`（1 = 重叠式）/ `screenId`（-1 = 全部屏幕）/ `screenList`。面板文案用对手原文
+（`排列方式` / `起始位置` / `窗口大小` / `窗口间距` / `窗口数量` · `个/行` / `显示器` / `一键排列` / `自定义排列`）。
+
+公式照它的三段直译：
+
+```
+网格（row > 0）      col = i % row,  rowIndex = floor(i / row)
+                    x = left + (width + hs) * col
+                    y = top  + (height + vs) * rowIndex
+重叠（range = 1）    x = left + vs * |i - (count-1)|,  y = top   （对应用的是 vs，不是 hs）
+全部屏幕（-1）       逐屏填满再进下一屏，x = 屏left + (k % col) * width，y = 屏top + floor(k/col) * height
+                    —— 这一段**不带间距**（对手只用了宽高，没有 hs/vs），照它
+```
+
+`row = 0` 也是对手的一个分支（全部堆到 `(0,0)`，连起始偏移都不加）。照它的行为，但**带一条 warning**
+说「会完全重叠」—— 照抄行为不等于照抄沉默。
+
+**原点用 `workArea`，不用 `bounds`。** 这条是硬约束：`bounds` 是整块屏幕（含任务栏），拿它当原点
+排窗口会把窗口压在任务栏底下。`workArea` 只有 Electron 主进程的 `screen.getAllDisplays()` 拿得到，
+而排列逻辑在服务进程里，所以走**文件交接**（`DATA_DIR/displays.json`，和全局快捷键同一个理由、同一个做法）：
+桌面壳写、服务进程读，插拔显示器 / 改缩放 / 任务栏移位都会重写。判据里两块矩形故意不同
+（`bounds.y = 0`、`workArea.y = 60`），实现用错了 y 立刻差 60。没有桌面壳时 `managed:false`，
+退化成按 `(0,0)` 排，并在 `warnings` 里说出来。
+
+**窗口宽度下限 516 是实测量出来的，不是拍的**（`.tmp/min-width-probe.mjs`，Chrome 157.0.8103.78）：
+
+```
+请求 200×200 → 得到 516×200     请求 500×320 → 得到 516×320
+请求 300×300 → 得到 516×300     请求 520×400 → 得到 520×400   ← 从这往上不夹
+请求 400×300 → 得到 516×300     请求 1000×700 → 得到 1000×700
+```
+
+也就是说宽度低于 516 时 `Browser.setWindowBounds` **返回成功但宽度被系统夹到 516**。所以下限就设 516：
+不给用户一个做不到的数，也就不会每个窗口都回读不符、每点一次都报「有 N 个窗口没能排到位」。
+超范围一律夹到边界并带 warning，**不静默**。
+
+**判定只认回读，而且判定只有一处。** 摆窗口那步抽成了 `placeOne()`（`src/sync/arrange.js`），
+`setBounds` / `readRect` 是注入参数。理由是真内核**造不出**「命令成功但窗口没到位」
+（系统要么照做、要么连不上），所以 B 层只能证明「正常情况能摆对」，抓不住「相信命令返回值」这种坏实现
+—— 用注入假读数才测得出来：命令返回 `{}`、回读是 `516`、期望 `300` → 必须 `ok:false` 且原因写清。
+配套一条静态判据：`arrangeWindows` 函数体里**不许自己写 `entry.ok =`**，防这种逻辑回流。
+
+判据：
+```
+npm run test:sync-arrange        → 67/67（A 层：参数归一 + 三段公式 + 计划自检 + 假读数判定 + 交接 + 静态扫描）
+npm run test:sync-arrange-kernel → 28/28（B 层：3 个真环境，1 主 2 受控）
+```
+
+B 层实读（真机 3440×1440，假显示器 `workArea = 40,60 1400×820`）：
+```
+600×350 / 每行 2 个 / hs 25 / vs 35 / left 10 / top 10
+  → 50,70  675,70  50,455   三个都 normal、互不重叠、都在 workArea 内、水平间距正好 25
+  → 第 3 个 x 回到 50、y = 455 = 70 + 350 + 35（换行）
+受控 2 先最大化 → 排列后 70,904 520×400 normal（回报 state_before: "maximized"）
+请求宽度 300 → 实际 516，回报带「窗口宽度 300 超出范围，按 516 处理」，计划按 516 出、回读对得上
+杀掉受控 1 的内核 → 那条 ok:false（原因「读不到窗口 id」），另两个照常排到位
+```
+
+**先红后绿**（五个变异，逐个还原后复跑全绿）：
+```
+① screensForArrange 改回用 bounds       → A 红 1、B 红 4（y 差 60：10,10 vs 50,70）
+② placeOne 里去掉「先回 normal」           → A 红 1（第一条命令不是 windowState=normal）、B 红 3
+                                            （最大化那个停在 50,455 600×350，没进计划位置 70,904 520×400）
+③ placeOne 里 entry.ok 改成恒 true       → A 红 3（命令成功但回读不符也报成功）
+③' arrangeWindows 里自己加 entry.ok = true → A 红 1（静态判据；B 层对这种坏法是绿的，所以必须有它）
+④ 网格去掉换行（rowIndex 恒 0）          → A 红 5、B 红 6（2 个窗口叠在一起 overlaps [[0,2]]）
+```
+
+`placeOne` 这个抽法本身就是被「假绿」逼出来的：判据全绿而实现明显是坏的，说明判据在测别的东西。
+
+**顺手收紧了一条旧判据（只改严，不放宽）**：`test/sync-window.test.mjs` 里原来的
+「统一尺寸不碰显示器/系统设置」是**整文件**扫 `workArea`，而同一个文件现在还有窗口排列 ——
+排列确实要用 `workArea`（从桌面壳的显示器交接里读，不是改系统设置）。改成按函数扫：
+`unifySize` 函数体里一个字都不许出现 `workArea` / `getAllDisplays` / `screen.`，
+比原来「整个文件里不许出现」更准（原来换个函数提到 `workArea` 就会误报，而真正该防的是
+「统一尺寸去动显示器」）。21 条 → 22 条。
 
 ### 阶段 3 第 3 件：显示窗口 / 置前
 
@@ -1749,6 +1826,8 @@ Target.createTarget({ url: 'about:blank' })
 | POST | `/api/v2/sync/settings` | 运行中改开关/延迟，不重开会话 |
 | POST | `/api/v2/sync/refresh` | 重读各窗口视口与外框尺寸 |
 | POST | `/api/v2/sync/unify-size` | 一键统一尺寸（只在用户点按钮时执行） |
+| POST | `/api/v2/sync/arrange` | 窗口排列：`{width,height,row,top,left,hs,vs,range,screenId,screenList}` 或 `{auto:true}`（一键排列）；摆完逐个回读，不一致如实报 |
+| GET | `/api/v2/sync/displays` | 显示器列表（桌面壳写、服务进程读；`managed:false` = 没有桌面壳，不是失败） |
 | POST | `/api/v2/sync/tab` | 打开网址：`{urls}`（数组或多行文本），每行一个、最多 10 个，超了报「一键最多打开10个网址」；走上面那条 about:blank 姿势 |
 | GET | `/api/v2/sync/tabs` | 各窗口标签列表 + 当前可见序号（`visible_confident:false` = 这条是猜的） |
 | POST | `/api/v2/sync/tab-close` | `{which: current\|others\|blank}`；回报逐窗口记了关掉的是第几个、什么 URL |
@@ -1765,8 +1844,10 @@ npm run test:sync-text       → 51/51   （阶段 2 文本输入 A 层：语义
 npm run test:sync-text-kernel → 21/21  （阶段 2 文本输入 B 层：1 主 + 2 受控真内核）
 npm run test:sync-tabs      → 59/59   （阶段 2 标签页 A 层：纯函数 + 设置 + 界面/开标签姿势静态扫描）
 npm run test:sync-tabs-kernel → 39/39 （阶段 2 标签页 B 层：1 主 + 2 受控真内核）
-npm run test:sync-window      → 21/21 （阶段 3 统一尺寸 A 层：状态归一 + 回读比对 + 汇总文案）
+npm run test:sync-window      → 22/22 （阶段 3 统一尺寸 A 层：状态归一 + 回读比对 + 汇总文案）
 npm run test:sync-window-kernel → 17/17（阶段 3 统一尺寸 B 层：3 个真环境，含最大化与「改不了」）
+npm run test:sync-arrange     → 67/67 （阶段 3 窗口排列 A 层：三段公式 + 假读数判定 + 显示器交接）
+npm run test:sync-arrange-kernel → 28/28（阶段 3 窗口排列 B 层：3 个真环境，含换行/最大化和内核已死）
 ```
 
 **标签页 A 层 59 条**覆盖：空白判定六种写法（含 `chrome://new-tab-page/` 子路径）、URL 归一（补 https、只收 http/https）、序号映射（`same_tab` 两方向、越界返回 `null` 不猜）、关其它从大到小、关空白只关空白、
@@ -1823,7 +1904,8 @@ npm run test:sync-window-kernel → 17/17（阶段 3 统一尺寸 B 层：3 个�
 
 1. **跨进程 iframe（OOPIF）里的输入不同步**。实测：键事件打进 A 的跨进程 iframe 里（读回 `"oop"`），受控窗口的 iframe 里读回空 —— 捕获脚本装在主帧的 document 上，OOPIF 是**另一个 document、另一个进程**。判据里两条都断言（一条证明输入真落进去了，一条记录不同步这个事实），不是「没测到」。
 2. **标签序号是「创建顺序」，不是标签栏的视觉顺序**。CDP 里没有「标签栏顺序」这个信息（`Target.getTargets` 是哈希序、`/json/list` 是最近使用序，两个都不对）。新开的标签一律追加在末尾，所以创建顺序在正常使用下就等于标签栏顺序；**用户拖动标签**之后才会不一致 —— 这时候「关第 N 个」关的可能是同一张标签栏位置不同的页。会话开始时就已经存在的标签（启动时那几张）拿不到创建事件，只能按 URL 排序定序，这条纯粹是**猜的**，只在「启动时就有多张标签」时才有影响。
-3. **不做窗口网格排列、置前、自定义位置间距**（阶段 3，且要评估 Win32 依赖）。
+3. **窗口排列只有「按屏幕排列」，没有「记住每个环境上次的位置」**：每次点按钮重算，不持久化布局。
+   不做 Win32 依赖（对手 Windows 侧用 koffi 调 `ReSizeAndShow`，我们全走 CDP `Browser.setWindowBounds`）。
 4. **8b 那条不能断言命中**：尺寸差 2 倍 + 响应式页面上比例映射本来就会点偏，断言命中就是假绿。只断言面板给出提示与 status 里各窗口实际尺寸。
 5. **`stopSync` 时若主窗口连接已经断了，binding 摘不掉**：如实记 `removed:false`，那个随机名会活到该环境关掉为止（页面里已 delete，实际暴露面极小）。
 6. **同步会话是单例**：同时只能有一个同步会话（两套同时往同一批窗口发输入必然是灾难），第二个 `start` 报 `100002`。

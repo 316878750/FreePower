@@ -37,7 +37,8 @@ import { readReportFile, summarize } from '../selfcheck/store.js';
 import { renderHtml } from '../selfcheck/html.js';
 import { issueTicket } from './tickets.js';
 import { apiInfoPayload, setApiVerify, resetStats } from './info.js';
-import { startSync, stopSync, syncStatus, updateSettings, refreshAll, unifySize, openTabInAll, tabState, closeTabs, copyTabToSlaves, unifyTabs } from '../sync/session.js';
+import { startSync, stopSync, syncStatus, updateSettings, refreshAll, unifySize, arrangeWindows, openTabInAll, tabState, closeTabs, copyTabToSlaves, unifyTabs } from '../sync/session.js';
+import { readDisplays } from '../sync/displays.js';
 import { readHotkeyStatus, requestHotkey } from '../sync/hotkey.js';
 import { resetApiKey } from '../store/db.js';
 import { listKernels } from '../kernel/chrome.js';
@@ -945,6 +946,23 @@ export function buildRoutes() {
       throw new ApiError(ERR.INVALID, e?.message || 'sync is not running');
     }
   });
+
+  /**
+   * 窗口排列（`tileWin`）：把参与同步的窗口按网格摆好。
+   * 参数对齐对手：row/hs/vs/left/top/width/height/range/screenId/screenList；`auto:true` = 一键排列。
+   * 摆完**回读**每个窗口的位置尺寸，不一致如实报（不静默当成功）。
+   */
+  add(['POST'], ['/api/v2/sync/arrange'], async (ctx) => {
+    const body = ctx.body && typeof ctx.body === 'object' ? ctx.body : {};
+    try {
+      return ok(await arrangeWindows(body));
+    } catch (e) {
+      throw new ApiError(ERR.INVALID, e?.message || 'sync is not running');
+    }
+  });
+
+  /** 显示器列表（桌面壳写、服务进程读）：多屏排列要用 workArea */
+  add(['GET'], ['/api/v2/sync/displays'], () => ok(readDisplays()));
 
   /**
    * 打开网址（`syncOperateOpenUrl`）：每个同步窗口打开同一批网址。

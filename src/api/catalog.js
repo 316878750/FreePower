@@ -34,6 +34,7 @@ const NOUN = new Map([
   ['category', '分类'],
   ['fb', 'Facebook'],
   ['api', '本地 API'],
+  ['sync', '窗口同步'],
 ]);
 
 /** 最后一个路径段（动作）→ 中文 */
@@ -79,6 +80,18 @@ const VERB = new Map([
   ['info', '信息'],
   ['verify', '验证开关'],
   ['reset', '重置 Key'],
+  // 窗口同步（0.4.2 阶段 1–3）：词表漏一个词，页面上就露出一段英文路径
+  ['refresh', '刷新读数'],
+  ['settings', '改同步设置'],
+  ['unify-size', '统一尺寸'],
+  ['arrange', '窗口排列'],
+  ['displays', '显示器列表'],
+  ['hotkey', '快捷键'],
+  ['tab', '打开网址'],
+  ['tabs', '标签列表'],
+  ['tab-close', '关闭标签'],
+  ['tab-copy', '复制标签到其它窗口'],
+  ['tab-unify', '统一标签页'],
 ]);
 
 /** `/api/v1/x/y` → ['x','y']；`api`、版本段、动态段（`:id`）都不是名词 */
