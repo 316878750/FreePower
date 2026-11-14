@@ -142,7 +142,7 @@ export default async function renderRecycle({ head, page }) {
       const okN = (res.purged || []).length;
       if (okN) toast('已彻底删除', 'ok');
       // 盘删不掉时后端不删库（留个还能再点的入口），这里必须如实说，不能报成功
-      else toast(`没能删掉：${(res.skipped || []).map((s) => s.reason).join('；') || '未知原因'}`, 'bad');
+      else toast(`没能删掉：${skipReason(res.skipped)}`, 'bad');
       await load();
     } catch (e) { toast(`彻底删除失败：${e.message}`, 'bad'); }
   }
@@ -161,11 +161,41 @@ export default async function renderRecycle({ head, page }) {
       const res = await api.recyclePurge({ all: true });
       const okN = (res.purged || []).length;
       const badN = (res.skipped || []).length;
-      toast(`已彻底删除 ${okN} 个${badN ? `，${badN} 个没删掉` : ''}`, badN ? 'bad' : 'ok');
+      // 「没删掉几个」不够：得说为什么没删掉，否则用户只能干瞪眼
+      toast(`已彻底删除 ${okN} 个${badN ? `，${badN} 个没删掉：${skipReason(res.skipped)}` : ''}`, badN ? 'bad' : 'ok');
       pageNo = 1;
       await load();
     } catch (e) { toast(`清空失败：${e.message}`, 'bad'); }
   }
+}
+
+/**
+ * skipped 里那条原因 → 给用户看的中文。
+ *
+ * 后端给的是**稳定的机器可读串**（`reason` + `error_code` + `error_message`），
+ * 翻译放在界面上做：脚本按 reason 判断，人看中文，两件事不挤在同一条串里。
+ * 认不出来的 reason **原样显示**，不猜、不吞掉 —— 未知原因被吞成「未知原因」才是最坏的结果。
+ */
+export function skipReasonText(s) {
+  if (!s) return '未知原因';
+  const code = s.error_code ? `（${s.error_code}）` : '';
+  switch (s.reason) {
+    case 'not_in_recycle_bin':
+      return '不在回收站里（只有回收站里的环境能彻底删除）';
+    case 'userdata_remove_failed':
+      return `user-data 目录删不掉${code}：可能有程序还占着它（比如没退干净的浏览器进程），`
+        + '关掉之后可以再试一次。记录已保留。';
+    default:
+      return s.reason ? `${s.reason}${code}` : '未知原因';
+  }
+}
+
+/** 一批 skipped → 一句话（去重，别把同一条原因印十遍） */
+export function skipReason(skipped) {
+  const list = (skipped || []).map(skipReasonText);
+  const uniq = [...new Set(list)];
+  if (!uniq.length) return '未知原因';
+  return uniq.length === 1 ? uniq[0] : uniq.slice(0, 2).join('；');
 }
 
 /**

@@ -775,7 +775,18 @@ export function buildRoutes() {
         if (dirGone) userdataRemoved++;
       } catch (e) {
         dirGone = false;
-        skipped.push({ profile_id: target.id, reason: `userdata_remove_failed: ${e.message}` });
+        /**
+         * 这一步**真的会失败**，而且不是罕见情况：残留的内核进程把 user-data 目录当工作目录、
+         * 或某个文件被别的程序锁着时，Windows 给的是 `EPERM`（实测：子进程 cwd 在目录里就必现）。
+         * 所以 reason 用**稳定的机器可读串**，错误码与原文分开挂 —— 界面上要显示原因，
+         * 脚本要能按 reason/code 判断「等会儿再试」，两件事不能挤在一条中文串里。
+         */
+        skipped.push({
+          profile_id: target.id,
+          reason: 'userdata_remove_failed',
+          error_code: e.code || null,
+          error_message: e.message,
+        });
       }
       if (!dirGone) continue; // 盘没删掉就不删库，留个还能再点的入口
       const r = purgeProfiles([target.id]);

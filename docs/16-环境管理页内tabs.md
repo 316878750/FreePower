@@ -76,8 +76,31 @@ environmentManagement:{tabs:[{labelKey:"nav.environmentTab",routeName:"browserLi
 | 只删回收站里的 | 在用环境 → `skipped: [{profile_id, reason:'not_in_recycle_bin'}]`，环境原样还在 |
 | 参数必须显式 | `{profile_id:[…]}` 或 `{all:true}`；两个都没有 → `100002`，`data.field='profile_id'`；拼错（`profile_ids`）同样 `100002` |
 | 顺序 | 先停（理论上不该在跑）→ 删 `data/profiles/<no>_<id8>/`（`userDataDirFor()` 的上一级，路径由系统算）→ 删记录 + 清 `profile_extensions` / `profile_tags` |
-| 盘删不掉 | **不删库**，进 `skipped` 带原因；界面如实报「没能删掉」，不报成功 |
+| 盘删不掉 | **不删库**，进 `skipped: {reason:'userdata_remove_failed', error_code, error_message}`；界面翻成「目录被占着，关掉之后再试，记录已保留」，不报成功 |
 | 出参 | `{purged:[…], skipped:[…], userdata_removed:N}` |
+
+**「盘删不掉就不删库」是被真实故障验过的，不是只写在注释里。** 造真实失败要先知道
+Windows 上什么真能让 `fs.rmSync(dir,{recursive:true,force:true})` 抛错，本机探了四种：
+
+```
+A 独占打开文件（fs.openSync 'r+'）  → removed      删得掉（Node 默认带 FILE_SHARE_DELETE）
+B 子进程 cwd 设在该目录里            → EPERM  ✅    删不掉（Windows 不许删任何进程的当前目录）
+C attrib +R 只读                    → removed      删得掉（force 会重试）
+D 子进程 cwd 设在被删目录本身        → EPERM  ✅    同上
+```
+
+所以判据用 B：起一个真进程把 cwd 钉在那个环境的目录里（模拟「没退干净的内核进程占着
+user-data」），然后 purge。断言六条：`purged` 为空且 `skipped` 点名该环境 /
+`reason === 'userdata_remove_failed'` / `error_code === 'EPERM'` 且原文非空 /
+库记录还在 / 回收站里还列得出来 / 目录与 cookie 文件都还在。
+然后**杀掉占用进程再 purge 一次**，断言这次 `purged=1`、`userdata_removed=1`、目录与记录都没了
+—— 后半段是关键：不做这一步，「还在」有可能只是功能坏了。
+
+顺带把 skipped 的形状改了：原来是拼在一条中文串里（`userdata_remove_failed: EPERM…`），
+现在 `reason` 是**稳定的机器可读串**、`error_code` / `error_message` 分开挂，
+翻译交给界面（`web/pages/recycle.js` 的 `skipReasonText`）。脚本按 reason 判断要不要重试，
+人看中文，两件事不挤在一条串里。**认不出来的 reason 原样显示** —— 吞成「未知原因」才是最坏的结果，
+这条也钉了判据。
 
 **参数必须显式**这条是被 CEO 抓过一次同类缺陷之后立的规矩：0.4.3 ① 的
 `app/profile/set` 因为 `ext_ids ?? ids` 在字段拼错时取到 `undefined`，被当成空数组把勾选全清了，
@@ -117,10 +140,11 @@ environmentManagement:{tabs:[{labelKey:"nav.environmentTab",routeName:"browserLi
 ## 七、判据
 
 ```
-node --no-warnings test/profiles-tabs.test.mjs     # 39 PASS / 0 FAIL
+node --no-warnings test/profiles-tabs.test.mjs     # 50 PASS / 0 FAIL
 npm test                                            # 已并入链
 ```
 
-五段：tab 模型（纯函数）→ 路由顺序/页面静态检查 → 分组（真 HTTP）→ 回收站（真 HTTP + 真删目录）
-→ 文案与约束。回收站那段会真的建一个 `data/profiles/<no>_<id8>/userdata/Cookies`，
-purge 之后断言目录没了、库记录没了、`profile_no` 不再被占。
+五段：tab 模型（纯函数）→ 路由顺序/页面静态检查 → 分组（真 HTTP）→ 回收站（真 HTTP + 真删目录
++ **真实占用的失败**）→ 文案与 skipped 翻译。回收站那段会真的建一个
+`data/profiles/<no>_<id8>/userdata/Cookies`，purge 之后断言目录没了、库记录没了、
+`profile_no` 不再被占；4b 那段起一个真进程占住目录，验「盘删不掉就不删库」，再放掉重试验能删掉。

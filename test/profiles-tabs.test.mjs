@@ -19,6 +19,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -192,6 +193,62 @@ try {
     && (purgedLive.json.data.skipped || []).some((s) => s.profile_id === p2.id && s.reason === 'not_in_recycle_bin')
     && !!prof.getProfile(p2.id), JSON.stringify(purgedLive.json?.data));
 
+  /* ---- 真实故障：盘删不掉时必须不删库（不用 mock） ---- */
+  /**
+   * 为什么必须用**真实**失败：mock 的失败等于没验。
+   * 本机探过四种「让 rmSync 真失败」的路子（`.tmp/rm-fail-probe.mjs` 的读数）：
+   *   A 独占打开文件 → 删掉了（Node 默认带 FILE_SHARE_DELETE）
+   *   B 子进程 cwd 在目录里 → **EPERM，删不掉**（Windows 不许删任何进程的当前目录）
+   *   C `attrib +R` 只读  → 删掉了（force 会重试）
+   *   D 子进程 cwd 在被删目录本身 → **EPERM，删不掉**
+   * 所以用 B：起一个真进程把 cwd 设在该环境的目录里，模拟「没退干净的浏览器进程占着目录」。
+   * 这不是人为构造的怪场景 —— 内核残留时 user-data 目录就是被占着的。
+   */
+  console.log('\n— 4b. 真实故障：user-data 占着时 purge 不许删库 —');
+
+  const p3 = prof.createProfile({ name: 'purge-locked', group_id: '0' });
+  const udd3 = userDataDirFor(prof.getProfile(p3.id));
+  const lockDir = path.dirname(udd3);
+  fs.mkdirSync(udd3, { recursive: true });
+  fs.writeFileSync(path.join(udd3, 'Cookies'), 'locked-cookie-db');
+  await api('POST', '/api/v2/browser-profile/delete', { profile_id: [p3.id] });
+
+  // 起一个真进程，cwd 钉在那个目录里并活着（stdio 'ignore'：沙箱里不收管道）
+  const locker = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 30000)'], {
+    cwd: lockDir, stdio: 'ignore', windowsHide: true,
+  });
+  await new Promise((r) => setTimeout(r, 600));
+
+  const lockedPurge = await api('POST', '/api/v2/browser-profile/recycle-bin/purge', { profile_id: [p3.id] });
+  const lockedSkip = (lockedPurge.json?.data?.skipped || []).find((s) => s.profile_id === p3.id);
+  check('盘被占住：purge 回 code=0 但 purged 为空、skipped 点名该环境（不假成功）',
+    lockedPurge.json?.code === 0
+    && (lockedPurge.json.data.purged || []).length === 0
+    && !!lockedSkip,
+    JSON.stringify(lockedPurge.json?.data));
+  check('盘被占住：skipped.reason 是稳定的机器可读串 userdata_remove_failed',
+    lockedSkip?.reason === 'userdata_remove_failed', String(lockedSkip?.reason));
+  check('盘被占住：错误码与原文分开带出（EPERM + 原文非空）',
+    lockedSkip?.error_code === 'EPERM' && !!lockedSkip?.error_message?.length,
+    JSON.stringify({ code: lockedSkip?.error_code, msg: String(lockedSkip?.error_message || '').slice(0, 60) }));
+  check('盘被占住：库记录还在（还能再点一次，不会变成谁也管不着的目录）',
+    !!prof.getRecycledProfile({ profile_id: p3.id }));
+  check('盘被占住：回收站里还列得出来', (await (async () => {
+    const b = await api('POST', '/api/v2/browser-profile/recycle-bin/list', { page: 1, limit: 100 });
+    return (b.json?.data?.list || []).some((x) => x.profile_id === p3.id);
+  })()));
+  check('盘被占住：目录与 cookie 文件都还在', fs.existsSync(udd3) && fs.existsSync(path.join(udd3, 'Cookies')));
+
+  // 放掉占用之后，同一条应该真的删得掉 —— 否则上面那些「还在」就只是功能坏了
+  try { locker.kill(); } catch { /* 可能已经退了 */ }
+  await new Promise((r) => setTimeout(r, 800));
+  const retried = await api('POST', '/api/v2/browser-profile/recycle-bin/purge', { profile_id: [p3.id] });
+  check('放掉占用后重试：purged=1、userdata_removed=1（同一条能删掉，证明前面是真故障不是死路）',
+    retried.json?.code === 0 && (retried.json.data.purged || []).includes(p3.id) && retried.json.data.userdata_removed === 1,
+    JSON.stringify(retried.json?.data));
+  check('放掉占用后重试：目录与库记录都没了',
+    !fs.existsSync(lockDir) && !prof.getRecycledProfile({ profile_id: p3.id }));
+
   // 清空：all:true
   await api('POST', '/api/v2/browser-profile/delete', { profile_id: [p2.id] });
   const empty = await api('POST', '/api/v2/browser-profile/recycle-bin/purge', { all: true });
@@ -211,6 +268,21 @@ try {
     /不会自动清理/.test(read('web/pages/recycle.js')));
   check('彻底删除的弹窗写清不可恢复（危险动作必须说后果）',
     /不可恢复/.test(read('web/pages/recycle.js')));
+
+  /**
+   * 后端给机器可读串、界面负责翻成人话 —— 这条要被单独钉住：
+   * 未知 reason 必须原样显示，不许吞成「未知原因」（那才是最难查的一类）。
+   */
+  const { skipReasonText } = await import('../web/pages/recycle.js');
+  check('skipped 翻译：userdata_remove_failed → 说清是目录被占 + 带错误码 + 说还能再试',
+    /占着它/.test(skipReasonText({ reason: 'userdata_remove_failed', error_code: 'EPERM' }))
+    && /EPERM/.test(skipReasonText({ reason: 'userdata_remove_failed', error_code: 'EPERM' }))
+    && /再试/.test(skipReasonText({ reason: 'userdata_remove_failed', error_code: 'EPERM' })));
+  check('skipped 翻译：not_in_recycle_bin → 说清只有回收站里的能删',
+    /只有回收站里的环境能彻底删除/.test(skipReasonText({ reason: 'not_in_recycle_bin' })));
+  check('skipped 翻译：认不出来的 reason 原样显示，不吞成「未知原因」',
+    skipReasonText({ reason: 'some_new_reason', error_code: 'EXYZ' }) === 'some_new_reason（EXYZ）',
+    skipReasonText({ reason: 'some_new_reason', error_code: 'EXYZ' }));
 
   /* ---- 收尾 ---- */
   server.close();

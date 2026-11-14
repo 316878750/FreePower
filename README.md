@@ -353,6 +353,10 @@ MV2 装得上但 Chrome 137+ 可能不给跑（导入时明确告警）。完整
 - **只删回收站里的**：在用环境走这条一律 `skipped: not_in_recycle_bin`，不给绕过软删除的口子；
 - **参数必须显式**：`profile_id`（数组）或 `all: true`，一个都没给就 `100002` —— 全量动作最怕字段拼错被当成「清空」；
 - **盘删不掉就不删库**：留一条记录让用户还能再点一次，比删了库留下一堆没人管得着的目录强。
+  这不是只写在注释里 —— 判据用**真实的 `EPERM`** 验过（起一个进程把 cwd 钉在该环境目录里，
+  Windows 必现「不许删任何进程的当前目录」），见 16 号文档那节与 `test/profiles-tabs.test.mjs` 的 4b 段。
+  失败时 `skipped` 给 `{reason:'userdata_remove_failed', error_code:'EPERM', error_message}` ——
+  原因要机器可读（脚本判断要不要重试），人看的中文由界面翻，不挤在一条串里。
 
 顺手改掉一处**文案与行为不一致**：列表页的「删除」原来是「本地硬删，不可恢复」，
 实际从 2026-11-12 起就是软删除（进回收站、user-data 留在盘上）。现在文案跟着行为走。
@@ -804,7 +808,7 @@ Object.getOwnPropertyNames(window).some(n => /^__fp/.test(n))   // true → 这�
       我们加它是为了不让回收站变成只进不出的黑洞，但三条边界写死：**只对回收站里的生效**
       （在用环境一律 `skipped: not_in_recycle_bin`，不给绕过软删除做硬删的口子）、
       **参数必须显式**（`profile_id` 数组或 `all: true`，一个都没给就 `100002`，绝不当成「清空」）、
-      **盘删不掉就不删库**（留一条还能再点的记录，不留一堆没人管得着的目录）。
+      **盘删不掉就不删库**（留一条还能再点的记录，不留一堆没人管得着的目录；判据用真实 `EPERM` 验过）。
     - 回收站里恢复出来的是**同一个环境**：id、`profile_no`、user-data 目录都不变
       （因为删除是软删除，不是搬走再搬回）。
     - 删分组**不删环境**：组里的环境挪回 Default，`moved` 会如实回挪了几个；Default 不能删。
@@ -1250,14 +1254,15 @@ B 层那四条为什么必须真机：**`Preferences` 里写着 1 不等于恢�
 | 入参 | `{profile_id: [...]}` 或 `{all: true}`（清空）。**两个都没有 → `100002`**，`data.field = 'profile_id'`；字段名拼错（`profile_ids`）同样 `100002` —— 全量动作最怕「拼错被当成空/当成全清」 |
 | 只删回收站里的 | 在用环境 → `skipped: [{profile_id, reason:'not_in_recycle_bin'}]`，环境原样还在。不给绕过软删除做硬删的口子 |
 | 顺序 | 先停（理论上不该在跑）→ 删 `data/profiles/<no>_<id8>/`（`userDataDirFor` 的上一级）→ 删记录 + 清 `profile_extensions` / `profile_tags` |
-| 盘删不掉 | **不删库**，进 `skipped` 带原因；界面上如实报「没能删掉」，不报成功 |
+| 盘删不掉 | **不删库**，`skipped: {reason:'userdata_remove_failed', error_code, error_message}`（reason 是机器可读串，界面翻成人话）；弹窗如实报「目录被占着，关掉之后再试，记录已保留」，不报成功。**这条被真实故障验过**：起一个真进程把 cwd 钉在目录里（Windows 必现 `EPERM`），purge 后库记录与目录都还在，放掉占用再试就删掉了 |
 | 出参 | `{purged:[…], skipped:[…], userdata_removed:N}` |
 
-**判据**：`node --no-warnings test/profiles-tabs.test.mjs` → **39 PASS / 0 FAIL**，已并入 `npm test`。五段：
+**判据**：`node --no-warnings test/profiles-tabs.test.mjs` → **50 PASS / 0 FAIL**，已并入 `npm test`。六段：
 tab 模型（三个 hash + `tabOf` 认末尾斜杠 + 编辑页不算 tab）、路由顺序（`groups`/`recycle` 必须在 `/profiles/:id` 之前）、
 分组（`profile_count` 只数在用的、改名/备注读得回、Default 不能删、删组挪回 Default 且 `moved=2`）、
 回收站（6 字段 + 无 total、restore 缺 `group_id` 报错、purge 三条边界、清空）、
-文案（列表页说「移入回收站」、回收站页说「不会自动清理」、彻底删除说「不可恢复」）。
+**4b 真实故障**（进程占住目录 → `EPERM` → 不删库；放掉重试 → 真删掉）、
+文案与 skipped 翻译（未知 reason 原样显示，不吞成「未知原因」）。
 
 **判据**：`node --no-warnings test/recycle.test.mjs` → **44 passed / 0 failed**，已并入 `npm test`。四段：
 
