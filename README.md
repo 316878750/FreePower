@@ -577,11 +577,28 @@ Object.getOwnPropertyNames(window).some(n => /^__fp/.test(n))   // true → 这�
   另外 4 条自检断言跟着红 —— 同一个原因，不是另一处坏）。还原后全部回绿。
 
 **已知残留（如实记）**：
-- 窗口同步的 binding 名仍是 `__fpS_<8位hex>`（**前缀 `__fpS_` 是固定的**）。
-  它随机、抓到引用后立刻 `delete`（实测暴露窗口 1ms），但名字形状本身带签名。
-  2026-11-14 定为**阶段 2 的第一件事**：换成不带 `fp` 的形状，单独一笔提交（不与 P0 混），
-  判据至少两条 —— 运行中名字形状不带 `__fp`/`fp`、停止后页面里查不到（沿用已有的 `removeBinding` 判据）。
+- 窗口同步的 binding 名曾经是 `__fpS_<8位hex>`（固定前缀），**2026-11-14 已修**，
+  单独一笔提交（阶段 2 第一件事），见下面「已修：同步 binding 名的固定前缀」。
 - 拦截页自己的 `window.__fpBlock` **不在范围内**：那是我们自己渲染的拦截页，不是被检测的网站页面。
+
+### 已修：同步 binding 名的固定前缀（阶段 2 第一件，2026-11-14）
+
+**修之前**：`__fpS_<8位hex>`。名字本身是随机的（每会话换新、抓到引用立刻 `delete`、
+实测暴露 1 ms），但**固定的 `__fp` 前缀本身就是一行判定代码** ——
+同步期间 `Object.getOwnPropertyNames(window).some(n => n.startsWith('__fp'))` 能扫到它。
+这与 P0 的 7 个固定名标记是同一类问题，只是暴露窗口短。
+
+**修法**：`_s` + 8 位小写 hex（4 字节随机），看起来像页面上随手起的局部变量。
+形状定义收在 `src/sync/binding.js`（`BINDING_NAME_RE` + `newBindingName()`），
+主进程、页面脚本、判据三处共用同一份 —— 不许各写一套正则，否则「改了实现没改判据」会静默通过。
+
+**判据（先红后绿，读数）**：
+- A 层把生成器改回旧前缀 → `sync-rules` **92/95（红 3 条）**：名字形状、名字不含 `fp`/`__`、
+  以及**用实现生成的名字构造脚本后仍不含 `__fp`/`fpS` 字面量**。
+- B 层同样变异 → `sync-kernel` 红 **4 条**：形状、不含固定签名、第二次会话的形状与签名。
+- 还原后 A 层 **95/95**、B 层 **39/39**；实测名 `_s8fc82dab` / `_se5ff8523`，暴露窗口 0–1 ms。
+- 停止后两条都查：`typeof window[那个名字] === 'undefined'`，且 own names 里连
+  `_s<8hex>` 形状都查不到（防「只按旧前缀查 = 永远查不到」的假绿）。
 
 其余已知限制（继续编号）：
 
@@ -1547,7 +1564,7 @@ FREEPOWER_KERNEL_DOWNLOAD_ATTEMPTS   续传最多重连几次（默认 12）
 | binding 不跨文档存活 | about:blank 上是 function，导航后 `typeof` = undefined | 脚本装到新文档时先**同步抓一次**引用，再轮询兜底（实测消失用时 **1 ms**） |
 | 抓引用后能删掉名字 | `delete window[NAME]` 后 `getOwnPropertyNames(window)` 里**查不到**；抓到的引用**仍能推消息** | 用 `delete`，**不用** `defineProperty`（后者名字会残留在 own names 里，是检测面） |
 | 浏览器级 addBinding 不存在 | 不带 sessionId 报 `'Runtime.addBinding' wasn't found` | 必须走 page session |
-| 名字每次会话随机 | `__fpS_<8位 hex>`，两次会话 `__fpS_44c36592 → __fpS_a981b2f5` | 主进程生成，同时给 `addBinding` 和脚本 |
+| 名字每次会话随机 | `_s<8位 hex>`（不带 `fp`、不带 `__` 前缀），两次会话 `_s44c36592 → _sa981b2f5` | 主进程生成（`src/sync/binding.js`），同时给 `addBinding` 和脚本 |
 | **stop 时必须摘** | `Runtime.removeBinding`；`teardown.removed === true` | 先摘再关连接；异常结束（内核被杀）如实记 `removed:false / reason:connection_lost`，**不假装干净** |
 | 后台标签页定时器被节流 | 只靠轮询时残留可达 **1000 ms**（4 ms 的轮询被 Chrome 按后台标签页降到 1 s） | 脚本装上时**同步抓**，把窗口压到 1 ms；轮询只当兜底 |
 
@@ -1610,15 +1627,15 @@ Target.createTarget({ url: 'about:blank' })
 ### 判据
 
 ```
-npm run test:sync          → 90/90   （A 层：纯函数 + 路由清单，不需要 Chrome）
-npm run test:sync-kernel   → 36/36   （B 层：真内核 + 两个环境 + CDP 派发模拟输入）
+npm run test:sync          → 95/95   （A 层：纯函数 + 路由清单，不需要 Chrome）
+npm run test:sync-kernel   → 39/39   （B 层：真内核 + 两个环境 + CDP 派发模拟输入）
 ```
 
-**A 层 90 条**覆盖：坐标映射（两种视口给出不同坐标 —— 防「直传绝对像素」的实现；退化视口返回 null，宁可不发也不在 (0,0) 乱点）、事件→CDP 计划（down 必先发 `mouseMoved`；带 Ctrl 的 keyDown 不带 `text`，否则 Ctrl+A 变成插入 "a"）、四个开关**两个方向**、调度保序与 stop 后不补发、捕获脚本形状（用 delete 不用 defineProperty、不含 `__fpSync*`、不含 eval）、设置归一、快捷键归一（没有修饰键一律拒）、8 条路由存在性。
+**A 层 95 条**覆盖：坐标映射（两种视口给出不同坐标 —— 防「直传绝对像素」的实现；退化视口返回 null，宁可不发也不在 (0,0) 乱点）、事件→CDP 计划（down 必先发 `mouseMoved`；带 Ctrl 的 keyDown 不带 `text`，否则 Ctrl+A 变成插入 "a"）、四个开关**两个方向**、调度保序与 stop 后不补发、**binding 名形状（`_s<8hex>`、不含 `fp`/`__`、200 次不撞名、形状正则抓得住旧名）**、捕获脚本形状（用 delete 不用 defineProperty、不含 `__fp`/`fpS`/eval、不往 window 挂属性）、设置归一、快捷键归一（没有修饰键一律拒）、8 条路由存在性。
 
 **变异验证**（`.tmp/mutate-sync.mjs`，不入库）：把实现故意改坏，确认判据会红 —— mapPoint 去掉退化保护 / down 不先发 mouseMoved / Ctrl 也带 text / 开关恒真 / 用 defineProperty 代替 delete / 调度器不 await / stop() 停不干净，**7 个全部被抓住**；`removeBinding` 去掉会让 B 层红 2 条。
 
-**B 层 36 条**覆盖：注入前置、8a（视口统一后按**元素 id** 断言命中 `hits=["target"]`）、键盘同步与 `input:false` 两方向（含「被开关拦下的条数 > 0」，证明是拦下而非没捕获）、`move`/`scroll` 两方向、binding 名形状与页面 own names 里查不到、**stop 后 `typeof window[随机名] === undefined`**、暴露窗口 ≤1500ms（实测 1ms）、第二次 stop 也 `removed=true`、异常结束如实记 `connection_lost`、8b（2 倍尺寸差只断言提示与各窗口尺寸、会话仍在跑）、新标签三条、OOPIF 两条。
+**B 层 39 条**覆盖：注入前置、8a（视口统一后按**元素 id** 断言命中 `hits=["target"]`）、键盘同步与 `input:false` 两方向（含「被开关拦下的条数 > 0」，证明是拦下而非没捕获）、`move`/`scroll` 两方向、binding 名形状与「不带固定签名」、页面 own names 里查不到（按**本次那个名字 + `_s<8hex>` 形状**两条查）、**stop 后 `typeof window[随机名] === undefined` 且连形状都查不到**、暴露窗口 ≤1500ms（实测 0–1ms）、第二次会话换新名且同样干净、第二次 stop 也 `removed=true`、异常结束如实记 `connection_lost`、8b（2 倍尺寸差只断言提示与各窗口尺寸、会话仍在跑）、新标签三条、OOPIF 两条。
 
 ### 已知限制（阶段 1）
 

@@ -12,6 +12,7 @@ import crypto from 'node:crypto';
 import { CdpClient } from '../kernel/cdp.js';
 import { getInstance, getRunning } from '../runtime/manager.js';
 import { buildCaptureScript } from './agent-script.js';
+import { newBindingName } from './binding.js';
 import { buildInputPlan, enabledBySwitch } from './replay.js';
 import { SyncScheduler, makeRng } from './scheduler.js';
 
@@ -131,7 +132,8 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
   }
 
   const st = normalizeSettings(settings);
-  const bindingName = `__fpS_${crypto.randomBytes(4).toString('hex')}`;
+  /* 名字形状不带 `fp`、不带 `__` 前缀：固定的签名前缀本身就是检测面（见 ./binding.js） */
+  const bindingName = newBindingName();
   const seed = rngSeed === null || rngSeed === undefined ? crypto.randomInt(1, 2 ** 31) : Number(rngSeed);
   const scheduler = new SyncScheduler({ delayMs: st.delay_ms, jitterMs: st.jitter_ms, rng: makeRng(seed) });
 

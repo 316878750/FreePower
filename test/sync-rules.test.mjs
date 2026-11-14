@@ -230,7 +230,20 @@ check('typingDelays 落在区间内', delays.every((d) => d >= 30 && d <= 40), d
 
 /* ============================ 6. 捕获脚本形状 ============================ */
 console.log('\n— 6. 捕获脚本形状（检测面）—');
-const NAME = '__fpS_deadbeef';
+
+/* binding 名：形状由实现模块统一给，判据不许自己另写一套正则（那会掩盖「改了实现没改判据」） */
+const { BINDING_NAME_RE, newBindingName } = await import('../src/sync/binding.js');
+const draws = Array.from({ length: 200 }, () => newBindingName());
+check('binding 名形状 _s<8位小写 hex>', draws.every((n) => BINDING_NAME_RE.test(n)),
+  draws.slice(0, 3).join(','));
+check('binding 名不含固定签名：没有 fp 子串、没有 __ 前缀',
+  draws.every((n) => !/fp/i.test(n) && !n.startsWith('__') && !n.includes('S_')),
+  draws.slice(0, 3).join(','));
+check('两次生成不会撞名（4 字节随机，200 次全不同）', new Set(draws).size === draws.length,
+  `${new Set(draws).size}/${draws.length}`);
+check('形状正则本身抓得住旧名（__fpS_deadbeef 必须不匹配）', BINDING_NAME_RE.test('__fpS_deadbeef') === false);
+
+const NAME = '_sdeadbeef';
 const src = buildCaptureScript({ bindingName: NAME });
 
 check('脚本里出现本次会话的随机 binding 名', src.includes(NAME), NAME);
@@ -240,9 +253,18 @@ check('**不**用 defineProperty 覆盖（实测删不干净名字，仍是检�
   !src.includes('defineProperty'), '无 defineProperty');
 
 const forbiddenHits = FORBIDDEN_IN_SCRIPT.filter((f) => src.includes(f));
-check('脚本不含任一检测面/逃逸面字面量', forbiddenHits.length === 0, forbiddenHits.join(',') || 'none');
-check('脚本不往 window 上挂自己的属性', !/window\.__fp/.test(src),
-  (src.match(/window\.__fp\w*/g) || []).join(',') || 'none');
+check('脚本不含任一检测面/逃逸面字面量（含 __fp / fpS）', forbiddenHits.length === 0, forbiddenHits.join(',') || 'none');
+
+/* 上一条用的是手写的干净名字，只能证明模板干净；这一条用**实现生成的名字**再构造一次，
+ * 把「生成器退回旧前缀」这条也钉在 A 层（真内核那层另有一条同样的断言）。 */
+const genName = newBindingName();
+const genSrc = buildCaptureScript({ bindingName: genName });
+const genHits = FORBIDDEN_IN_SCRIPT.filter((f) => genSrc.includes(f));
+check('用实现生成的 binding 名构造脚本：脚本里也没有 __fp / fpS 字面量',
+  genHits.length === 0, `${genName} → ${genHits.join(',') || 'none'}`);
+check('脚本不往 window 上挂自己的属性（只有读 window[NAME] 与 delete）',
+  !/\bwindow\[[^\]]+\]\s*=(?!=)/.test(src) && !/window\.[A-Za-z_$][\w$]*\s*=(?!=)/.test(src),
+  (src.match(/window[.\[]\w*[^\n]{0,12}=/g) || []).join(' | ') || 'none');
 
 const listeners = ['mousemove', 'mousedown', 'mouseup', 'wheel', 'keydown', 'keyup', 'compositionend']
   .filter((e) => src.includes(`'${e}'`));

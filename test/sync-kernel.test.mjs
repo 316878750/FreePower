@@ -11,7 +11,7 @@
  *         不断言命中（比例映射在响应式页面上本来就会点偏，断言命中就是假绿）；
  *   · 四个开关两个方向；
  *   · binding 名每会话随机、页面 own names 里查不到（覆盖前/后的读数）；
- *   · 新判据 ①：同步开的新标签首个文档 `__fpApplied === 'object'` 且 `navigation.type === 'navigate'`；
+ *   · 新判据 ①：同步开的新标签首个文档的注入完成标记（按 fp_seed 派生）是 `object` 且 `navigation.type === 'navigate'`；
  *   · OOPIF iframe 里的输入能不能捕获（读数，写进 README 的「不同步」清单）。
  *
  * 跑法：npm run test:sync-kernel（会起 2 个真环境，约 1–2 分钟）
@@ -73,6 +73,7 @@ const URL_MAIN = `http://127.0.0.1:${PORT}/page`;
 const manager = await import('../src/runtime/manager.js');
 const profiles = await import('../src/store/profiles.js');
 const sync = await import('../src/sync/session.js');
+const { BINDING_NAME_RE } = await import('../src/sync/binding.js');
 const { markerNames } = await import('../src/kernel/markers.js');
 const { fingerprintView } = await import('../src/fingerprint/view.js');
 
@@ -285,10 +286,14 @@ try {
   /* ------------------------------ binding：随机名 + 抓完即删 ------------------------------ */
   console.log('\n— binding 名与检测面 —');
   const stNow = sync.syncStatus();
-  check('binding 名形状 __fpS_<8位 hex>（每会话随机）', /^__fpS_[0-9a-f]{8}$/.test(String(stNow.binding_name)),
-    String(stNow.binding_name));
+  const nameNow = String(stNow.binding_name);
+  check('binding 名形状 _s<8位小写 hex>（每会话随机）', BINDING_NAME_RE.test(nameNow), nameNow);
+  check('binding 名不带固定签名（无 fp 子串、无 __ 前缀）',
+    !/fp/i.test(nameNow) && !nameNow.startsWith('__'), nameNow);
+  /* 残留判定同时按「本次会话那个名字」和「_s<8hex> 形状」查：
+   * 换名后只按旧前缀查会永远查不到 —— 那是假绿，所以两条一起上。 */
   const leftover = await evalIn(instA, pageA.sessionId,
-    `JSON.stringify(Object.getOwnPropertyNames(window).filter((n) => n.startsWith('__fpS_')))`);
+    `JSON.stringify(Object.getOwnPropertyNames(window).filter((n) => n === ${JSON.stringify(nameNow)} || /^_s[0-9a-f]{8}$/.test(n)))`);
   check('主窗口 own names 里查不到 binding 名（抓完就 delete 了）', leftover === '[]', String(leftover));
   const typeofBinding = await evalIn(instA, pageA.sessionId, `typeof window[${JSON.stringify(String(stNow.binding_name))}]`);
   check('按名字直接取也拿不到（typeof undefined）', typeofBinding === 'undefined', String(typeofBinding));
@@ -420,13 +425,20 @@ try {
     `${stopped.teardown?.binding_name} vs ${name1}`);
   const afterStop = await evalIn(instA, pageA.sessionId, `typeof window[${JSON.stringify(String(name1))}]`);
   check('停止后主窗口页面里 typeof window[随机名] === undefined', afterStop === 'undefined', String(afterStop));
+  /* 停掉之后再扫一遍形状：名字抓完就 delete 了，所以这一条要证明的是
+   * 「页面里连这个形状的残留都没有」，而不是「我们记的那个名字取不到」。 */
+  const shapeAfterStop = await evalIn(instA, pageA.sessionId,
+    'JSON.stringify(Object.getOwnPropertyNames(window).filter((n) => /^_s[0-9a-f]{8}$/.test(n)))');
+  check('停止后页面 own names 里连 _s<8hex> 形状都查不到', shapeAfterStop === '[]', String(shapeAfterStop));
 
   /* ------------------------------ 会话重建：名字换新 + 抓完即删 ------------------------------ */
   console.log('\n— 会话重建 —');
   const st2 = await sync.startSync({ masterId: started[0], slaveIds: [started[1]], settings: {} });
   check('第二次会话的 binding 名与第一次不同（每次会话随机）',
-    st2.binding_name !== name1 && /^__fpS_[0-9a-f]{8}$/.test(String(st2.binding_name)),
+    st2.binding_name !== name1 && BINDING_NAME_RE.test(String(st2.binding_name)),
     `${name1} → ${st2.binding_name}`);
+  check('第二次会话的名字也不带固定签名（无 fp / 无 __ 前缀）',
+    !/fp/i.test(String(st2.binding_name)) && !String(st2.binding_name).startsWith('__'), String(st2.binding_name));
 
   // 不写死等待时间，**量**暴露窗口：从会话起来到名字从页面 own names 里消失用了多久。
   // 后台标签页的定时器会被 Chrome 节流（4ms → 1000ms），所以这个数字要如实打出来。
@@ -435,7 +447,7 @@ try {
   let elapsed = -1;
   for (let i = 0; i < 40; i++) {
     leftover2 = await evalIn(instA, pageA.sessionId,
-      `JSON.stringify(Object.getOwnPropertyNames(window).filter((n) => n.startsWith('__fpS_')))`);
+      `JSON.stringify(Object.getOwnPropertyNames(window).filter((n) => n === ${JSON.stringify(String(st2.binding_name))} || /^_s[0-9a-f]{8}$/.test(n)))`);
     if (leftover2 === '[]') { elapsed = Date.now() - t0; break; }
     await sleep(100);
   }

@@ -13,7 +13,7 @@
  *      `Object.getOwnPropertyNames(window).includes(name) === false`（名字彻底消失），
  *      而 `defineProperty(..., {value: undefined})` 名字还留在 own names 里 —— 那是个检测面。
  *      抓到的引用在 delete 之后**仍然能推消息**（实测 CDP 收到 1 条）。
- *   3. **不留任何 window 属性**：不挂 `__fpSync*`、不挂调试入口。所有状态都在闭包里。
+ *   3. **不留任何 window 属性**：不挂调试入口、不往 window 上打标记。所有状态都在闭包里。
  *
  * 残留暴露窗口（如实写）：从主进程补装 binding 到脚本 delete 掉它之间，实测约 4 ms
  * （轮询第 1 次就抓到）。这段时间内**页面自己的 document-start 脚本看不到它**
@@ -34,7 +34,7 @@ export const EVENT_KIND = {
 /**
  * 生成捕获脚本。
  * @param {object} opt
- * @param {string} opt.bindingName 本次会话随机的 binding 名（`__fpS_<8位>`）
+ * @param {string} opt.bindingName 本次会话随机的 binding 名（`_s<8位 hex>`，见 ./binding.js）
  * @param {number} [opt.moveIntervalMs] mousemove 节流间隔（默认 30ms，太快会把受控窗口压死）
  * @param {number} [opt.flushMs] 批量上送间隔（默认 16ms）
  */
@@ -153,9 +153,15 @@ export function buildCaptureScript({ bindingName, moveIntervalMs = 30, flushMs =
 })();`;
 }
 
-/** 给判据用：脚本里不该出现这些（检测面 / 逃逸面） */
+/**
+ * 给判据用：脚本里不该出现这些（检测面 / 逃逸面）。
+ *
+ * `__fp` 与 `fpS` 两条是 P0 那一类问题的防回流：binding 名现在也不带这两个形状，
+ * 谁再往脚本里塞固定前缀的调试入口/标记，A 层判据会直接红。
+ */
 export const FORBIDDEN_IN_SCRIPT = [
-  '__fpSyncSend',
+  '__fp',
+  'fpS',
   'eval(',
   'new Function',
   'document.write',
