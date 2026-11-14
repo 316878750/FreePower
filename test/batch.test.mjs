@@ -444,6 +444,26 @@ try {
   check('检查代理的结果界面把「超时」单独显示并带秒数',
     /超时（\$\{x\.timeout_seconds\} 秒/.test(listSrc), '');
 
+  /* ---- 11b. 「更新环境信息」：字段清单必须能看见，且口径要说清是我们的解释 ---- */
+  const INFO_FIELDS = [
+    'name', 'remark', 'group_id', 'domain_name', 'open_urls',
+    'username', 'password', 'fakey', 'platform_account', 'profile_tag_ids',
+  ];
+  const infoBlock = listSrc.slice(
+    listSrc.indexOf('UPDATE_INFO_FIELDS'),
+    listSrc.indexOf('function batchUpdateInfo'),
+  );
+  check(`更新环境信息：界面把白名单 ${INFO_FIELDS.length} 个字段全列出来（勾完知道改了啥）`,
+    INFO_FIELDS.every((k) => new RegExp(`key: '${k}'`).test(infoBlock)),
+    INFO_FIELDS.filter((k) => !new RegExp(`key: '${k}'`).test(infoBlock)).join(','));
+  check('界面写明「勾了才发、没勾的原样不动」（不是静默全量覆盖）',
+    /勾上才会改/.test(listSrc) && /没勾的字段\*\*原样不动\*\*|没勾的字段一个都不动/.test(listSrc));
+  check('界面写明「这条的语义是我们自己的解释、对手只留了名字」',
+    /updateUserInfo/.test(listSrc) && /没有证据|是我们自己的解释/.test(listSrc));
+  check('README 与 17 号文档都写了这条口径声明（不许当成对齐对手）',
+    /updateUserInfo/.test(read('README.md')) && /没有字段清单|没有证据/.test(read('README.md'))
+    && /没有字段清单|没有证据/.test(read('docs/17-批量菜单与视图密度.md')));
+
   /* ---- 收尾 ---- */
   server.close();
   closeDb();

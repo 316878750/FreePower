@@ -1,4 +1,4 @@
-# FreePower
+﻿# FreePower
 
 独立实现的指纹浏览器（AdsPower 同类产品）：**多环境隔离 + 代理绑定 + 指纹一致 + 本地 API**。
 
@@ -380,7 +380,7 @@ MV2 装得上但 Chrome 137+ 可能不给跑（导入时明确告警）。完整
 | 1 | 修改代理 | `proxy_config` 写死一条 / `proxy_id` 绑代理列表 / `clear:true` 改直连 | 写死一条回 `shared_egress:true`，界面提醒「共用同一个出口 IP」；在跑的回 `restart_required` |
 | 2 | 修改 UA / 内核 | UA 与内核大版本必须一致；只给 UA 时从**本机已装内核**里挑同大版本 | 对不上 `100002 field=ua`，不静默改其中一个 |
 | 3 | 修改备注 | 四档 `replace`（默认）/ `append` / `prefix` / `suffix` | 覆盖会删掉原有备注，界面必须提示 |
-| 4 | 更新环境信息 | 白名单 10 个基础字段 | 非白名单进 `ignored_fields` 原样回报；**指纹种子不给批量口子** |
+| 4 | 更新环境信息 | 白名单 10 个基础字段，界面**把 10 个字段全列出来**（勾了才发、空着不改） | 非白名单进 `ignored_fields` 原样回报；**指纹种子不给批量口子**。**这条语义是我们自己定的，见下面那段的说明** |
 | 5 | 批量归档 | 写 `archived_at`，移出主列表 | **不是删除**：不碰 `deleted_at`、不碰 user-data、能启动能编辑 |
 | 6 | 批量恢复 | 从归档放回主列表 | 不是回收站恢复（那是 `/recycle-bin/restore`，且必须选分组） |
 | 7 | 批量删除 | 移入回收站 | 软删除，可以随时恢复 |
@@ -389,14 +389,22 @@ MV2 装得上但 Chrome 137+ 可能不给跑（导入时明确告警）。完整
 | 10 | 还原 Cookie（覆盖） | 写完以文件为准，文件里没有的删掉 | **先预览再确认**，预览不带 cookie 值 |
 | 11 | 合并 Cookie（并集） | 只补文件里有、环境里没有的 | 同名**以环境现有为准**，不动登录态 |
 
-**归档与回收站是两套语义，数据层就分开**：归档写 `archived_at`、回收站写 `deleted_at`；
-归档的能启动能编辑、主列表默认看不见（选「只看已归档」）、永远不进回收站。
+**归档与回收站是两套语义，数据层就分开**：归档写 `archived_at`、回收站写 `deleted_at`；归档的能启动能编辑、主列表默认看不见（选「只看已归档」）、永远不进回收站。
 `/recycle-bin/*` 一次都没复用成归档，判据里有静态断言钉住。
 另外两条边界：回收站里的不能被归档（`skipped: in_recycle_bin`），
 **归档 → 删除 → 恢复后 `archived_at` 必须清空**（否则环境会「隐身」在主列表外，用户点了恢复找不到）。
 
 **检查代理直连不算通过**：`outcome:'direct'` + `ok:false` + 「这个环境没绑代理（直连），没有代理可查」。
 检查的是代理，直连没有代理可查 —— 给它编一个「检查通过」才是骗人。
+
+**「更新环境信息」的语义是我们自己的解释，不是抄来的（口径要写清）**：逆向 `28-` 号文里，
+对手在批量清单里只留下一个名字 `updateUserInfo` —— **没有字段清单，也没有行为证据**。
+所以「批量改哪 10 个字段、覆盖还是追加、要不要白名单」全是 FreePower 的定义：
+白名单 10 个（`name` / `remark` / `group_id` / `domain_name` / `open_urls` / `username` /
+`password` / `fakey` / `platform_account` / `profile_tag_ids`），**整条覆盖不追加**，
+非白名单字段进 `ignored_fields` 原样回报。界面把这 10 个字段**全列出来**（勾了才发、空着不改），
+不能让人「勾完不知道改了啥」，也不能让人以为没列出来的字段也能在这里改。
+以后谁看这段：**别把它当成对手的行为引用**，它没有证据支撑，是我们为了让批量入口好用而定的。
 
 **还原 vs 合并**这栏最容易做错，所以两个都默认 `preview:true`：只算不写，回「会加几条 / 改几条 / 删几条 /
 留几条 / 无效几条」，用户看数字确认之后才真写。写后**回读校验**：`verified` 是「能读回来的条数」，
@@ -415,7 +423,7 @@ MV2 装得上但 Chrome 137+ 可能不给跑（导入时明确告警）。完整
 判据：
 
 ```
-node --no-warnings test/batch.test.mjs               → 70 PASS / 0 FAIL  （A 层，进 npm test）
+node --no-warnings test/batch.test.mjs               → 74 PASS / 0 FAIL  （A 层，进 npm test）
 node --no-warnings test/batch-cookie-kernel.test.mjs → 18 PASS / 0 FAIL （B 层真内核，进 npm run smoke）
 node --no-warnings test/batch-show-kernel.test.mjs   → 13 PASS / 0 FAIL （B 层真内核，进 npm run smoke）
 ```
@@ -1004,7 +1012,7 @@ npm run test
 npm run smoke
 ```
 
-当前实测（2026-11-14，本机）：`npm run test` = schema **10** + net-rules **56** + chain-rules **31** + recycle **44** + apps **54** + profiles-tabs **60** + batch **70** + settings-diagnose **56** + unit **85** + agent **15** + api **102** + api-mcp **46** + sync-rules **95** + sync-text **51** + sync-tabs **59** + sync-window **22** + sync-arrange **67** + sync-show **55** + markers **34** + nav-fold **60** + ui **46** + desktop **59** + kernel-download **62**（`package.json` 里那条脚本就是这二十三组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（proxy-chain，两跳代理链）+ **24/24**（workers）+ **30/30**（agent-smoke）+ **9/9**（session-restore）+ **12/12**（startup-tabs）+ **17/17**（block-page，全离线）+ **18/18**（markers-kernel）+ **39/39**（sync-kernel）+ **21/21**（sync-text-kernel）+ **39/39**（sync-tabs-kernel）+ **17/17**（sync-window-kernel）+ **28/28**（sync-arrange-kernel）+ **42/42**（sync-show-kernel）+ **15/15**（apps-kernel）+ **14/14**（purge-lock-kernel）+ **18/18**（batch-cookie-kernel）+ **13/13**（batch-show-kernel），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测（2026-11-14，本机）：`npm run test` = schema **10** + net-rules **56** + chain-rules **31** + recycle **44** + apps **54** + profiles-tabs **60** + batch **74** + settings-diagnose **56** + unit **85** + agent **15** + api **102** + api-mcp **46** + sync-rules **95** + sync-text **51** + sync-tabs **59** + sync-window **22** + sync-arrange **67** + sync-show **55** + markers **34** + nav-fold **60** + ui **46** + desktop **59** + kernel-download **62**（`package.json` 里那条脚本就是这二十三组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（proxy-chain，两跳代理链）+ **24/24**（workers）+ **30/30**（agent-smoke）+ **9/9**（session-restore）+ **12/12**（startup-tabs）+ **17/17**（block-page，全离线）+ **18/18**（markers-kernel）+ **39/39**（sync-kernel）+ **21/21**（sync-text-kernel）+ **39/39**（sync-tabs-kernel）+ **17/17**（sync-window-kernel）+ **28/28**（sync-arrange-kernel）+ **42/42**（sync-show-kernel）+ **15/15**（apps-kernel）+ **14/14**（purge-lock-kernel）+ **18/18**（batch-cookie-kernel）+ **13/13**（batch-show-kernel），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 > 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：

@@ -567,29 +567,124 @@ export default async function renderProfiles({ head, page }) {
   }
 
   /* ---- 4. 更新环境信息 ---- */
+  /**
+   * 4. 更新环境信息。
+   *
+   * **语义是我们自己定的，不是抄来的**：逆向 `28-` 号文里对手只留下一个名字
+   * `updateUserInfo`，没有字段清单、没有行为证据。所以这里的「批量改哪几个字段」
+   * 是 FreePower 的解释（见 README 与 17 号文档），别当对手行为引用。
+   *
+   * 因此界面上把**白名单十个字段全列出来**（勾了才发，空着 = 不改）：
+   * 不能让人「勾完不知道改了啥」，也不能让人以为没列出来的字段也能在这里改。
+   */
+  const UPDATE_INFO_FIELDS = [
+    { key: 'name', label: '环境名称', type: 'text' },
+    { key: 'remark', label: '备注', type: 'text', hint: '整条覆盖；要追加用「修改备注」' },
+    { key: 'group_id', label: '分组', type: 'select' },
+    { key: 'domain_name', label: '域名', type: 'text' },
+    { key: 'open_urls', label: '启动时打开的网址', type: 'textarea', hint: '每行一个' },
+    { key: 'username', label: '内置账号', type: 'text' },
+    { key: 'password', label: '内置密码', type: 'password' },
+    { key: 'fakey', label: '2FA 密钥', type: 'text' },
+    { key: 'platform_account', label: '平台账号（JSON）', type: 'textarea' },
+    { key: 'profile_tag_ids', label: '标签 id', type: 'text', hint: '逗号分隔；批量改标签容易串，建议用环境编辑页' },
+  ];
+
   function batchUpdateInfo() {
     const ids = picked();
     if (!ids) return;
-    const group = h('select', null,
-      h('option', { value: '' }, '（不改分组）'),
-      ...state.groups.map((g) => h('option', { value: g.id }, g.name)));
-    const domain = h('input', { type: 'text', placeholder: '域名（可空 = 不改）' });
-    const remark = h('input', { type: 'text', placeholder: '备注（可空 = 不改）' });
+    const inputs = new Map();
+
+    const rows = UPDATE_INFO_FIELDS.map((f) => {
+      const box = h('input', { type: 'checkbox', 'data-field': f.key });
+      let input;
+      if (f.type === 'select') {
+        input = h('select', { disabled: 'disabled' },
+          h('option', { value: '' }, '（选一个分组）'),
+          ...state.groups.map((g) => h('option', { value: g.id }, g.name)));
+      } else if (f.type === 'textarea') {
+        input = h('textarea', { rows: 2, disabled: 'disabled', placeholder: f.hint || '' });
+      } else {
+        input = h('input', { type: f.type, disabled: 'disabled', placeholder: f.hint || '' });
+      }
+      box.addEventListener('change', () => {
+        if (box.checked) input.removeAttribute('disabled'); else input.setAttribute('disabled', 'disabled');
+      });
+      inputs.set(f.key, { box, input, type: f.type });
+      return h('tr', null,
+        h('td', null, h('label', { class: 'checks' }, box, h('span', null, f.label))),
+        h('td', null, input),
+        h('td', { class: 'muted small mono' }, f.key));
+    });
+
     const d = drawer({
       title: `更新环境信息（${ids.length} 个环境）`,
       body: h('div', { class: 'stack' },
-        field('分组', group),
-        field('域名', domain),
-        field('备注', remark, '这里是整条覆盖；要追加请用「修改备注」'),
-        h('div', { class: 'notice' }, '批量入口只改这些基础字段。指纹、UA、内核有专门的入口，避免一个手滑改掉一批指纹。')),
+        h('div', { class: 'notice' }, '勾上才会改，没勾的字段**原样不动**。这里是整条覆盖，不是追加。'),
+        h('table', { class: 'grid' },
+          h('thead', null, h('tr', null,
+            h('th', null, '改这个字段'), h('th', null, '新值'), h('th', null, '接口字段'))),
+          h('tbody', null, ...rows)),
+        h('div', { class: 'muted small' },
+          `白名单就是上面这 ${UPDATE_INFO_FIELDS.length} 个。指纹、UA / 内核、代理、扩展都有专门的入口 —— `
+          + '批量入口不给它们开口子，一个手滑就改掉一批指纹的代价太大。'),
+        h('div', { class: 'muted small' },
+          '「更新环境信息」这个动作名来自对手（28-号文只给了名字 `updateUserInfo`），'
+          + '**它到底改哪些字段没有证据**，所以上面的字段表是我们自己的解释。')),
       footer: h('button', { class: 'btn primary', onClick: submit }, '更新'),
     });
+
     async function submit() {
       const fields = {};
-      if (group.value) fields.group_id = group.value;
-      if (domain.value.trim()) fields.domain_name = domain.value.trim();
-      if (remark.value.trim()) fields.remark = remark.value.trim();
-      if (!Object.keys(fields).length) { toast('至少填一项'); return; }
+      const bad = [];
+      for (const [key, { box, input, type }] of inputs) {
+        if (!box.checked) continue;
+        const raw = String(input.value ?? '');
+        if (type === 'select') {
+          if (!raw) { bad.push(key); continue; }
+          fields[key] = raw;
+        } else if (type === 'textarea' && key === 'open_urls') {
+          const lines = raw.split('\n').map((x) => x.trim()).filter(Boolean);
+          if (!lines.length) { bad.push(key); continue; }
+          fields[key] = lines;
+        } else if (type === 'textarea' && key === 'platform_account') {
+          const t = raw.trim();
+          if (!t) { bad.push(key); continue; }
+          try {
+            fields[key] = JSON.parse(t);
+          } catch {
+            toast('平台账号要填 JSON（例如 {"fb":"user"}）', 'bad');
+            return;
+          }
+        } else if (key === 'profile_tag_ids') {
+          const list = raw.split(',').map((x) => x.trim()).filter(Boolean);
+          if (!list.length) { bad.push(key); continue; }
+          fields[key] = list;
+        } else {
+          // 勾了但留空：name / remark 允许清空（显式传空串），其余字段留空视为没填
+          if (!raw.trim()) {
+            if (key === 'name' || key === 'remark') fields[key] = '';
+            else bad.push(key);
+            continue;
+          }
+          fields[key] = raw;
+        }
+      }
+      if (bad.length) {
+        toast(`勾了但没填值：${bad.map((k) => UPDATE_INFO_FIELDS.find((f) => f.key === k)?.label || k).join('、')}`, 'bad');
+        return;
+      }
+      if (!Object.keys(fields).length) { toast('至少勾一项'); return; }
+      const overwriteName = 'name' in fields;
+      const yes = await confirmDialog({
+        title: '确认更新环境信息',
+        body: h('div', { class: 'stack' },
+          h('div', null, `会改这 ${ids.length} 个环境的 ${Object.keys(fields).length} 个字段：${Object.keys(fields).join('、')}。`),
+          overwriteName ? h('div', { class: 'notice warn' }, '环境名称是整条覆盖：填什么就是什么。') : null,
+          h('div', { class: 'muted small' }, '没勾的字段一个都不动。')),
+        okLabel: '更新',
+      });
+      if (!yes) return;
       try {
         const r = await api.batchUpdateInfo(ids, fields);
         d.close();
