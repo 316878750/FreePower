@@ -1470,7 +1470,7 @@ tab 模型（三个 hash + `tabOf` 认末尾斜杠 + 编辑页不算 tab）、�
 - **四维噪声确定性**：canvas / webgl_image / audio / client_rects 各自种子入库，重启后哈希与种子都不漂移
 - **自检**：启动后自动跑 19 项、覆盖度 7/10/2、四个哈希齐全、`rerun=1` 重跑、HTML 页可读且无外链
 - **双 Realm**（`test/workers.test.mjs`，已进 `npm run smoke`）：同一张页里起专用 worker / SharedWorker / ServiceWorker（**页面直接创建的**，嵌套 worker 另有三条断言，见已知限制第 6 条），断言三者的脚本首行已注入（`atTop === 'worker'`）、五处 canvas 哈希完全一致、硬件/语言/时区/UA 与主帧同值、`workerStats.injected === 3`；另断言 AudioWorklet 未被注入且可测表面只有 `sampleRate`/`currentTime`
-- **嵌套 worker**（同文件）：页面里起的 worker 再 `new Worker`，断言外层与嵌套层首行都已注入、主帧/外层/嵌套三者的 `hardwareConcurrency` 一致、两层都进注入计数 —— 防的是「同一台机器同时暴露伪装值与真实核数」
+- **嵌套 worker**（同文件）：页面里起的 worker 再 `new Worker`，断言外层与嵌套层首行都已注入、主帧/外层/嵌套三者的 `hardwareConcurrency` 一致、两层都进注入计数 —— 防的是「同一台机器同时暴露伪装值与真实核数」。**计数那条判据是「轮询等落定（50ms 间隔、上限 3s）再断言」，不是当场断言**：`workerStats.by_type[type]` 在 `Target.attachedToTarget` 一进来就 +1，`workerStats.injected` 要等 `Runtime.evaluate` 的响应回来才 +1，页面收到内层 `postMessage` 时内层那次的响应**可能还没到**（实测同一条判据一次 `injected` +1 红、重跑 +2 绿，产品侧两次都对）。断言没放宽（`injected` 与 `by_type.worker` 各需 ≥+2），超时才红，失败信息带「等了多久 / 最终两个读数」；把 `armChildAutoAttach` 那步注释掉会红在「计数未到」而不是超时误报（2026-11-14 先红后绿验过）
 - **本地 API 完整化**：`active` 的 Active/Inactive 形状、`local-active`、`cookies`、`kernels`、标签/代理列表 CRUD、占位接口明确不支持（`share` 之类）；**回收站两条已从占位变成真实现**，断言改成验「`code:0` + `data` 键全等 `limit,list,page` + 无 `total`」；**内核下载也已从占位变成真实现**（`test/kernel-download.test.mjs` 57 项，本地假源，见第十一节）
 - **批量启停**：一次起 3 个、批量停、失败清单带 code/message、中途失败即中断、并发上限生效
 - **cloud-active 明确报错**（`-1` + `supported:false`，不假成功）

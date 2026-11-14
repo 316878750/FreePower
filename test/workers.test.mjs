@@ -17,6 +17,9 @@
  *   ⑥ **嵌套 worker**（worker 里再 `new Worker`）也被注入：两层 atTop 都是 worker，
  *      主帧 / 外层 / 嵌套三者的 hardwareConcurrency 一致（这条防的是「伪装值与真实值同台」）
  *
+ * 计数那条判据的时序：`by_type` 在 attach 时 +1、`injected` 在 evaluate 响应回来才 +1，
+ * 页面拿到内层结果时响应可能还没到 —— 所以判据是「轮询等落定（≤3s）再断言」，不是当场断言。
+ *
  * 自带起环境与收尾：本地 http 源、临时数据目录、退出前 stop + 杀进程、删临时目录。
  * 需要真实 Chrome 与完整权限（沙箱挡命名管道，Chrome 起不来）。
  */
@@ -48,6 +51,32 @@ const { markerNames } = await import('../src/kernel/markers.js');
 const { fingerprintView } = await import('../src/fingerprint/view.js');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 等 worker 注入计数落定（**不是**放宽断言，是等两件事都发生完）。
+ *
+ * 为什么必须等：`workerStats.by_type[type]` 在 `Target.attachedToTarget` 一进来就 +1，
+ * 而 `workerStats.injected` 要等 `Runtime.evaluate` 的响应回来才 +1（injectWorkerTarget 里那行）。
+ * 页面里那层 worker 收到内层 postMessage 时，内层那次的 evaluate 响应**可能还没到** ——
+ * 所以「页面已经拿到结果」和「计数已经到 2」之间没有先后保证，当场断言就是 flaky
+ * （实测同一条判据一次 injected +1 红、重跑 +2 绿，产品侧两次都是对的）。
+ *
+ * 判据本身不放宽：injected 与 by_type.worker 都必须**各自**至少 +2，只是给它 3 秒时间到齐。
+ */
+async function waitInjectionSettled(inst, before, timeoutMs = 3000, stepMs = 50) {
+  const started = Date.now();
+  const read = () => {
+    const s = inst.workerStats || {};
+    return { injected: s.injected || 0, workers: (s.by_type || {}).worker || 0 };
+  };
+  const reached = (now) => now.injected - before.injected >= 2 && now.workers - before.workers >= 2;
+  let now = read();
+  while (!reached(now) && Date.now() - started < timeoutMs) {
+    await sleep(stepMs);
+    now = read();
+  }
+  return { ok: reached(now), waited: Date.now() - started, now };
+}
 
 /** 等进程真的退出（Windows 上 user-data-dir 要等它放手才能删） */
 async function waitPidGone(targetPid, timeoutMs = 8000) {
@@ -191,9 +220,16 @@ try {
     check('嵌套 worker：主帧 / 外层 / 嵌套三者的 hardwareConcurrency 一致（不泄漏真实核数）',
       n.mainCores !== undefined && n.mainCores === n.cores && n.cores === n.inner?.cores,
       `主帧 ${n.mainCores} / 外层 ${n.cores} / 嵌套 ${n.inner?.cores}`);
+    /* 计数要看的是「两件事都发生完」：by_type 在 attach 时 +1、injected 在 evaluate 响应回来才 +1。
+     * 页面收到内层 postMessage 不等于内层那次的 evaluate 响应已到，所以这里轮询等落定（上限 3s）。
+     * 断言不变：injected 至少 +2 且 by_type.worker 至少 +2；超时没到才是真红，失败信息带等了多久和最终读数。 */
+    const settled = await waitInjectionSettled(inst, before);
     check('嵌套 worker：两层都算进注入计数（by_type.worker 至少 +2）',
-      stats.injected - before.injected >= 2 && (stats.by_type.worker || 0) - before.workers >= 2,
-      `injected ${before.injected}→${stats.injected}，worker ${before.workers}→${stats.by_type.worker}`);
+      settled.ok,
+      settled.ok
+        ? `injected ${before.injected}→${settled.now.injected}，worker ${before.workers}→${settled.now.workers}（等 ${settled.waited}ms 落定）`
+        : `等了 ${settled.waited}ms 计数仍未到：injected ${before.injected}→${settled.now.injected}（需 ≥+2），`
+          + `worker ${before.workers}→${settled.now.workers}（需 ≥+2）`);
   }
 
   /* ---------- 5. 自检报告四项 ---------- */
