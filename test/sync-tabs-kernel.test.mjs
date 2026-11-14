@@ -117,7 +117,7 @@ try {
     const bySlave = (opened.opened || []).filter((o) => o.role === 'slave');
     check('打开网址：三个窗口都开了新标签', (opened.opened || []).length === 3 && bySlave.length === 2,
       JSON.stringify((opened.opened || []).map((o) => o.role)));
-    check('target_blank 开：都是「新开标签」模式（不是原地跳）',
+    check('打开网址默认全部新开标签（没有「原地跳」这个分支）',
       (opened.opened || []).every((o) => o.mode === 'new_tab'), JSON.stringify((opened.opened || []).map((o) => o.mode)));
 
     // 对受控窗口那张新标签：读首帧的注入标记 + navigation.type + 文档条数
@@ -292,23 +292,54 @@ try {
     }
   }
 
-  /* ------------------------------ 相同标签页关掉的区别 ------------------------------ */
-  console.log('\n— same_tab 关掉：不按序号对齐 —');
+  /* ------------------------------ 首个网址在当前标签页打开 ------------------------------ */
+  console.log('\n— 首个网址在当前标签页打开（对手原文 syncOperateCurrentTabURL）—');
   {
-    sync.updateSettings({ same_tab: false, target_blank: false });
-    const before = await Promise.all(started.map((id) => tabsOf(id)));
-    const opened = await sync.openTabInAll(U('/same-tab-mode'));
-    await sleep(700);
-    const after = await Promise.all(started.map((id) => tabsOf(id)));
-    check('target_blank 关：不再新开标签（标签数不变）',
-      after.every((x, i) => x.length === before[i].length),
-      `${before.map((x) => x.length).join('/')} → ${after.map((x) => x.length).join('/')}`);
-    check('target_blank 关：模式记为 same_tab（原地跳）',
-      (opened.opened || []).every((o) => o.mode === 'same_tab'), JSON.stringify((opened.opened || []).map((o) => o.mode)));
-    check('same_tab 关：受控窗口动的是自己当前那个标签（URL 变成新地址）',
-      after.slice(1).every((x) => x.some((t) => t.url === U('/same-tab-mode'))),
-      JSON.stringify(after.slice(1).map((x) => x.map((t) => t.url))));
-    sync.updateSettings({ same_tab: true, target_blank: true });
+    const count = async () => Promise.all(started.map((id) => tabsOf(id)));
+
+    // 关（默认）：两个网址都新开 → 每个窗口 +2
+    sync.updateSettings({ current_tab_url: false });
+    const before = await count();
+    const off = await sync.openTabInAll([U('/ct-off-1'), U('/ct-off-2')]);
+    await sleep(900);
+    const afterOff = await count();
+    check('关掉：两个网址都新开（每个窗口 +2）',
+      afterOff.every((x, i) => x.length === before[i].length + 2),
+      `${before.map((x) => x.length).join('/')} → ${afterOff.map((x) => x.length).join('/')}`);
+    check('关掉：模式全是 new_tab',
+      (off.opened || []).every((o) => o.mode === 'new_tab'), JSON.stringify((off.opened || []).map((o) => o.mode)));
+
+    // 打开：第一个在当前标签页跳、第二个新开 → 每个窗口只 +1，两个地址都在
+    sync.updateSettings({ current_tab_url: true });
+    const beforeOn = await count();
+    const on = await sync.openTabInAll([U('/ct-on-1'), U('/ct-on-2')]);
+    await sleep(900);
+    const afterOn = await count();
+    check('打开：只多开一张（第一个网址没有新开标签）',
+      afterOn.every((x, i) => x.length === beforeOn[i].length + 1),
+      `${beforeOn.map((x) => x.length).join('/')} → ${afterOn.map((x) => x.length).join('/')}`);
+    check('打开：第一个网址落在原有标签里（两个地址各只有一张标签）',
+      afterOn.every((x) => x.filter((t) => t.url === U('/ct-on-1')).length === 1
+        && x.filter((t) => t.url === U('/ct-on-2')).length === 1),
+      JSON.stringify(afterOn.map((x) => x.map((t) => t.url))));
+    check('打开：回报里第一个是 current_tab、第二个是 new_tab',
+      (on.opened || []).length === 6
+      && JSON.stringify((on.opened || []).map((o) => o.mode)) === JSON.stringify(['current_tab', 'new_tab', 'current_tab', 'new_tab', 'current_tab', 'new_tab']),
+      JSON.stringify((on.opened || []).map((o) => o.mode)));
+
+    // 超过 10 个：报「一键最多打开10个网址」，且**一个标签都不开**（不许静默截断后照开 10 个）
+    const before11 = await count();
+    let msg11 = '';
+    try {
+      await sync.openTabInAll(Array.from({ length: 11 }, (_, i) => U(`/over-${i}`)));
+    } catch (e) { msg11 = e?.message || String(e); }
+    await sleep(600);
+    const after11 = await count();
+    check('11 个网址：报错文案是一键最多打开10个网址', msg11 === '一键最多打开10个网址', msg11 || '（没报错）');
+    check('11 个网址：一个标签都没开（不是静默截断后开 10 个）',
+      after11.every((x, i) => x.length === before11[i].length),
+      `${before11.map((x) => x.length).join('/')} → ${after11.map((x) => x.length).join('/')}`);
+    sync.updateSettings({ current_tab_url: false });
   }
 } catch (e) {
   console.log('异常：', e && e.stack ? e.stack.split('\n').slice(0, 5).join(' | ') : e);

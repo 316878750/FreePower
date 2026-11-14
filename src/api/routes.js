@@ -947,13 +947,15 @@ export function buildRoutes() {
   });
 
   /**
-   * 在所有同步窗口新开标签并访问同一 URL（「访问指定网站 → 新标签」）。
+   * 打开网址（`syncOperateOpenUrl`）：每个同步窗口打开同一批网址。
+   * 入参是**多行文本**（`url`，每行一个，对齐对手的 `syncOperateUrlList`）或数组（`urls`），
+   * 最多 10 个 —— 超过就报「一键最多打开10个网址」（对手原文），**不静默截断**。
    * 内部走 about:blank → 登记豁免 → attach → navigate，避免首帧原始指纹。
    */
   add(['POST'], ['/api/v2/sync/tab'], async (ctx) => {
-    const url = ctx.body?.url ?? ctx.body?.urls ?? ctx.query?.url;
+    const raw = ctx.body?.urls ?? ctx.body?.url ?? ctx.query?.urls ?? ctx.query?.url;
     try {
-      return ok(await openTabInAll(url));
+      return ok(await openTabInAll(raw));
     } catch (e) {
       throw new ApiError(ERR.INVALID, e?.message || 'sync is not running', 200, { field: 'url' });
     }

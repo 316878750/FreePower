@@ -1,5 +1,5 @@
 /**
- * 标签页同步的 A 层判据（零 Chrome）：纯计划函数 + 两个开关的语义 + 界面静态扫描。
+ * 标签页同步的 A 层判据（零 Chrome）：纯计划函数 + 设置归一 + 界面静态扫描。
  *
  * 为什么先判纯函数：真内核那层（`test/sync-tabs-kernel.test.mjs`）跑一次要 1 分钟，
  * 而「序号越界该跳过还是该猜」「关其它该从大到小关」「统一标签页该开几个」这些是**算出来的**，
@@ -19,7 +19,7 @@ const t = (name, fn) => {
 };
 
 const {
-  isBlankUrl, normalizeUrl, targetIndex, planCloseOthers, planCloseBlank, planUnify,
+  isBlankUrl, normalizeUrl, parseOpenUrls, targetIndex, planCloseOthers, planCloseBlank, planUnify,
 } = await import('../src/sync/tabs.js');
 const { normalizeSettings, DEFAULT_SETTINGS } = await import('../src/sync/session.js');
 
@@ -106,37 +106,58 @@ t('主窗口 1 个、受控 0 个 → 全开', () => {
   assert.deepEqual(planUnify(['a', 'b'], []), { navigate: [], open: ['a', 'b'], close: [] });
 });
 
-/* ============================ 6. 两个开关独立 ============================ */
-console.log('\n— 6. 两个开关必须独立（别合并成一个）—');
-t('默认：相同标签页开、目标空白开', () => {
+/* ========== 6. 标签区只有「首个网址在当前标签页打开」一个选项 ========== */
+console.log('\n— 6. 自创开关必须去掉，只留对手界面上真有的那一个 —');
+t('默认：内部 same_tab 开、首个网址在当前标签页打开关', () => {
   assert.equal(DEFAULT_SETTINGS.same_tab, true);
-  assert.equal(DEFAULT_SETTINGS.target_blank, true);
+  assert.equal(DEFAULT_SETTINGS.current_tab_url, false);
 });
-t('只关「相同标签页」不影响「目标空白」', () => {
-  const st = normalizeSettings({ same_tab: false });
-  assert.equal(st.same_tab, false);
-  assert.equal(st.target_blank, true);
-});
-t('只关「目标空白」不影响「相同标签页」', () => {
+t('「目标空白」不再是设置项（先开空白再导航是硬约束，不可关）', () => {
+  assert.equal('target_blank' in DEFAULT_SETTINGS, false);
   const st = normalizeSettings({ target_blank: false });
-  assert.equal(st.target_blank, false);
-  assert.equal(st.same_tab, true);
+  assert.equal(st.target_blank, undefined);
 });
-t('两个都能关（四种组合都表达得出来）', () => {
-  const combos = [
-    { same_tab: true, target_blank: true }, { same_tab: true, target_blank: false },
-    { same_tab: false, target_blank: true }, { same_tab: false, target_blank: false },
-  ];
-  for (const c of combos) {
-    const st = normalizeSettings(c);
-    assert.equal(st.same_tab, c.same_tab);
-    assert.equal(st.target_blank, c.target_blank);
-  }
+t('「首个网址在当前标签页打开」是独立开关，字符串 "true" 也认', () => {
+  assert.equal(normalizeSettings({}).current_tab_url, false);
+  assert.equal(normalizeSettings({ current_tab_url: true }).current_tab_url, true);
+  assert.equal(normalizeSettings({ current_tab_url: 'true' }).current_tab_url, true);
+  assert.equal(normalizeSettings({ current_tab_url: '1' }).current_tab_url, true);
+  assert.equal(normalizeSettings({ current_tab_url: 'false' }).current_tab_url, false);
 });
-t('字符串 "false" 也真变 false', () => {
-  const st = normalizeSettings({ same_tab: 'false', target_blank: 'false' });
-  assert.equal(st.same_tab, false);
-  assert.equal(st.target_blank, false);
+t('关掉它不影响内部 same_tab，反之亦然', () => {
+  const a = normalizeSettings({ current_tab_url: true });
+  assert.equal(a.same_tab, true);
+  const b = normalizeSettings({ same_tab: false });
+  assert.equal(b.current_tab_url, false);
+});
+
+/* ================== 6b. 打开网址：多行、最多 10 个、不静默截断 ================== */
+console.log('\n— 6b. 打开网址的列表解析（对手原文：一键最多打开10个网址）—');
+t('多行文本按行切，空行丢掉', () => {
+  assert.deepEqual(parseOpenUrls('www.a.com\n  \nwww.b.com\n').urls, ['https://www.a.com/', 'https://www.b.com/']);
+});
+t('数组入参同样接受（面板传的是行数组）', () => {
+  assert.deepEqual(parseOpenUrls(['a.com', 'https://b.com/x']).urls, ['https://a.com/', 'https://b.com/x']);
+});
+t('恰好 10 个可以', () => {
+  const r = parseOpenUrls(Array.from({ length: 10 }, (_, i) => `https://e${i}.com/`));
+  assert.equal(r.error, null);
+  assert.equal(r.urls.length, 10);
+});
+t('11 个直接报错，**不静默截断**（不许返回前 10 个就说成功）', () => {
+  const r = parseOpenUrls(Array.from({ length: 11 }, (_, i) => `https://e${i}.com/`));
+  assert.equal(r.error, '一键最多打开10个网址');
+  assert.deepEqual(r.urls, []);
+});
+t('超过 10 个时错误文案就是对手原文', () => {
+  assert.match(parseOpenUrls(Array.from({ length: 12 }, () => 'a.com')).error, /^一键最多打开10个网址$/);
+});
+t('非 http/https 协议拒掉', () => {
+  assert.equal(parseOpenUrls('ftp://a.com/x').error, 'url 必须是 http/https 地址');
+  assert.equal(parseOpenUrls('javascript:alert(1)').error, 'url 必须是 http/https 地址');
+});
+t('全空 → 报错（不当作「什么都不用做」静默成功）', () => {
+  assert.equal(parseOpenUrls('  \n\n ').error, 'url 必须是 http/https 地址');
 });
 
 /* ============================ 7. 界面与路由 ============================ */
@@ -148,20 +169,27 @@ console.log('\n— 7. 界面与路由 —');
   const apiSrc = fs.readFileSync(path.resolve(import.meta.dirname, '../web/api.js'), 'utf8');
   const routeSrc = fs.readFileSync(path.resolve(import.meta.dirname, '../src/api/routes.js'), 'utf8');
 
-  check('同步页有独立的「相同标签页」开关', /sw\('same_tab'/.test(uiSrc));
-  check('同步页有独立的「目标空白」开关', /sw\('target_blank'/.test(uiSrc));
-  check('两个开关是两个勾选框，不是二选一', /sw\('same_tab'/.test(uiSrc) && /sw\('target_blank'/.test(uiSrc));
+  check('同步页有「首个网址在当前标签页打开」勾选项（对手原文）',
+    uiSrc.includes('首个网址在当前标签页打开') && uiSrc.includes('current_tab_url'));
+  check('同步页**不再**有「目标空白」这个名字（自创名去掉）', !uiSrc.includes('目标空白'));
+  check('同步页**不再**有「相同标签页」这个用户可见开关', !uiSrc.includes('相同标签页'));
+  check('打开网址的输入是多行文本框（不是单行 input）', /h\('textarea'/.test(uiSrc));
+  check('提示语用对手原文「一键最多打开10个网址」', uiSrc.includes('一键最多打开10个网址'));
+  check('网址框的占位文案用对手原文（请输入网址，每行一个）', uiSrc.includes('请输入网址，每行一个'));
   for (const [label, fn] of [
-    ['关当前标签页', 'syncCloseTabs(\'current\')'],
+    ['关闭当前标签页', 'syncCloseTabs(\'current\')'],
     ['关闭其他', 'syncCloseTabs(\'others\')'],
     ['关闭空白标签页', 'syncCloseTabs(\'blank\')'],
     ['复制当前标签到其它窗口', 'syncCopyTab'],
     ['统一标签页', 'syncUnifyTabs'],
-    ['打开网址', 'syncOpenTab'],
   ]) {
     check(`同步页有「${label}」按钮并接到了对应 API`, uiSrc.includes(label) && uiSrc.includes(fn), fn);
   }
-  for (const r of ['/api/v2/sync/tabs', '/api/v2/sync/tab-close', '/api/v2/sync/tab-copy', '/api/v2/sync/tab-unify']) {
+  /* 「打开」两个字太短，includes 会被别的按钮名蹭过去，用带 act(' 的形式钉 */
+  check('同步页有「打开」按钮并接到了 syncOpenTab',
+    /act\('打开',\s*openUrls\)/.test(uiSrc) && uiSrc.includes('api.syncOpenTab(list)'),
+    (uiSrc.match(/act\('打开'[^\n]*/) || ['?'])[0]);
+  for (const r of ['/api/v2/sync/tabs', '/api/v2/sync/tab-close', '/api/v2/sync/tab-copy', '/api/v2/sync/tab-unify', '/api/v2/sync/tab']) {
     check(`路由存在：${r}`, routeSrc.includes(`'${r}'`), r);
   }
   check('web/api.js 四个标签接口都在', ['syncTabs', 'syncCloseTabs', 'syncCopyTab', 'syncUnifyTabs'].every((k) => apiSrc.includes(k)));

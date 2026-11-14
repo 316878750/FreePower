@@ -17,8 +17,8 @@ import { buildSyncPlan, enabledBySwitch } from './replay.js';
 import { makeTextResolver, textOf } from './text-input.js';
 import { SyncScheduler, makeRng } from './scheduler.js';
 import {
-  closeTabAt, isBlankUrl, listTabs, navigateAt, normalizeUrl, openTabFor,
-  planCloseBlank, planCloseOthers, planUnify, settle, targetIndex, visibleTabIndex,
+  closeTabAt, isBlankUrl, listTabs, navigateAt, openTabFor,
+  parseOpenUrls, planCloseBlank, planCloseOthers, planUnify, settle, targetIndex, visibleTabIndex,
 } from './tabs.js';
 
 /** 一次只允许一个同步会话：两套同时往同一批窗口发输入必然是灾难 */
@@ -55,9 +55,16 @@ export const DEFAULT_SETTINGS = Object.freeze({
   typing_max_ms: 120,
   random_min: 1000,
   random_max: 9999,
-  /* ---- 标签页：两个开关独立（same_tab 管「动哪个」，target_blank 管「怎么开」） ---- */
-  same_tab: true,         // 相同标签页：按序号对应主窗口的那个标签
-  target_blank: true,     // 目标空白：新开标签先开空白页再导航
+  /* ---- 标签页 ----
+   * `same_tab` 是**内部**字段、默认 true、**面板不暴露**：按序号对应是「同步」成立的前提，
+   * 关掉这个能力没有使用场景（对手界面上也没有这个开关，实测 `28-远端UI界面结构.md:156-161`
+   * 的标签区只有「统一标签页 / 关闭其他 / 关闭当前标签页 / 关闭空白标签页 / 打开网址
+   * + 首个网址在当前标签页打开」）。
+   * 「目标空白」同理**不是开关**：先开空白页再导航是**首帧指纹的硬约束**，
+   * 不是可选项 —— 去掉关闭分支，两个分支迟早腐化成一个（和拦截页不加开关同一个理由）。
+   */
+  same_tab: true,
+  current_tab_url: false, // 首个网址在当前标签页打开（syncOperateCurrentTabURL）
   delay_ms: 0,
   jitter_ms: 0,
 });
@@ -94,7 +101,7 @@ export function normalizeSettings(raw = {}) {
     random_min: randMin,
     random_max: randMax,
     same_tab: bool(raw.same_tab, true),
-    target_blank: bool(raw.target_blank, true),
+    current_tab_url: bool(raw.current_tab_url, false),
     delay_ms: num(raw.delay_ms, 0),
     jitter_ms: num(raw.jitter_ms, 0),
   };
@@ -481,28 +488,24 @@ export async function unifySize() {
 }
 
 /**
- * 在所有同步窗口里新开标签并访问网址（「打开网址」；最多 10 个，与对手的提示一致）。
+ * 打开网址（`syncOperateOpenUrl`）：在每个同步窗口里打开同一批网址，**最多 10 个**
+ * （对手的提示原文 `syncOperateOpenUrlsMaxCountExceed` 是「一键最多打开10个网址」）。
+ * 超过 10 个**直接报错**，不静默截断 —— 用户填了 12 个却发现只开了 10 个，比报错难查得多。
  *
  * **姿势不能错**：`Target.createTarget({url})` 会在 attach 之前就把首个文档建好，
  * 注入脚本只对下一个文档生效 —— 那张标签的首帧就是原始指纹（`manager.js:807` 的实测）。
  * 所以一律 `about:blank` → 登记 blank-reload 豁免 → attach → `Page.navigate`。
  * 判据钉的就是这个：首个文档的**注入完成标记**（按该环境 `fp_seed` 派生的名字，见 `kernel/markers.js`）
- * 是 `object`，且 `navigation.type === 'navigate'`。
+ * 是 `object`，且 `navigation.type === 'navigate'`，并且**服务器只收到一次请求**。
  *
- * 两个开关：
- *   `target_blank` 关掉 → 不新开，直接在**同序号**（或当前）那个标签里跳（`navigateAt`）；
- *   `same_tab` 关掉    → 不按序号对齐，只动各窗口**当前可见**的那个标签。
+ * 只有一条选项（对手也是这么表达的）：
+ *   `current_tab_url`（首个网址在当前标签页打开）→ **第一个**网址在窗口当前标签页里跳（`navigateAt`），
+ *   其余网址照常新开。关掉（默认）时全部新开。
  */
 export async function openTabInAll(rawUrl) {
   if (!current) throw new Error('没有正在运行的同步会话');
-  const list = Array.isArray(rawUrl) ? rawUrl : [rawUrl];
-  const urls = [];
-  for (const item of list.slice(0, 10)) {
-    const u = normalizeUrl(item);
-    if (!u) throw new Error('url 必须是 http/https 地址');
-    urls.push(u);
-  }
-  if (!urls.length) throw new Error('url 必须是 http/https 地址');
+  const { urls, error } = parseOpenUrls(rawUrl);
+  if (error) throw new Error(error);
 
   const opened = [];
   const masterTabs = await listTabs(current.targets.get(current.master).client);
@@ -515,17 +518,22 @@ export async function openTabInAll(rawUrl) {
     try {
       const tabs = isMaster ? masterTabs : await listTabs(t.client);
       const vis = isMaster ? masterVis : await visibleTabIndex(t.client, tabs);
-      for (const url of urls) {
-        if (current.settings.target_blank) {
-          const r = await openTabFor(t.client, { url, onTarget: (tid) => inst?.exemptBlankReload?.(tid) });
-          opened.push({ profile_id: id, role: isMaster ? 'master' : 'slave', target_id: r.targetId, url, mode: 'new_tab' });
-        } else {
+      for (let n = 0; n < urls.length; n++) {
+        const url = urls[n];
+        // 「首个网址在当前标签页打开」只对**第一个**网址生效，其余照常新开（对手就是这么分的）
+        if (n === 0 && current.settings.current_tab_url) {
           const idx = isMaster ? vis.index : slaveAnchor(masterVis.index, vis.index, tabs.length, current.settings.same_tab);
           const tab = tabs[idx];
-          if (!tab) { opened.push({ profile_id: id, target_id: null, url, mode: 'same_tab', error: '没有可导航的标签' }); continue; }
+          if (!tab) {
+            opened.push({ profile_id: id, target_id: null, url, mode: 'current_tab', error: '没有可导航的标签' });
+            continue;
+          }
           await navigateAt(t.client, tab.targetId, url);
-          opened.push({ profile_id: id, role: isMaster ? 'master' : 'slave', target_id: tab.targetId, url, mode: 'same_tab' });
+          opened.push({ profile_id: id, role: isMaster ? 'master' : 'slave', target_id: tab.targetId, url, mode: 'current_tab' });
+          continue;
         }
+        const r = await openTabFor(t.client, { url, onTarget: (tid) => inst?.exemptBlankReload?.(tid) });
+        opened.push({ profile_id: id, role: isMaster ? 'master' : 'slave', target_id: r.targetId, url, mode: 'new_tab' });
       }
     } catch (e) {
       opened.push({ profile_id: id, target_id: null, urls, error: e?.message || String(e) });
@@ -555,8 +563,8 @@ export async function tabState() {
   }
   return {
     running: true,
-    same_tab: current.settings.same_tab,
-    target_blank: current.settings.target_blank,
+    same_tab: current.settings.same_tab,          // 内部字段，面板不展示
+    current_tab_url: current.settings.current_tab_url,
     windows,
   };
 }
@@ -639,17 +647,10 @@ export async function copyTabToSlaves({ index = null } = {}) {
     if (!t) continue;
     try {
       const inst = getInstance(id);
-      if (current.settings.target_blank) {
-        const r = await openTabFor(t.client, { url: src.url, onTarget: (tid) => inst?.exemptBlankReload?.(tid) });
-        copied.push({ profile_id: id, target_id: r.targetId, url: src.url, mode: 'new_tab' });
-      } else {
-        const tabs = await listTabs(t.client);
-        const i = targetIndex(idx, tabs.length, current.settings.same_tab);
-        const dst = tabs[i ?? idx];
-        if (!dst) { copied.push({ profile_id: id, target_id: null, url: src.url, error: '受控窗口没有对应序号的标签' }); continue; }
-        await navigateAt(t.client, dst.targetId, src.url);
-        copied.push({ profile_id: id, target_id: dst.targetId, url: src.url, mode: 'same_tab' });
-      }
+      // 复制标签**永远新开一张**（没有「目标空白」这个开关，也没有原地跳的分支）：
+      // 复制到其它窗口的语义就是「多出一张」，原地跳是「替换掉现在这张」，那是另一件事。
+      const r = await openTabFor(t.client, { url: src.url, onTarget: (tid) => inst?.exemptBlankReload?.(tid) });
+      copied.push({ profile_id: id, target_id: r.targetId, url: src.url, mode: 'new_tab' });
     } catch (e) {
       copied.push({ profile_id: id, target_id: null, url: src.url, error: e?.message || String(e) });
     }

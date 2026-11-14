@@ -139,7 +139,8 @@ export const api = {
   syncHotkeySet: (accelerator) => call('/api/v2/sync/hotkey', { method: 'POST', body: { accelerator } }),
   /* ---- 标签页管理（阶段 2） ---- */
   syncTabs: () => call('/api/v2/sync/tabs'),
-  syncOpenTab: (url) => call('/api/v2/sync/tab', { method: 'POST', body: { url } }),
+  // 多行文本原样交给服务端切行（每行一个，最多 10 个；超了服务端报「一键最多打开10个网址」）
+  syncOpenTab: (urls) => call('/api/v2/sync/tab', { method: 'POST', body: { urls } }),
   /** which: current（关当前）/ others（留当前，关其它）/ blank（关空白） */
   syncCloseTabs: (which) => call('/api/v2/sync/tab-close', { method: 'POST', body: { which } }),
   /** index 省略 = 复制主窗口当前可见那个标签 */

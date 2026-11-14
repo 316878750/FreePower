@@ -7,13 +7,13 @@
  *   · CDP 操作（`listTabs` / `visibleTabIndex` / `openTabFor` / `closeTabAt`）
  *     —— 真正去开、关、跳。
  *
- * 两个开关（照对手面板的语义分开，别合并）：
- *   `same_tab`     相同标签页：动的是**与主窗口同序号**的那个标签；关掉 = 只动受控窗口当前可见的那个。
- *   `target_blank` 目标空白：新开标签时**先开一张空白页再导航**；关掉 = 在受控窗口当前标签里直接跳。
- *
- * 为什么「先空白再导航」是硬约束：`Target.createTarget({url})` 会在 attach 之前就把首个文档建好，
- * 注入脚本只对**下一个**文档生效 —— 那张标签的首帧就是原始指纹（manager 里有实测记录）。
- * 所以这里的 `openTabFor` 一律 about:blank → 登记 blank-reload 豁免 → attach → `Page.navigate`。
+ * 一条选项 + 一条硬约束（照对手界面，`28-远端UI界面结构.md:156-161`）：
+ *   选项 `current_tab_url`：**首个网址在当前标签页打开**（`syncOperateCurrentTabURL`）
+ *     —— 第一个网址在当前标签页里跳，其余照常新开。
+ *   硬约束「先空白再导航」：`Target.createTarget({url})` 会在 attach 之前就把首个文档建好，
+ *   注入脚本只对**下一个**文档生效 —— 那张标签的首帧就是原始指纹（manager 里有实测记录）。
+ *   所以这里的 `openTabFor` 一律 about:blank → 登记 blank-reload 豁免 → attach → `Page.navigate`。
+ *   **这条不做成开关**：首帧指纹不是可选项，两个分支迟早腐化成一个（拦截页不加开关同一个理由）。
  */
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -42,6 +42,28 @@ export function normalizeUrl(raw) {
   } catch {
     return null;
   }
+}
+
+/**
+ * 「打开网址」的输入解析：切行、去空、归一，**最多 10 个**。
+ * 超过 10 个返回 error（文案用对手原文 `syncOperateOpenUrlsMaxCountExceed`），
+ * **不静默截断** —— 用户填 12 个却只开 10 个，比直接报错难查得多。
+ * 入参可以是数组，也可以是**多行文本**（对手的 `syncOperateUrlList` 就是多行文本框）。
+ */
+export function parseOpenUrls(raw) {
+  const list = (Array.isArray(raw) ? raw : [raw])
+    .flatMap((v) => String(v ?? '').split(/\r?\n/))
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!list.length) return { urls: [], error: 'url 必须是 http/https 地址' };
+  if (list.length > 10) return { urls: [], error: '一键最多打开10个网址' };
+  const urls = [];
+  for (const item of list) {
+    const u = normalizeUrl(item);
+    if (!u) return { urls: [], error: 'url 必须是 http/https 地址' };
+    urls.push(u);
+  }
+  return { urls, error: null };
 }
 
 /**
@@ -196,7 +218,7 @@ export async function openTabFor(client, { url, onTarget } = {}) {
   return { targetId, sessionId };
 }
 
-/** 在当前可见标签里直接跳（`target_blank` 关掉时用这条）。 */
+/** 在当前可见标签里直接跳（「首个网址在当前标签页打开」那条用它）。 */
 export async function navigateAt(client, targetId, url) {
   const { sessionId } = await client.send('Target.attachToTarget', { targetId, flatten: true });
   await client.send('Page.enable', {}, sessionId).catch(() => {});

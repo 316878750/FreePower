@@ -21,7 +21,7 @@ const state = {
     input: true, click: true, scroll: true, move: true,
     text_sync: true, typing: false, paste: true, random_number: false,
     typing_min_ms: 30, typing_max_ms: 120, random_min: 1000, random_max: 9999,
-    same_tab: true, target_blank: true,
+    same_tab: true, current_tab_url: false,
     delay_ms: 0, jitter_ms: 0,
   },
   status: null,
@@ -241,39 +241,46 @@ export default async function renderSync({ head, page }) {
 
   function buildTabs() {
     const box = h('div');
-    const sw = (key, label, hint) => h('label', { class: 'check' },
-      h('input', {
-        type: 'checkbox', checked: (state.settings[key] ?? true) === true,
-        onChange: (e) => applySettings({ [key]: e.target.checked }),
-      }),
-      h('span', null, label),
-      hint ? h('span', { class: 'muted small' }, `　${hint}`) : null);
-
-    const urlInput = h('input', {
-      type: 'text',
-      placeholder: 'https://example.com（一行一个，最多 10 个）',
-      style: { width: '360px' },
+    const urlInput = h('textarea', {
+      rows: 3,
+      placeholder: '请输入网址，每行一个，示例：\nwww.google.com\nwww.facebook.com',
+      style: { width: '420px', fontFamily: 'inherit' },
     });
+
+    // 「首个网址在当前标签页打开」（对手原文 syncOperateCurrentTabURL）—— 标签区唯一的勾选项
+    const currentTab = h('label', { class: 'check' },
+      h('input', {
+        type: 'checkbox', checked: (state.settings.current_tab_url ?? false) === true,
+        onChange: (e) => applySettings({ current_tab_url: e.target.checked }),
+      }),
+      h('span', null, '首个网址在当前标签页打开'),
+      h('span', { class: 'muted small' }, '　勾选后第一个网址在当前标签页里跳，其余网址照常新开'));
 
     const act = (label, fn) => h('button', {
       class: 'btn sm', disabled: !state.status?.running,
       onClick: () => runTabAction(fn),
     }, label);
 
+    // 前端先数一遍只为**立刻**给出同一句提示；真正的判定在服务端（`parseOpenUrls`），单一来源
+    const openUrls = () => {
+      const list = String(urlInput.value || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      if (list.length > 10) return Promise.reject(new Error('一键最多打开10个网址'));
+      return api.syncOpenTab(list);
+    };
+
     state.tabBox = h('div', { class: 'muted small', style: { marginTop: '8px' } });
 
     mount(box,
-      h('div', { class: 'row' },
-        sw('same_tab', '相同标签页', '动的是与主窗口同序号的那个标签；关掉只动当前可见标签'),
-        sw('target_blank', '目标空白', '新开标签先开空白页再导航（保证首帧指纹）；关掉在当前标签里跳')),
+      h('div', { class: 'row' }, currentTab),
       h('div', { class: 'row', style: { marginTop: '8px' } },
-        urlInput, act('打开网址', () => api.syncOpenTab(urlInput.value))),
+        urlInput, act('打开', openUrls)),
+      h('div', { class: 'muted small' }, '每行一个，最多 10 个（超过会提示「一键最多打开10个网址」，不会偷偷少开）。'),
       h('div', { class: 'row', style: { marginTop: '8px' } },
-        act('关当前标签页', () => api.syncCloseTabs('current')),
+        act('统一标签页', () => api.syncUnifyTabs()),
         act('关闭其他', () => api.syncCloseTabs('others')),
+        act('关闭当前标签页', () => api.syncCloseTabs('current')),
         act('关闭空白标签页', () => api.syncCloseTabs('blank')),
-        act('复制当前标签到其它窗口', () => api.syncCopyTab()),
-        act('统一标签页', () => api.syncUnifyTabs())),
+        act('复制当前标签到其它窗口', () => api.syncCopyTab())),
       state.tabBox);
     return box;
   }
@@ -303,7 +310,7 @@ export default async function renderSync({ head, page }) {
           + `　${urls.join(' | ')}`;
       });
       mount(state.tabBox,
-        h('div', null, `相同标签页 ${info.same_tab ? '开' : '关'} · 目标空白 ${info.target_blank ? '开' : '关'}`),
+        h('div', null, `首个网址在当前标签页打开 ${info.current_tab_url ? '开' : '关'}`),
         ...rows.map((t) => h('div', null, t)));
     } catch { /* 状态刷新失败不弹错，下一秒会再试 */ }
   }
