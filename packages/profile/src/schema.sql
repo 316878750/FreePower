@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS profiles (
   "updated_at" TEXT,
   "last_launch_at" TEXT,
   "deleted_at" TEXT,
+  "archived_at" TEXT,
 
   -- 平铺字段（拆解表）
   "name" TEXT,
@@ -251,5 +252,6 @@ CREATE TABLE IF NOT EXISTS profiles (
 CREATE INDEX IF NOT EXISTS idx_profiles_group ON profiles("group_id");
 CREATE INDEX IF NOT EXISTS idx_profiles_status ON profiles("status");
 CREATE INDEX IF NOT EXISTS idx_profiles_deleted ON profiles("deleted_at");
+CREATE INDEX IF NOT EXISTS idx_profiles_archived ON profiles("archived_at");
 CREATE INDEX IF NOT EXISTS idx_launches_profile ON launches(profile_id);
 CREATE INDEX IF NOT EXISTS idx_profile_extensions_ext ON profile_extensions(ext_id);

@@ -198,3 +198,157 @@ export function missingAfterWrite(written, cookiesNow) {
   const have = new Set(cookiesNow.map(key));
   return written.filter((c) => !have.has(key(c)));
 }
+
+/* ========================================================================
+ * 还原 / 合并（0.4.3 ③ 批量菜单）
+ *
+ * 两种语义必须分清，**不能做成一个「导入」按钮**：
+ *   还原（restore） = **覆盖**：目标状态就是文件里那份 —— 文件里有的写进去、库里多出来的删掉；
+ *   合并（merge）   = **并集**：只补文件里有、库里没有的；**同名以现有为准**（不覆盖登录态）。
+ *
+ * 两个都先 `plan` 再 `apply`：plan 只读、回「会加几条/改几条/删几条」，
+ * 用户看过预览、显式确认之后才写。**不许一键静默改登录态。**
+ *
+ * 预览里**不带 cookie 的值**：它是登录凭据，界面上不该出现、日志里更不该。
+ * ====================================================================== */
+
+/** cookie 的身份：name + domain(去前导点、小写) + path + 分区（CHIPS） */
+export function cookieKey(c = {}) {
+  const domain = String(c.domain || '').replace(/^\./, '').toLowerCase();
+  const path = String(c.path || '/');
+  const pk = c.partitionKey && typeof c.partitionKey === 'object'
+    ? String(c.partitionKey.topLevelSite || '')
+    : String(c.CookiePartitionKey || c.partitionKey || '');
+  return `${c.name || ''}|${domain}|${path}|${pk}`;
+}
+
+/** 值以外还影响语义的字段；任何一个变了都算「改」 */
+function cookieSignature(c = {}) {
+  return [
+    String(c.value ?? ''),
+    Number(c.expires ?? -1),
+    c.httpOnly ? '1' : '0',
+    c.secure ? '1' : '0',
+    String(normalizeSameSite(c.sameSite) || ''),
+  ].join('\u0000');
+}
+
+/** 预览里一条 cookie 的可读摘要（**不含 value**） */
+function cookieBrief(c = {}) {
+  return { name: String(c.name ?? ''), domain: String(c.domain ?? ''), path: String(c.path || '/') };
+}
+
+/**
+ * 算出写入计划。**纯函数**，不碰内核、不写任何东西。
+ * @param {object[]} existing 现在内核里的 cookie（`readCookies` 的返回）
+ * @param {object[]} incoming 要写进去的 cookie
+ * @param {'restore'|'merge'} mode
+ */
+export function planCookieWrite(existing = [], incoming = [], mode = 'restore') {
+  const target = mode === 'merge' ? 'merge' : 'restore';
+  const have = new Map();
+  for (const c of existing) have.set(cookieKey(c), c);
+
+  const add = [];
+  const update = [];
+  const keep = [];
+  const unchanged = [];
+  const invalid = [];
+  const incomingKeys = new Set();
+
+  incoming.forEach((raw, index) => {
+    const mapped = cdpCookieParam(raw);
+    if (mapped.error) {
+      invalid.push({ index, name: String(raw?.name ?? ''), domain: String(raw?.domain ?? ''), reason: mapped.error });
+      return;
+    }
+    // 写进去的形状（CDP 参数）→ 用它算身份，保证「预览里说要写的」和「真写进去的」一致
+    const param = mapped.param;
+    const key = cookieKey(param);
+    incomingKeys.add(key);
+    const cur = have.get(key);
+    if (!cur) { add.push({ ...cookieBrief(param), entry: param }); return; }
+    if (cookieSignature(cur) === cookieSignature(param)) { unchanged.push(cookieBrief(param)); return; }
+    if (target === 'merge') {
+      // 合并：同名以**现有**为准，冲突只记账、不覆盖（登录态不能被悄悄换成另一份）
+      keep.push({ ...cookieBrief(param), value_differs: true });
+      return;
+    }
+    update.push({ ...cookieBrief(param), value_changed: String(cur.value ?? '') !== String(param.value ?? ''), entry: param });
+  });
+
+  const del = [];
+  if (target === 'restore') {
+    for (const [key, c] of have) {
+      if (incomingKeys.has(key)) continue;
+      del.push(cookieBrief(c));
+    }
+  }
+
+  return {
+    mode: target,
+    existing_total: existing.length,
+    incoming_total: incoming.length,
+    will_add: add.length,
+    will_update: update.length,
+    will_delete: del.length,
+    /** 合并模式下与现有同名、按「现有优先」保留的条数 */
+    will_keep: keep.length,
+    unchanged: unchanged.length,
+    invalid,
+    /** 给界面预览用：每类最多列 20 条（不含 value） */
+    sample: {
+      add: add.slice(0, 20).map(({ entry, ...rest }) => rest),
+      update: update.slice(0, 20).map(({ entry, ...rest }) => rest),
+      delete: del.slice(0, 20),
+    },
+    /* 内部用：apply 直接拿这几组去写/删，别在外面再算一遍（算两遍必然漂移） */
+    _write: [...add, ...update].map((x) => x.entry),
+    _delete: target === 'restore' ? existing.filter((c) => !incomingKeys.has(cookieKey(c))) : [],
+  };
+}
+
+/**
+ * 删 cookie：`Network.deleteCookies` 是**页面级**方法，所以要借一个页面会话。
+ * 一条失败不拖整批（失败带 name/domain/reason 回来）。
+ */
+export async function deleteCookies(client, cookies = []) {
+  if (!cookies.length) return { deleted: [], failed: [] };
+  let sessionId = null;
+  try {
+    const { targetInfos = [] } = await client.send('Target.getTargets');
+    const page = targetInfos.find((t) => t.type === 'page' && !String(t.url).startsWith('devtools://'));
+    if (!page) throw new Error('没有可用的页面会话（删 cookie 需要页面级 CDP 会话）');
+    ({ sessionId } = await client.send('Target.attachToTarget', { targetId: page.targetId, flatten: true }));
+  } catch (e) {
+    return {
+      deleted: [],
+      failed: cookies.map((c) => ({ ...cookieBrief(c), reason: `拿不到页面会话：${e.message}` })),
+    };
+  }
+  const deleted = [];
+  const failed = [];
+  for (const c of cookies) {
+    const mapped = cdpCookieParam(c);
+    if (mapped.error) { failed.push({ ...cookieBrief(c), reason: mapped.error }); continue; }
+    const param = { name: mapped.param.name, domain: mapped.param.domain, path: mapped.param.path };
+    if (mapped.param.partitionKey) param.partitionKey = mapped.param.partitionKey;
+    try {
+      await client.send('Network.deleteCookies', param, sessionId);
+      deleted.push(cookieBrief(c));
+    } catch (e) {
+      failed.push({ ...cookieBrief(c), reason: e.message });
+    }
+  }
+  return { deleted, failed };
+}
+
+/**
+ * 按计划执行写入：先删（只有还原模式会删），再写。
+ * 顺序有讲究：先删再写，最后状态才是「文件里那份」；反过来的话刚写进去的会被删掉。
+ */
+export async function applyCookiePlan(client, plan) {
+  const del = await deleteCookies(client, plan._delete || []);
+  const written = await writeCookies(client, plan._write || []);
+  return { deleted: del, written };
+}

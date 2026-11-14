@@ -184,6 +184,30 @@ export const api = {
   syncCopyTab: (index) => call('/api/v2/sync/tab-copy', { method: 'POST', body: index === undefined ? {} : { index } }),
   syncUnifyTabs: () => call('/api/v2/sync/tab-unify', { method: 'POST', body: {} }),
 
+  /* ---- 批量菜单（0.4.3 ③） ---- */
+  /** 归档：移出主列表但**不是删除**（回收站那套是 `/recycle-bin/*`，语义不同，没复用） */
+  batchArchive: (ids) => call('/api/v2/browser-profile/batch/archive', { method: 'POST', body: { profile_ids: ids } }),
+  batchUnarchive: (ids) => call('/api/v2/browser-profile/batch/unarchive', { method: 'POST', body: { profile_ids: ids } }),
+  /** 改代理：`{proxy_config}` 写死一条 / `{proxy_id}` 绑代理列表 / `{clear:true}` 直连 */
+  batchProxy: (ids, body) => call('/api/v2/browser-profile/batch/proxy', { method: 'POST', body: { profile_ids: ids, ...body } }),
+  /** 检查代理：服务端限并发 + 单条 10s，逐条回 ok/fail/timeout/direct，失败不中断整批 */
+  batchCheckProxy: (ids, opts) => call('/api/v2/browser-profile/batch/check-proxy', {
+    method: 'POST', body: { profile_ids: ids, ...opts }, timeoutMs: 180000,
+  }),
+  /** 改 UA / 内核：两者必须自洽（大版本一致），服务端不一致会 100002 */
+  batchUa: (ids, body) => call('/api/v2/browser-profile/batch/ua', { method: 'POST', body: { profile_ids: ids, ...body } }),
+  batchRemark: (ids, body) => call('/api/v2/browser-profile/batch/remark', { method: 'POST', body: { profile_ids: ids, ...body } }),
+  batchUpdateInfo: (ids, fields) => call('/api/v2/browser-profile/batch/update-info', { method: 'POST', body: { profile_ids: ids, fields } }),
+  /** 显示窗口（不要求开同步会话）；`force:true` 是会闪任务栏的一次性动作 */
+  batchShow: (ids, force) => call('/api/v2/browser-profile/batch/show', {
+    method: 'POST', body: { profile_ids: ids, force: force ? true : undefined },
+  }),
+  /**
+   * 还原 / 合并 Cookie。`preview:true` **只算不写**（界面必须先预览再确认）；
+   * restore = 覆盖、merge = 并集（同名以现有为准）。
+   */
+  batchCookie: (ids, body) => call('/api/v2/browser-profile/batch/cookie', { method: 'POST', body: { profile_ids: ids, ...body }, timeoutMs: 180000 }),
+
   /* ---- 应用中心 / 扩展（0.4.3） ---- */
   /**
    * 扩展库。**文件全局共享一份**（`<数据根>/ext_env/<id>/`），环境只存勾选关系。

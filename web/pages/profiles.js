@@ -1,7 +1,10 @@
 /** 环境列表：启动/停止/自检状态/批量操作。所有动作都打 Local API，没有私有通道。 */
-import { h, mount, clear, toast, confirmDialog, promptDialog, downloadText, pickFile, pill, empty, fmtTime } from '../ui.js';
+import { h, mount, clear, toast, confirmDialog, promptDialog, downloadText, pickFile, pill, empty, fmtTime, drawer } from '../ui.js';
 import { api } from '../api.js';
 import { tabBar } from '../tabs.js';
+import {
+  DENSITIES, densityOf, applyDensity, setDensity, VIEW_STORAGE_KEY,
+} from '../density.js';
 
 const state = {
   rows: [],
@@ -12,12 +15,19 @@ const state = {
   busy: new Set(),
   q: '',
   groupId: '',
+  /** '' 主列表（不含已归档）/ only 只看已归档 / include 全都算 */
+  archiveFilter: '',
+  density: densityOf(),
+  /** 上一次「显示窗口」的目标：强制置前要用同一批（不重新算勾选，避免用户中途改了勾选） */
+  lastShowIds: null,
   total: 0,
   timer: null,
 };
 
 export default async function renderProfiles({ head, page }) {
   clearInterval(state.timer);
+  // 密度是本地偏好：进页面就读一次并落到 body 上（别的页面不清它，全局一致）
+  applyDensity(state.density);
   mount(head,
     h('h1', null, '环境管理'),
     h('span', { class: 'sub', id: 'count-sub' }, '加载中…'),
@@ -26,6 +36,7 @@ export default async function renderProfiles({ head, page }) {
 
   const body = h('tbody');
   const selBar = h('span', { class: 'sub' });
+  const menu = batchMenu();
   const toolbar = h('div', { class: 'toolbar' },
     h('input', {
       type: 'text', placeholder: '搜索名称 / 编号', value: state.q,
@@ -36,8 +47,25 @@ export default async function renderProfiles({ head, page }) {
     },
       h('option', { value: '' }, '全部分组'),
       ...state.groups.map((g) => h('option', { value: g.id, selected: state.groupId === String(g.id) }, `${g.name}（${g.profile_count || 0}）`))),
+    // 归档筛选：默认「未归档」（= 主列表）；归档的还在我们能看见的地方，不是删除
+    h('select', {
+      title: '归档 = 移出主列表但不算删除：cookie、user-data、能启动，一样不少',
+      onChange: (e) => { state.archiveFilter = e.target.value; load(false); },
+    },
+      h('option', { value: '', selected: state.archiveFilter === '' }, '未归档（主列表）'),
+      h('option', { value: 'only', selected: state.archiveFilter === 'only' }, '只看已归档'),
+      h('option', { value: 'include', selected: state.archiveFilter === 'include' }, '全部（含已归档）')),
+    h('select', {
+      title: '只影响本机显示，不写库、不同步到别的机器',
+      onChange: (e) => {
+        state.density = setDensity(e.target.value);
+        paintSub();
+      },
+    },
+      ...DENSITIES.map((d) => h('option', { value: d.id, selected: state.density === d.id }, `视图：${d.label}`))),
     h('span', { class: 'grow' }),
     selBar,
+    menu,
     h('button', { class: 'btn primary', onClick: () => { location.hash = '#/profiles/new'; } }, '新建环境'),
     h('button', { class: 'btn', onClick: importFile, title: 'JSON（{list} / {data:{list}} / 裸数组）或 AdsPower 的 .txt 块格式；未知字段会列在结果里' }, '导入'),
     h('button', { class: 'btn', onClick: exportTxt, title: 'AdsPower .txt：账号+代理+cookie+UA 的搬运单，不含指纹配置；保真备份请用每行的「导出」JSON' }, '导出 txt'),
@@ -69,6 +97,92 @@ export default async function renderProfiles({ head, page }) {
   state.timer = setInterval(() => { tick().catch(() => {}); }, 3000);
   window.addEventListener('hashchange', () => clearInterval(state.timer), { once: true });
 
+  /* ---------------------------- 批量操作菜单 ---------------------------- */
+  /**
+   * 11 项，顺序照逆向 `28-` 号文的「批量操作」清单 + 行内四项。
+   * 分组（sep）是有意的：上面是「改配置」，中间是「归档 / 删除」（会改变列表归属），
+   * 下面是「窗口与网络 / 登录态」这类会动运行时或登录信息的动作。
+   */
+  function batchMenu() {
+    const wrap = h('div', { class: 'dropdown' });
+    const panel = h('div', { class: 'menu' });
+    const btn = h('button', {
+      class: 'btn',
+      onClick: (e) => { e.stopPropagation(); wrap.classList.toggle('open'); },
+    }, '批量操作 ▾');
+    const item = (label, fn, { danger = false, title = '' } = {}) => h('button', {
+      class: danger ? 'danger' : '',
+      title,
+      onClick: (e) => { e.stopPropagation(); wrap.classList.remove('open'); fn(); },
+    }, label);
+
+    mount(panel,
+      item('修改代理', () => batchProxy()),
+      item('修改 UA / 内核', () => batchUa()),
+      item('修改备注', () => batchRemark()),
+      item('更新环境信息', () => batchUpdateInfo()),
+      h('div', { class: 'sep' }),
+      item('批量归档', () => batchArchive(), { title: '移出主列表，但不是删除：还能启动、还能在「只看已归档」里看到' }),
+      item('批量恢复', () => batchUnarchive(), { title: '把归档的环境放回主列表（不是从回收站恢复）' }),
+      item('批量删除', () => batchDelete(), { danger: true, title: '移入回收站，可以恢复' }),
+      h('div', { class: 'sep' }),
+      item('显示窗口', () => batchShow()),
+      item('检查代理', () => batchCheckProxy()),
+      item('还原 Cookie（覆盖）', () => batchCookie('restore'), { title: '写完之后以文件为准：文件里没有的会被删掉。先预览再确认' }),
+      item('合并 Cookie（并集）', () => batchCookie('merge'), { title: '只补文件里有、环境里没有的；同名以环境现有为准，不动登录态' }));
+    wrap.appendChild(btn);
+    wrap.appendChild(panel);
+    // 点别处收起（一次性监听，页面切走也无所谓）
+    document.addEventListener('click', () => wrap.classList.remove('open'));
+    return wrap;
+  }
+
+  /** 批量动作的统一前置：勾选非空 + 一次最多 500 条 */
+  function picked() {
+    const ids = [...state.selected];
+    if (!ids.length) { toast('先勾选环境（表头复选框可以全选当前筛选结果）'); return null; }
+    if (ids.length > 500) { toast('一次最多 500 个环境', 'bad'); return null; }
+    return ids;
+  }
+
+  /** 批量动作的结果都要「如实分说」：成功多少、失败多少、跳过了什么 */
+  function reportBatch(title, r, { okKey, failKey = 'failed', skipKey = 'skipped', extra = '' } = {}) {
+    const okN = (r?.[okKey] || []).length;
+    const failN = (r?.[failKey] || []).length;
+    const skipN = (r?.[skipKey] || []).length;
+    const bits = [`${title}：成功 ${okN}`];
+    if (failN) bits.push(`失败 ${failN}`);
+    if (skipN) bits.push(`跳过 ${skipN}`);
+    if (extra) bits.push(extra);
+    toast(bits.join(' · '), failN ? 'bad' : okN ? 'ok' : 'warn');
+    if (failN || skipN) {
+      const lines = [];
+      for (const f of r[failKey] || []) lines.push(`✗ ${String(f.profile_id).slice(0, 8)}：${f.message || f.reason || '失败'}`);
+      for (const s of r[skipKey] || []) lines.push(`- 跳过 ${String(s.profile_id).slice(0, 8)}：${skipReason(s.reason)}`);
+      confirmDialog({
+        title: `${title}：有未完成的`,
+        body: h('div', null,
+          h('div', null, `成功 ${okN} 个。`),
+          h('div', { class: 'code-block', style: { whiteSpace: 'pre-wrap' } }, lines.join('\n'))),
+        okLabel: '知道了', cancelLabel: '关闭',
+      });
+    }
+  }
+
+  /** 批量动作里跳过的原因 → 人话（认不出来就原样显示，不吞成「未知」） */
+  function skipReason(reason) {
+    return ({
+      not_found: '环境不存在',
+      not_running: '环境没在跑（cookie 存在内核里，先启动）',
+      no_proxy: '没绑代理，没有代理可检查',
+      in_recycle_bin: '在回收站里（这条要用回收站页，不是归档）',
+      already_archived: '本来就已经归档了',
+      not_archived: '本来就没有归档',
+      read_failed: '读取现况失败',
+      not_in_sync: '不在同步会话里',
+    })[reason] || String(reason);
+  }
+
   function toggleAll(on) {
     state.selected.clear();
     if (on) for (const r of filtered()) state.selected.add(r.profile_id);
@@ -97,12 +211,23 @@ export default async function renderProfiles({ head, page }) {
   async function load(showToast) {
     try {
       const [listRes, runRes] = await Promise.all([
-        api.list({ limit: 200, page: 1, name: state.q || undefined, group_id: state.groupId || undefined }),
+        api.list({
+          limit: 200,
+          page: 1,
+          name: state.q || undefined,
+          group_id: state.groupId || undefined,
+          // 归档筛选：'' = 主列表（不含已归档）；only = 只看已归档；include = 全都算
+          archived: state.archiveFilter || undefined,
+        }),
         api.running(),
       ]);
       state.rows = listRes.list || [];
       state.total = listRes.total || state.rows.length;
       state.running = new Map((runRes.list || []).map((i) => [i.profile_id, i]));
+      // 勾选跟着列表走：归档/删除之后那些 id 已经不在当前视图里了，
+      // 留着会让下一次批量动作打到一个「看不见的环境」上
+      const visible = new Set(state.rows.map((r) => r.profile_id));
+      for (const id of [...state.selected]) if (!visible.has(id)) state.selected.delete(id);
       paintSel();
       paintRows(body);
       paintSub();
@@ -132,8 +257,10 @@ export default async function renderProfiles({ head, page }) {
 
   function paintSub() {
     const n = state.running.size;
+    const arch = state.archiveFilter === 'only' ? ' · 只看已归档'
+      : state.archiveFilter === 'include' ? ' · 含已归档' : '';
     mount(document.getElementById('count-sub'),
-      `${state.total} 个环境${state.q ? `（含搜索：${state.q}）` : ''} · 运行中 ${n} 个`);
+      `${state.total} 个环境${state.q ? `（含搜索：${state.q}）` : ''}${arch} · 运行中 ${n} 个 · 视图${densityOf(state.density).label}`);
   }
 
   function filtered() {
@@ -170,8 +297,12 @@ export default async function renderProfiles({ head, page }) {
         onChange: (e) => { if (e.target.checked) state.selected.add(id); else state.selected.delete(id); paintSel(); },
       })),
       h('td', null,
-        h('div', null, h('a', { href: `#/profiles/${id}` }, r.name), h('span', { class: 'muted small' }, `  #${r.profile_no}`)),
-        r.remark ? h('div', { class: 'muted small' }, r.remark) : null),
+        h('div', { class: 'row-main' },
+          h('a', { href: `#/profiles/${id}` }, r.name),
+          h('span', { class: 'muted small' }, `  #${r.profile_no}`),
+          // 归档 ≠ 删除：标出来是因为它默认不在主列表里，用户得知道自己看的是哪批
+          r.archived_at ? h('span', { class: 'muted small' }, '  ', pill('已归档', 'warn')) : null),
+        r.remark ? h('div', { class: 'muted small row-sub' }, r.remark) : null),
       h('td', null, r.group_name || 'Default'),
       h('td', { class: 'num' }, px),
       h('td', null, live
@@ -253,6 +384,360 @@ export default async function renderProfiles({ head, page }) {
         h('div', { class: 'code-block', style: { whiteSpace: 'pre-wrap' } }, lines.join('\n') || '（没有失败明细）')),
       okLabel: '知道了', cancelLabel: '关闭',
     });
+  }
+
+  /* ------------------------ 批量菜单的 11 个动作 ------------------------ */
+
+  /** 一个简单的结果抽屉（批量动作要能看到逐条结果，不能只弹一个 toast） */
+  function resultDrawer(title, intro, rows, { footer } = {}) {
+    return drawer({
+      title,
+      body: h('div', { class: 'stack' },
+        intro ? h('div', { class: 'muted small' }, intro) : null,
+        h('div', { class: 'code-block', style: { whiteSpace: 'pre-wrap', maxHeight: '52vh', overflow: 'auto' } },
+          rows.join('\n') || '（没有明细）')),
+      footer,
+    });
+  }
+
+  /** 抽屉里的一个字段行 */
+  const field = (label, control, hint) => h('label', { class: 'field' },
+    h('span', { class: 'lbl' }, label),
+    control,
+    hint ? h('span', { class: 'muted small' }, hint) : null);
+
+  /* ---- 1. 修改代理 ---- */
+  function batchProxy() {
+    const ids = picked();
+    if (!ids) return;
+    let mode = 'config';
+    const type = h('select', null,
+      h('option', { value: 'http' }, 'HTTP'),
+      h('option', { value: 'https' }, 'HTTPS'),
+      h('option', { value: 'socks5' }, 'SOCKS5'));
+    const host = h('input', { type: 'text', placeholder: 'host 或 IP' });
+    const port = h('input', { type: 'text', placeholder: '端口' });
+    const user = h('input', { type: 'text', placeholder: '用户名（可空）' });
+    const pass = h('input', { type: 'password', placeholder: '密码（可空）' });
+    const preset = h('select', null, h('option', { value: '' }, '（加载代理列表中…）'));
+    const manual = h('div', { class: 'stack' },
+      h('div', { class: 'row' }, type, port),
+      host, user, pass);
+    const presetBox = h('div', { class: 'stack' }, preset);
+    const clearNote = h('div', { class: 'notice' }, '勾选的这批环境会改成直连（不经过任何代理）。');
+    // 用显示/隐藏切换，不重建 DOM —— 重建会把用户刚填的内容清掉
+    const sync = () => {
+      manual.style.display = mode === 'config' ? '' : 'none';
+      presetBox.style.display = mode === 'preset' ? '' : 'none';
+      clearNote.style.display = mode === 'clear' ? '' : 'none';
+    };
+
+    const modeSel = h('select', {
+      onChange: (e) => { mode = e.target.value; sync(); },
+    },
+      h('option', { value: 'config' }, '手填一条代理'),
+      h('option', { value: 'preset' }, '用代理管理里的某条'),
+      h('option', { value: 'clear' }, '改成直连（不绑代理）'));
+
+    const d = drawer({
+      title: `修改代理（${ids.length} 个环境）`,
+      body: h('div', { class: 'stack' },
+        field('怎么做', modeSel),
+        manual,
+        presetBox,
+        clearNote,
+        h('div', { class: 'notice warn' }, `同一条代理套到 ${ids.length} 个环境，它们会共用同一个出口 IP —— 同 IP 多开是最容易被平台识别的信号。`)),
+      footer: h('button', { class: 'btn primary', onClick: submit }, '改代理'),
+    });
+    sync();
+
+    api.proxies().then((r) => {
+      clear(preset);
+      preset.appendChild(h('option', { value: '' }, '选一条代理'));
+      for (const p of r.list || []) {
+        preset.appendChild(h('option', { value: p.proxy_id }, `${p.remark || `${p.host}:${p.port}`}（${p.type}）`));
+      }
+    }).catch(() => {
+      clear(preset);
+      preset.appendChild(h('option', { value: '' }, '（代理列表读取失败）'));
+    });
+
+    async function submit() {
+      let body;
+      if (mode === 'clear') body = { clear: true };
+      else if (mode === 'preset') {
+        if (!preset.value) { toast('先选一条代理'); return; }
+        body = { proxy_id: preset.value };
+      } else {
+        if (!host.value.trim() || !Number(port.value)) { toast('host 与端口必填', 'bad'); return; }
+        body = {
+          proxy_config: {
+            proxy_type: type.value, host: host.value.trim(), port: Number(port.value),
+            username: user.value.trim(), password: pass.value,
+          },
+        };
+      }
+      try {
+        const r = await api.batchProxy(ids, body);
+        d.close();
+        reportBatch('修改代理', r, { okKey: 'changed', extra: r.restart_required ? '在运行的环境需要重启才生效' : '' });
+        await load(false);
+      } catch (e) { toast(`改代理失败：${e.message}`, 'bad'); }
+    }
+  }
+
+  /* ---- 2. 修改 UA / 内核 ---- */
+  async function batchUa() {
+    const ids = picked();
+    if (!ids) return;
+    let kernels = [];
+    try { kernels = (await api.kernels()).list || []; } catch { /* 取不到就让用户手填 */ }
+    const kernelSel = h('select', null,
+      ...kernels.map((k) => h('option', { value: k.kernel }, `${k.kernel}${k.is_downloaded === false ? '（未下载）' : ''}`)),
+      kernels.length ? null : h('option', { value: '' }, '（没读本机内核，手填）'));
+    const kernelInput = h('input', { type: 'text', placeholder: '如 157.0.8103.78（留空 = 用上面选的）' });
+    const ua = h('textarea', { rows: 3, placeholder: '留空 = 按内核版本自动生成一条自洽的 UA' });
+
+    const d = drawer({
+      title: `修改 UA / 内核（${ids.length} 个环境）`,
+      body: h('div', { class: 'stack' },
+        field('内核版本', kernelSel),
+        field('或手填内核版本', kernelInput),
+        field('UA', ua, 'UA 里的 Chrome 大版本必须与内核一致，否则会报错（指纹不能自相矛盾）'),
+        h('div', { class: 'notice' }, '改完的 UA / 内核在**下次启动**生效；正在跑的环境不会自动重启。')),
+      footer: h('button', { class: 'btn primary', onClick: submit }, '改 UA / 内核'),
+    });
+
+    async function submit() {
+      const body = {};
+      const k = kernelInput.value.trim() || kernelSel.value;
+      if (k) body.kernel_version = k;
+      if (ua.value.trim()) body.ua = ua.value.trim();
+      if (!body.kernel_version && !body.ua) { toast('内核版本或 UA 至少给一个', 'bad'); return; }
+      try {
+        const r = await api.batchUa(ids, body);
+        d.close();
+        reportBatch('修改 UA / 内核', r, { okKey: 'changed', extra: r.restart_required ? '在运行的环境需要重启才生效' : '' });
+        await load(false);
+      } catch (e) { toast(`改 UA 失败：${e.message}`, 'bad'); }
+    }
+  }
+
+  /* ---- 3. 修改备注 ---- */
+  function batchRemark() {
+    const ids = picked();
+    if (!ids) return;
+    const mode = h('select', null,
+      h('option', { value: 'replace' }, '覆盖（会删掉原来的备注）'),
+      h('option', { value: 'append' }, '追加到末尾'),
+      h('option', { value: 'prefix' }, '加到开头'),
+      h('option', { value: 'suffix' }, '加到末尾（同追加）'));
+    const text = h('textarea', { rows: 3, placeholder: '备注内容（覆盖模式留空 = 清空备注）' });
+    const d = drawer({
+      title: `修改备注（${ids.length} 个环境）`,
+      body: h('div', { class: 'stack' },
+        field('方式', mode),
+        field('内容', text),
+        h('div', { class: 'notice warn' }, '「覆盖」会把这批环境原来的备注整条替换掉，选之前想清楚。')),
+      footer: h('button', { class: 'btn primary', onClick: submit }, '改备注'),
+    });
+    async function submit() {
+      if (mode.value === 'replace' && !text.value.trim()) {
+        const yes = await confirmDialog({ title: '确认清空备注', body: `会把 ${ids.length} 个环境的备注清空。`, okLabel: '清空', danger: true });
+        if (!yes) return;
+      }
+      try {
+        const r = await api.batchRemark(ids, { remark: text.value, mode: mode.value });
+        d.close();
+        reportBatch('修改备注', r, { okKey: 'changed' });
+        await load(false);
+      } catch (e) { toast(`改备注失败：${e.message}`, 'bad'); }
+    }
+  }
+
+  /* ---- 4. 更新环境信息 ---- */
+  function batchUpdateInfo() {
+    const ids = picked();
+    if (!ids) return;
+    const group = h('select', null,
+      h('option', { value: '' }, '（不改分组）'),
+      ...state.groups.map((g) => h('option', { value: g.id }, g.name)));
+    const domain = h('input', { type: 'text', placeholder: '域名（可空 = 不改）' });
+    const remark = h('input', { type: 'text', placeholder: '备注（可空 = 不改）' });
+    const d = drawer({
+      title: `更新环境信息（${ids.length} 个环境）`,
+      body: h('div', { class: 'stack' },
+        field('分组', group),
+        field('域名', domain),
+        field('备注', remark, '这里是整条覆盖；要追加请用「修改备注」'),
+        h('div', { class: 'notice' }, '批量入口只改这些基础字段。指纹、UA、内核有专门的入口，避免一个手滑改掉一批指纹。')),
+      footer: h('button', { class: 'btn primary', onClick: submit }, '更新'),
+    });
+    async function submit() {
+      const fields = {};
+      if (group.value) fields.group_id = group.value;
+      if (domain.value.trim()) fields.domain_name = domain.value.trim();
+      if (remark.value.trim()) fields.remark = remark.value.trim();
+      if (!Object.keys(fields).length) { toast('至少填一项'); return; }
+      try {
+        const r = await api.batchUpdateInfo(ids, fields);
+        d.close();
+        reportBatch('更新环境信息', r, { okKey: 'changed', extra: r.ignored_fields?.length ? `忽略字段：${r.ignored_fields.join(', ')}` : '' });
+        await load(false);
+      } catch (e) { toast(`更新失败：${e.message}`, 'bad'); }
+    }
+  }
+
+  /* ---- 5. 批量归档 / 6. 批量恢复 / 7. 批量删除 ---- */
+  async function batchArchive() {
+    const ids = picked();
+    if (!ids) return;
+    const yes = await confirmDialog({
+      title: '批量归档',
+      body: h('div', { class: 'stack' },
+        h('div', null, `把这 ${ids.length} 个环境移出主列表。`),
+        h('div', { class: 'notice' }, '归档**不是删除**：cookie、user-data、绑定的代理全都原样保留，随时能启动、能编辑。'),
+        h('div', { class: 'muted small' }, '归档的看「只看已归档」这一个筛选；要彻底删掉才用「批量删除」或回收站。')),
+      okLabel: '归档',
+    });
+    if (!yes) return;
+    try {
+      const r = await api.batchArchive(ids);
+      reportBatch('归档', r, { okKey: 'archived' });
+      await load(false);
+    } catch (e) { toast(`归档失败：${e.message}`, 'bad'); }
+  }
+
+  async function batchUnarchive() {
+    const ids = picked();
+    if (!ids) return;
+    try {
+      const r = await api.batchUnarchive(ids);
+      reportBatch('从归档恢复', r, { okKey: 'restored' });
+      await load(false);
+    } catch (e) { toast(`恢复失败：${e.message}`, 'bad'); }
+  }
+
+  async function batchDelete() {
+    const ids = picked();
+    if (!ids) return;
+    const yes = await confirmDialog({
+      title: '批量删除',
+      body: h('div', { class: 'stack' },
+        h('div', null, `把这 ${ids.length} 个环境移入回收站。`),
+        h('div', { class: 'notice' }, '环境会移入回收站：可以随时恢复，user-data 目录（cookie、登录态）原样留在盘上。'),
+        h('div', { class: 'muted small' }, '正在运行的环境会先停止。')),
+      okLabel: '移入回收站', danger: true,
+    });
+    if (!yes) return;
+    try {
+      const r = await api.remove(ids);
+      toast(`已移入回收站 ${(r.deleted || []).length} 个（可在「回收站」里恢复）`, 'ok');
+      state.selected.clear();
+      await load(false);
+    } catch (e) { toast(`删除失败：${e.message}`, 'bad'); }
+  }
+
+  /* ---- 8. 显示窗口 ---- */
+  async function batchShow(force = false) {
+    const ids = force ? (state.lastShowIds || []) : picked();
+    if (!ids || !ids.length) return;
+    try {
+      const r = await api.batchShow(ids, force);
+      const rows = (r.shown || []).map((x) => {
+        const who = String(x.profile_id || '').slice(0, 8);
+        if (x.raise === 'restored') return `✓ ${who}：已恢复显示并尝试置前`;
+        if (x.raise === 'page_only') return `· ${who}：只做了页面级激活（可能仍被其它窗口盖住）`;
+        return `${x.ok ? '·' : '✗'} ${who}：${x.reason || '没有动作'}`;
+      });
+      for (const s of r.skipped || []) rows.push(`- 跳过 ${String(s.profile_id).slice(0, 8)}：${skipReason(s.reason)}`);
+      state.lastShowIds = ids;
+      const summary = r.summary || {};
+      // 文案边界：零依赖下「被盖住」的窗口抬不动，所以只能说「已恢复显示并尝试置前」
+      const intro = force
+        ? `${summary.message || ''}（能确认的是窗口已恢复正常，确认不了它是否在最前面）`
+        : `${summary.message || ''}${summary.page_only ? '。要让被盖住的窗口真的到前面，点下面的「强制抬到前台（会闪一下）」' : ''}`;
+      resultDrawer(force ? '强制抬到前台' : '显示窗口', intro, rows, {
+        footer: (!force && summary.page_only)
+          ? h('button', { class: 'btn', onClick: () => batchShow(true) }, '强制抬到前台（会闪一下）')
+          : null,
+      });
+    } catch (e) { toast(`显示窗口失败：${e.message}`, 'bad'); }
+  }
+
+  /* ---- 9. 检查代理 ---- */
+  async function batchCheckProxy() {
+    const ids = picked();
+    if (!ids) return;
+    const d = drawer({ title: `检查代理（${ids.length} 个环境）`, body: h('div', { class: 'muted small' }, '正在逐条检查（限并发 3、单条 10 秒超时）…') });
+    try {
+      const r = await api.batchCheckProxy(ids);
+      d.close();
+      const rows = (r.list || []).map((x) => {
+        const who = `${String(x.profile_id).slice(0, 8)}${x.name ? ` ${x.name}` : ''}`;
+        const px = x.proxy ? `${x.proxy.proxy_type}://${x.proxy.host}:${x.proxy.port}` : '直连';
+        if (x.outcome === 'ok') return `✓ ${who}　${px}　出口 ${x.ip || '?'} ${x.country || ''}　${x.latency_ms}ms`;
+        if (x.outcome === 'timeout') return `⌛ ${who}　${px}　超时（${x.timeout_seconds} 秒内没完成握手）`;
+        if (x.outcome === 'direct') return `· ${who}　${x.error_label}`;
+        return `✗ ${who}　${px}　${x.error_label || x.error || '失败'}`;
+      });
+      const intro = `成功 ${r.ok} · 失败 ${r.fail} · 超时 ${r.timeout}${r.direct ? ` · 直连 ${r.direct}` : ''}（限并发 ${r.concurrency}，单条 ${r.timeout_seconds} 秒，用时 ${r.elapsed_ms}ms）`;
+      resultDrawer('检查代理结果', intro, rows);
+      if (r.fail || r.timeout) toast(`有 ${r.fail + r.timeout} 个代理不可用（明细已列出）`, 'bad');
+      else if (r.ok) toast(`代理检查通过：${r.ok} 个`, 'ok');
+    } catch (e) {
+      d.close();
+      toast(`检查代理失败：${e.message}`, 'bad');
+    }
+  }
+
+  /* ---- 10 / 11. 还原 Cookie（覆盖）/ 合并 Cookie（并集） ---- */
+  async function batchCookie(mode) {
+    const ids = picked();
+    if (!ids) return;
+    const file = await pickFile('.json,.txt,application/json,text/plain');
+    if (!file) return;
+    const text = await file.text();
+    const isTxt = /\.txt$/i.test(file.name) || !/^\s*[[{]/.test(text);
+    let body;
+    if (isTxt) {
+      body = { format: 'netscape', content: text };
+    } else {
+      let parsed;
+      try { parsed = JSON.parse(text); } catch (e) { toast(`JSON 解析失败：${e.message}`, 'bad'); return; }
+      const list = Array.isArray(parsed) ? parsed
+        : Array.isArray(parsed?.cookies) ? parsed.cookies
+          : Array.isArray(parsed?.list) ? parsed.list
+            : Array.isArray(parsed?.data?.cookies) ? parsed.data.cookies : null;
+      if (!list) { toast('文件里没有 cookie 数组（支持裸数组 / {cookies} / {list}）', 'bad'); return; }
+      body = { cookies: list };
+    }
+    const label = mode === 'restore' ? '还原 Cookie（覆盖）' : '合并 Cookie（并集）';
+    try {
+      // 第一步：**只算不写**。必须先让用户看到会加几条/改几条/删几条
+      const pv = await api.batchCookie(ids, { ...body, mode, preview: true });
+      const s = pv.summary || {};
+      const lines = (pv.list || []).map((x) => `· ${String(x.profile_id).slice(0, 8)}${x.name ? ` ${x.name}` : ''}：现有 ${x.existing_total} 条 → 加 ${x.will_add} / 改 ${x.will_update} / 删 ${x.will_delete}${x.will_keep ? ` / 保留现有 ${x.will_keep}` : ''}`);
+      for (const sk of pv.skipped || []) lines.push(`- 跳过 ${String(sk.profile_id).slice(0, 8)}：${skipReason(sk.reason)}`);
+      const yes = await confirmDialog({
+        title: `${label} · 预览`,
+        body: h('div', { class: 'stack' },
+          h('div', null, `合计：新增 ${s.will_add || 0} 条、修改 ${s.will_update || 0} 条、删除 ${s.will_delete || 0} 条${s.will_keep ? `、保留现有 ${s.will_keep} 条` : ''}。`),
+          mode === 'restore'
+            ? h('div', { class: 'notice warn' }, '「还原」是**覆盖**：写完以文件为准，文件里没有的 cookie 会被删掉。')
+            : h('div', { class: 'notice' }, '「合并」是**并集**：只补文件里有、环境里没有的；同名以环境现有为准，不会覆盖登录态。'),
+          h('div', { class: 'code-block', style: { whiteSpace: 'pre-wrap', maxHeight: '40vh', overflow: 'auto' } }, lines.join('\n') || '（没有明细）'),
+          h('div', { class: 'muted small' }, '预览里不显示 cookie 的值（那是登录凭据）。')),
+        okLabel: `确认${mode === 'restore' ? '覆盖' : '合并'}`,
+        danger: mode === 'restore',
+      });
+      if (!yes) { toast('已取消，一条都没写'); return; }
+      // 第二步：真写
+      const r = await api.batchCookie(ids, { ...body, mode, preview: false });
+      const rows = (r.list || []).map((x) => `✓ ${String(x.profile_id).slice(0, 8)}${x.name ? ` ${x.name}` : ''}：写入 ${x.written} 条、删除 ${x.deleted} 条、回读确认 ${x.verified ?? '?'} 条${x.write_failed ? `、失败 ${x.write_failed}` : ''}${(x.warnings || []).length ? `\n   ⚠ ${x.warnings.join('；')}` : ''}`);
+      for (const sk of r.skipped || []) rows.push(`- 跳过 ${String(sk.profile_id).slice(0, 8)}：${skipReason(sk.reason)}${sk.error_message ? `（${sk.error_message}）` : ''}`);
+      resultDrawer(`${label} · 结果`, `${(r.summary || {}).applied} 个环境已处理`, rows);
+    } catch (e) { toast(`${label}失败：${e.message}`, 'bad'); }
   }
 
   async function stopAll() {

@@ -23,6 +23,7 @@ const NOUN = new Map([
   ['dynamic-proxy-traffic', '代理流量'],
   ['cookie', 'Cookie'],
   ['recycle-bin', '回收站'],
+  ['batch', '批量'],
   ['agent', 'AI Agent'],
   ['workflow', '工作流'],
   ['selfcheck', '自检'],
@@ -96,6 +97,15 @@ const VERB = new Map([
   // 否则「API & MCP」页会露出 `回收站 · restore` 这种半截英文
   ['restore', '从回收站恢复'],
   ['purge', '彻底删除（不可恢复）'],
+  // 批量菜单（0.4.3 ③）：归档与回收站是两套语义，动词必须分开写清楚
+  ['archive', '归档（移出主列表，不算删除）'],
+  ['unarchive', '从归档恢复'],
+  ['proxy', '改代理'],
+  ['check-proxy', '批量检查代理'],
+  ['remark', '改备注'],
+  ['update-info', '更新环境信息'],
+  ['show', '显示窗口'],
+  ['cookie', '还原 / 合并 Cookie'],
 ]);
 
 /** `/api/v1/x/y` → ['x','y']；`api`、版本段、动态段（`:id`）都不是名词 */

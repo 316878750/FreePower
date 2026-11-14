@@ -15,9 +15,13 @@ export { DDL };
 
 const FLAT = FIELDS.filter((f) => f.storage !== 'fp');
 const FP = FIELDS.filter((f) => f.storage === 'fp');
-const EXT_COLS = ['id', 'profile_no', 'fp_seed', 'kernel_version', 'proxy_id', 'status', 'created_at', 'updated_at', 'last_launch_at'];
+// `archived_at` 也放这里：它不是字段表里的「指纹/浏览器配置」，是状态列，
+// 但要让 toApi/fromRow 原样带上（列表页要靠它画「已归档」标签、筛选也读它）。
+const EXT_COLS = ['id', 'profile_no', 'fp_seed', 'kernel_version', 'proxy_id', 'status', 'created_at', 'updated_at', 'last_launch_at', 'archived_at'];
 /** 可能存 number 也可能存 "default" 的枚举列 */
 const NUMERIC_ENUM = ['hardware_concurrency', 'device_memory'];
+/** 允许被显式置空（`null`）的列：校验层会丢掉 null，这里单独接住 */
+const NULLABLE_COLS = ['user_proxy_config', 'proxy_id', 'cookie', 'archived_at'];
 
 export function openDatabase(file) {
   const db = new DatabaseSync(file);
@@ -134,6 +138,12 @@ export function updateProfile(db, id, input) {
   if (!res.ok) return { ok: false, errors: res.errors, warnings: res.warnings };
 
   const merged = { ...existing, ...res.value, id, updated_at: now() };
+  /**
+   * **显式 null 要能清掉**：校验层会丢掉 `null`（`user_proxy_config: null` 不在 res.value 里），
+   * 于是「改成直连」这类动作会把旧值原样留下来、还回 code=0 —— 报的和做的相反。
+   * 所以对这几个「可以合法为空」的列，输入里出现了 null 就照着写 null。
+   */
+  for (const k of NULLABLE_COLS) if (input[k] === null) merged[k] = null;
   // 扩展列（fp_seed / kernel_version / status …）不参与字段表校验，显式合并
   for (const col of EXT_COLS) if (input[col] !== undefined) merged[col] = input[col];
   // fingerprint_config 合并而不是覆盖（webgl_config 只改一半时不能丢字段）
@@ -177,7 +187,9 @@ export function listProfiles(db, filter = {}) {
  * @returns {boolean} 是否真的删了一条（对已在回收站的、或不存在的返回 false）
  */
 export function deleteProfile(db, id) {
-  const r = db.prepare('UPDATE profiles SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL')
+  // 顺带清掉归档标记：归档过的环境被删除、再恢复时应该回到**主列表**，
+  // 不该带着一个「已归档」的旧状态让人找不到它（归档 ≠ 删除，两者不叠加）。
+  const r = db.prepare('UPDATE profiles SET deleted_at = ?, archived_at = NULL, updated_at = ? WHERE id = ? AND deleted_at IS NULL')
     .run(deleteStamp(), now(), id);
   return r.changes > 0;
 }

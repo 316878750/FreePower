@@ -207,11 +207,24 @@ export function getProfileByNo(no) {
   return row ? toApi(dbGet(getDb(), row.id)) : null;
 }
 
-export function listProfiles({ page = 1, page_size = 50, group_id = null, name = null, ids = null, profile_nos = null, tag_ids = null, sort_field = null, sort_order = null, include_deleted = false } = {}) {
+/**
+ * 环境列表。
+ *
+ * `archived` 控制**归档**的这批算不算在内（0.4.3 ③）：
+ *   - 不传 / `'exclude'`：只看主列表（默认）—— 归档的「移出主列表」就是这个意思；
+ *   - `'only'`：只看已归档的（列表页那个「已归档」筛选）；
+ *   - `'include'` / `'all'`：全都算进来。
+ * 归档**不是删除**：`deleted_at` 为空的归档环境照样能启动、能编辑，
+ * 只是默认不在主列表里出现。回收站（`deleted_at` 非空）与它是两套语义，别混。
+ */
+export function listProfiles({ page = 1, page_size = 50, group_id = null, name = null, ids = null, profile_nos = null, tag_ids = null, sort_field = null, sort_order = null, include_deleted = false, archived = null } = {}) {
   const db = getDb();
   // 回收站里的环境一律不出现在 list 里（软删除语义，见 deleteProfiles）
   const where = include_deleted ? [] : ['deleted_at IS NULL'];
   const args = [];
+  const arch = String(archived || 'exclude').toLowerCase();
+  if (arch === 'only') where.push('archived_at IS NOT NULL');
+  else if (arch !== 'include' && arch !== 'all') where.push('archived_at IS NULL');
   if (group_id !== null && group_id !== undefined && group_id !== '') {
     where.push('group_id = ?');
     args.push(String(group_id));
@@ -266,7 +279,17 @@ export function updateProfile(profileId, patch = {}) {
     const u = patch.open_urls ?? patch.openfb_urls;
     flat.open_urls = Array.isArray(u) ? u : u ? [u] : [];
   }
-  if (patch.proxy_config !== undefined || patch.proxy_host !== undefined || patch.host !== undefined) {
+  /*
+   * 代理三态必须分清（批量改代理「改成直连」就栽在这条上）：
+   *   `proxy_config: null`  → **显式清空**，不合并旧值（老实现 `{...cur, ...(null || patch)}`
+   *                          会把旧 host/port 原样留下来，于是「改成直连」回 code=0 但其实没改）；
+   *   `proxy_config: {...}` → 与现有合并（只改端口的场景要保住 host/username）；
+   *   不给                 → 不动。
+   */
+  if (patch.proxy_config === null) {
+    flat.user_proxy_config = null;
+    flat.proxy_id = null;
+  } else if (patch.proxy_config !== undefined || patch.proxy_host !== undefined || patch.host !== undefined) {
     flat.user_proxy_config = normalizeProxy({ ...(cur.user_proxy_config || {}), ...(patch.proxy_config || patch) });
   }
   if (patch.login_cookie !== undefined) flat.cookie = cookieToStorage(patch.login_cookie);
@@ -330,6 +353,58 @@ export function deleteProfiles(ids = []) {
     if (dbDelete(db, id)) deleted.push(id);
   }
   return deleted;
+}
+
+/**
+ * 归档（0.4.3 ③）：**移出主列表，但不是删除**。
+ *
+ * 和回收站的区别（CEO 明确要求分清，别把 `/recycle-bin/*` 复用成归档）：
+ *   - 归档：`archived_at` 有值、`deleted_at` 仍为空 → 还能启动、能编辑，筛选「已归档」看得见，
+ *     一条 cookie 一个字节都没动；
+ *   - 回收站：`deleted_at` 有值 → 不在任何列表里，要从回收站恢复。
+ *
+ * 归档时间格式与 `deleteStamp` 一致（`YYYY-MM-DD HH:mm:ss`，Asia/Shanghai），
+ * 这样按字符串排序就是按时间排序，界面不用再解析。
+ * @returns {{archived:string[], skipped:{profile_id:string, reason:string}[]}}
+ */
+export function archiveProfiles(ids = []) {
+  const db = getDb();
+  const stamp = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' });
+  const archived = [];
+  const skipped = [];
+  for (const id of ids) {
+    const key = String(id);
+    const row = db.prepare('SELECT archived_at, deleted_at FROM profiles WHERE id = ?').get(key);
+    if (!row) { skipped.push({ profile_id: key, reason: 'not_found' }); continue; }
+    // 回收站里的不能被「归档」：那会把两套语义混在一起（用户会以为归档等于删了）
+    if (row.deleted_at) { skipped.push({ profile_id: key, reason: 'in_recycle_bin' }); continue; }
+    if (row.archived_at) { skipped.push({ profile_id: key, reason: 'already_archived' }); continue; }
+    db.prepare('UPDATE profiles SET archived_at = ?, updated_at = ? WHERE id = ?')
+      .run(stamp, new Date().toISOString(), key);
+    archived.push(key);
+  }
+  return { archived, skipped };
+}
+
+/**
+ * 批量恢复（**从归档里恢复**，不是从回收站恢复 —— 那是 `/recycle-bin/restore`）。
+ * @returns {{restored:string[], skipped:{profile_id:string, reason:string}[]}}
+ */
+export function unarchiveProfiles(ids = []) {
+  const db = getDb();
+  const restored = [];
+  const skipped = [];
+  for (const id of ids) {
+    const key = String(id);
+    const row = db.prepare('SELECT archived_at, deleted_at FROM profiles WHERE id = ?').get(key);
+    if (!row) { skipped.push({ profile_id: key, reason: 'not_found' }); continue; }
+    if (row.deleted_at) { skipped.push({ profile_id: key, reason: 'in_recycle_bin' }); continue; }
+    if (!row.archived_at) { skipped.push({ profile_id: key, reason: 'not_archived' }); continue; }
+    db.prepare('UPDATE profiles SET archived_at = NULL, updated_at = ? WHERE id = ?')
+      .run(new Date().toISOString(), key);
+    restored.push(key);
+  }
+  return { restored, skipped };
 }
 
 /**

@@ -54,10 +54,10 @@ function migrate(d) {
   }
 
   // 2) 建新结构（幂等）
-  // 注意顺序：DDL 里带着 `CREATE INDEX ... ON profiles("deleted_at")`，
-  // 老库（0.3.x）已经有 profiles 表但没有这一列 —— 必须先补列再跑 DDL，
-  // 否则 `CREATE INDEX IF NOT EXISTS` 会报 `no such column: deleted_at`。
-  if (tableExists(d, 'profiles')) ensureColumns(d, 'profiles', { deleted_at: 'TEXT' });
+  // 注意顺序：DDL 里带着 `CREATE INDEX ... ON profiles("deleted_at")` 和
+  // `... ON profiles("archived_at")`，老库（0.3.x / 0.4.2）已经有 profiles 表但没有这些列 ——
+  // **必须先补列再跑 DDL**，否则 `CREATE INDEX IF NOT EXISTS` 会报 `no such column`。
+  if (tableExists(d, 'profiles')) ensureColumns(d, 'profiles', { deleted_at: 'TEXT', archived_at: 'TEXT' });
   d.exec(DDL);
   d.exec('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);');
   ensureColumns(d, 'proxies', { remark: 'TEXT', ipchecker: 'TEXT' });

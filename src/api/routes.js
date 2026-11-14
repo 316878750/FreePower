@@ -16,7 +16,7 @@ import path from 'node:path';
 import {
   createProfile, getProfile, getProfileByNo, listProfiles, updateProfile, deleteProfiles, regroupProfiles,
   newFingerprintFor, listGroups, createGroup, getGroup, updateGroup, deleteGroup, cookieText, cookieToStorage,
-  listRecycleBin, restoreProfiles, getRecycledProfile, purgeProfiles,
+  listRecycleBin, restoreProfiles, getRecycledProfile, purgeProfiles, archiveProfiles, unarchiveProfiles,
 } from '../store/profiles.js';
 import { listTags, createTags, updateTags, deleteTags, tagIdsOf } from '../store/tags.js';
 import {
@@ -25,7 +25,7 @@ import {
 } from '../store/extensions.js';
 import { importProfiles, copyProfile } from '../store/transfer.js';
 import { parseAdspowerTxt, formatAdspowerTxt, txtFilename } from '../store/adspower-txt.js';
-import { readCookies, writeCookies, formatNetscape, parseNetscape, missingAfterWrite } from '../kernel/cookies.js';
+import { readCookies, writeCookies, formatNetscape, parseNetscape, missingAfterWrite, planCookieWrite, applyCookiePlan } from '../kernel/cookies.js';
 import {
   createProxies, updateProxy, listProxies, deleteProxies, rememberProxyCheck, getProxy,
 } from '../store/proxies.js';
@@ -45,6 +45,7 @@ import { apiInfoPayload, setApiVerify, resetStats } from './info.js';
 import { startSync, stopSync, syncStatus, updateSettings, refreshAll, unifySize, arrangeWindows, showWindows, forceShowWindows, openTabInAll, tabState, closeTabs, copyTabToSlaves, unifyTabs } from '../sync/session.js';
 import { readDisplays } from '../sync/displays.js';
 import { readHotkeyStatus, requestHotkey } from '../sync/hotkey.js';
+import { showWindowsOfProfiles } from '../sync/batch-show.js';
 import { resetApiKey } from '../store/db.js';
 import { listKernels } from '../kernel/chrome.js';
 import { runKernelDownload } from '../kernel/download.js';
@@ -262,6 +263,9 @@ export function buildRoutes() {
       tag_ids: idList(src.tag_ids ?? src.profile_tag_ids, v),
       sort_field: src.sort_type ?? src.user_sort,
       sort_order: src.sort_order,
+      // 归档筛选（0.4.3 ③）：默认不含已归档（「移出主列表」就是这个意思）；
+      // `only` 只看已归档，`include`/`all` 全都算。它**不影响**回收站里的（那由 deleted_at 管）。
+      archived: src.archived ?? src.archive_filter ?? null,
     });
     const body = { list: r.list.map((p) => present(p, v)), page: r.page, total: r.total };
     if (v === 'v2') body.limit = r.page_size;
@@ -811,6 +815,490 @@ export function buildRoutes() {
       });
     }
     return ok({ purged, skipped, userdata_removed: userdataRemoved });
+  });
+
+  /* ==================== 4.8 批量菜单（0.4.3 ③） ====================
+   *
+   * 形态依据逆向 `28-远端UI界面结构.md` 的「批量操作」清单：
+   *   修改代理 / 修改UA内核 / 修改备注 / 更新环境信息 / 批量删除 / 批量归档 / 批量恢复，
+   * 行内另有：显示窗口 / 检查代理 / 还原Cookie / 合并Cookie。
+   *
+   * 这些路由都是**我们自己加的**（对手是云端 webui 内部接口，没有可抄的本地 REST），
+   * 所以形状自己定，但四条纪律必须守住：
+   *   1. **归档 ≠ 删除**：归档只写 `archived_at`，不碰 `deleted_at`、不碰 user-data；
+   *      回收站那套 `/recycle-bin/*` 一次都不复用（那是软删除语义）。
+   *   2. **参数缺失就报错**：`profile_ids` 一个都没有 → `100002` 且 `data.field='profile_ids'`，
+   *      绝不把「字段名拼错」当成「一条都没选」然后回 code=0（0.4.3 ① 已经栽过一次）。
+   *   3. **一条失败不中断整批**：逐条结果分开报，`failed` / `skipped` 里点名到 profile_id。
+   *   4. **超时要给具体秒数**，不许只说「超时」。
+   */
+
+  /** 批量动作的公共入口：解析 profile_ids（缺就 100002），并保持**入参顺序** */
+  const batchTargets = (ctx) => {
+    const src = ctx.body || {};
+    // 只认 `profile_ids` / `profile_id`。拼错（`profileIds` / `ids`）→ 报错，
+    // 不当成空数组 —— 空数组在批量动作里等于「什么都没做」，用户会以为成功了。
+    const raw = src.profile_ids ?? src.profile_id;
+    if (raw === undefined || raw === null || raw === '') {
+      throw new ApiError(ERR.INVALID, 'profile_ids is required', 200, { field: 'profile_ids' });
+    }
+    if (!Array.isArray(raw) && typeof raw !== 'string') {
+      throw new ApiError(ERR.INVALID, 'profile_ids must be an array', 200, { field: 'profile_ids' });
+    }
+    const ids = idList(raw, 'v2');
+    if (!ids.length) {
+      throw new ApiError(ERR.INVALID, 'profile_ids is required', 200, { field: 'profile_ids' });
+    }
+    if (ids.length > 500) throw new ApiError(ERR.INVALID, '一次最多 500 个环境', 200, { field: 'profile_ids' });
+    return ids;
+  };
+
+  /**
+   * 批量归档：**移出主列表，但不是删除**。
+   * 归档的还在（`deleted_at` 仍为空）→ 能启动、能编辑、筛选「已归档」看得见，cookie 一个字节没动。
+   * 已经在回收站里的不能被归档（skipped: in_recycle_bin）—— 那会把两套语义混在一起。
+   */
+  add(['POST'], ['/api/v2/browser-profile/batch/archive'], (ctx) => {
+    const ids = batchTargets(ctx);
+    const r = archiveProfiles(ids);
+    return ok({ archived: r.archived, skipped: r.skipped, count: r.archived.length });
+  });
+
+  /** 批量恢复：**从归档里恢复**（不是从回收站恢复，那是 `/recycle-bin/restore`） */
+  add(['POST'], ['/api/v2/browser-profile/batch/unarchive'], (ctx) => {
+    const ids = batchTargets(ctx);
+    const r = unarchiveProfiles(ids);
+    return ok({ restored: r.restored, skipped: r.skipped, count: r.restored.length });
+  });
+
+  /**
+   * 批量改代理：三种写法
+   *   - `{proxy_config:{proxy_type,host,port,username,password}}`：写死一条（**同一条代理套到一批环境**，
+   *     界面必须提醒「这些环境会共用同一个出口 IP」—— 同 IP 多开是平台最容易识别的信号）；
+   *   - `{proxy_id:'...'}`：绑代理列表里的某条；
+   *   - `{clear:true}`：清成直连。
+   * 走 `updateProfile` 的同一条路径，所以 PAC 拒绝、字段校验、`user_proxy_config` 形状全部一致。
+   * 在跑的环境回 `restart_required:true`（代理是启动参数，改完必须重启才生效，不偷偷重启）。
+   */
+  add(['POST'], ['/api/v2/browser-profile/batch/proxy'], (ctx) => {
+    const ids = batchTargets(ctx);
+    const body = ctx.body || {};
+    const cfg = body.proxy_config || null;
+    const proxyId = body.proxy_id ?? null;
+    const clear = ['1', 'true', 'yes'].includes(String(body.clear ?? '').toLowerCase());
+
+    let patch;
+    if (clear) {
+      patch = { proxy_id: null, proxy_config: null };
+    } else if (proxyId) {
+      if (!getProxy(String(proxyId))) throw new ApiError(ERR.INVALID, 'proxy_id 不存在（先在代理管理里建这条代理）', 200, { field: 'proxy_id' });
+      patch = { proxy_id: String(proxyId) };
+    } else if (cfg && typeof cfg === 'object') {
+      if (!hasProxy(cfg)) throw new ApiError(ERR.INVALID, 'proxy_config 里 host / port 必填', 200, { field: 'proxy_config' });
+      const pac = pacInUse({ proxy_config: cfg });
+      if (pac) throw new ApiError(ERR.INVALID, pacMessage(pac), 200, { field: 'proxy_config' });
+      patch = { proxy_config: cfg };
+    } else {
+      throw new ApiError(ERR.INVALID, '给 proxy_config、proxy_id，或显式 clear:true（改成直连）', 200, { field: 'proxy_config' });
+    }
+
+    const changed = [];
+    const failed = [];
+    let restartRequired = false;
+    for (const id of ids) {
+      const cur = getProfile(id) || getProfileByNo(id);
+      if (!cur) { failed.push({ profile_id: String(id), reason: 'not_found', message: '环境不存在' }); continue; }
+      try {
+        const next = updateProfile(cur.id, patch);
+        if (getRunning(cur.id)) restartRequired = true;
+        changed.push({
+          profile_id: cur.id,
+          ok: true,
+          proxy_config: next.proxy_config
+            ? { proxy_type: next.proxy_config.proxy_type, host: next.proxy_config.host, port: next.proxy_config.port }
+            : null,
+        });
+      } catch (e) {
+        failed.push({ profile_id: cur.id, reason: 'update_failed', message: e.message });
+      }
+    }
+    return ok({ changed, failed, count: changed.length, restart_required: restartRequired, shared_egress: Boolean(cfg) && !clear });
+  });
+
+  /**
+   * 批量检查代理：**限并发 + 逐条结果**。
+   *
+   * 三条硬要求（CEO 明确提的）：
+   *   - 一条失败**不能中断整批**（`checkMany` 是固定 N 个 worker 抢队头，不是分批 sleep）；
+   *   - 成功 / 失败 / **超时**分开：`outcome` 字段是 `ok|fail|timeout|direct`，
+   *     超时的还带具体秒数（`timeout_ms` + `timeout_seconds`）；
+   *   - 不许把失败显示成成功：`ok` 只在探测真的拿到出口 IP 时为 true。
+   *
+   * 没绑代理的环境走 `outcome:'direct'`：**检查的是「代理」，直连没有代理可查**，
+   * 所以不算成功也不算失败，界面照实说「没绑代理」。给直连环境编一个「检查通过」才是骗人。
+   * 用的是与启动前同一套探测（`src/proxy/health.js`，零依赖、fail-closed），结果可比。
+   */
+  add(['POST'], ['/api/v2/browser-profile/batch/check-proxy'], async (ctx) => {
+    const ids = batchTargets(ctx);
+    const concurrency = Math.min(Math.max(Number(ctx.body?.concurrency) || HEALTH_CONCURRENCY, 1), 10);
+    const timeoutMs = Math.min(Math.max(Number(ctx.body?.timeout_ms) || HEALTH_TIMEOUT_MS, 1000), 60000);
+
+    const items = [];
+    const direct = [];
+    for (const id of ids) {
+      const p = getProfile(id);
+      if (!p) { direct.push({ profile_id: String(id), outcome: 'not_found', ok: false, error_label: '环境不存在' }); continue; }
+      const cfg = p.proxy_config || {};
+      if (!hasProxy(cfg)) {
+        direct.push({
+          profile_id: p.profile_id ?? p.id,
+          profile_no: p.profile_no,
+          name: p.name ?? '',
+          outcome: 'direct',
+          ok: false,
+          has_proxy: false,
+          error_kind: 'direct',
+          error_label: '这个环境没绑代理（直连），没有代理可查',
+        });
+        continue;
+      }
+      items.push({
+        profile_id: p.profile_id ?? p.id,
+        profile_no: p.profile_no,
+        name: p.name ?? '',
+        has_proxy: true,
+        proxy: { proxy_type: cfg.proxy_type || 'http', host: cfg.host, port: cfg.port },
+        proxyConfig: cfg,
+      });
+    }
+
+    const batch = await checkMany(items.map((x) => ({ proxy_id: x.profile_id, proxy: x.proxyConfig })), { concurrency, timeoutMs });
+    const byId = new Map();
+    items.forEach((x, k) => {
+      const r = batch.list[k] || {};
+      const timedOut = r.error_kind === 'timeout';
+      byId.set(x.profile_id, {
+        profile_id: x.profile_id,
+        profile_no: x.profile_no,
+        name: x.name,
+        has_proxy: true,
+        proxy: x.proxy,
+        ok: Boolean(r.ok),
+        outcome: r.ok ? 'ok' : timedOut ? 'timeout' : 'fail',
+        error_kind: r.ok ? null : (r.error_kind || 'other'),
+        error_label: r.ok ? null : (r.error_label || r.error || '代理不可用'),
+        error: r.ok ? null : (r.error || null),
+        ip: r.ip ?? null,
+        country: r.country ?? null,
+        latency_ms: r.latency_ms ?? 0,
+        checked_at: r.checked_at ?? null,
+        // 超时要说清是多少秒，而不是一句「超时」
+        timeout_ms: r.ok ? null : (timedOut ? timeoutMs : null),
+        timeout_seconds: timedOut ? Number((timeoutMs / 1000).toFixed(1)) : null,
+      });
+    });
+
+    const list = ids.map((id) => byId.get(String(id)) || direct.find((d) => d.profile_id === String(id)));
+    const okN = list.filter((r) => r && r.outcome === 'ok').length;
+    const failN = list.filter((r) => r && r.outcome === 'fail').length;
+    const timeoutN = list.filter((r) => r && r.outcome === 'timeout').length;
+    const directN = list.filter((r) => r && r.outcome === 'direct').length;
+    return ok({
+      list,
+      total: list.length,
+      ok: okN,
+      fail: failN,
+      timeout: timeoutN,
+      direct: directN,
+      concurrency: batch.concurrency_limit || concurrency,
+      timeout_ms: timeoutMs,
+      timeout_seconds: Number((timeoutMs / 1000).toFixed(1)),
+      elapsed_ms: batch.elapsed_ms,
+    });
+  });
+
+  /**
+   * 批量改 UA / 内核。
+   *
+   * **身份自洽是硬约束**（README 与 `validate.js` 都钉着）：UA 里的 `Chrome/<大版本>` 必须等于
+   * `client_hints.ua_full_version`，也应当等于这个环境的内核版本。所以这里：
+   *   - 只给 `kernel_version` → UA 按这个内核的大版本重写；
+   *   - 只给 `ua` → 从 UA 里抽出 `Chrome/<x.y.z.w>` 当内核版本，两个一起写；
+   *   - 两个都给了但对不上 → `100002`，**不静默改其中一个**（那会造出一个自相矛盾的指纹）。
+   * 改动在下次启动生效：在跑的环境回 `restart_required:true`，界面据此提示，**不偷偷重启**。
+   */
+  add(['POST'], ['/api/v2/browser-profile/batch/ua'], (ctx) => {
+    const ids = batchTargets(ctx);
+    const body = ctx.body || {};
+    const uaIn = typeof body.ua === 'string' ? body.ua.trim() : '';
+    const kernelIn = body.kernel_version !== undefined && body.kernel_version !== null ? String(body.kernel_version).trim() : '';
+    if (!uaIn && !kernelIn) {
+      throw new ApiError(ERR.INVALID, 'ua 或 kernel_version 至少给一个', 200, { field: 'ua' });
+    }
+
+    const installed = new Set(listKernels({ type: 'chrome' }).map((k) => String(k.kernel)));
+    const uaVersion = (ua) => {
+      const m = /Chrome\/(\d+)(?:\.(\d+)\.(\d+)\.(\d+))?/.exec(String(ua || ''));
+      return m ? [m[1], m[2] || '0', m[3] || '0', m[4] || '0'].join('.') : null;
+    };
+
+    let kernel = kernelIn;
+    let ua = uaIn;
+    if (kernel && !/^\d+\.\d+\.\d+\.\d+$/.test(kernel)) {
+      throw new ApiError(ERR.INVALID, 'kernel_version 形如 157.0.8103.78', 200, { field: 'kernel_version' });
+    }
+    if (kernel && installed.size && !installed.has(kernel)) {
+      throw new ApiError(ERR.INVALID, `本机没有安装内核 ${kernel}（先在内核页下载，或在环境里用本机已有的版本）`, 200, { field: 'kernel_version' });
+    }
+    if (!kernel) {
+      /*
+       * 只给 UA：从 UA 里抽 `Chrome/<大版本>`，再到本机已装内核里找**同一个大版本**的那一个。
+       * 不能直接拿 UA 里的 `157.0.0.0` 当内核版本 —— 真实内核是 `157.0.8103.78`，
+       * UA 那四段里的后三段本来就是打码值（`.0.0.0`），拿去当内核版本必然匹配不上，
+       * 用户只会看到「本机没有安装内核 157.0.0.0」这种看不懂的错。
+       */
+      const major = uaVersion(ua)?.split('.')[0];
+      if (!major) throw new ApiError(ERR.INVALID, 'ua 里认不出 Chrome/<版本>，请同时给 kernel_version', 200, { field: 'ua' });
+      const sameMajor = [...installed].filter((v) => v.split('.')[0] === major).sort();
+      kernel = sameMajor[sameMajor.length - 1] || `${major}.0.0.0`;
+      if (installed.size && !sameMajor.length) {
+        throw new ApiError(ERR.INVALID, `ua 报 Chrome/${major}，但本机没有这个大版本的内核`, 200, { field: 'ua' });
+      }
+    }
+    if (!ua) ua = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${kernel.split('.').slice(0, 3).join('.')}.0 Safari/537.36`;
+    const fromUa = uaVersion(ua);
+    if (fromUa && fromUa.split('.')[0] !== kernel.split('.')[0]) {
+      throw new ApiError(ERR.INVALID, `ua 报 Chrome/${fromUa.split('.')[0]}，但内核是 ${kernel}（大版本必须一致，否则指纹自相矛盾）`, 200, { field: 'ua' });
+    }
+
+    const changed = [];
+    const failed = [];
+    let restartRequired = false;
+    for (const id of ids) {
+      const cur = getProfile(id) || getProfileByNo(id);
+      if (!cur) { failed.push({ profile_id: String(id), reason: 'not_found', message: '环境不存在' }); continue; }
+      const hints = { ...(cur.client_hints || {}), ua_full_version: kernel, platform: (cur.client_hints || {}).platform || 'Windows' };
+      try {
+        const next = updateProfile(cur.id, { ua, client_hints: hints, kernel_version: kernel });
+        if (getRunning(cur.id)) restartRequired = true;
+        changed.push({ profile_id: cur.id, ok: true, ua: next.ua, kernel_version: next.kernel_version });
+      } catch (e) {
+        failed.push({ profile_id: cur.id, reason: 'update_failed', message: e.message });
+      }
+    }
+    return ok({ changed, failed, count: changed.length, restart_required: restartRequired, ua, kernel_version: kernel });
+  });
+
+  /**
+   * 批量改备注。`mode` 四档：replace（默认）/ append / prefix / suffix。
+   * 为什么要这几档：对手那边改备注是把同一段话写到一批环境上，
+   * 但「覆盖」和「追加」对已有备注差别很大 —— 覆盖会**删掉用户原来写的东西**，所以显式给 mode，
+   * 默认 replace 且界面必须提示会覆盖。
+   */
+  add(['POST'], ['/api/v2/browser-profile/batch/remark'], (ctx) => {
+    const ids = batchTargets(ctx);
+    const body = ctx.body || {};
+    if (body.remark === undefined) throw new ApiError(ERR.INVALID, 'remark is required（要清空请显式传空串）', 200, { field: 'remark' });
+    const text = String(body.remark);
+    const mode = String(body.mode || 'replace').toLowerCase();
+    if (!['replace', 'append', 'prefix', 'suffix'].includes(mode)) {
+      throw new ApiError(ERR.INVALID, 'mode 只能是 replace / append / prefix / suffix', 200, { field: 'mode' });
+    }
+    const sep = body.separator === undefined ? ' ' : String(body.separator);
+    const changed = [];
+    const failed = [];
+    for (const id of ids) {
+      const cur = getProfile(id) || getProfileByNo(id);
+      if (!cur) { failed.push({ profile_id: String(id), reason: 'not_found', message: '环境不存在' }); continue; }
+      const old = String(cur.remark ?? '');
+      let next = text;
+      if (mode === 'append') next = old ? `${old}${sep}${text}` : text;
+      else if (mode === 'prefix') next = old ? `${text}${sep}${old}` : text;
+      else if (mode === 'suffix') next = old ? `${old}${sep}${text}` : text;
+      try {
+        updateProfile(cur.id, { remark: next });
+        changed.push({ profile_id: cur.id, ok: true, remark: next, previous: old });
+      } catch (e) {
+        failed.push({ profile_id: cur.id, reason: 'update_failed', message: e.message });
+      }
+    }
+    return ok({ changed, failed, count: changed.length, mode });
+  });
+
+  /**
+   * 批量「更新环境信息」：一次改多个**基础字段**（其余字段走单环境编辑页）。
+   * 白名单收窄是故意的：这里是批量入口，一个手滑就把一批环境的指纹改掉，
+   * 代价太大；UA/内核有专门的路由，指纹种子根本不给批量改的口子。
+   */
+  add(['POST'], ['/api/v2/browser-profile/batch/update-info'], (ctx) => {
+    const ids = batchTargets(ctx);
+    const src = (ctx.body && ctx.body.fields) || ctx.body || {};
+    const ALLOW = ['name', 'remark', 'group_id', 'domain_name', 'open_urls', 'username', 'password', 'fakey', 'platform_account', 'profile_tag_ids'];
+    const patch = {};
+    const ignored = [];
+    for (const [k, v] of Object.entries(src)) {
+      if (k === 'profile_ids' || k === 'profile_id') continue;
+      if (!ALLOW.includes(k)) { ignored.push(k); continue; }
+      patch[k] = v;
+    }
+    if (!Object.keys(patch).length) {
+      throw new ApiError(ERR.INVALID, `没有可更新的字段（允许：${ALLOW.join(', ')}）`, 200, { field: 'fields' });
+    }
+    if (patch.group_id !== undefined) {
+      const g = String(patch.group_id ?? '');
+      if (!getGroup(g)) throw new ApiError(ERR.INVALID, 'group_id 不存在', 200, { field: 'group_id' });
+    }
+    const changed = [];
+    const failed = [];
+    for (const id of ids) {
+      const cur = getProfile(id) || getProfileByNo(id);
+      if (!cur) { failed.push({ profile_id: String(id), reason: 'not_found', message: '环境不存在' }); continue; }
+      try {
+        const next = updateProfile(cur.id, patch);
+        changed.push({ profile_id: cur.id, ok: true, fields: Object.keys(patch), name: next.name });
+      } catch (e) {
+        failed.push({ profile_id: cur.id, reason: 'update_failed', message: e.message });
+      }
+    }
+    return ok({ changed, failed, count: changed.length, ignored_fields: ignored, fields: Object.keys(patch) });
+  });
+
+  /**
+   * 批量「显示窗口 / 强制抬到前台」—— 对**任意勾选的环境**用，不要求开同步会话。
+   * 判定复用 `src/sync/show.js` 那一套（`planShow` / `verifyShown` / `summarizeShow`），
+   * 面板文案与同步面板保持同一口径：只有最小化的那批是真到前台（`restore`），
+   * 被盖住的那批只做了页面级激活（`page_only`），**不许说成「已置前」**。
+   *
+   * `force:true` 是**一次性显式动作**（最小化→恢复，会闪任务栏、每个窗口约 1 秒），
+   * 默认 false；不写设置、不做开关。
+   */
+  add(['POST'], ['/api/v2/browser-profile/batch/show'], async (ctx) => {
+    const ids = batchTargets(ctx);
+    const force = ['1', 'true', 'yes'].includes(String(ctx.body?.force ?? '').toLowerCase());
+    const r = await showWindowsOfProfiles(ids, { force });
+    return ok(r);
+  });
+
+  /**
+   * 批量「还原 Cookie」/「合并 Cookie」。
+   *
+   * 两种语义**必须分开**（CEO 明确要求，也是这里最容易做错的地方）：
+   *   - `restore` = **覆盖**：写完之后内核里的 cookie 就是文件里那份（文件里没有的删掉）；
+   *   - `merge`   = **并集**：只补文件里有、内核里没有的；**同名以现有为准**（不覆盖登录态）。
+   *
+   * 两个都支持 `preview:true`：**只算不写**，回「会加几条 / 改几条 / 删几条」。
+   * 界面必须先调 preview、把数字摆给用户看、用户点确认之后再 `preview:false` 真写。
+   * 预览里**不带 cookie 的 value** —— 那是登录凭据，不该出现在界面上，更不该进日志。
+   *
+   * 依赖：cookie 在内核里，所以环境必须在跑（与 `/cookie/import` 同一条口径，
+   * 不为了改 cookie 偷偷起内核）。没跑的那条进 `skipped: not_running`，不影响其它条。
+   */
+  add(['POST'], ['/api/v2/browser-profile/batch/cookie'], async (ctx) => {
+    const ids = batchTargets(ctx);
+    const body = ctx.body || {};
+    const mode = String(body.mode || '').toLowerCase();
+    if (mode !== 'restore' && mode !== 'merge') {
+      throw new ApiError(ERR.INVALID, 'mode 必须是 restore（覆盖）或 merge（并集）', 200, { field: 'mode' });
+    }
+    let list = body.cookies;
+    let parseFailed = [];
+    if (!Array.isArray(list)) {
+      const content = body.content;
+      if (typeof content !== 'string' || !content.trim()) {
+        throw new ApiError(ERR.INVALID, '提供 cookies 数组，或 {format:"netscape", content:"..."}', 200, { field: 'cookies' });
+      }
+      const format = String(body.format || '').toLowerCase();
+      if (format && format !== 'netscape') throw new ApiError(ERR.INVALID, 'format 只支持 netscape；数组请用 cookies 字段', 200, { field: 'format' });
+      const parsed = parseNetscape(content);
+      list = parsed.cookies;
+      parseFailed = parsed.failed;
+    }
+    if (!list.length) throw new ApiError(ERR.INVALID, '没有可用的 cookie（解析出 0 条）', 200, { field: 'cookies' });
+    if (list.length > 5000) throw new ApiError(ERR.INVALID, '单次最多 5000 条 cookie', 200, { field: 'cookies' });
+
+    const preview = body.preview === undefined ? true : ['1', 'true', 'yes'].includes(String(body.preview).toLowerCase());
+    const results = [];
+    const skipped = [];
+
+    for (const id of ids) {
+      const p = getProfile(id) || getProfileByNo(id);
+      if (!p) { skipped.push({ profile_id: String(id), reason: 'not_found' }); continue; }
+      const inst = getInstance(p.id);
+      if (!inst) { skipped.push({ profile_id: p.id, profile_no: p.profile_no, name: p.name, reason: 'not_running' }); continue; }
+      try {
+        const existing = await readCookies(inst.client);
+        const plan = planCookieWrite(existing, list, mode);
+        const base = {
+          profile_id: p.id,
+          profile_no: p.profile_no,
+          name: p.name,
+          mode: plan.mode,
+          preview,
+          existing_total: plan.existing_total,
+          incoming_total: plan.incoming_total,
+          will_add: plan.will_add,
+          will_update: plan.will_update,
+          will_delete: plan.will_delete,
+          will_keep: plan.will_keep,
+          unchanged: plan.unchanged,
+          invalid: plan.invalid,
+          sample: plan.sample,
+        };
+        if (preview) { results.push({ ...base, applied: false }); continue; }
+
+        const done = await applyCookiePlan(inst.client, plan);
+        // 写后回读：报告「实际生效了几条」，不假装全成
+        let verified = null;
+        const warnings = [];
+        try {
+          const now = await readCookies(inst.client);
+          const missing = missingAfterWrite(done.written.written, now);
+          verified = done.written.written.length - missing.length;
+          if (missing.length) {
+            warnings.push(`${missing.length} 条写入后回读不到（可能被内核按策略丢弃）：${missing.slice(0, 5).map((c) => `${c.name}@${c.domain}`).join('、')}`);
+          }
+          if (plan.mode === 'restore') {
+            const keys = new Set(now.map((c) => `${c.name}|${String(c.domain || '').replace(/^\./, '').toLowerCase()}`));
+            const left = plan._delete.filter((c) => keys.has(`${c.name}|${String(c.domain || '').replace(/^\./, '').toLowerCase()}`));
+            if (left.length) warnings.push(`${left.length} 条应当被覆盖删掉、回读却还在`);
+          }
+        } catch (e) {
+          warnings.push(`回读校验失败：${e.message}`);
+        }
+        results.push({
+          ...base,
+          applied: true,
+          written: done.written.written.length,
+          deleted: done.deleted.deleted.length,
+          write_failed: done.written.failed.length + done.deleted.failed.length,
+          failed_detail: [...done.deleted.failed, ...done.written.failed].slice(0, 20),
+          verified,
+          warnings,
+        });
+      } catch (e) {
+        skipped.push({ profile_id: p.id, profile_no: p.profile_no, name: p.name, reason: 'read_failed', error_message: e.message });
+      }
+    }
+
+    // 预览不写盘，但也把「这条会变成什么」一次算清楚；真写时额外带 verified
+    return ok({
+      mode,
+      preview,
+      list: results,
+      skipped,
+      parse_failed: parseFailed,
+      // 汇总，界面直接显示「N 个环境会 +x −y」
+      summary: {
+        targets: ids.length,
+        applied: results.filter((r) => r.applied).length,
+        planned: results.length,
+        will_add: results.reduce((n, r) => n + r.will_add, 0),
+        will_update: results.reduce((n, r) => n + r.will_update, 0),
+        will_delete: results.reduce((n, r) => n + r.will_delete, 0),
+        will_keep: results.reduce((n, r) => n + r.will_keep, 0),
+        skipped: skipped.length,
+      },
+    });
   });
 
   /* ==================== 6. AI Agent（0.4.0 骨架；对手那套在云端，见 docs/reverse 24-） ====================

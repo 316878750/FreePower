@@ -18,6 +18,7 @@
 - **回收站**（2026-11-12 第一批 ②）：删除改成**软删除**（只置 `deleted_at`、**不删 user-data**），`list`/`detail`/`start`/`update` 一律看不到已删项；`recycle-bin/list`、`recycle-bin/restore` 两条路由按逆向切片的形状落地（item 严格 6 字段、恢复要显式选 `group_id`），见第八节「回收站」
 - 自检：每个环境启动后自动跑一次真实页面探针，输出 19 项可读报告（覆盖度对齐字段表 full/partial/none），含「页面直接创建的三类 worker + 嵌套 worker」双 Realm 断言与 AudioWorklet 明确 `none`，支持 API 与本地 HTML 页。**worker 不是全覆盖**（OOPIF 子帧、启动前已在跑的 SW 仍是盲区），边界见已知限制第 6 条
 - 代理：HTTP/HTTPS/SOCKS5 绑定、账号密码认证（HTTP 代理）、**fail-closed**；PAC 明确拒绝（不支持就报错，不静默降级）；代理管理页**单条 / 批量健康检查**（出口 IP / 国家 / 延迟 / 时间，失败区分超时、认证失败、代理拒绝 CONNECT、连接被拒、DNS、TLS；批量限并发 3、单条 10s 上限，超 24h 的结果标「结果过期」）
+- **批量菜单 11 项 + 归档 + 视图密度**（0.4.3 ③）：批量改代理 / UA 内核 / 备注 / 环境信息、批量归档·恢复·删除、显示窗口、检查代理、还原 Cookie（覆盖）· 合并 Cookie（并集）；**归档 ≠ 删除**（只写 `archived_at`，不碰 `deleted_at` 与 user-data，和 `/recycle-bin/*` 是两套语义）；检查代理限并发、成功/失败/超时/直连四态分开报且超时给秒数；两种 Cookie 操作都**先预览再确认**；视图密度三档**只存 localStorage**。九条路由 `/api/v2/browser-profile/batch/*` 见第五节
 - 本地 API：`/status`、环境 CRUD、分组、标签、代理列表、浏览器启停、**批量启停（并发上限 + 失败清单 + 可中断）**、自检报告；返回值形状对齐 AdsPower（`ws.puppeteer` / `ws.selenium` / `debug_port` / `status: Active|Inactive` / `cookies` / `kernels`）
 - **Web 管理控制台**（`node:http` 直接托管，浏览器打开 `127.0.0.1:<端口>/` 即用）：环境列表（启动/停止/自检状态/批量操作）、环境编辑（11 组分栏表单，值域与必填来自后端注册表）、代理管理、自检报告、**AI Agent 面板**（一句话目标 → 动作清单 → 逐条批准 → 运行 → 每步结果）。五个页面全部只调自己的 Local API，没有私有通道
 - **AI Agent（0.4.0）**：`browser_task` 7 个动作、HITL 每步审批 + digest 绑定、工作流落盘与本地 CDP 执行、**模型真调用**（OpenAI 兼容，key 用户自填、不带内置 key）、控制台面板与截图票据取图 —— 细节见第十节
@@ -269,7 +270,7 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 
 | 页面 | 做什么 |
 |---|---|
-| 环境列表 | 启动/停止/批量启停/全部停止、运行态与端口、自检摘要、搜索与分组筛选、删除；工具条「导入」（JSON 三种形状，或 AdsPower `.txt`，按扩展名/首字符自动识别）、「导出 txt」（当前勾选或筛选结果 → AdsPower 块格式，值里的换行会替换并提示），每行「导出」JSON（保真备份）、「复制」（复制=配置原样、四个指纹种子重生） |
+| 环境列表 | 启动/停止/批量启停/全部停止、运行态与端口、自检摘要、搜索与分组筛选、删除；工具条「导入」（JSON 三种形状，或 AdsPower `.txt`，按扩展名/首字符自动识别）、「导出 txt」（当前勾选或筛选结果 → AdsPower 块格式，值里的换行会替换并提示）、**归档筛选**、**视图密度**、**「批量操作 ▾」11 项**（0.4.3 ③，见下面那节），每行「导出」JSON（保真备份）、「复制」（复制=配置原样、四个指纹种子重生） |
 | 分组管理（0.4.3 ②） | 分组列表带**环境数**（只数在用的，回收站里的不算）、新建、重命名、改备注、删除（**不删环境**：组里的环境挪回 Default，并如实回挪了几个；Default 不能删） |
 | 回收站（0.4.3 ②） | 软删除的环境（user-data 还在盘上，恢复后能直接启动）；恢复（**必须选分组**，对齐对手）+ 彻底删除 / 清空（删记录 + 删 user-data 目录，不可恢复）；分页 100/页 |
 | 环境编辑 | 11 组分栏表单（基本信息 / 浏览器与内核 / UA 与语言 / 噪声四维 / 字体 / 屏幕与硬件 / 媒体设备 / 网络与代理 / 地理定位 / 隐私开关 / 启动与缓存），保存前实时校验；Cookie 一栏带「导出 cookie（JSON / netscape）」「导入 cookie 文件」（**需要环境运行中**：cookie 在内核里，和这一栏的登录 cookie 文本不是一份数据） |
@@ -363,6 +364,75 @@ MV2 装得上但 Chrome 137+ 可能不给跑（导入时明确告警）。完整
 
 顺手改掉一处**文案与行为不一致**：列表页的「删除」原来是「本地硬删，不可恢复」，
 实际从 2026-11-12 起就是软删除（进回收站、user-data 留在盘上）。现在文案跟着行为走。
+
+### 批量菜单与视图密度（0.4.3 ③）
+
+形态依据 `28-远端UI界面结构.md`（第 195–205 行）：对手工具条上有「批量操作」清单 + 行内四项 +
+「列表设置」的视图密度。我们照它的 11 项、照它的顺序，中间用两条分隔线分三段
+（改配置 / 改列表归属 / 动运行时与登录态）：
+
+| # | 菜单项 | 做什么 | 关键约束 |
+|---|---|---|---|
+| 1 | 修改代理 | `proxy_config` 写死一条 / `proxy_id` 绑代理列表 / `clear:true` 改直连 | 写死一条回 `shared_egress:true`，界面提醒「共用同一个出口 IP」；在跑的回 `restart_required` |
+| 2 | 修改 UA / 内核 | UA 与内核大版本必须一致；只给 UA 时从**本机已装内核**里挑同大版本 | 对不上 `100002 field=ua`，不静默改其中一个 |
+| 3 | 修改备注 | 四档 `replace`（默认）/ `append` / `prefix` / `suffix` | 覆盖会删掉原有备注，界面必须提示 |
+| 4 | 更新环境信息 | 白名单 10 个基础字段 | 非白名单进 `ignored_fields` 原样回报；**指纹种子不给批量口子** |
+| 5 | 批量归档 | 写 `archived_at`，移出主列表 | **不是删除**：不碰 `deleted_at`、不碰 user-data、能启动能编辑 |
+| 6 | 批量恢复 | 从归档放回主列表 | 不是回收站恢复（那是 `/recycle-bin/restore`，且必须选分组） |
+| 7 | 批量删除 | 移入回收站 | 软删除，可以随时恢复 |
+| 8 | 显示窗口 | 批量版，不要求开同步会话 | 复用同步那套判定；`page_only` 不许说成「已置前」 |
+| 9 | 检查代理 | 限并发 + 逐条结果 | `outcome: ok\|fail\|timeout\|direct`，超时带**具体秒数** |
+| 10 | 还原 Cookie（覆盖） | 写完以文件为准，文件里没有的删掉 | **先预览再确认**，预览不带 cookie 值 |
+| 11 | 合并 Cookie（并集） | 只补文件里有、环境里没有的 | 同名**以环境现有为准**，不动登录态 |
+
+**归档与回收站是两套语义，数据层就分开**：归档写 `archived_at`、回收站写 `deleted_at`；
+归档的能启动能编辑、主列表默认看不见（选「只看已归档」）、永远不进回收站。
+`/recycle-bin/*` 一次都没复用成归档，判据里有静态断言钉住。
+另外两条边界：回收站里的不能被归档（`skipped: in_recycle_bin`），
+**归档 → 删除 → 恢复后 `archived_at` 必须清空**（否则环境会「隐身」在主列表外，用户点了恢复找不到）。
+
+**检查代理直连不算通过**：`outcome:'direct'` + `ok:false` + 「这个环境没绑代理（直连），没有代理可查」。
+检查的是代理，直连没有代理可查 —— 给它编一个「检查通过」才是骗人。
+
+**还原 vs 合并**这栏最容易做错，所以两个都默认 `preview:true`：只算不写，回「会加几条 / 改几条 / 删几条 /
+留几条 / 无效几条」，用户看数字确认之后才真写。写后**回读校验**：`verified` 是「能读回来的条数」，
+不是「发出去的条数」，读不回来的进 `warnings` 并点名。cookie 在内核里，所以**环境必须在跑**
+（与 `/cookie/import` 同一口径，不为改 cookie 偷偷起内核），没跑的进 `skipped: not_running`。
+
+**视图密度三档：紧凑 / 标准 / 超高，行高 30 / 44 / 64 px**。这三个数字是我们选的 ——
+28- 号文只给了三个名字（`fbcc2` / `standard` / `broad`），没给行高，别写成「对手原值」或「系统下限」。
+**只写 localStorage**（`fp.view_density`），不写库、不同步到别的机器：那是「这台机器上这个人看着舒服」
+的显示偏好，跟着库走会被别人的习惯覆盖。脏值一律回「标准」。
+
+九条批量路由（`/api/v2/browser-profile/batch/*`）都是**我们自己加的**（对手是云端 webui 内部接口，
+没有可抄的本地 REST）。四条纪律：`profile_ids` 缺失/拼错一律 `100002` + `field`（**绝不当成「一条都没选」**）、
+一条失败不中断整批（`failed` / `skipped` 点名到 profile_id）、超时给秒数、一次最多 500 个环境。
+
+判据：
+
+```
+node --no-warnings test/batch.test.mjs               → 70 PASS / 0 FAIL  （A 层，进 npm test）
+node --no-warnings test/batch-cookie-kernel.test.mjs → 18 PASS / 0 FAIL （B 层真内核，进 npm run smoke）
+node --no-warnings test/batch-show-kernel.test.mjs   → 13 PASS / 0 FAIL （B 层真内核，进 npm run smoke）
+```
+
+A 层 11 段：九条路由缺字段、归档七条边界、检查代理四态与并发（整批 `1200×4+3000ms` 内收口）、
+UA 自洽、备注四档、白名单、改代理三种、Cookie 纯函数（还原 `a1/u1/d1/same1/bad1`、
+合并 `a1/u0/d0/keep1`）、显示窗口 skipped、密度（30/44/64 + 脏值回标准 + 只有一处 `setItem`）、页面静态 7 条。
+Cookie B 层真内核读数：还原预览 `u1/a1/d1` 且**没写盘** → 真写 `w2/d1/verified2` →
+回读 `[["added","a"],["sid","new"]]`（`gone` 真被删）→ 合并 `w1/d0` 且 `sid` 仍是 `new`。
+显示窗口 B 层：最小化→`restored` 且位置尺寸一个像素没搬、没最小化→`page_only` 且 `os_foreground:false`、
+`force`→`confirmed:'window_restored'` 且位置回原样、默认 `force:false`、没在跑→`skipped`。
+
+这一块抓出两个**真缺陷**（都不是「测试没测到」，是测到了才发现行为与报告相反）：
+
+1. **`proxy_config: null` 被吞**：「批量改成直连」回 `code=0`，但 host/port 原样留着。
+   根因是 `updateProfile` 把 `null` 当成「没给」合并掉了。修法两处：store 里 null 走显式清空；
+   repo 加 `NULLABLE_COLS`，显式 null 照写。
+2. **只给 UA 时内核版本取错**：拿 UA 里的 `157.0.0.0` 当内核版本（后三段本来就是打码值），
+   于是报「本机没有安装内核 157.0.0.0」。改成从已装内核里挑同大版本。
+
+完整设计与逐条读数见 [17 号文档](docs/17-批量菜单与视图密度.md)。
 
 ## 六、桌面壳与安装包（P6）
 
@@ -823,6 +893,23 @@ Object.getOwnPropertyNames(window).some(n => /^__fp/.test(n))   // true → 这�
     - **页面形态**：环境管理是「一个侧栏项 + 三个页内 tab」，不是侧栏加三项（对齐对手
       `28-` 号文的 `childrenAsTabs`）。tab 是 `<a href>` + `aria-current="page"`，三条是真路由。
 
+49. **视图密度的三档行高（30 / 44 / 64 px）是我们选的，不是对手原值**（0.4.3 ③）：
+    `28-` 号文只给了三个名字（`fbcc2` / `standard` / `broad`），没给数字。数字来源要分清，
+    界面与文档都不许写成「对手/系统下限」。另外它**只存 localStorage**（`fp.view_density`），
+    不写库、不同步到别的机器 —— 那是「这台机器上这个人看着舒服」的显示偏好，跟着库走会被别人的习惯覆盖。
+
+50. **批量菜单的六条边界（0.4.3 ③，都不是「以后补」，是当前事实）**：
+    - **归档不进回收站、也不会自动清理**：归档只改变「主列表里看不看得见」，磁盘一个字节都不动；
+      要腾磁盘得先删除进回收站，再「彻底删除」。
+    - **批量 Cookie 要求环境在跑**：cookie 在内核里，不为改 cookie 偷偷起内核；没跑的进 `skipped: not_running`。
+    - **还原模式下「应当删掉却还在」只告警不重试**：内核按策略丢弃某些 cookie 时，删了也可能被写回来，
+      如实进 `warnings` 并点名，不循环重试。
+    - **批量改代理写死一条 = 这批环境共用同一个出口 IP**：响应里有 `shared_egress:true`，界面必须提醒。
+      同 IP 多开是平台最容易识别的信号之一，不该默默发生。
+    - **改 UA / 内核、改代理都要重启环境才生效**：回 `restart_required`，不偷偷重启。
+    - **一次最多 500 个环境**：批量动作是同步执行的 HTTP 请求，上千个会撞上请求超时，分两批比等超时好。
+      另外「检查代理」的并发与超时可传但被夹在 [1,10] / [1000,60000] ms 区间。
+
 
 
 - **0.4.0 及以前**：命中黑名单 / 白名单外的**顶层文档**走 `Fetch.failRequest`，浏览器显示的是 `net::ERR_BLOCKED_BY_CLIENT`（「无法访问此网站」），`page.goto(...)` 直接抛错。
@@ -853,7 +940,7 @@ npm run test
 npm run smoke
 ```
 
-当前实测（2026-11-14，本机）：`npm run test` = schema **10** + net-rules **56** + chain-rules **31** + recycle **44** + unit **85** + agent **15** + api **102** + **api-mcp 46**（0.4.2 新增）+ ui **46** + desktop **54** + kernel-download **62**（`package.json` 里那条脚本就是这十一组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（`test/proxy-chain.test.mjs`，两跳代理链）+ **24/24**（`test/workers.test.mjs`）+ **30/30**（`test/agent-smoke.test.mjs`，AI Agent 判定门 B 层，真内核）+ **9/9**（`test/session-restore.test.mjs`，会话恢复 + 启动标签不累积：真内核真重启）+ **17/17**（`test/block-page.test.mjs`，拦截页：真内核、全离线），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测（2026-11-14，本机）：`npm run test` = schema **10** + net-rules **56** + chain-rules **31** + recycle **44** + apps **54** + profiles-tabs **60** + batch **70** + unit **85** + agent **15** + api **102** + api-mcp **46** + sync-rules **95** + sync-text **51** + sync-tabs **59** + sync-window **22** + sync-arrange **67** + sync-show **55** + markers **34** + nav-fold **60** + ui **46** + desktop **59** + kernel-download **62**（`package.json` 里那条脚本就是这二十二组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（proxy-chain，两跳代理链）+ **24/24**（workers）+ **30/30**（agent-smoke）+ **9/9**（session-restore）+ **12/12**（startup-tabs）+ **17/17**（block-page，全离线）+ **18/18**（markers-kernel）+ **39/39**（sync-kernel）+ **21/21**（sync-text-kernel）+ **39/39**（sync-tabs-kernel）+ **17/17**（sync-window-kernel）+ **28/28**（sync-arrange-kernel）+ **42/42**（sync-show-kernel）+ **15/15**（apps-kernel）+ **14/14**（purge-lock-kernel）+ **18/18**（batch-cookie-kernel）+ **13/13**（batch-show-kernel），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 > 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：

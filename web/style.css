@@ -143,6 +143,35 @@ table.grid th { font-weight: 600; color: var(--ink-2); font-size: 12px; backgrou
 table.grid tr:hover td { background: #fafbfd; }
 table.grid td.actions { text-align: right; white-space: nowrap; }
 table.grid td.num { font-family: var(--mono); font-size: 12px; color: var(--ink-2); }
+
+/* ---------------- 视图密度（0.4.3 ③） ----------------
+ * 只影响列表行高，不改别的。三档的行高数字是**我们选的**（28- 号文只给了
+ * 「紧凑 / 标准 / 超高」三个名字，没给具体像素），别对用户说成「对手原值」。
+ * 偏好只存 localStorage（web/density.js），不写库、不同步。 */
+body.density-compact table.grid td, body.density-compact table.grid th { padding-top: 4px; padding-bottom: 4px; font-size: 12.5px; }
+body.density-standard table.grid td, body.density-standard table.grid th { padding-top: 8px; padding-bottom: 8px; }
+body.density-ultra table.grid td, body.density-ultra table.grid th { padding-top: 14px; padding-bottom: 14px; font-size: 13.5px; }
+body.density-compact .row-sub { display: none; }        /* 紧凑档把备注那行藏起来，否则压不住 */
+body.density-ultra .row-main { margin-bottom: 4px; }
+
+/* ---------------- 下拉菜单（批量操作） ---------------- */
+.dropdown { position: relative; display: inline-block; }
+.dropdown > .menu {
+  position: absolute; right: 0; top: calc(100% + 4px); z-index: 40;
+  background: #fff; border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(20,23,28,.14); padding: 4px; min-width: 200px; display: none;
+}
+.dropdown.open > .menu { display: block; }
+.dropdown > .menu button {
+  display: block; width: 100%; text-align: left; border: 0; background: transparent;
+  padding: 7px 10px; border-radius: 6px; font-size: 12.5px; color: var(--ink); cursor: pointer;
+}
+.dropdown > .menu button:hover { background: var(--accent-soft); color: var(--accent); }
+.dropdown > .menu button.danger { color: var(--bad); }
+.dropdown > .menu button.danger:hover { background: var(--bad-soft); }
+.dropdown > .menu button:disabled { color: var(--ink-3); cursor: not-allowed; background: transparent; }
+.dropdown > .menu .sep { height: 1px; background: var(--line-2); margin: 4px 2px; }
+.dropdown > .menu .hint { padding: 6px 10px 2px; font-size: 11px; color: var(--ink-3); }
 .empty { padding: 40px 10px; text-align: center; color: var(--ink-3); font-size: 13px; }
 
 .pill { display: inline-flex; align-items: center; gap: 4px; padding: 1px 7px; border-radius: 999px; font-size: 11px; border: 1px solid transparent; }

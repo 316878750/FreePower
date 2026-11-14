@@ -74,6 +74,11 @@ const EXT = [
   // 不对外暴露成字段（不在 repo.js 的 EXT_COLS 里）：它是存储状态，不是环境属性，
   // 出现在 v1/v2 响应里会凭空多一个键、破坏 54 条路由契约。
   { name: 'deleted_at', sqlType: 'TEXT', note: 'NULL=在用；有值=回收站（软删除时刻 ISO）' },
+  // 归档（0.4.3 ③）：**移出主列表但不算删除**。与 deleted_at 是两件事 ——
+  // 归档的 `deleted_at` 仍为空（能启动、能编辑、cookie 一个字节没动），只是默认不在主列表里。
+  // 这个列**要**出现在响应里（列表页靠它画「已归档」标签、筛选也读它，见 repo.js EXT_COLS），
+  // 所以和 deleted_at 不同：它进 EXT_COLS。
+  { name: 'archived_at', sqlType: 'TEXT', note: 'NULL=未归档；有值=已归档（移出主列表，不是删除）' },
 ];
 
 // ---- DDL ----
@@ -192,6 +197,7 @@ ${colLines.join(',\n')},
 CREATE INDEX IF NOT EXISTS idx_profiles_group ON profiles("group_id");
 CREATE INDEX IF NOT EXISTS idx_profiles_status ON profiles("status");
 CREATE INDEX IF NOT EXISTS idx_profiles_deleted ON profiles("deleted_at");
+CREATE INDEX IF NOT EXISTS idx_profiles_archived ON profiles("archived_at");
 CREATE INDEX IF NOT EXISTS idx_launches_profile ON launches(profile_id);
 CREATE INDEX IF NOT EXISTS idx_profile_extensions_ext ON profile_extensions(ext_id);
 `;

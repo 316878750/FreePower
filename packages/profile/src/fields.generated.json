@@ -52,6 +52,11 @@
         "name": "deleted_at",
         "sqlType": "TEXT",
         "note": "NULL=在用；有值=回收站（软删除时刻 ISO）"
+      },
+      {
+        "name": "archived_at",
+        "sqlType": "TEXT",
+        "note": "NULL=未归档；有值=已归档（移出主列表，不是删除）"
       }
     ]
   },
