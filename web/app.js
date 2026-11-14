@@ -9,6 +9,7 @@ import agentPage from './pages/agent.js';
 import apiPage from './pages/api.js';
 import syncPage from './pages/sync.js';
 import syncPanelPage from './pages/sync-panel.js';
+import { FOLD_KEY, parseFold, isFolded, toggleFold, writeFold } from './nav.js';
 
 const routes = [
   { re: /^\/profiles$/, nav: 'profiles', page: profilesList },
@@ -26,7 +27,54 @@ const routes = [
 
 const head = document.getElementById('page-head');
 const page = document.getElementById('page');
+const navRoot = document.getElementById('nav');
 let current = null;
+
+/* ---- 侧栏折叠 ----
+   只有带 data-fold 的组能折（现在只有「自动化」）；「常用」那组没有折叠入口，
+   所以它「不能折」是结构上做不到，不是靠一个默认值。
+   状态存 localStorage，读写都走 nav.js 的容错函数：隐私模式下写不进去也不该崩。 */
+function storage() {
+  try { return window.localStorage || null; } catch { return null; }
+}
+
+let foldState = parseFold(storage() ? storage().getItem(FOLD_KEY) : null);
+
+function applyFold() {
+  for (const group of document.querySelectorAll('.nav-group[data-fold]')) {
+    const id = group.dataset.fold;
+    const folded = isFolded(foldState, id);
+    group.classList.toggle('collapsed', folded);
+    const btn = group.querySelector('[data-fold-toggle]');
+    if (btn) {
+      btn.setAttribute('aria-expanded', folded ? 'false' : 'true');
+      btn.title = folded ? '展开' : '折叠';
+    }
+  }
+}
+
+function setFold(next) {
+  foldState = next;
+  writeFold(storage(), foldState);
+  applyFold();
+}
+
+/** 当前页在折起来的组里时把它展开 —— 不能让当前页在侧栏里看不见 */
+function revealActive() {
+  const active = document.querySelector('.nav-item.active');
+  const group = active && active.closest('.nav-group[data-fold]');
+  if (!group) return;
+  const id = group.dataset.fold;
+  if (isFolded(foldState, id)) setFold(toggleFold(foldState, id));
+}
+
+navRoot.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-fold-toggle]');
+  if (!btn) return;
+  setFold(toggleFold(foldState, btn.dataset.foldToggle));
+});
+
+applyFold();
 
 function hashPath() {
   const raw = location.hash.replace(/^#/, '') || '/profiles';
@@ -45,6 +93,7 @@ async function route() {
   for (const a of document.querySelectorAll('.nav-item')) {
     a.classList.toggle('active', a.dataset.nav === hit.nav);
   }
+  revealActive();
   current = hit;
   try {
     await hit.page({ head, page, params, navigate });
