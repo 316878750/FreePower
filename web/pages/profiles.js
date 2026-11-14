@@ -37,6 +37,24 @@ export default async function renderProfiles({ head, page }) {
   const body = h('tbody');
   const selBar = h('span', { class: 'sub' });
   const menu = batchMenu();
+  // 视图密度下拉：与侧栏底部账号菜单的「外观」是同一个设置（同一个 localStorage 键）。
+  // 两边都要能改，所以互相跟着变 —— 靠 density.js 广播的 `fp:density` 事件，不互相 import。
+  const densitySel = h('select', {
+    title: '只影响本机显示，不写库、不同步到别的机器',
+    onChange: (e) => {
+      state.density = setDensity(e.target.value);
+      paintSub();
+    },
+  },
+    ...DENSITIES.map((d) => h('option', { value: d.id, selected: state.density === d.id }, `视图：${d.label}`)));
+  document.addEventListener('fp:density', (e) => {
+    const id = e?.detail?.id;
+    if (!id || densitySel.value === id) return;
+    state.density = densityOf(id).id;
+    densitySel.value = state.density;
+    paintSub();
+  });
+
   const toolbar = h('div', { class: 'toolbar' },
     h('input', {
       type: 'text', placeholder: '搜索名称 / 编号', value: state.q,
@@ -55,14 +73,7 @@ export default async function renderProfiles({ head, page }) {
       h('option', { value: '', selected: state.archiveFilter === '' }, '未归档（主列表）'),
       h('option', { value: 'only', selected: state.archiveFilter === 'only' }, '只看已归档'),
       h('option', { value: 'include', selected: state.archiveFilter === 'include' }, '全部（含已归档）')),
-    h('select', {
-      title: '只影响本机显示，不写库、不同步到别的机器',
-      onChange: (e) => {
-        state.density = setDensity(e.target.value);
-        paintSub();
-      },
-    },
-      ...DENSITIES.map((d) => h('option', { value: d.id, selected: state.density === d.id }, `视图：${d.label}`))),
+    densitySel,
     h('span', { class: 'grow' }),
     selBar,
     menu,

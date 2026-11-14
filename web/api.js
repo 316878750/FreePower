@@ -220,6 +220,17 @@ export const api = {
   appForProfile: (id) => call('/api/v2/app/profile', { query: { profile_id: id } }),
   appSetForProfile: (id, extIds) => call('/api/v2/app/profile/set', { method: 'POST', body: { profile_id: id, ext_ids: extIds } }),
 
+  /* ---- 设置 / 网络诊断（0.4.3 ④） ---- */
+  /** 设置：目前只有「窗口同步默认设置」（真的会在 `/sync/start` 生效） */
+  settings: () => call('/api/v2/settings'),
+  /** 改同步默认设置：**合并**语义，只传要改的字段；不认识的字段会在 `ignored` 里回报 */
+  saveSyncDefaults: (patch) => call('/api/v2/settings/sync-defaults', { method: 'POST', body: patch }),
+  resetSyncDefaults: () => call('/api/v2/settings/sync-defaults/reset', { method: 'POST', body: {} }),
+  /** 网络诊断快照：**只读**（不改配置、不写库、不起停内核） */
+  diagnoseNetwork: () => call('/api/v2/diagnose/network'),
+  /** 只读探测环境绑定的代理（按 host:port:账号 去重，结果不落盘） */
+  diagnoseProxy: (opts) => call('/api/v2/diagnose/proxy', { method: 'POST', body: opts || {}, timeoutMs: 180000 }),
+
   /* ---- AI Agent（0.4.0） ---- */
   /** 一句话目标 → 工作流：等服务端调模型（默认 60s 超时），所以给足本端等待时间 */
   agentCreateFromGoal: (body) => call('/api/v1/agent/workflow/create-from-goal', { method: 'POST', body }),

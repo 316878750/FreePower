@@ -12,7 +12,10 @@ import agentPage from './pages/agent.js';
 import apiPage from './pages/api.js';
 import syncPage from './pages/sync.js';
 import syncPanelPage from './pages/sync-panel.js';
+import settingsPage from './pages/settings.js';
+import diagnosticsPage from './pages/diagnostics.js';
 import { FOLD_KEY, parseFold, isFolded, toggleFold, writeFold } from './nav.js';
+import { DENSITIES, readDensity, setDensity } from './density.js';
 
 const routes = [
   { re: /^\/profiles$/, nav: 'profiles', page: profilesList },
@@ -31,6 +34,9 @@ const routes = [
   { re: /^\/sync-panel$/, nav: 'sync', page: syncPanelPage },
   // 可选带工作流 id：刷新页面 / 从地址栏打开时还能捞回同一条工作流
   { re: /^\/agent(?:\/([^/]+))?$/, nav: 'agent', page: agentPage, params: (m) => ({ id: m[1] || null }) },
+  // 侧栏底部账号菜单的两页（0.4.3 ④）：不占侧栏分组，地址栏直达
+  { re: /^\/settings$/, nav: 'settings', page: settingsPage },
+  { re: /^\/diagnostics$/, nav: 'diagnostics', page: diagnosticsPage },
 ];
 
 const head = document.getElementById('page-head');
@@ -98,7 +104,7 @@ async function route() {
     if (m) { hit = r; params = r.params ? r.params(m) : {}; break; }
   }
   if (!hit) { location.hash = '#/profiles'; return; }
-  for (const a of document.querySelectorAll('.nav-item')) {
+  for (const a of document.querySelectorAll('.nav-item, .account-item')) {
     a.classList.toggle('active', a.dataset.nav === hit.nav);
   }
   revealActive();
@@ -116,6 +122,82 @@ export function navigate(hash) {
   if (location.hash === hash) route();
   else location.hash = hash;
 }
+
+/* ---- 侧栏底部账号菜单（0.4.3 ④）----
+   形态照逆向 `28-远端UI界面结构.md` 的侧栏底部：设置 / 外观（子菜单）/ 网络诊断。
+   对手那六项里的「邀请奖励 / 语言 / 退出登录」我们没有对应能力（无账号体系、无多语言），
+   不摆假入口 —— 设置页最后一节把这些逐条写明了。
+   「外观」用的是 ③ 的密度口径：只写 localStorage（`fp.view_density`），不新造一套存储。 */
+const accountRoot = document.getElementById('account-menu');
+
+function buildAccountMenu() {
+  if (!accountRoot) return;
+  const panelEl = h('div', { class: 'account-panel', hidden: 'hidden' });
+  const trigger = h('button', {
+    class: 'account-trigger', type: 'button', 'aria-expanded': 'false', 'aria-haspopup': 'menu',
+    onClick: (e) => { e.stopPropagation(); toggle(); },
+  },
+    h('span', { class: 'account-avatar', 'aria-hidden': 'true' }, 'FP'),
+    h('span', { class: 'account-text' },
+      h('strong', null, '本地运行'),
+      h('small', null, '设置 · 外观 · 诊断')),
+    h('span', { class: 'account-caret', 'aria-hidden': 'true' }, '▴'));
+
+  const sub = h('div', { class: 'account-sub', hidden: 'hidden' });
+  const appearanceBtn = h('button', {
+    class: 'account-item', type: 'button', 'aria-expanded': 'false',
+    onClick: (e) => {
+      e.stopPropagation();
+      const open = sub.hasAttribute('hidden');
+      if (open) sub.removeAttribute('hidden'); else sub.setAttribute('hidden', 'hidden');
+      appearanceBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      appearanceBtn.classList.toggle('open', open);
+    },
+  }, h('span', null, '外观'), h('span', { class: 'account-sub-caret', 'aria-hidden': 'true' }, '▸'));
+
+  function paintDensity() {
+    const cur = readDensity();
+    for (const el of sub.querySelectorAll('[data-density]')) {
+      el.classList.toggle('on', el.dataset.density === cur);
+      el.setAttribute('aria-checked', el.dataset.density === cur ? 'true' : 'false');
+    }
+  }
+
+  mount(sub, ...DENSITIES.map((d) => h('button', {
+    class: 'account-sub-item', type: 'button', role: 'menuitemradio', 'data-density': d.id,
+    onClick: (e) => {
+      e.stopPropagation();
+      setDensity(d.id);   // 写 localStorage + 落 DOM + 广播（列表页那个下拉框会跟着变）
+      paintDensity();
+    },
+  }, h('span', { class: 'account-check', 'aria-hidden': 'true' }, '✓'), d.label)));
+  paintDensity();
+  // 别处改了密度（列表页工具条）→ 这里跟着变
+  document.addEventListener('fp:density', paintDensity);
+
+  mount(panelEl,
+    h('a', { class: 'account-item', 'data-nav': 'settings', href: '#/settings' }, '设置'),
+    appearanceBtn,
+    sub,
+    h('a', { class: 'account-item', 'data-nav': 'diagnostics', href: '#/diagnostics' }, '网络诊断'));
+
+  function setOpen(open) {
+    panelEl.toggleAttribute('hidden', !open);
+    trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+    accountRoot.classList.toggle('open', open);
+  }
+  function toggle() { setOpen(panelEl.hasAttribute('hidden')); }
+
+  // 点菜单里的链接后收起（hashchange 也会到这一页）
+  panelEl.addEventListener('click', (e) => { if (e.target.closest('a')) setOpen(false); });
+  document.addEventListener('click', () => setOpen(false));
+  // Esc 收起，键盘用户能退出来
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') setOpen(false); });
+
+  mount(accountRoot, panelEl, trigger);
+}
+
+buildAccountMenu();
 
 /* ---- 侧栏角标：端口 + 当前在跑几个环境 ---- */
 const footPort = document.getElementById('foot-port');

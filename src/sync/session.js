@@ -24,6 +24,7 @@ import {
 } from './arrange.js';
 import { screensForArrange } from './displays.js';
 import { planForce, planShow, summarizeForce, summarizeShow, verifyForced, verifyShown } from './show.js';
+import { DEFAULT_SETTINGS, normalizeSettings } from './settings.js';
 import {
   closeTabAt, isBlankUrl, listTabs, navigateAt, openTabFor,
   parseOpenUrls, planCloseBlank, planCloseOthers, planUnify, settle, targetIndex, visibleTabIndex,
@@ -48,72 +49,9 @@ export function getSession() {
   return current;
 }
 
-/** 默认设置：键鼠四开关全开、无延迟；文本三个开关按对手面板的默认（相同文本/粘贴开，人工输入/随机数字关） */
-export const DEFAULT_SETTINGS = Object.freeze({
-  input: true,
-  click: true,
-  scroll: true,
-  move: true,
-  /* ---- 文本输入：四个开关互相独立，别合并（语义见 text-input.js） ---- */
-  text_sync: true,        // 相同文本输入
-  typing: false,          // 模拟人工输入（逐字 + 随机间隔）
-  paste: true,            // 粘贴同步
-  random_number: false,   // 随机数字输入（每窗口各自一个数，替换原文）
-  typing_min_ms: 30,
-  typing_max_ms: 120,
-  random_min: 1000,
-  random_max: 9999,
-  /* ---- 标签页 ----
-   * `same_tab` 是**内部**字段、默认 true、**面板不暴露**：按序号对应是「同步」成立的前提，
-   * 关掉这个能力没有使用场景（对手界面上也没有这个开关，实测 `28-远端UI界面结构.md:156-161`
-   * 的标签区只有「统一标签页 / 关闭其他 / 关闭当前标签页 / 关闭空白标签页 / 打开网址
-   * + 首个网址在当前标签页打开」）。
-   * 「目标空白」同理**不是开关**：先开空白页再导航是**首帧指纹的硬约束**，
-   * 不是可选项 —— 去掉关闭分支，两个分支迟早腐化成一个（和拦截页不加开关同一个理由）。
-   */
-  same_tab: true,
-  current_tab_url: false, // 首个网址在当前标签页打开（syncOperateCurrentTabURL）
-  delay_ms: 0,
-  jitter_ms: 0,
-});
-
-export function normalizeSettings(raw = {}) {
-  const bool = (v, dflt) => (v === undefined ? dflt : v === true || v === 'true' || v === 1 || v === '1');
-  const num = (v, dflt) => {
-    const n = Number(v);
-    return Number.isFinite(n) && n >= 0 ? Math.min(n, 5000) : dflt;
-  };
-  /* 文本相关的数值上限大得多（随机数可以到十亿位、打字间隔到 2 秒），
-   * 不能复用 num() 的 5000 上限 —— 否则「随机数 1–99999」会被静默改成 5000。 */
-  const int = (v, dflt, lo, hi) => {
-    const n = Math.round(Number(v));
-    return Number.isFinite(n) ? Math.min(Math.max(n, lo), hi) : dflt;
-  };
-  let typingMin = int(raw.typing_min_ms, DEFAULT_SETTINGS.typing_min_ms, 0, 2000);
-  let typingMax = int(raw.typing_max_ms, DEFAULT_SETTINGS.typing_max_ms, 0, 2000);
-  if (typingMin > typingMax) [typingMin, typingMax] = [typingMax, typingMin];
-  let randMin = int(raw.random_min, DEFAULT_SETTINGS.random_min, 0, 1e9);
-  let randMax = int(raw.random_max, DEFAULT_SETTINGS.random_max, 0, 1e9);
-  if (randMin > randMax) [randMin, randMax] = [randMax, randMin];
-  return {
-    input: bool(raw.input, true),
-    click: bool(raw.click, true),
-    scroll: bool(raw.scroll, true),
-    move: bool(raw.move, true),
-    text_sync: bool(raw.text_sync, true),
-    typing: bool(raw.typing, false),
-    paste: bool(raw.paste, true),
-    random_number: bool(raw.random_number, false),
-    typing_min_ms: typingMin,
-    typing_max_ms: typingMax,
-    random_min: randMin,
-    random_max: randMax,
-    same_tab: bool(raw.same_tab, true),
-    current_tab_url: bool(raw.current_tab_url, false),
-    delay_ms: num(raw.delay_ms, 0),
-    jitter_ms: num(raw.jitter_ms, 0),
-  };
-}
+/* 默认设置与归一化在 `./settings.js`（0.4.3 ④ 的「设置」页要单独读它，
+ * 而 `prefs.js → session.js` 会把整个运行时拖进来）。这里原样再导出，对外契约不变。 */
+export { DEFAULT_SETTINGS, normalizeSettings };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

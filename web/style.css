@@ -77,6 +77,50 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .nav-item:hover { background: #22262d; text-decoration: none; }
 .nav-item.active { background: var(--accent); color: #fff; }
 .sidebar-foot { margin-top: auto; padding: 6px; border-top: 1px solid #262a31; display: grid; gap: 2px; }
+
+/* ---- 侧栏底部账号菜单（0.4.3 ④）：菜单向上弹，因为它在侧栏最底下 ---- */
+.account-menu { position: relative; margin-top: 6px; }
+.account-trigger {
+  width: 100%; display: flex; align-items: center; gap: 8px; padding: 6px 6px;
+  border: 1px solid transparent; border-radius: 6px; background: transparent;
+  color: #c8cfd8; cursor: pointer; text-align: left; font: inherit;
+}
+.account-trigger:hover, .account-menu.open .account-trigger { background: #22262d; border-color: #2d333c; }
+.account-avatar {
+  width: 22px; height: 22px; border-radius: 50%; background: var(--accent); color: #fff;
+  font-size: 10px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center;
+  flex: none;
+}
+.account-text { display: flex; flex-direction: column; line-height: 1.25; min-width: 0; }
+.account-text strong { font-size: 12px; color: #e6eaef; font-weight: 600; }
+.account-text small { font-size: 10.5px; color: #78828f; }
+.account-caret { margin-left: auto; font-size: 9px; color: #78828f; transition: transform .12s ease; }
+.account-menu.open .account-caret { transform: rotate(180deg); }
+.account-panel {
+  position: absolute; left: 4px; right: 4px; bottom: calc(100% + 6px); z-index: 30;
+  background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 4px;
+  box-shadow: 0 8px 24px rgba(20, 23, 28, .16); display: grid; gap: 2px;
+}
+.account-panel[hidden] { display: none; }
+.account-item {
+  display: flex; align-items: center; gap: 6px; width: 100%; padding: 6px 8px;
+  border: 0; border-radius: 5px; background: transparent; color: var(--ink); font: inherit;
+  font-size: 12.5px; text-align: left; cursor: pointer; text-decoration: none;
+}
+.account-item:hover, .account-item.active { background: var(--accent-soft); color: var(--accent); }
+.account-sub-caret { margin-left: auto; font-size: 9px; color: var(--ink-3); transition: transform .12s ease; }
+.account-item.open .account-sub-caret { transform: rotate(90deg); }
+.account-sub { display: grid; gap: 1px; padding: 2px 0 4px 14px; }
+.account-sub[hidden] { display: none; }
+.account-sub-item {
+  display: flex; align-items: center; gap: 6px; padding: 5px 8px; border: 0; border-radius: 5px;
+  background: transparent; color: var(--ink-2); font: inherit; font-size: 12px;
+  text-align: left; cursor: pointer;
+}
+.account-sub-item:hover { background: #f4f6f9; }
+.account-sub-item.on { color: var(--accent); font-weight: 600; }
+.account-check { width: 10px; display: inline-block; visibility: hidden; }
+.account-sub-item.on .account-check { visibility: visible; }
 .muted { color: var(--ink-3); }
 .small { font-size: 12px; }
 .mono { font-family: var(--mono); font-size: 12px; }

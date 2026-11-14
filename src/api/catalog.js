@@ -36,6 +36,8 @@ const NOUN = new Map([
   ['fb', 'Facebook'],
   ['api', '本地 API'],
   ['sync', '窗口同步'],
+  ['settings', '设置'],
+  ['diagnose', '网络诊断'],
 ]);
 
 /** 最后一个路径段（动作）→ 中文 */
@@ -121,9 +123,23 @@ function segments(pathname) {
   return out;
 }
 
+/**
+ * 少数路径按「整条」写死说明：这些路由的段名复用得太厉害，
+ * 按词表拼会拼出反义（比如 `settings/sync-defaults/reset` 的 `reset` 会被翻成「重置 Key」）。
+ * 写死的只是**这几条**，其余仍从路由表派生。
+ */
+const DESC_OVERRIDE = new Map([
+  ['/api/v2/settings', '设置 · 读取（同步默认设置等）'],
+  ['/api/v2/settings/sync-defaults', '设置 · 改窗口同步默认设置（合并语义）'],
+  ['/api/v2/settings/sync-defaults/reset', '设置 · 恢复内置同步默认'],
+  ['/api/v2/diagnose/network', '网络诊断 · 网络 / 内核 / 端口快照（只读）'],
+  ['/api/v2/diagnose/proxy', '网络诊断 · 探测环境绑定的代理（只读，不落盘）'],
+]);
+
 /** 一句话说明：名词段按词表翻，动作段按词表翻，翻不出来就原样给英文段 */
 export function describePath(pathname) {
   if (pathname === '/status') return '服务状态（免鉴权）';
+  if (DESC_OVERRIDE.has(pathname)) return DESC_OVERRIDE.get(pathname);
   const segs = segments(pathname);
   if (!segs.length) return String(pathname);
   const last = segs[segs.length - 1];

@@ -24,6 +24,7 @@
 - **AI Agent（0.4.0）**：`browser_task` 7 个动作、HITL 每步审批 + digest 绑定、工作流落盘与本地 CDP 执行、**模型真调用**（OpenAI 兼容，key 用户自填、不带内置 key）、控制台面板与截图票据取图 —— 细节见第十节
 - 未实现的云端透传接口（分享、成员体系…）**明确报「不支持」**（`code:-1` + `data.supported:false`），不假成功、不留未知码。**现在这条清单实际是 14 条**（`src/api/routes.js` 的 `placeholders` 数组，2026-11-13 逐个数过）：原来这类有 46 条，回收站两条已本地实现（2026-11-12），**内核下载已本地实现**（2026-11-13，走 Chrome for Testing，见第十一节），其余云端依赖的同类项合并后剩 14 条 —— 数字按实际数组算，不按历史回执抄（旧回执里写过的 44 / 17 / 15 都不再作为当前值）。
 - **桌面版**：Electron 壳（单实例 / 托盘 / 关窗不退出 / 开机自启开关 / 退出前必清残留内核）+ NSIS 安装包，不需要 VS 编译链
+- **侧栏底部账号菜单 + 设置 + 网络诊断**（0.4.3 ④）：设置（窗口同步默认设置存库并真的用在「开始同步」上、全局快捷键、外观=视图密度、本地 API 摘要，**没做的项逐条写明**）、网络诊断（**只读**：服务 / 监听端口 / 内核 / 绑在环境上的代理探测，不写库、不起停内核、探测不落盘），见第五节
 
 ### 不做（已和 CEO 确认，写进范围外）
 
@@ -265,8 +266,9 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 
 `npm start` 之后浏览器直接打开 `http://127.0.0.1:<端口>/`（端口看 `data/local_api`）。不用装任何东西，也没有第二套进程。
 
-七个页面（其中「环境管理」是**一个侧栏项 + 三个页内 tab**：环境列表 / 分组管理 / 回收站 ——
-形态照逆向 `28-远端UI界面结构.md` 里对手的 `environmentManagement.tabs`，侧栏没有二级展开菜单）：
+十二个页面（其中「环境管理」是**一个侧栏项 + 三个页内 tab**：环境列表 / 分组管理 / 回收站 ——
+形态照逆向 `28-远端UI界面结构.md` 里对手的 `environmentManagement.tabs`，侧栏没有二级展开菜单；
+最后两页「设置」「网络诊断」不占侧栏分组，从**侧栏底部的账号菜单**进）：
 
 | 页面 | 做什么 |
 |---|---|
@@ -280,6 +282,8 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 | API & MCP（0.4.2） | 本地 API 状态（地址 / key 显示·复制·重置 / **验证开关** / 请求计数）、端点清单（从路由表派生，可搜可按分组筛，标出「不支持」那批）、MCP 配置（Claude Desktop / Cursor / Codex 三段，端口与 key 自动填，可一键复制） |
 | 窗口同步（0.4.2 阶段 1） | 选主窗口 + 受控窗口 → 开始/停止；四个同步开关（输入 / 点击 / 滚动 / 移动）与延迟、抖动，**运行中改立刻生效**；实时读数（转发条数、被开关拦下、已发出/待发）；**窗口尺寸不一致显著提示 + 一键统一尺寸**；另有独立置顶小面板（`#/sync-panel`，桌面壳里是单独小窗，全程不抢焦点）与全局快捷键（默认 `Ctrl+Alt+S`，可改） |
 | 应用中心（0.4.3 ①） | 扩展库：导入（粘本机目录或 `.zip` 路径，**不是上传**）、启用/停用、改名、删除、看「被几个环境用」与落盘目录；环境编辑页里勾「这个环境用哪些」。文件全局共享一份，启用状态是环境级的，见 [15 号文档](docs/15-应用中心与扩展.md) |
+| 设置（0.4.3 ④） | 窗口同步的**默认设置**（14 个开关/数值，存库、`/sync/start` 真的读它）、全局快捷键、外观（= 视图密度，与列表页同一个 localStorage 键）、本地 API 摘要；最后一节**逐条列出没做的项**（语言 / 主题 / 自动更新 / 退出登录 / 开机自启在别处）并说明原因 |
+| 网络诊断（0.4.3 ④） | **只读**：服务（版本 / pid / 运行时长 / 内存 / 数据库 + WAL 字节数 / API 计数）、本产品自己的监听端口（本地 API + 各运行中环境的 CDP）、内核（已装 / 运行中 / 出口 IP）、绑在环境上的代理（按钮探测，按 host:port:账号 去重，三态分开、超时给秒数、**不落盘**） |
 
 三条设计约束（都不是口号，代码里能对得上）：
 
@@ -433,6 +437,45 @@ Cookie B 层真内核读数：还原预览 `u1/a1/d1` 且**没写盘** → 真�
    于是报「本机没有安装内核 157.0.0.0」。改成从已装内核里挑同大版本。
 
 完整设计与逐条读数见 [17 号文档](docs/17-批量菜单与视图密度.md)。
+
+### 侧栏底部账号菜单：设置 / 外观 / 网络诊断（0.4.3 ④）
+
+形态照 `28-号文` §2 的「侧栏底部（账号菜单）」：对手那六项里我们做三项，其余三项**不摆假入口**
+（没有账号体系就没有「邀请奖励 / 退出登录」，没有多语言就没有「语言」），
+设置页最后一节把它们逐条写出来：状态 + 为什么 + 入口在哪。
+
+菜单**向上弹**（它在侧栏最底下），`aria-haspopup` / `aria-expanded` / `role="menuitemradio"` 都有，
+Esc 能收起。
+
+**网络诊断只读，写在三个地方**（不是只写在文档里）：
+
+1. **代码里零写操作**：`src/api/diagnose.js` 只 `stat`、只读内存表、只调纯探测；
+   判据剥掉注释后扫 `setMeta(` / `updateProfile(` / `startProfile(` / `stopProfile(` /
+   `writeFileSync` / `rmSync` / `rememberProxyCheck(`，一个都不许出现。
+2. **行为验**：连读两次快照，环境 / 代理 / 设置**逐字节不变**。
+3. **探测不落盘**：`/api/v2/diagnose/proxy` 与代理管理页那条**不是同一条路**（后者会写
+   `last_ip` / `checked_at`），响应里明写 `readonly:true` + `persisted:false`，
+   判据比对探测前后 `checked_at` 没变。
+
+还有一条：**不为了出一份报告去起内核** —— 只报「现在在跑什么」，没跑就是空数组，
+诊断页也不会因为想看内核就帮用户启动环境。端口**只列本产品自己的**，不扫全机端口。
+代理账号**打码**、密码连字段名都不出现（这页会被截图发给别人）。
+
+**设置页的项都要真生效**：同步默认设置存进库（`meta.sync_defaults`），`/api/v2/sync/start`
+没显式给 settings 时用它，`/sync/status` 没在跑时显示的也是它 —— 判据直接验 `mergeSyncSettings()`
+的合并结果，并静态断言 start 路由用的是它。存坏的 JSON 回默认但**如实说**（`broken:true`，
+页面提示「已回内置默认」）。
+
+**顺手修掉一处「说了但没做」**：同步页在「没在跑」时改开关，原来弹「已记住，开始同步后生效」，
+实际什么都没存 —— 刷新就丢，那句提示等于骗人。现在它真存进库，设置页看得见同一份。
+
+**外观沿用 ③ 的密度口径**：同一个 `fp.view_density`、同一套三档，不新造存储。
+两个入口（列表页工具条的下拉、侧栏菜单的「外观」）靠一条 `fp:density` 事件互相同步，
+不在两边互相 import。
+
+判据 `test/settings-diagnose.test.mjs` **56 PASS / 0 FAIL**（A 层，不起内核，已进 `npm test`），
+七段：设置合并与越界、真生效、存坏了、快照内容与只读、代理探测三态与不落盘、静态约束、纯函数契约。
+完整设计见 [18 号文档](docs/18-侧栏账号菜单-设置-外观-网络诊断.md)。
 
 ## 六、桌面壳与安装包（P6）
 
@@ -910,6 +953,27 @@ Object.getOwnPropertyNames(window).some(n => /^__fp/.test(n))   // true → 这�
     - **一次最多 500 个环境**：批量动作是同步执行的 HTTP 请求，上千个会撞上请求超时，分两批比等超时好。
       另外「检查代理」的并发与超时可传但被夹在 [1,10] / [1000,60000] ms 区间。
 
+51. **设置页只摆真生效的项；没做的逐条写明（0.4.3 ④）**：
+    - **没有主题切换**：只有一套浅色配色。深色主题要重做整套 CSS 变量并逐页核对对比度，
+      不是加一个开关的事 —— 设置页的「没做」表里写着，不摆一个点了没反应的按钮。
+    - **没有界面多语言**：文案直接写在代码里、只有中文。
+    - **没有自动更新**：升级方式是装新版本安装包（升级说明里写了怎么退回去）。
+    - **没有「退出登录」**：纯本地产品，没有账号体系，也就没有登录态可退。
+    - **「开机自启」入口在桌面版托盘菜单里**，不在设置页 —— 网页端没有 Electron 能力，
+      重复摆一个只在桌面版生效的开关，用户会以为是坏的。
+    - **设置里没有「恢复全部默认」总按钮**：现在只有同步默认那一组有 reset，
+      等有第二组再谈总开关，免得先做一个管不到东西的按钮。
+    - **诊断不扫全机端口、不查系统代理设置**：只报本产品自己的监听端口。
+      系统代理是环境启动时读的东西，诊断页不去动它（动了就是「顺手改配置」）。
+    - **代理探测只探「绑在环境上的」**：代理列表里没绑到任何环境的代理不在诊断范围里，
+      要检查那些去代理管理页（那边会记最近结果）。
+
+52. **`DEFAULT_SETTINGS` / `normalizeSettings` 搬到了 `src/sync/settings.js`（0.4.3 ④）**：
+    `session.js` **原样再导出**，所以对外契约没变（判据断言两边是**同一个对象**，不是两份长得一样的常量）。
+    搬家的原因：`src/settings/prefs.js` 要读默认值，而 `prefs.js → session.js` 会把整个运行时
+    （CDP 客户端、内核管理器）拖进来，`session.js` 又要用 prefs —— 一个循环。
+    以后加设置项，**改 `settings.js`，别改回 `session.js`**。
+
 
 
 - **0.4.0 及以前**：命中黑名单 / 白名单外的**顶层文档**走 `Fetch.failRequest`，浏览器显示的是 `net::ERR_BLOCKED_BY_CLIENT`（「无法访问此网站」），`page.goto(...)` 直接抛错。
@@ -940,7 +1004,7 @@ npm run test
 npm run smoke
 ```
 
-当前实测（2026-11-14，本机）：`npm run test` = schema **10** + net-rules **56** + chain-rules **31** + recycle **44** + apps **54** + profiles-tabs **60** + batch **70** + unit **85** + agent **15** + api **102** + api-mcp **46** + sync-rules **95** + sync-text **51** + sync-tabs **59** + sync-window **22** + sync-arrange **67** + sync-show **55** + markers **34** + nav-fold **60** + ui **46** + desktop **59** + kernel-download **62**（`package.json` 里那条脚本就是这二十二组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（proxy-chain，两跳代理链）+ **24/24**（workers）+ **30/30**（agent-smoke）+ **9/9**（session-restore）+ **12/12**（startup-tabs）+ **17/17**（block-page，全离线）+ **18/18**（markers-kernel）+ **39/39**（sync-kernel）+ **21/21**（sync-text-kernel）+ **39/39**（sync-tabs-kernel）+ **17/17**（sync-window-kernel）+ **28/28**（sync-arrange-kernel）+ **42/42**（sync-show-kernel）+ **15/15**（apps-kernel）+ **14/14**（purge-lock-kernel）+ **18/18**（batch-cookie-kernel）+ **13/13**（batch-show-kernel），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测（2026-11-14，本机）：`npm run test` = schema **10** + net-rules **56** + chain-rules **31** + recycle **44** + apps **54** + profiles-tabs **60** + batch **70** + settings-diagnose **56** + unit **85** + agent **15** + api **102** + api-mcp **46** + sync-rules **95** + sync-text **51** + sync-tabs **59** + sync-window **22** + sync-arrange **67** + sync-show **55** + markers **34** + nav-fold **60** + ui **46** + desktop **59** + kernel-download **62**（`package.json` 里那条脚本就是这二十三组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（proxy-chain，两跳代理链）+ **24/24**（workers）+ **30/30**（agent-smoke）+ **9/9**（session-restore）+ **12/12**（startup-tabs）+ **17/17**（block-page，全离线）+ **18/18**（markers-kernel）+ **39/39**（sync-kernel）+ **21/21**（sync-text-kernel）+ **39/39**（sync-tabs-kernel）+ **17/17**（sync-window-kernel）+ **28/28**（sync-arrange-kernel）+ **42/42**（sync-show-kernel）+ **15/15**（apps-kernel）+ **14/14**（purge-lock-kernel）+ **18/18**（batch-cookie-kernel）+ **13/13**（batch-show-kernel），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 > 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：

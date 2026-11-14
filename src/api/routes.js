@@ -42,7 +42,9 @@ import { readReportFile, summarize } from '../selfcheck/store.js';
 import { renderHtml } from '../selfcheck/html.js';
 import { issueTicket } from './tickets.js';
 import { apiInfoPayload, setApiVerify, resetStats } from './info.js';
-import { startSync, stopSync, syncStatus, updateSettings, refreshAll, unifySize, arrangeWindows, showWindows, forceShowWindows, openTabInAll, tabState, closeTabs, copyTabToSlaves, unifyTabs } from '../sync/session.js';
+import { startSync, stopSync, syncStatus, updateSettings, refreshAll, unifySize, arrangeWindows, showWindows, forceShowWindows, openTabInAll, tabState, closeTabs, copyTabToSlaves, unifyTabs, DEFAULT_SETTINGS } from '../sync/session.js';
+import { readSyncDefaults, writeSyncDefaults, resetSyncDefaults, syncDefaultsDiff, mergeSyncSettings } from '../settings/prefs.js';
+import { networkSnapshot, probeBoundProxies } from './diagnose.js';
 import { readDisplays } from '../sync/displays.js';
 import { readHotkeyStatus, requestHotkey } from '../sync/hotkey.js';
 import { showWindowsOfProfiles } from '../sync/batch-show.js';
@@ -1301,6 +1303,74 @@ export function buildRoutes() {
     });
   });
 
+  /* ==================== 4.9 设置（0.4.3 ④） ====================
+   *
+   * 只放**真的有行为在用**的偏好，且都在服务端生效：
+   *   - `sync_defaults`：窗口同步的默认设置。`/api/v2/sync/start` 没显式给 settings 时用它，
+   *     所以它是「改了确实会变」的，不是装饰。
+   *
+   * 界面自己的显示偏好（视图密度、侧栏折叠）**不进这里**：那些只存 localStorage，
+   * 服务端读不到、也不需要读（见 web/density.js / web/nav.js 的头注释）。
+   */
+
+  /** 读设置：一次给全（目前只有同步默认），并如实说「存过没有 / 存坏了没有」 */
+  add(['GET'], ['/api/v2/settings'], () => {
+    const r = readSyncDefaults();
+    return ok({
+      sync_defaults: r.settings,
+      sync_defaults_saved: r.saved,
+      // 存坏了：界面要显式提示「已回默认」，不能静默当没事
+      sync_defaults_broken: r.broken,
+      sync_defaults_diff: syncDefaultsDiff(),
+    });
+  });
+
+  /**
+   * 改同步默认设置（**合并**语义：只传要改的字段）。
+   * 归一化复用 `/sync/settings` 那一套 —— 越界值夹回区间，不在第二个地方另写一份规则。
+   * 不认识的字段**如实回报**在 `ignored` 里，不静默吞掉（否则用户以为改了）。
+   */
+  add(['POST'], ['/api/v2/settings/sync-defaults'], (ctx) => {
+    const b = ctx.body || {};
+    const raw = b.settings && typeof b.settings === 'object' ? b.settings : b;
+    const ignored = Object.keys(raw).filter((k) => k !== 'settings' && !(k in DEFAULT_SETTINGS));
+    const r = writeSyncDefaults(raw);
+    return ok({ settings: r.settings, saved: true, changed: r.changed, ignored });
+  });
+
+  /** 恢复内置默认（清掉已存的那份）。同步会话正在跑也不动它 —— 只影响下一次开始同步 */
+  add(['POST'], ['/api/v2/settings/sync-defaults/reset'], () => {
+    const r = resetSyncDefaults();
+    return ok({ settings: r.settings, saved: false });
+  });
+
+  /* ==================== 4.10 网络诊断（0.4.3 ④，只读） ====================
+   *
+   * 诊断只回答「现在是什么样」，**不许顺手改任何东西**：
+   * 不写库、不改代理、不起停内核（逻辑全在 `src/api/diagnose.js`，那边有静态判据扫）。
+   */
+  add(['GET'], ['/api/v2/diagnose/network'], (ctx) => ok(networkSnapshot(ctx)));
+
+  /**
+   * 探测当前绑在环境上的代理（按 host:port:user 去重）。
+   * `readonly:true` / `persisted:false` 写在响应里，不是只写在文档里：
+   * 这条**不记 last_check**，与代理管理页那条会落盘的路由不是同一条。
+   */
+  add(['POST'], ['/api/v2/diagnose/proxy'], async (ctx) => {
+    const b = ctx.body || {};
+    const ids = b.profile_ids ?? b.profile_id;
+    let profileIds = null;
+    if (ids !== undefined && ids !== null && ids !== '') {
+      profileIds = Array.isArray(ids) ? ids.map(String) : idList(ids, 'v2');
+      if (!profileIds.length) throw new ApiError(ERR.INVALID, 'profile_ids 不能为空', 200, { field: 'profile_ids' });
+    }
+    return ok(await probeBoundProxies({
+      profileIds,
+      timeoutMs: b.timeout_ms,
+      concurrency: b.concurrency,
+    }));
+  });
+
   /* ==================== 6. AI Agent（0.4.0 骨架；对手那套在云端，见 docs/reverse 24-） ====================
    *
    * 三条路由都是**我们自己的契约**（对手没有可抄的本地 REST：它是 5.3 MB Agent Core 子进程
@@ -1492,10 +1562,15 @@ export function buildRoutes() {
       throw new ApiError(ERR.INVALID, 'slave_ids must be a non-empty array', 200, { field: 'slave_ids' });
     }
     try {
+      /*
+       * 「设置」页存的**默认设置**在这里生效（0.4.3 ④）：没显式给 settings 时用它，
+       * 给了就覆盖在上面（缺的字段仍取默认）。
+       * 这样「设置」页上的开关不是装饰 —— 改了，下一次开始同步就按新值走。
+       */
       return ok(await startSync({
         masterId,
         slaveIds: rawSlaves,
-        settings: b.settings && typeof b.settings === 'object' ? b.settings : {},
+        settings: mergeSyncSettings(b.settings),
         rngSeed: b.rng_seed ?? null,
       }));
     } catch (e) {
@@ -1506,8 +1581,16 @@ export function buildRoutes() {
   /** 停止同步：没在跑也回 200（幂等），界面不用先查状态再关 */
   add(['POST'], ['/api/v2/sync/stop'], async () => ok(await stopSync()));
 
-  /** 同步状态：没在跑也给稳定形状（running:false + 默认设置），界面不用到处判空 */
-  add(['GET'], ['/api/v2/sync/status'], () => ok(syncStatus()));
+  /**
+   * 同步状态：没在跑也给稳定形状（running:false + 设置），界面不用到处判空。
+   * 没在跑时回的是**「设置」页存的那份默认**（不是写死的常量）——
+   * 否则用户改了默认，面板上显示的却还是内置值，等于界面在骗人。
+   */
+  add(['GET'], ['/api/v2/sync/status'], () => {
+    const st = syncStatus();
+    if (!st.running) st.settings = readSyncDefaults().settings;
+    return ok(st);
+  });
 
   /**
    * 运行中改设置（四个开关 / 延迟）。**不重开会话** —— 重开等于把用户已经打开的标签

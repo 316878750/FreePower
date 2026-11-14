@@ -226,7 +226,22 @@ export default async function renderSync({ head, page }) {
 
   async function applySettings(patch) {
     state.settings = { ...state.settings, ...patch };
-    if (!state.status?.running) { toast('已记住，开始同步后生效'); return; }
+    if (!state.status?.running) {
+      /*
+       * 没在跑时改开关：**真的存起来**（0.4.3 ④ 的「同步默认设置」），不是只在本页记着。
+       * 之前这里写的是「已记住，开始同步后生效」，但什么都没存 —— 刷新页面就丢，
+       * 那句提示等于骗人。现在它写进库，`/sync/start` 会用它，设置页也看得见同一份。
+       */
+      try {
+        const r = await api.saveSyncDefaults(patch);
+        state.settings = { ...state.settings, ...(r?.settings || {}) };
+        toast('已存为默认设置，开始同步时生效', 'ok');
+      } catch (e) {
+        toast(`保存失败：${e.message}`, 'bad');
+        await reload(false);
+      }
+      return;
+    }
     try {
       const r = await api.syncSettings(patch);
       state.settings = { ...state.settings, ...(r?.settings || {}) };

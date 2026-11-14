@@ -66,5 +66,16 @@ export function applyDensity(id, doc) {
 export function setDensity(id, { storage, doc } = {}) {
   const saved = writeDensity(id, storage);
   applyDensity(saved, doc);
+  /*
+   * 密度现在有两个入口（列表页工具条的「视图」下拉、侧栏底部账号菜单的「外观」），
+   * 两个入口必须互相同步，否则会出现「菜单里选了紧凑、下拉框还显示标准」。
+   * 用一条自定义事件通知，谁在显示这个值谁自己更新 —— 比在两边互相 import 干净。
+   */
+  try {
+    const target = doc || (typeof document !== 'undefined' ? document : null);
+    if (target && typeof target.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
+      target.dispatchEvent(new CustomEvent('fp:density', { detail: { id: saved } }));
+    }
+  } catch { /* 没有 DOM（node 里跑判据）就只是不广播 */ }
   return saved;
 }
