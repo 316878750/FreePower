@@ -520,7 +520,77 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 44. **0.3.2 及更早的安装包没有 FreePower 的版本资源，`FreePower.exe` 在文件属性里显示的是 Electron**：【实】用户机器上现装的 0.3.2（`%LOCALAPPDATA%\Programs\freepower\FreePower.exe`，`249,831,936` B）的 `VersionInfo` 是 `ProductName=Electron` / `FileVersion=45.2.3` / `CompanyName=GitHub, Inc.` —— 说明那些包当年也是 `signAndEditExecutable=false` 打出来的（与 0.4.0 草稿同一个坑）。**0.4.1 起才由 rcedit 写进 `ProductName=FreePower` / `FileVersion=0.4.1` / `ProductVersion=0.4.1.0`**（0.4.0 的正式包 `4010CF47…` 是第一次修好的）。记这条的用处：将来有人拿老包的版本资源跟新包对比，**别以为是我们把版本资源改坏了 —— 老包本来就没有**；也解释了为什么用户装了两年没发现这件事。
 
 
-### 0.4.1 破坏性变更：被拦的顶层文档从「网络错误」变成「一张页面」
+### 已修：`__fp*` 固定名标记（P0，2026-11-14）
+
+**修之前是什么样**：注入层在 `window` / `self` 上挂了 **7 个固定名字**的诊断标记 ——
+`__fpApplied` / `__fpInstalled` / `__fpRealm` / `__fpSeeds` / `__fpSeed` / `__fpMediaMode` / `__fpFontsDeclared`。
+对手网站一行 JS 就能认出我们：
+
+```js
+Object.getOwnPropertyNames(window).some(n => /^__fp/.test(n))   // true → 这是 FreePower
+```
+
+其中 `__fpInstalled` 还是**普通赋值**（`window.__fpInstalled = true`），**可枚举** ——
+`for (const k in window)` 也能看见。而 `__fpSeed`（`= CFG.seed`）**全仓库零消费者**，纯粹是白送的检测面。
+
+**为什么是 P0**：这个洞**每个环境、每个页面、每次打开**都在，不需要用户做任何事。
+窗口同步那条只在同步时暴露 1ms，这个是常驻的 —— 性质上比同步那条严重。
+
+**修法**：
+
+1. **`__fpSeed` 直接删**，零消费者。
+2. 其余 6 个 + 2 个 DEBUG 标记改成**按 `fp_seed` 派生的每环境随机名**：
+   `_` + 8 位小写 hex，例如 `_01cfcea1`。**不含 `fp` 子串、没有 `__` 前缀** ——
+   看起来就是页面上一个随手起的临时变量，不是我们的签名。
+   派生：`sha256("freepower|marker|<种类>|<seed>").slice(0,8)`，实现在 `src/kernel/markers.js`。
+   **同一个环境必须稳定**（刷新前后名字不变 —— 名字每次都变本身就是另一个信号），
+   不同环境必须不同（跨环境关联不起来）。
+3. **全部走 `defineProperty({enumerable:false, configurable:false})`**，
+   `installed` 那条不再用普通赋值。
+4. 名字由主进程算好、作为常量塞进注入源（`const MK = {...}`）——
+   **页面里没有我们的哈希实现**可供比对。
+5. worker 那份探针脚本整体包进 IIFE，`MK` 不落到 worker 的全局词法环境
+   （站点 worker 与我们共享全局作用域，`typeof MK` 会变成新的检测面）。
+
+**判据**（两层，都能复跑）：
+
+| 层 | 跑法 | 断言 |
+|---|---|---|
+| A（纯 node，34 条） | `npm run test:markers` | 派生形状/稳定性/跨环境差异；注入源代码行里 0 个 `__fp` 字面量（注释允许）；沙箱里 `getOwnPropertyNames` 与 `for...in` 都看不到 `__fp*`；派生名确实挂上且不可枚举 |
+| B（真内核，18 条） | `npm run test:markers-kernel`（**也已挂在 `npm run smoke` 里**） | 真页面 `own names 993 条里 __fp* 0 条`、`for...in 0 条`；**专用 worker / SharedWorker / ServiceWorker 各 0 条**；同环境两次启动名字相同；两个环境名字不同 |
+
+**判据本身也跟着改名**（4 条冻结判据，只改「名字怎么来」，断言一条不减）：
+`test/smoke.mjs`（`注入已生效` ×3 + `新开标签完成注入`）、`tools/p9c-judge.mjs`（`[C1]`）、
+`test/nav-type.test.mjs`、`test/media-label.test.mjs` 都改成
+`markerNames(fingerprintView(getProfile(id)).seed)` 现算，**文件里不写死任何派生名**
+（写死一个派生名等于换个固定名，检测面还在）。smoke 的三个国家环境各算各的，不共用模板。
+
+**先红后绿（读数）**：
+- A 层 6 个变异全部被抓住（改回固定名 → 红 9 条；派生不随种子 → 红 1 条；
+  `installed` 改回普通赋值 → 红 1 条；标记改成可枚举 → 红 1 条；`__fpSeed` 加回去 → 红 3 条；名字加 `__` 前缀 → 红 3 条）。
+- 真内核反向：把名字改回固定名 → **18 条里红 7 条**，读到的固定名是
+  `__fpFontsDeclared,__fpApplied,__fpSeeds,__fpRealm,__fpInstalled`，三类 worker 各 4 条。
+- **4 条判据的反向验证**（把 `inject.js` 里写 `applied` 标记的那一行注释掉，等于注入不写标记）：
+  nav-type `4 passed, 1 failed`（`applied="undefined"`）、media-label `15 passed, 1 failed`、
+  p9c-judge `[C1]` FAIL（`applied:"undefined"`，判据 20/21 → 结论 FAIL）、
+  smoke `144/152`（US/JP/SG 注入已生效 = `null`、新开标签完成注入 = `null`，
+  另外 4 条自检断言跟着红 —— 同一个原因，不是另一处坏）。还原后全部回绿。
+
+**已知残留（如实记）**：
+- 窗口同步的 binding 名仍是 `__fpS_<8位hex>`（**前缀 `__fpS_` 是固定的**）。
+  它随机、抓到引用后立刻 `delete`（实测暴露窗口 1ms），但名字形状本身带签名。
+  2026-11-14 定为**阶段 2 的第一件事**：换成不带 `fp` 的形状，单独一笔提交（不与 P0 混），
+  判据至少两条 —— 运行中名字形状不带 `__fp`/`fp`、停止后页面里查不到（沿用已有的 `removeBinding` 判据）。
+- 拦截页自己的 `window.__fpBlock` **不在范围内**：那是我们自己渲染的拦截页，不是被检测的网站页面。
+
+其余已知限制（继续编号）：
+
+
+45. **注入层的诊断标记不再是固定名**（接上面「已修：`__fp*` 固定名标记」）：自检页、宿主、判据读这些标记时，
+    一律用 `markerNames(fp_seed)` 派生，**不许再写死名字**。判据里有一条静态扫描专门防回流：
+    `inject.js` / `manager.js` / `probe.js` / `worker-probe.js` 的**代码行**里出现 `__fp` 字面量就红。
+
+
 
 - **0.4.0 及以前**：命中黑名单 / 白名单外的**顶层文档**走 `Fetch.failRequest`，浏览器显示的是 `net::ERR_BLOCKED_BY_CLIENT`（「无法访问此网站」），`page.goto(...)` 直接抛错。
 - **0.4.1 起**：同一个请求变成 **HTTP 200 + 我们自己的拦截页 HTML**，地址栏停在原 URL，`goto` 正常返回。

@@ -7,6 +7,7 @@ import {
 import { findChrome, buildArgs, launchChrome, waitForDevToolsPort, killProcessTree, rememberVersion } from '../kernel/chrome.js';
 import { CdpClient, fetchJson } from '../kernel/cdp.js';
 import { buildInjectionSource, buildWorkerInjectionSource } from '../kernel/inject.js';
+import { markerNames, installedExpression, workerRealmExpression } from '../kernel/markers.js';
 import { compileNetRules, decideRequest } from '../kernel/net-rules.js';
 import { blockPageResponse } from '../kernel/block-page.js';
 import { alignProfileToKernel } from '../kernel/version.js';
@@ -419,6 +420,9 @@ export async function startProfile(profile, { force = false, systemProxy = null 
 async function injectAndOpen(instance, profile, view) {
   const client = instance.client;
   const profileId = instance.profile_id;
+  /* 诊断标记名按 fp_seed 派生：每环境不同、同环境稳定。
+   * 全仓库不再有固定的 `__fp*` 名 —— 固定名等于给对手一行判定代码（P0）。 */
+  const markers = markerNames(view?.seed);
 
   /** targetId -> { prep, sessionId } */
   const pageReady = new Map();
@@ -459,7 +463,7 @@ async function injectAndOpen(instance, profile, view) {
   async function verifyInjectedAfterNav(sessionId) {
     try {
       const r = await client.send('Runtime.evaluate', {
-        expression: 'window.__fpInstalled === true',
+        expression: installedExpression(markers),
         returnByValue: true,
       }, sessionId);
       if (r?.result?.value === true) return true;
@@ -670,8 +674,8 @@ async function injectAndOpen(instance, profile, view) {
         );
       }
     }
-    // 末行回显 __fpRealm：注入真跑过才等于 'worker'，这是「真值」而不是「发过就算」
-    const expression = buildWorkerInjectionSource(view, { debug: FP_DEBUG }) + '\n;(self.__fpRealm || null)';
+    // 末行回显 realm 标记：注入真跑过才等于 'worker'，这是「真值」而不是「发过就算」
+    const expression = buildWorkerInjectionSource(view, { debug: FP_DEBUG, markers }) + `\n;${workerRealmExpression(markers)}`;
     const pending = client
       .send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: false }, sessionId)
       .then((r) => ({ ok: true, r }), (e) => ({ ok: false, error: e.message }));
@@ -720,7 +724,7 @@ async function injectAndOpen(instance, profile, view) {
       if (blank) scheduleBlankReload({ targetId: targetInfo.targetId, sessionId });
       else if (!repairedTargets.has(targetInfo.targetId)) {
         repairedTargets.add(targetInfo.targetId);
-        await ensureInjectedOrReload(client, sessionId).catch(() => {});
+        await ensureInjectedOrReload(client, sessionId, markers).catch(() => {});
       }
     })();
     pageReady.set(targetInfo.targetId, { prep, sessionId });
@@ -779,7 +783,7 @@ async function injectAndOpen(instance, profile, view) {
         }
       } else if (entry) {
         // 空白页不会再有新文档，补一次重载让注入脚本跑上
-        await ensureInjected(client, entry.sessionId);
+        await ensureInjected(client, entry.sessionId, markers);
       }
     }
   }
@@ -791,7 +795,7 @@ async function injectAndOpen(instance, profile, view) {
     if (!entry) throw new Error('新页面没有被 auto-attach 接住');
     await entry.prep.catch(() => {});
     // 首个 about:blank 文档早于脚本注册，先确认注入真的生效，再决定要不要导航
-    await ensureInjected(client, entry.sessionId);
+    await ensureInjected(client, entry.sessionId, markers);
     if (url && url !== 'about:blank') {
       await client.send('Page.navigate', { url }, entry.sessionId)
         .catch((e) => log(profileId, 'navigate 失败', url, e.message));
@@ -824,11 +828,11 @@ async function injectAndOpen(instance, profile, view) {
  * `Runtime.runIfWaitingForDebugger`，页面照样 load 完），于是我们注册的脚本永远赶不上首文档。
  * 也就是说这条路上「零额外加载」做不到，能消掉的只有 reload 标记。
  */
-async function ensureInjectedOrReload(client, sessionId, timeoutMs = 2500) {
+async function ensureInjectedOrReload(client, sessionId, markers, timeoutMs = 2500) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const r = await client.send('Runtime.evaluate', {
-      expression: 'typeof window.__fpApplied + "|" + document.readyState',
+      expression: `typeof window[${JSON.stringify(markers.applied)}] + "|" + document.readyState`,
       returnByValue: true,
     }, sessionId).catch(() => null);
     const [applied, ready] = String(r?.result?.value ?? '').split('|');
@@ -848,9 +852,9 @@ async function ensureInjectedOrReload(client, sessionId, timeoutMs = 2500) {
  * 确认这张页面的「当前文档」真跑过注入；没有就重载一次等新文档。
  * 注意重载会丢掉页面里的状态，只对空白页/我们自己的内部页用。
  */
-async function ensureInjected(client, sessionId) {
+async function ensureInjected(client, sessionId, markers) {
   const r = await client.send('Runtime.evaluate', {
-    expression: 'window.__fpInstalled === true',
+    expression: installedExpression(markers),
     returnByValue: true,
   }, sessionId).catch(() => null);
   if (r?.result?.value === true) return true;
@@ -931,7 +935,7 @@ async function applyToSession(client, sessionId, profile, view, { proxyAuth = tr
   // waitForDebuggerOnStart 让 worker 停在首行之前，注入完再放行 —— 宁可多几毫秒，不留裸窗口。
   await client.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, s)
     .catch((e) => log(instance_profile(profile), 'worker auto-attach 失败', e.message));
-  await client.send('Page.addScriptToEvaluateOnNewDocument', { source: buildInjectionSource(view, { debug: FP_DEBUG }) }, s);
+  await client.send('Page.addScriptToEvaluateOnNewDocument', { source: buildInjectionSource(view, { debug: FP_DEBUG, markers: markerNames(view?.seed) }) }, s);
 
   if (view.ua) {
     await client.send('Emulation.setUserAgentOverride', {

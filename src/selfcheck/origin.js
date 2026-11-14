@@ -18,20 +18,25 @@
  */
 import http from 'node:http';
 import { workerScript, serviceWorkerScript, workletModule } from './worker-probe.js';
+import { markerNames } from '../kernel/markers.js';
 
 const PAGE = '<!doctype html><html><head><meta charset="utf-8"><title>FreePower selfcheck</title></head><body>FreePower selfcheck</body></html>';
 
 /** 路由表：路径 → { body, type, headers } */
-function routes() {
+function routes(markers) {
   return {
-    '/fp-worker.js': { body: workerScript(), type: 'text/javascript; charset=utf-8' },
-    '/fp-sw.js': { body: serviceWorkerScript(), type: 'text/javascript; charset=utf-8', headers: { 'service-worker-allowed': '/' } },
-    '/fp-worklet.js': { body: workletModule(), type: 'text/javascript; charset=utf-8' },
+    '/fp-worker.js': { body: workerScript(markers), type: 'text/javascript; charset=utf-8' },
+    '/fp-sw.js': { body: serviceWorkerScript(markers), type: 'text/javascript; charset=utf-8', headers: { 'service-worker-allowed': '/' } },
+    '/fp-worklet.js': { body: workletModule(markers), type: 'text/javascript; charset=utf-8' },
   };
 }
 
-export async function openSelfcheckOrigin() {
-  const table = routes();
+/**
+ * @param {object} [opt]
+ * @param {object} [opt.markers] 按 fp_seed 派生的诊断标记名（与被测环境一致，否则探针读不到注入标记）
+ */
+export async function openSelfcheckOrigin({ markers = markerNames() } = {}) {
+  const table = routes(markers);
   const server = http.createServer((req, res) => {
     const url = String(req.url || '/').split('?')[0];
     const hit = table[url];

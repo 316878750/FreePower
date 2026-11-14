@@ -1713,9 +1713,9 @@
       "coverage": "none",
       "effect": "inject",
       "effectSites": [
-        "src/kernel/inject.js#Object.defineProperty(window, '__fpFontsDeclared'"
+        "src/kernel/inject.js#Object.defineProperty(window, MK.fontsDeclared"
       ],
-      "inert": "注入层只把列表挂成 window.__fpFontsDeclared（自检页拿它比对「声明的字体」），没有禁用/过滤；页面能枚举到的字体一条不变",
+      "inert": "注入层只把列表挂成一条按种子的派生名（不可枚举，自检页拿它比对「声明的字体」），没有禁用/过滤；页面能枚举到的字体一条不变",
       "note": "[\"all\"] 是特殊值（不过滤）；语义是黑名单 DisabledFonts",
       "evidence": "实测"
     },

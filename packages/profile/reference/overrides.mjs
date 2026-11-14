@@ -283,8 +283,8 @@ export const EFFECT = {
   // 字体：CDP 路线的结构性硬伤
   fonts: {
     effect: 'inject',
-    sites: ['src/kernel/inject.js#Object.defineProperty(window, \'__fpFontsDeclared\''],
-    inert: '注入层只把列表挂成 window.__fpFontsDeclared（自检页拿它比对「声明的字体」），没有禁用/过滤；页面能枚举到的字体一条不变',
+    sites: ['src/kernel/inject.js#Object.defineProperty(window, MK.fontsDeclared'],
+    inert: '注入层只把列表挂成一条按种子的派生名（不可枚举，自检页拿它比对「声明的字体」），没有禁用/过滤；页面能枚举到的字体一条不变',
   },
   disabled_fonts: { effect: 'none', inert: '全 src 零读取（只在校验与详情视图里出现）' },
 

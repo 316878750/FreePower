@@ -54,11 +54,16 @@ export async function withProbe(fn) {
 
   const manager = await import('../../src/runtime/manager.js');
   const profiles = await import('../../src/store/profiles.js');
+  const { fingerprintView } = await import('../../src/fingerprint/view.js');
+  const { markerNames } = await import('../../src/kernel/markers.js');
   let client = null;
   let profileId = null;
   try {
     const created = profiles.createProfile({ name: `probe-${Date.now()}`, group_id: '0', remark: 'P9 真机探针' });
     profileId = created.profile_id;
+    /* 诊断标记名按 fp_seed 派生（P0：页面里不再有固定的 __fp* 名）。
+     * 判据要读「这张页注入过没有」，就得用与注入层同一份派生 —— 种子从库里取。 */
+    const markers = markerNames(fingerprintView(profiles.getProfile(profileId)).seed);
     const started = await manager.startProfile(profiles.getProfile(profileId));
     console.log(`环境 ${profileId} · 内核 ${started.real_version}`);
     const inst = manager.getInstance(profileId);
@@ -84,7 +89,7 @@ export async function withProbe(fn) {
     };
 
     await fn({
-      evalIn, nav, grant, client, profileId,
+      evalIn, nav, grant, client, profileId, markers,
       URL_A: `http://127.0.0.1:${port}/a`,
       URL_B: `http://localhost:${port}/b`,
     });

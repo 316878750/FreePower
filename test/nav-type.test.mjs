@@ -8,7 +8,7 @@
  *
  * 这里只判**用户/页面能观测到的那一面**：
  *   ① `navigation.type` 是 `navigate`（修前实测是 `reload`）；
- *   ② 注入仍然生效（`__fpApplied` 是 object）；
+ *   ② 注入仍然生效（按该环境 fp_seed 派生的「注入完成」标记是 object，见 src/kernel/markers.js）；
  *   ③ hardwareConcurrency 是配置值（首帧不是宿主值）。
  *
  * 同时**判**文档请求次数 = 2：这条路径即使去掉了 reload 标记，仍然是两次文档加载
@@ -35,11 +35,14 @@ await new Promise((r) => srv.listen(0, '127.0.0.1', r));
 const port = srv.address().port;
 
 try {
-  await withProbe(async ({ client, profileId }) => {
+  await withProbe(async ({ client, profileId, markers }) => {
     const { getProfile } = await import('../src/store/profiles.js');
     const { fingerprintView } = await import('../src/fingerprint/view.js');
     const view = fingerprintView(getProfile(profileId));
     const wantHc = Number(view.hardware_concurrency);
+    /* 注入标记名按这个环境的 fp_seed 派生（P0：页面里没有固定的 __fp* 名）。
+     * 名字从 markers 拿，不写死 —— 写死一个派生名等于换个固定名，检测面还在。 */
+    const APPLIED = `window[${JSON.stringify(markers.applied)}]`;
 
     const path = '/nav-type.html';
     const url = `http://127.0.0.1:${port}${path}`;
@@ -49,7 +52,7 @@ try {
       let seen = { ready: '', applied: '', navType: '', hc: '', href: '' };
       for (let i = 0; i < 120; i++) {
         const r = await client.send('Runtime.evaluate', {
-          expression: 'document.readyState + "|" + typeof window.__fpApplied + "|" + (performance.getEntriesByType("navigation")[0] || {}).type + "|" + navigator.hardwareConcurrency + "|" + location.href',
+          expression: `document.readyState + "|" + typeof ${APPLIED} + "|" + (performance.getEntriesByType("navigation")[0] || {}).type + "|" + navigator.hardwareConcurrency + "|" + location.href`,
           returnByValue: true,
         }, sessionId).catch(() => null);
         const [ready, applied, navType, hc, href] = String(r?.result?.value ?? '').split('|');
@@ -64,7 +67,7 @@ try {
 
       check('CDP 直建带 URL 的页面：navigation.type 是 navigate（修前是 reload）',
         seen.navType === 'navigate', `实测 ${seen.navType}`);
-      check('CDP 直建带 URL 的页面：注入生效（__fpApplied 是 object）',
+      check('CDP 直建带 URL 的页面：注入生效（注入完成标记是 object）',
         seen.applied === 'object', JSON.stringify(seen));
       check('CDP 直建带 URL 的页面：hardwareConcurrency 是配置值',
         Number(seen.hc) === wantHc, `实测 ${seen.hc}，配置 ${wantHc}`);

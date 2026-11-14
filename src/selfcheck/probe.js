@@ -6,10 +6,16 @@
  * 不联网（WebRTC 不配 STUN），所以代理环境里也能跑，不依赖出口接口。
  */
 import { REALM_RECIPE } from './worker-probe.js';
+import { markerNames } from '../kernel/markers.js';
 
-export function buildProbeSource() {
+/**
+ * @param {object} [markers] 按 fp_seed 派生的诊断标记名（src/kernel/markers.js）。
+ *   不传就按默认种子算 —— **绝不回落到固定名**（固定名等于给对手一行判定代码）。
+ */
+export function buildProbeSource(markers = markerNames()) {
   return `(async () => {
   'use strict';
+  const MK = ${JSON.stringify(markers)};
   const out = {};
   const hashStr = (str) => {
     let h = 2166136261 >>> 0;
@@ -42,11 +48,11 @@ export function buildProbeSource() {
     innerWidth: window.innerWidth, innerHeight: window.innerHeight,
   };
   out.isSecureContext = !!window.isSecureContext;
-  out.mediaMode = window.__fpMediaMode || null;
-  out.applied = window.__fpApplied ? Array.prototype.slice.call(window.__fpApplied) : [];
-  out.seeds = window.__fpSeeds || null;
-  out.fontsDeclared = window.__fpFontsDeclared || null;
-  out.installed = !!window.__fpInstalled;
+  out.mediaMode = window[MK.mediaMode] || null;
+  out.applied = window[MK.applied] ? Array.prototype.slice.call(window[MK.applied]) : [];
+  out.seeds = window[MK.seeds] || null;
+  out.fontsDeclared = window[MK.fontsDeclared] || null;
+  out.installed = !!window[MK.installed];
 
   /* ---------- UA-CH ---------- */
   try {

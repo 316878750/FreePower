@@ -9,6 +9,7 @@
  * 跑法：npm run test:cdp-page
  */
 import { withProbe, makeChecker, finish, sleep } from './helpers/profile-probe.mjs';
+import { markerNames } from '../src/kernel/markers.js';
 
 const { results, check } = makeChecker();
 try {
@@ -16,6 +17,8 @@ try {
     const { getProfile } = await import('../src/store/profiles.js');
     const { fingerprintView } = await import('../src/fingerprint/view.js');
     const view = fingerprintView(getProfile(profileId));
+    // 诊断标记名按 fp_seed 派生（P0：页面里不再有固定的 __fp* 名）
+    const mk = markerNames(view.seed);
     const wantHc = Number(view.hardware_concurrency);
     const wantLang = String((view.language || [])[0] || '').toLowerCase();
     const url = `${URL_A}?cdp-created=1`;
@@ -27,7 +30,7 @@ try {
       let seen = { applied: '', ready: '', hc: '', lang: '', href: '' };
       for (let i = 0; i < 80; i++) {
         const r = await client.send('Runtime.evaluate', {
-          expression: 'typeof window.__fpApplied + "|" + document.readyState + "|" + navigator.hardwareConcurrency + "|" + navigator.language + "|" + location.href',
+          expression: `typeof window[${JSON.stringify(mk.applied)}] + "|" + document.readyState + "|" + navigator.hardwareConcurrency + "|" + navigator.language + "|" + location.href`,
           returnByValue: true,
         }, sessionId).catch(() => null);
         const [applied, ready, hc, lang, href] = String(r?.result?.value ?? '').split('|');
@@ -37,7 +40,7 @@ try {
       }
       console.log(`\nCDP 直建页面：${JSON.stringify(seen)}`);
 
-      check('CDP 直建带 URL 的页面：注入最终生效（__fpApplied 是 object）', seen.applied === 'object', JSON.stringify(seen));
+      check('CDP 直建带 URL 的页面：注入最终生效（派生的 applied 标记是 object）', seen.applied === 'object', JSON.stringify(seen));
       check('CDP 直建带 URL 的页面：hardwareConcurrency 是配置值，不是宿主值',
         Number(seen.hc) === wantHc, `实测 ${seen.hc}，配置 ${wantHc}`);
       check('CDP 直建带 URL 的页面：navigator.language 是配置值',

@@ -73,6 +73,8 @@ const URL_MAIN = `http://127.0.0.1:${PORT}/page`;
 const manager = await import('../src/runtime/manager.js');
 const profiles = await import('../src/store/profiles.js');
 const sync = await import('../src/sync/session.js');
+const { markerNames } = await import('../src/kernel/markers.js');
+const { fingerprintView } = await import('../src/fingerprint/view.js');
 
 const started = [];
 let instA = null;
@@ -168,12 +170,16 @@ try {
     console.log(`环境 ${name} = ${p.profile_id} · 内核 ${st.real_version}`);
   }
   [instA, instB] = [manager.getInstance(started[0]), manager.getInstance(started[1])];
+  /* P0 起诊断标记名按 fp_seed 派生（页面里不再有固定的 __fp* 名）：
+   * 判据读「注入过没有」必须用同一份派生，否则读到的永远是 undefined。 */
+  const mkA = markerNames(fingerprintView(profiles.getProfile(started[0])).seed);
+  const mkB = markerNames(fingerprintView(profiles.getProfile(started[1])).seed);
   pageA = await instA.openPage(URL_MAIN);
   pageB = await instB.openPage(URL_MAIN);
   // 等内核把启动尺寸应用完再动手，否则我们的 resize 会被它自己覆盖（实测过）
   await sleep(2200);
 
-  const applied = await evalIn(instA, pageA.sessionId, 'typeof window.__fpApplied');
+  const applied = await evalIn(instA, pageA.sessionId, `typeof window[${JSON.stringify(mkA.applied)}]`);
   check('主窗口页面注入生效（后面所有断言的前提）', applied === 'object', String(applied));
 
   /* ------------------------------ 8a：统一尺寸，按元素 id 命中 ------------------------------ */
@@ -310,13 +316,13 @@ try {
     let seen = { applied: '', nav: '', entries: 0 };
     for (let i = 0; i < 60; i++) {
       const v = await evalIn(instB, att.sessionId,
-        'typeof window.__fpApplied + "|" + ((performance.getEntriesByType("navigation")[0]||{}).type || "") + "|" + performance.getEntriesByType("navigation").length');
+        `typeof window[${JSON.stringify(mkB.applied)}] + "|" + ((performance.getEntriesByType("navigation")[0]||{}).type || "") + "|" + performance.getEntriesByType("navigation").length`);
       const [applied2, nav, entries] = String(v).split('|');
       seen = { applied: applied2, nav, entries: Number(entries) };
       if (applied2 === 'object' && nav) break;
       await sleep(100);
     }
-    check('新标签首个文档 __fpApplied 就是 object（注入没被首帧绕过）', seen.applied === 'object', JSON.stringify(seen));
+    check('新标签首个文档 applied 标记就是 object（注入没被首帧绕过）', seen.applied === 'object', JSON.stringify(seen));
     check('新标签 navigation.type === navigate（不是 reload）', seen.nav === 'navigate', seen.nav);
     check('新标签只加载一次文档（navigation 条目 = 1）', seen.entries === 1, String(seen.entries));
   }

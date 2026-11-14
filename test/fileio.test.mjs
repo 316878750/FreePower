@@ -30,6 +30,9 @@ process.env.FREEPOWER_EGRESS_TIMEOUT = '1000';
 const { createApiServer } = await import('../src/api/server.js');
 const { CdpClient } = await import('../src/kernel/cdp.js');
 const { buildProbeSource } = await import('../src/selfcheck/probe.js');
+const { markerNames } = await import('../src/kernel/markers.js');
+const { getProfile } = await import('../src/store/profiles.js');
+const { fingerprintView } = await import('../src/fingerprint/view.js');
 
 const { results, check } = (() => {
   const results = [];
@@ -71,13 +74,15 @@ const HASH_KEYS = ['canvas', 'webgl_image', 'audio', 'client_rects'];
 /** 起环境 → 连 CDP 开一张注入好的页 → 读四个噪点哈希 + 声明值 */
 async function hashOf(startData) {
   const c = await CdpClient.connect(startData.ws.puppeteer);
+  // 诊断标记名按 fp_seed 派生（P0：页面里没有固定的 __fp* 名）；种子从库里取，与注入层同源
+  const mk = markerNames(fingerprintView(getProfile(startData.profile_id)).seed);
   try {
     const { targetId } = await c.send('Target.createTarget', { url: 'about:blank' });
     const { sessionId } = await c.send('Target.attachToTarget', { targetId, flatten: true });
     await c.send('Page.enable', {}, sessionId).catch(() => {});
     // 等注入生效（空白页由产品的补重载兜底）
     for (let i = 0; i < 60; i++) {
-      const r = await c.send('Runtime.evaluate', { expression: 'typeof window.__fpApplied', returnByValue: true }, sessionId).catch(() => null);
+      const r = await c.send('Runtime.evaluate', { expression: `typeof window[${JSON.stringify(mk.applied)}]`, returnByValue: true }, sessionId).catch(() => null);
       if (r?.result?.value === 'object') break;
       await sleep(100);
     }
@@ -90,12 +95,12 @@ async function hashOf(startData) {
         lang: navigator.language,
         screen: screen.width + '_' + screen.height,
         hc: navigator.hardwareConcurrency,
-        applied: typeof window.__fpApplied
+        applied: typeof window[${JSON.stringify(mk.applied)}]
       })`,
       returnByValue: true,
     }, sessionId);
     const probe = await c.send('Runtime.evaluate', {
-      expression: buildProbeSource(), returnByValue: true, awaitPromise: true,
+      expression: buildProbeSource(mk), returnByValue: true, awaitPromise: true,
     }, sessionId);
     const v = probe?.result?.value || {};
     return {

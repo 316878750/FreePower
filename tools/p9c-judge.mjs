@@ -204,6 +204,7 @@ async function childMain(mode, outFile, keep) {
   const manager = await import(pathToFileURL(path.join(FP_REPO, 'src/runtime/manager.js')).href);
   const profiles = await import(pathToFileURL(path.join(FP_REPO, 'src/store/profiles.js')).href);
   const { fingerprintView } = await import(pathToFileURL(path.join(FP_REPO, 'src/fingerprint/view.js')).href);
+  const { markerNames } = await import(pathToFileURL(path.join(FP_REPO, 'src/kernel/markers.js')).href);
 
   let profileId = null;
   let cdp = null;
@@ -223,6 +224,9 @@ async function childMain(mode, outFile, keep) {
     obs.env = { profile_id: profileId, real_version: started.real_version, ws: String(inst.wsUrl || '').replace(/\/devtools\/browser\/.*/, '/devtools/browser/***') };
     const view = fingerprintView(profiles.getProfile(profileId));
     obs.config = { media: view.media, hardware_concurrency: view.hardware_concurrency, language: view.language };
+    /* 注入完成标记的名字按这个环境的 fp_seed 派生（P0：页面里没有固定的 __fp* 名）。
+     * 不写死派生名 —— 写死等于换个固定名，检测面还在。 */
+    const APPLIED = `window[${JSON.stringify(markerNames(view.seed).applied)}]`;
 
     cdp = await MiniCdp.connect(inst.wsUrl, { timeoutMs: 15000 });
     const sendB = (m, p = {}) => cdp.send(m, p);
@@ -286,7 +290,7 @@ async function childMain(mode, outFile, keep) {
     let cdpSeen = null;
     for (let i = 0; i < 60; i++) {
       const r = await send2('Runtime.evaluate', {
-        expression: "(() => { const n = performance.getEntriesByType('navigation')[0] || {}; return JSON.stringify({ applied: typeof window.__fpApplied, ready: document.readyState, hc: navigator.hardwareConcurrency, lang: navigator.language, nav_type: n.type || null, href: location.href }); })()",
+        expression: `(() => { const n = performance.getEntriesByType('navigation')[0] || {}; return JSON.stringify({ applied: typeof ${APPLIED}, ready: document.readyState, hc: navigator.hardwareConcurrency, lang: navigator.language, nav_type: n.type || null, href: location.href }); })()`,
         returnByValue: true,
       }).catch(() => null);
       const v = r && r.result ? r.result.value : null;

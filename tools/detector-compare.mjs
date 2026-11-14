@@ -32,8 +32,9 @@ process.env.FREEPOWER_EGRESS_TIMEOUT = process.env.FREEPOWER_EGRESS_TIMEOUT || '
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** 页面内取指标：只用标准 API，两遍跑同一份，才能相减 */
-const METRICS = `(() => {
+/** 页面内取指标：只用标准 API，两遍跑同一份，才能相减。
+ *  诊断标记名按该环境的 fp_seed 派生（P0：页面里没有固定的 `__fp*` 名），所以源按 markers 现生成。 */
+const metricsSource = (mk) => `(() => {
   const h = (d) => { let x = 2166136261 >>> 0; for (let i = 0; i < d.length; i++) { x ^= d[i]; x = Math.imul(x, 16777619) >>> 0; } return x.toString(16); };
   function canvasHash() {
     const c = document.createElement('canvas'); c.width = 200; c.height = 80;
@@ -54,9 +55,9 @@ const METRICS = `(() => {
   let voices = [];
   try { voices = (speechSynthesis.getVoices() || []).map((v) => v.lang + ':' + v.name); } catch {}
   return {
-    injected: Boolean(self.__fpInstalled),
-    realm: self.__fpRealm || null,
-    applied: (self.__fpApplied || []).join(','),
+    injected: Boolean(self[${JSON.stringify(mk.installed ?? '')}]),
+    realm: self[${JSON.stringify(mk.realm ?? '')}] || null,
+    applied: (self[${JSON.stringify(mk.applied ?? '')}] || []).join(','),
     ua: navigator.userAgent,
     platform: navigator.platform,
     hc: navigator.hardwareConcurrency,
@@ -100,6 +101,8 @@ function pickLines(text) {
 async function runOurs() {
   const { startProfile, stopProfile, getInstance } = await import('../src/runtime/manager.js');
   const { createProfile, getProfile, deleteProfiles } = await import('../src/store/profiles.js');
+  const { fingerprintView } = await import('../src/fingerprint/view.js');
+  const { markerNames } = await import('../src/kernel/markers.js');
   fs.mkdirSync(DATA, { recursive: true });
   const created = createProfile({ name: `detect-ours-${Date.now()}`, group_id: '0', remark: '外部检测对照' });
   const id = created.profile_id;
@@ -107,13 +110,15 @@ async function runOurs() {
   try {
     const started = await startProfile(getProfile(id));
     inst = getInstance(id);
+    /* 标记名与注入层同源：同一个环境的 fp_seed 派生 */
+    const mk = markerNames(fingerprintView(getProfile(id)).seed);
     const { sessionId } = await inst.openPage(TARGET);
     const evalIn = async (expr, extra = {}) => {
       const r = await inst.client.send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true, ...extra }, sessionId);
       return r.exceptionDetails ? null : r.result.value;
     };
     await sleep(WAIT_MS);
-    const metrics = await evalIn(METRICS);
+    const metrics = await evalIn(metricsSource(mk));
     const text = (await evalIn('document.body.innerText')) || '';
     return { ok: true, chrome: started.real_version, metrics, picks: pickLines(text), text };
   } catch (e) {
@@ -128,6 +133,8 @@ async function runPlain() {
   const { findChrome, launchChrome, waitForDevToolsPort, killProcessTree, buildArgs } = await import('../src/kernel/chrome.js');
   const { CdpClient, fetchJson } = await import('../src/kernel/cdp.js');
   const { createProfile } = await import('../src/store/profiles.js');
+  const { fingerprintView } = await import('../src/fingerprint/view.js');
+  const { markerNames } = await import('../src/kernel/markers.js');
   const UDD = path.join(ROOT, '.tmp', 'detector-plain-udd');
   fs.rmSync(UDD, { recursive: true, force: true });
   fs.mkdirSync(UDD, { recursive: true });
@@ -150,7 +157,8 @@ async function runPlain() {
       return r.exceptionDetails ? null : r.result.value;
     };
     await sleep(WAIT_MS);
-    const metrics = await evalIn(METRICS);
+    // 基线不注入，标记名照样按这个环境的种子算 —— 读到的就是「没有注入」那一面
+    const metrics = await evalIn(metricsSource(markerNames(fingerprintView(prof).seed)));
     const text = (await evalIn('document.body.innerText')) || '';
     return { ok: true, chrome: chrome.version, metrics, picks: pickLines(text), text };
   } catch (e) {

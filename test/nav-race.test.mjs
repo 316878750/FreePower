@@ -18,6 +18,8 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { makeChecker, finish, sleep } from './helpers/profile-probe.mjs';
+import { markerNames } from '../src/kernel/markers.js';
+import { fingerprintView } from '../src/fingerprint/view.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { check, results } = makeChecker();
@@ -100,14 +102,17 @@ async function openBlankTarget() {
   return { targetId, sessionId };
 }
 
-const navReport = `(() => {
+/* 诊断标记名按 fp_seed 派生（P0：页面里不再有固定的 __fp* 名）。
+ * 环境建好之后才算得出来，所以判据源码用函数生成。 */
+let MK = null;
+const navReport = () => `(() => {
   let navType = null;
   try { navType = performance.getEntriesByType('navigation')[0]?.type ?? null; } catch (e) {}
   return {
     href: location.href,
     text: ((document.body && document.body.textContent) || '').slice(0, 300),
     navType,
-    injected: window.__fpInstalled === true,
+    injected: window[${JSON.stringify(MK ? MK.installed : '')}] === true,
     readyState: document.readyState,
   };
 })()`;
@@ -120,6 +125,7 @@ try {
     open_urls: [SLOW],
   });
   profileId = created.profile_id;
+  MK = markerNames(fingerprintView(profiles.getProfile(profileId)).seed);
   const started = await manager.startProfile(profiles.getProfile(profileId));
   const inst = manager.getInstance(profileId);
   client = inst.client;
@@ -146,7 +152,7 @@ try {
       if (sessionId) {
         openTargets.push(page.targetId);
         await sleep(400);
-        const r = await evalIn(sessionId, navReport);
+        const r = await evalIn(sessionId, navReport());
         console.log(`  open_urls 页：${JSON.stringify({ href: r?.href, navType: r?.navType, injected: r?.injected })}`);
         check('open_urls：location.href 就是那个 JSON 地址', String(r?.href) === SLOW, String(r?.href));
         check('open_urls：能读到 JSON 正文（不是空 body）', /198\.51\.100\.9/.test(String(r?.text)), String(r?.text).slice(0, 80));
@@ -168,7 +174,7 @@ try {
     const { sessionId } = await openBlankTarget();
     await client.send('Page.navigate', { url: SLOW }, sessionId).catch(() => {});
     await sleep(2200);
-    const r = await evalIn(sessionId, navReport);
+    const r = await evalIn(sessionId, navReport());
     console.log(`  CDP 空目标 → 慢 JSON：${JSON.stringify({ href: r?.href, navType: r?.navType, injected: r?.injected, readyState: r?.readyState })}`);
     check('CDP 新建目标导航慢 JSON：location.href 落在目标上（不再停在 about:blank）', String(r?.href) === SLOW, String(r?.href));
     check('CDP 新建目标导航慢 JSON：body 能读到 JSON（ERR_ABORTED 已消失）', /198\.51\.100\.9/.test(String(r?.text)), String(r?.text).slice(0, 80));
@@ -181,7 +187,7 @@ try {
     // 4a. 纯空白页（没人导航）：watcher 必须照旧补一次 reload 让注入生效
     const { targetId, sessionId } = await openBlankTarget();
     await sleep(1500);
-    const r = await evalIn(sessionId, '({ href: location.href, injected: window.__fpInstalled === true })');
+    const r = await evalIn(sessionId, `({ href: location.href, injected: window[${JSON.stringify(MK.installed)}] === true })`);
     check('反面对照：纯空白页仍会被补注入（watcher 没被关掉）', r?.injected === true,
       JSON.stringify({ targetId: String(targetId).slice(0, 8), ...r }));
 
@@ -195,7 +201,7 @@ try {
       if (!sess) await sleep(150);
     }
     await sleep(1500);
-    const r2 = sess ? await evalIn(sess, '({ href: location.href, injected: window.__fpInstalled === true })') : {};
+    const r2 = sess ? await evalIn(sess, `({ href: location.href, injected: window[${JSON.stringify(MK.installed)}] === true })`) : {};
     check('反面对照：CDP 直建带 URL 的快页面仍然注入成功（bff86c6 的用途没退化）',
       r2?.injected === true, JSON.stringify({ href: r2?.href, injected: r2?.injected }));
   }

@@ -9,8 +9,13 @@
  * 一旦不一致就分不清「噪声没同源」还是「字体不同」。用纯图形（渐变 + 矩形 + 圆弧）
  * 才能把变量收敛到「噪声实现是否同一份」这一件事上。
  */
+import { markerNames } from '../kernel/markers.js';
 
-/** 主帧与 worker 共用的绘制 + 哈希快照（不含 DOM 依赖的部分） */
+/** 主帧与 worker 共用的绘制 + 哈希快照（不含 DOM 依赖的部分）。
+ *
+ * ⚠️ 这份配方里读诊断标记用的是 `MK.*`，**由嵌入方提供 `MK` 常量**
+ * （probe.js 在头部定义、worker 三个脚本在各自的 IIFE 里定义）。
+ * 这样配方只有一份字节，而名字是每环境派生的（src/kernel/markers.js）。 */
 export const REALM_RECIPE = `
 function fpDraw(ctx) {
   const g = ctx.createLinearGradient(0, 0, 200, 80);
@@ -49,7 +54,7 @@ function fpCanvasDomHash() {
 /** WorkerNavigator / Navigator 上「必须与主帧一致」的那几个值 */
 function fpNavSnapshot() {
   return {
-    realm: (typeof self !== 'undefined' && self.__fpRealm) || null,
+    realm: (typeof self !== 'undefined' && self[MK.realm]) || null,
     ua: navigator.userAgent,
     platform: navigator.platform,
     cores: navigator.hardwareConcurrency,
@@ -60,20 +65,25 @@ function fpNavSnapshot() {
   };
 }
 function fpAppliedList() {
-  try { return Array.prototype.slice.call(self.__fpApplied || []); } catch (e) { return []; }
+  try { return Array.prototype.slice.call(self[MK.applied] || []); } catch (e) { return []; }
 }
 `;
 
-/**
- * 专用 worker 与 SharedWorker 共用这一个脚本：
+/** 专用 worker 与 SharedWorker 共用这一个脚本：
  * 专用 worker 走 onmessage，SharedWorker 走 onconnect，两个都挂上互不影响。
  *
- * `atTop` 是本文件最重要的字段：它在**脚本第一行**读 `self.__fpRealm`。
+ * `atTop` 是本文件最重要的字段：它在**脚本第一行**读 realm 标记（名字按环境派生）。
  * 如果注入发生在脚本顶层之前，它必须是 'worker'；为 null 就说明存在「裸窗口」。
+ *
+ * 整体包在 IIFE 里：`MK` 是本脚本自己的常量，**不能落到 worker 的全局词法环境**
+ * —— 站点的 worker 脚本和我们这份共享同一个全局作用域，`typeof MK` 就成了一条新的检测面。
  */
-export function workerScript() {
-  return `${REALM_RECIPE}
-const fpAtTop = (typeof self !== 'undefined' && self.__fpRealm) || null;
+export function workerScript(markers = markerNames()) {
+  return `(() => {
+'use strict';
+const MK = ${JSON.stringify(markers)};
+${REALM_RECIPE}
+const fpAtTop = (typeof self !== 'undefined' && self[MK.realm]) || null;
 
 function fpReport() {
   return {
@@ -92,13 +102,17 @@ self.onmessage = function (e) {
   else self.postMessage(data);
 };
 self.onconnect = function (e) { e.ports[0].postMessage(fpReport()); };
+})();
 `;
 }
 
 /** ServiceWorker 脚本：只能通过 message 端口回话，没有 onmessage */
-export function serviceWorkerScript() {
-  return `${REALM_RECIPE}
-const fpAtTop = (typeof self !== 'undefined' && self.__fpRealm) || null;
+export function serviceWorkerScript(markers = markerNames()) {
+  return `(() => {
+'use strict';
+const MK = ${JSON.stringify(markers)};
+${REALM_RECIPE}
+const fpAtTop = (typeof self !== 'undefined' && self[MK.realm]) || null;
 
 self.addEventListener('install', function () { self.skipWaiting(); });
 self.addEventListener('activate', function (e) { e.waitUntil(self.clients.claim()); });
@@ -113,6 +127,7 @@ self.addEventListener('message', function (e) {
     ...fpNavSnapshot(),
   });
 });
+})();
 `;
 }
 
@@ -121,8 +136,9 @@ self.addEventListener('message', function (e) {
  * 好让自检页能用实测值说明「裸的只有 sampleRate / currentTime」，
  * 而不是一句「不支持」了事。
  */
-export function workletModule() {
+export function workletModule(markers = markerNames()) {
   return `
+const MK = ${JSON.stringify(markers)};
 class FpProbeProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
@@ -137,7 +153,7 @@ class FpProbeProcessor extends AudioWorkletProcessor {
         ua: (typeof navigator !== 'undefined' && navigator.userAgent) || null,
         sampleRate: typeof sampleRate === 'number' ? sampleRate : null,
         currentTime: typeof currentTime === 'number' ? currentTime : null,
-        fpInjected: !!(typeof self !== 'undefined' && self.__fpRealm),
+        fpInjected: !!(typeof self !== 'undefined' && self[MK.realm]),
         // 这个作用域里「能当指纹用」的表面，实测就这两项
         surfaces: ['sampleRate', 'currentTime'],
       };

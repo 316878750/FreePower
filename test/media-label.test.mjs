@@ -17,7 +17,9 @@
  */
 import { withProbe, makeChecker, finish } from './helpers/profile-probe.mjs';
 
-const PROBE = `(async () => {
+/* 探针要读「这张页注入过没有」。名字按该环境 fp_seed 派生（P0：页面里没有固定的 __fp* 名），
+ * 所以探针源按 markers 现生成，**不把任何一个派生名写死在文件里**。 */
+const probeFor = (mk) => `(async () => {
   const list = await navigator.mediaDevices.enumerateDevices();
   const pool = /^(?:\\d+- )?(Microphone|Microphone Array|Line In|Speakers|Headphones|Digital Audio|HD WebCam|USB Video Device|Integrated Camera)/;
   const proto = MediaDeviceInfo.prototype;
@@ -25,7 +27,7 @@ const PROBE = `(async () => {
   // 同 realm 的原生 getter 当对照，别把「我们自己写的期望值」抄成判据
   const nativeGetter = Object.getOwnPropertyDescriptor(Navigator.prototype, 'platform').get;
   return {
-    injected: typeof window.__fpApplied,
+    injected: typeof window[${JSON.stringify(mk.applied)}],
     counts: list.reduce((a, d) => { a[d.kind] = (a[d.kind] || 0) + 1; return a; }, {}),
     devices: list.map((d) => ({
       kind: d.kind,
@@ -66,7 +68,8 @@ const noOwnLabel = (x) => (x.devices || []).every((d) => !d.hasOwnLabel
   && d.spreadKeys.length === 0 && d.reflectKeys.length === 0);
 
 try {
-  await withProbe(async ({ evalIn, nav, grant, client, URL_A }) => {
+  await withProbe(async ({ evalIn, nav, grant, client, URL_A, markers }) => {
+    const PROBE = probeFor(markers);
     const originA = new URL(URL_A).origin;
 
     /* ---------------- 未授权 ---------------- */

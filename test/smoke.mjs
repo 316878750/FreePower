@@ -161,6 +161,27 @@ async function main() {
   const { findChrome } = await import('../src/kernel/chrome.js');
   const { getDb } = await import('../src/store/db.js');
   const { DATA_DIR } = await import('../src/config.js');
+  const { getProfile } = await import('../src/store/profiles.js');
+  const { fingerprintView } = await import('../src/fingerprint/view.js');
+  const { markerNames } = await import('../src/kernel/markers.js');
+
+  /**
+   * 注入完成标记的名字：按**这个环境自己的 fp_seed** 派生（P0：页面里不再有固定的 `__fp*` 名）。
+   * 三个国家环境各有各的种子，所以每个环境单独算，不能共用一条探针模板；
+   * 也绝不在这里写死任何一个派生名 —— 写死等于换个固定名，检测面还在。
+   */
+  const markersOf = (profileId) => markerNames(fingerprintView(getProfile(profileId)).seed);
+  const probeOf = (mk) => `(() => ({
+      ua: navigator.userAgent,
+      platform: navigator.platform,
+      webdriver: navigator.webdriver,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      languages: navigator.languages,
+      cores: navigator.hardwareConcurrency,
+      memory: navigator.deviceMemory,
+      gl: (() => { const g = document.createElement('canvas').getContext('webgl'); return g ? [g.getParameter(37445), g.getParameter(37446)] : null; })(),
+      fpApplied: window[${JSON.stringify(mk.applied)}] || null,
+    }))()`;
 
   const chrome = findChrome();
   if (!chrome) {
@@ -294,18 +315,7 @@ async function main() {
     }
 
     /* ---------- 指纹生效 ---------- */
-    const PROBE = `(() => ({
-      ua: navigator.userAgent,
-      platform: navigator.platform,
-      webdriver: navigator.webdriver,
-      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-      languages: navigator.languages,
-      cores: navigator.hardwareConcurrency,
-      memory: navigator.deviceMemory,
-      gl: (() => { const g = document.createElement('canvas').getContext('webgl'); return g ? [g.getParameter(37445), g.getParameter(37446)] : null; })(),
-      fpApplied: window.__fpApplied || null,
-    }))()`;
-    const probes = await Promise.all(started.map((s) => evalInPage(s.data.ws.puppeteer, PROBE)));
+    const probes = await Promise.all(started.map((s) => evalInPage(s.data.ws.puppeteer, probeOf(markersOf(s.profile.profile_id)))));
     // 启动时可能发生 UA 跟版（目录名不是版本真值），所以拿库里的现值来比
     const details = await Promise.all(started.map((s) => api('GET', `/api/v1/user/detail?user_id=${s.profile.profile_id}`)));
     for (const [i, v] of probes.entries()) {
@@ -365,7 +375,10 @@ async function main() {
         const { targetId } = await c.send('Target.createTarget', { url: 'about:blank' });
         await sleep(1200);
         const { sessionId } = await c.send('Target.attachToTarget', { targetId, flatten: true });
-        const r = await c.send('Runtime.evaluate', { expression: 'window.__fpApplied || null', returnByValue: true }, sessionId);
+        const r = await c.send('Runtime.evaluate', {
+          expression: `window[${JSON.stringify(markersOf(started[0].profile.profile_id).applied)}] || null`,
+          returnByValue: true,
+        }, sessionId);
         check('新开标签完成注入（首帧不漏）', Array.isArray(r.result.value) && r.result.value.includes('canvas'), JSON.stringify(r.result.value));
         const cores = await c.send('Runtime.evaluate', { expression: 'navigator.hardwareConcurrency', returnByValue: true }, sessionId);
         check('新开标签硬件参数已覆写', typeof cores.result.value === 'number', String(cores.result.value));

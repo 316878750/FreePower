@@ -8,7 +8,7 @@
  *   node test/workers.test.mjs
  *
  * 断言（全部是真机实测，不是推断）：
- *   ① 三类 worker 的脚本**第一行**就能读到 self.__fpRealm === 'worker'（无裸窗口）
+ *   ① 三类 worker 的脚本**第一行**就能读到 realm 标记 === 'worker'（无裸窗口）
  *   ② 主帧 DOM canvas / 主帧 OffscreenCanvas / 专用 worker / SharedWorker / ServiceWorker
  *      五处 canvas 哈希完全一致（噪声同源同值）
  *   ③ 硬件、语言、时区、UA 在 worker 与主帧一致
@@ -44,6 +44,8 @@ const { buildProbeSource } = await import('../src/selfcheck/probe.js');
 const { runSelfCheck } = await import('../src/selfcheck/index.js');
 const { findChrome, killProcessTree } = await import('../src/kernel/chrome.js');
 const { closeDb } = await import('../src/store/db.js');
+const { markerNames } = await import('../src/kernel/markers.js');
+const { fingerprintView } = await import('../src/fingerprint/view.js');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -69,13 +71,16 @@ let origin = null;
 let id = null;
 let pid = null;
 let udd = null;
+/* 诊断标记名按 fp_seed 派生（P0：页面/worker 里不再有固定的 __fp* 名）。
+ * 自检源、探针、判据三处必须用同一份派生，否则读不到自己的注入。 */
+let mk = null;
 
 try {
-  origin = await openSelfcheckOrigin();
-  console.log(`本地源：${origin.url}`);
-
   const created = createProfile({ name: `p7-workers-${Date.now()}`, group_id: '0', remark: 'P7 双 Realm 真机测试' });
   id = created.profile_id;
+  mk = markerNames(fingerprintView(getProfile(id)).seed);
+  origin = await openSelfcheckOrigin({ markers: mk });
+  console.log(`本地源：${origin.url}`);
 
   const started = await startProfile(getProfile(id));
   pid = started.pid;
@@ -95,7 +100,7 @@ try {
   }
 
   const res = await inst.client.send('Runtime.evaluate', {
-    expression: buildProbeSource(),
+    expression: buildProbeSource(mk),
     awaitPromise: true,
     returnByValue: true,
     userGesture: true,
@@ -159,9 +164,9 @@ try {
    */
   {
     const before = { injected: stats.injected, workers: stats.by_type.worker || 0 };
-    const innerSrc = `const t = self.__fpRealm || null;
+    const innerSrc = `const t = self[${JSON.stringify(mk.realm)}] || null;
       self.postMessage({ layer: 'inner', atTop: t, cores: self.navigator.hardwareConcurrency });`;
-    const outerSrc = `const t = self.__fpRealm || null;
+    const outerSrc = `const t = self[${JSON.stringify(mk.realm)}] || null;
       const src = ${JSON.stringify(innerSrc)};
       const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
       w.onmessage = (e) => self.postMessage({ layer: 'outer', atTop: t, cores: self.navigator.hardwareConcurrency, inner: e.data });
@@ -173,7 +178,7 @@ try {
         outer.onerror = (e) => rej(new Error(String(e.message || 'worker error')));
         setTimeout(() => rej(new Error('嵌套 worker 超时')), 5000);
       });
-      return { mainCores: navigator.hardwareConcurrency, mainRealm: self.__fpRealm || null, ...r };
+      return { mainCores: navigator.hardwareConcurrency, mainRealm: self[${JSON.stringify(mk.realm)}] || null, ...r };
     })()`;
     const r = await inst.client.send('Runtime.evaluate', {
       expression, awaitPromise: true, returnByValue: true, userGesture: true,

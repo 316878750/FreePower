@@ -32,6 +32,7 @@ import vm from 'node:vm';
 import fs from 'node:fs';
 import { buildArtifacts } from '../tools/gen-schema.mjs';
 import { buildInjectionSource, buildWorkerInjectionSource, sharedNoiseCoreSource } from '../src/kernel/inject.js';
+import { markerNames } from '../src/kernel/markers.js';
 import { mergeRestoreOnStartup, ensureRestoreOnStartup, prefsPathOf, RESTORE_ON_STARTUP } from '../src/runtime/prefs.js';
 import os from 'node:os';
 import path from 'node:path';
@@ -1017,7 +1018,8 @@ function makeRealm(kind, view, navOverrides = {}) {
   const context = vm.createContext(sandbox);
   const source = kind === 'page' ? buildInjectionSource(view) : buildWorkerInjectionSource(view);
   vm.runInContext(source, context, { filename: `${kind}.inject.js` });
-  return { sandbox, context };
+  // 诊断标记名按 fp_seed 派生（P0：不再有固定的 __fp* 名），断言一律走这份映射
+  return { sandbox, context, markers: markerNames(view.seed) };
 }
 
 /** 在某个 realm 里量 OffscreenCanvas 的 2D 像素哈希 */
@@ -1069,14 +1071,16 @@ test('P7 双 Realm：同一配置下主帧与 worker 的 OffscreenCanvas 噪声�
   assert.equal(offscreenHash(worker), workerHash);
 
   // 诊断字段：realm 标识正确，四个种子快照一致
-  assert.equal(page.sandbox.__fpRealm, 'page');
-  assert.equal(worker.sandbox.__fpRealm, 'worker');
+  assert.equal(page.sandbox[page.markers.realm], 'page');
+  assert.equal(worker.sandbox[worker.markers.realm], 'worker');
+  // 同一份指纹 → 两侧派生出的标记名必须完全相同（否则自检会读不到自己的注入）
+  assert.deepEqual(page.markers, worker.markers);
   assert.equal(
-    JSON.stringify(page.sandbox.__fpSeeds),
-    JSON.stringify(worker.sandbox.__fpSeeds),
+    JSON.stringify(page.sandbox[page.markers.seeds]),
+    JSON.stringify(worker.sandbox[worker.markers.seeds]),
     '四个噪点种子在两侧必须完全一致',
   );
-  assert.deepEqual(JSON.parse(JSON.stringify(worker.sandbox.__fpSeeds)), {
+  assert.deepEqual(JSON.parse(JSON.stringify(worker.sandbox[worker.markers.seeds])), {
     canvas: view.canvas.seed,
     webgl_image: view.webgl_image.seed,
     audio: view.audio.seed,
@@ -1123,7 +1127,7 @@ test('P7 worker 层：UA 已被 CDP 给对就不重复覆盖，没给对才用 J
   const view = p7View();
   // 专用 worker：CDP 已传播 UA → 不该再叠一层 JS 覆盖（少一层痕迹）
   const good = makeRealm('worker', view, { userAgent: view.ua });
-  assert.ok(!JSON.stringify(good.sandbox.__fpApplied).includes('userAgent'), 'CDP 已给对时不该再 patch');
+  assert.ok(!JSON.stringify(good.sandbox[good.markers.applied]).includes('userAgent'), 'CDP 已给对时不该再 patch');
 
   // SharedWorker / ServiceWorker：实测 CDP 不传播 UA → JS 必须补上
   const bad = makeRealm('worker', view);
@@ -1131,7 +1135,7 @@ test('P7 worker 层：UA 已被 CDP 给对就不重复覆盖，没给对才用 J
   assert.equal(bad.sandbox.navigator.appVersion, view.ua.replace(/^Mozilla\//, ''));
   assert.equal(bad.sandbox.navigator.platform, view.platform);
   assert.equal(bad.sandbox.navigator.hardwareConcurrency, view.hardware_concurrency);
-  assert.ok(JSON.stringify(bad.sandbox.__fpApplied).includes('userAgent'));
+  assert.ok(JSON.stringify(bad.sandbox[bad.markers.applied]).includes('userAgent'));
 });
 
 test('P11 page 层：注入后硬件/语言与声明一致，且只装一次（重复注入不叠 patch）', () => {
@@ -1143,7 +1147,7 @@ test('P11 page 层：注入后硬件/语言与声明一致，且只装一次（�
   assert.equal(realm.sandbox.navigator.hardwareConcurrency, 4, 'page 层不该再有 hardwareConcurrency 的 JS 覆盖');
   assert.equal(realm.sandbox.navigator.deviceMemory, view.device_memory);
   assert.equal(realm.sandbox.navigator.language, view.language[0]);
-  assert.equal(realm.sandbox.__fpInstalled, true);
+  assert.equal(realm.sandbox[realm.markers.installed], true);
 
   const before = offscreenHash(realm);
   vm.runInContext(buildInjectionSource(view), realm.context); // 再来一遍
@@ -1269,7 +1273,7 @@ test('P9-A 语音：按环境语言投影，中文声音被挡掉、default 仍�
 
   // 跨次调用稳定：同一批对象，不是每次 new 一批
   assert.equal(realm.sandbox.speechSynthesis.getVoices()[0], voices[0]);
-  assert.ok(JSON.stringify(realm.sandbox.__fpApplied).includes('speech'));
+  assert.ok(JSON.stringify(realm.sandbox[realm.markers.applied]).includes('speech'));
 });
 
 test('P9-A 语音：宿主没有该语言的声音时不凭空造（保持原生列表）', () => {

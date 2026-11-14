@@ -14,11 +14,11 @@
  */
 import { withProbe, makeChecker, finish } from './helpers/profile-probe.mjs';
 
-const ENUM = `(async () => {
+const ENUM = (mk) => `(async () => {
   const list = await navigator.mediaDevices.enumerateDevices();
   const dist = (k) => list.filter((d) => d.kind === k).length;
   return {
-    injected: Boolean(window.__fpApplied),
+    injected: Boolean(window[${JSON.stringify(mk.applied)}]),
     counts: { audioinput: dist('audioinput'), videoinput: dist('videoinput'), audiooutput: dist('audiooutput') },
     list: list.map((d) => ({ kind: d.kind, deviceId: d.deviceId, groupId: d.groupId, label: d.label })),
   };
@@ -60,7 +60,8 @@ const GUM = `(async () => {
 
 const { results, check } = makeChecker();
 try {
-  await withProbe(async ({ evalIn, nav, grant, URL_A, URL_B }) => {
+  await withProbe(async ({ evalIn, nav, grant, markers: mk, URL_A, URL_B }) => {
+    const ENUM_SRC = ENUM(mk);
     const ids = (x) => (x.list || []).map((d) => d.deviceId).join('|');
     const realIds = (x) => (x.list || [])
       .filter((d) => d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications')
@@ -70,11 +71,11 @@ try {
 
     /* ---------------- 未授权 ---------------- */
     await nav(URL_A);
-    const a1 = await evalIn(ENUM);
+    const a1 = await evalIn(ENUM_SRC);
     await nav(URL_A);
-    const a2 = await evalIn(ENUM);
+    const a2 = await evalIn(ENUM_SRC);
     await nav(URL_B);
-    const b1 = await evalIn(ENUM);
+    const b1 = await evalIn(ENUM_SRC);
 
     check('P9-C：注入确实生效', a1.injected === true, String(a1.injected));
     check('P9-C：未授权时 label 全为空（原生行为）', labelsEmpty(a1) && labelsEmpty(b1), JSON.stringify((a1.list || []).map((d) => d.label)));
@@ -85,7 +86,7 @@ try {
     const originB = new URL(URL_B).origin;
     await grant(originA, ['videoCapture']);
     await nav(URL_A);
-    const cam = await evalIn(ENUM);
+    const cam = await evalIn(ENUM_SRC);
     console.log(`\n只授权摄像头：${JSON.stringify(cam.counts)} · 音频 label ${JSON.stringify(labelsOf(cam, 'audioinput').concat(labelsOf(cam, 'audiooutput')))}`);
     check('P9-C：只授权摄像头时，音频设备的 label 仍为空（权限按 kind 判）',
       [...labelsOf(cam, 'audioinput'), ...labelsOf(cam, 'audiooutput')].every((l) => l === ''),
@@ -95,11 +96,11 @@ try {
     await grant(originA, ['audioCapture']);
     await grant(originB, ['videoCapture', 'audioCapture']);
     await nav(URL_A);
-    const a3 = await evalIn(ENUM);
+    const a3 = await evalIn(ENUM_SRC);
     const json = await evalIn(JSON_PROBE);
     const gum = await evalIn(GUM);
     await nav(URL_B);
-    const b2 = await evalIn(ENUM);
+    const b2 = await evalIn(ENUM_SRC);
 
     const labelsUsed = new Set((a3.list || []).map((d) => d.label));
     console.log(`\n授权后 A：${JSON.stringify(a3.counts)} · 名字 ${JSON.stringify([...labelsUsed])}`);

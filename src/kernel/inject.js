@@ -13,10 +13,12 @@
  * 为什么必须共用：主帧与 worker 里取到的 canvas/audio 哈希一旦不同，检测方只要让页面和 worker
  * 各算一遍再比对就穿帮。噪声算法的种子派生、步长、幅度只要有一份副本漂移，就会变成两套指纹。
  *
- * 每条 patch 都记在 `__fpApplied`（不可枚举），自检页据此判断「声明已生效」。
+ * 每条 patch 都记在一个**按种子派生的诊断名字**下（名字见 src/kernel/markers.js，
+ * 形状 `_xxxxxxxx`，不可枚举），自检页据此判断「声明已生效」。
  * 四个噪点维度用各自的入库种子：canvas_id / webgl_image_id / audio_id / client_rects_id，
  * 同一种子跨重启、跨页面加载结果一致 —— 这是不被判「换设备」的前提。
  */
+import { markerNames, markerConstSource } from './markers.js';
 
 function injectionConfig(fp) {
   return {
@@ -707,7 +709,7 @@ const PAGE_BODY = `
     }
 
     mark('media_devices');
-    try { Object.defineProperty(window, '__fpMediaMode', { value: 'native', enumerable: false, configurable: false }); } catch (e) {}
+    try { Object.defineProperty(window, MK.mediaMode, { value: 'native', enumerable: false, configurable: false }); } catch (e) {}
   }
 
   /* ---------- 语音合成：按环境 language 投影 getVoices() ----------
@@ -790,21 +792,24 @@ const PAGE_BODY = `
   /* ---------- 字体：只声明，不伪造 ---------- */
   // 字体度量来自 DirectWrite，JS 改不了；这里只把「声明值」暴露给自检页，不 patch measureText。
   try {
-    Object.defineProperty(window, '__fpFontsDeclared', {
+    Object.defineProperty(window, MK.fontsDeclared, {
       value: CFG.fonts || ['all'], enumerable: false, configurable: false,
     });
   } catch (e) {}
 
-  /* ---------- 诊断 ---------- */
+  /* ---------- 诊断 ----------
+   * 全部不可枚举：Object.keys(window) / for...in 都看不见。
+   * 名字按 fp_seed 派生（每环境不同、同环境稳定），页面拿不到固定签名。
+   * 原来这里还有一个 __fpSeed（= CFG.seed），**零消费者**，已删 —— 纯检测面。
+   */
   try {
-    Object.defineProperty(window, '__fpApplied', { value: applied, enumerable: false, configurable: false });
-    Object.defineProperty(window, '__fpSeed', { value: CFG.seed, enumerable: false, configurable: false });
-    Object.defineProperty(window, '__fpSeeds', { value: seedsSnapshot(), enumerable: false, configurable: false });
-    Object.defineProperty(window, '__fpRealm', { value: 'page', enumerable: false, configurable: false });
+    Object.defineProperty(window, MK.applied, { value: applied, enumerable: false, configurable: false });
+    Object.defineProperty(window, MK.seeds, { value: seedsSnapshot(), enumerable: false, configurable: false });
+    Object.defineProperty(window, MK.realm, { value: 'page', enumerable: false, configurable: false });
     if (DEBUG) {
-      Object.defineProperty(window, '__fpConfig', { value: CFG, enumerable: false, configurable: false });
+      Object.defineProperty(window, MK.config, { value: CFG, enumerable: false, configurable: false });
       // 排查用：注入前的原生函数（自检/支持人员可比对「基础渲染」和「加噪后」）
-      Object.defineProperty(window, '__fpOrig', {
+      Object.defineProperty(window, MK.orig, {
         value: { toDataURL: origToDataURL, getImageData: origGetImageData2d },
         enumerable: false, configurable: false,
       });
@@ -874,24 +879,31 @@ const WORKER_BODY = `
 
   /* ---------- 诊断 ---------- */
   try {
-    Object.defineProperty(self, '__fpApplied', { value: applied, enumerable: false, configurable: false });
-    Object.defineProperty(self, '__fpSeed', { value: CFG.seed, enumerable: false, configurable: false });
-    Object.defineProperty(self, '__fpSeeds', { value: seedsSnapshot(), enumerable: false, configurable: false });
-    Object.defineProperty(self, '__fpRealm', { value: 'worker', enumerable: false, configurable: false });
-    if (DEBUG) Object.defineProperty(self, '__fpConfig', { value: CFG, enumerable: false, configurable: false });
+    Object.defineProperty(self, MK.applied, { value: applied, enumerable: false, configurable: false });
+    Object.defineProperty(self, MK.seeds, { value: seedsSnapshot(), enumerable: false, configurable: false });
+    Object.defineProperty(self, MK.realm, { value: 'worker', enumerable: false, configurable: false });
+    if (DEBUG) Object.defineProperty(self, MK.config, { value: CFG, enumerable: false, configurable: false });
   } catch (e) {}
 `;
 
-/** 主帧注入源（Page.addScriptToEvaluateOnNewDocument） */
-export function buildInjectionSource(fp, { debug = false } = {}) {
+/**
+ * 主帧注入源（Page.addScriptToEvaluateOnNewDocument）
+ *
+ * `markers` 由调用方按 fp_seed 派生（src/kernel/markers.js）并显式传入：
+ * 注入脚本自己不算名字，名字是常量塞进来的 —— 页面里没有我们的哈希实现可比对。
+ * 没传就按默认种子算一份，**绝不回落到固定名**（固定名等于给对手一行判定代码）。
+ */
+export function buildInjectionSource(fp, { debug = false, markers = null } = {}) {
   const json = JSON.stringify(injectionConfig(fp));
+  const mk = markers || markerNames(fp && fp.seed);
   return `(() => {
   'use strict';
-  if (window.__fpInstalled) return;
+  ${markerConstSource(mk)}
+  if (window[MK.installed]) return;
   const CFG = ${json};
   const DEBUG = ${debug ? 'true' : 'false'};
 ${CORE}${PAGE_BODY}
-  window.__fpInstalled = true;
+  try { Object.defineProperty(window, MK.installed, { value: true, enumerable: false, configurable: false }); } catch (e) {}
 })();`;
 }
 
@@ -899,15 +911,17 @@ ${CORE}${PAGE_BODY}
  * worker 注入源（Target.setAutoAttach → Runtime.evaluate）。
  * 与 page 层共用 CORE：四维噪声的种子派生只有这一份实现。
  */
-export function buildWorkerInjectionSource(fp, { debug = false } = {}) {
+export function buildWorkerInjectionSource(fp, { debug = false, markers = null } = {}) {
   const json = JSON.stringify(injectionConfig(fp));
+  const mk = markers || markerNames(fp && fp.seed);
   return `(() => {
   'use strict';
-  if (self.__fpInstalled) return;
+  ${markerConstSource(mk)}
+  if (self[MK.installed]) return;
   const CFG = ${json};
   const DEBUG = ${debug ? 'true' : 'false'};
 ${CORE}${WORKER_BODY}
-  self.__fpInstalled = true;
+  try { Object.defineProperty(self, MK.installed, { value: true, enumerable: false, configurable: false }); } catch (e) {}
 })();`;
 }
 

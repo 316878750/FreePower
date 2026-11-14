@@ -17,6 +17,8 @@ import { buildProbeSource } from './probe.js';
 import { buildReport } from './report.js';
 import { loadPrevious, saveReport } from './store.js';
 import { openSelfcheckOrigin } from './origin.js';
+import { fingerprintView } from '../fingerprint/view.js';
+import { markerNames } from '../kernel/markers.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -60,12 +62,16 @@ export async function runSelfCheck(instance, profile, { timeoutMs = SELFCHECK_TI
   const page = await withTimeout(instance.openPage('about:blank'), Math.min(timeoutMs, 10000), '自检页创建');
   if (!page || !page.sessionId) throw new Error('selfcheck: 自检页没有拿到 CDP session');
 
+  /* 诊断标记名必须与这个环境的注入一致（按 fp_seed 派生）：
+   * 名字对不上，探针就会读不到「注入已生效」，把好环境误判成没生效。 */
+  const markers = markerNames(fingerprintView(profile).seed);
+
   let origin = null;
   const context = { secure: false, url: 'about:blank', note: null };
   try {
     // 尝试切到本地安全上下文页（127.0.0.1 是 potentially trustworthy origin）
     try {
-      origin = await openSelfcheckOrigin();
+      origin = await openSelfcheckOrigin({ markers });
       await goto(instance.client, page.sessionId, origin.url);
       if (await waitPage(instance.client, page.sessionId, { title: origin.title, timeoutMs: 3500 })) {
         context.secure = true;
@@ -82,7 +88,7 @@ export async function runSelfCheck(instance, profile, { timeoutMs = SELFCHECK_TI
 
     const res = await withTimeout(
       instance.client.send('Runtime.evaluate', {
-        expression: buildProbeSource(),
+        expression: buildProbeSource(markers),
         awaitPromise: true,
         returnByValue: true,
         userGesture: true,
