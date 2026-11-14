@@ -37,7 +37,7 @@ import { readReportFile, summarize } from '../selfcheck/store.js';
 import { renderHtml } from '../selfcheck/html.js';
 import { issueTicket } from './tickets.js';
 import { apiInfoPayload, setApiVerify, resetStats } from './info.js';
-import { startSync, stopSync, syncStatus, updateSettings, refreshAll, unifySize, arrangeWindows, showWindows, openTabInAll, tabState, closeTabs, copyTabToSlaves, unifyTabs } from '../sync/session.js';
+import { startSync, stopSync, syncStatus, updateSettings, refreshAll, unifySize, arrangeWindows, showWindows, forceShowWindows, openTabInAll, tabState, closeTabs, copyTabToSlaves, unifyTabs } from '../sync/session.js';
 import { readDisplays } from '../sync/displays.js';
 import { readHotkeyStatus, requestHotkey } from '../sync/hotkey.js';
 import { resetApiKey } from '../store/db.js';
@@ -977,6 +977,24 @@ export function buildRoutes() {
     const ids = body.profile_ids ?? body.profile_id ?? ctx.query?.profile_id;
     try {
       return ok(await showWindows(ids));
+    } catch (e) {
+      throw new ApiError(ERR.INVALID, e?.message || 'sync is not running');
+    }
+  });
+
+  /**
+   * 强制抬到前台（**用户显式点按钮才调，默认路径不许调**）：`{profile_ids?}`。
+   *
+   * 手段是「最小化 → 恢复原状态」—— 零依赖下唯一能真的把被盖住的窗口抬到 OS 前台的办法
+   * （实测会到前台，代价是任务栏闪一下、每个窗口 0.6–1.0 秒）。所以它是一次性动作，不是开关、
+   * 不写设置。返回 `confirmed: 'window_restored'`：**能确认窗口已恢复正常，确认不了它在最前面**
+   * （产品里不调 Win32）。
+   */
+  add(['POST'], ['/api/v2/sync/show/force'], async (ctx) => {
+    const body = ctx.body && typeof ctx.body === 'object' ? ctx.body : {};
+    const ids = body.profile_ids ?? body.profile_id ?? ctx.query?.profile_id;
+    try {
+      return ok(await forceShowWindows(ids));
     } catch (e) {
       throw new ApiError(ERR.INVALID, e?.message || 'sync is not running');
     }

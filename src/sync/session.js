@@ -23,7 +23,7 @@ import {
   autoFit, auditPlan, planArrange, placeOne, summarizeArrange,
 } from './arrange.js';
 import { screensForArrange } from './displays.js';
-import { planShow, summarizeShow, verifyShown } from './show.js';
+import { planForce, planShow, summarizeForce, summarizeShow, verifyForced, verifyShown } from './show.js';
 import {
   closeTabAt, isBlankUrl, listTabs, navigateAt, openTabFor,
   parseOpenUrls, planCloseBlank, planCloseOthers, planUnify, settle, targetIndex, visibleTabIndex,
@@ -653,6 +653,101 @@ export async function arrangeWindows(rawParams = {}) {
     summary: summarizeArrange(placed),
     status: current.status(),
   };
+}
+
+/**
+ * 强制置前：**用户显式点按钮才走这里**，默认的「显示窗口」绝不调用它。
+ *
+ * 为什么需要它：零依赖下 `Page.bringToFront` 抬不动被其它窗口盖住的窗口（实测 Win32 前台
+ * 仍是别的窗口、z 序不动）。唯一能做到的办法是「最小化 → 恢复原状态」，实测会真的成为
+ * OS 前台，代价是任务栏闪一下、每个窗口 0.6–1.0 秒。所以做成**一次性显式动作**：
+ * 不写设置、不做开关、不默认执行 —— 用户点了就是要「现在看见它」。
+ *
+ * **能确认到哪**：产品里不调 Win32，所以只能回读 `windowState` 确认「窗口已恢复正常」，
+ * 确认不了「它现在在最前面」。返回值的 `confirmed: 'window_restored'` 和文案
+ * 「已恢复显示并尝试置前」说的就是这个边界，不写「已置前」。
+ *
+ * 判定**复用 `verifyShown(..., {strictRect:true})`**（`verifyForced`）：
+ * 动过窗口，所以位置尺寸也要回到原样，别把多屏窗口搬回主屏。
+ */
+export async function forceShowWindows(rawIds) {
+  if (!current) throw new Error('没有正在运行的同步会话');
+  const s = current;
+  const all = [s.master, ...s.slaves];
+  const want = rawIds === undefined || rawIds === null
+    ? all
+    : (Array.isArray(rawIds) ? rawIds : [rawIds]).map(String);
+  const ids = want.filter((id) => s.targets.get(id));
+  if (!ids.length) throw new Error('没有可显示的窗口');
+
+  const results = [];
+  for (const id of ids) {
+    const t = s.targets.get(id);
+    const entry = {
+      profile_id: id,
+      role: id === s.master ? 'master' : 'slave',
+      ok: false,
+      action: 'force',
+      raise: 'none',
+      state_before: null,
+      state_after: null,
+      rect_before: null,
+      rect_after: null,
+    };
+    try {
+      const win = await windowSizeOf(t.client, t.targetId);
+      if (!win?.windowId) throw new Error('读不到窗口 id');
+      const before = await windowRectOf(t.client, t.targetId);
+      entry.state_before = normalizeState(win.state);
+      entry.rect_before = before;
+      const [plan] = planForce([{ profile_id: id, state: win.state }]);
+      entry.action = plan.action;
+      if (plan.action === 'skip') {
+        entry.reason = plan.reason;
+        entry.ok = true;
+        entry.raise = 'none';
+        results.push(entry);
+        continue;
+      }
+
+      /* 唯一「闪一下」的地方：最小化，再恢复成它原来的状态（normal 或 maximized） */
+      await nudgeToFront(t.client, win.windowId, entry.state_before);
+      entry.raise = 'restored';
+
+      const after = await windowRectOf(t.client, t.targetId);
+      entry.rect_after = after;
+      entry.state_after = normalizeState(after?.state);
+      const v = verifyForced({ state_before: entry.state_before, rect_before: before }, after);
+      entry.ok = v.ok;
+      entry.problems = v.problems;
+      if (!v.ok) entry.reason = v.problems.map((m) => `${m.field} 期望 ${m.expected} 实际 ${m.actual}`).join('；');
+    } catch (e) {
+      entry.reason = e?.message || String(e);
+    }
+    results.push(entry);
+  }
+
+  await refreshAll();
+  return {
+    forced: results,
+    summary: summarizeForce(results),
+    /** 能确认的只有「窗口恢复正常」，不是「在最前面」（产品里不调 Win32） */
+    os_foreground_confirmed: false,
+    status: current.status(),
+  };
+}
+
+/**
+ * 最小化 → 恢复原状态。**只给强制置前用**，默认路径不许调（判据里有静态断言）。
+ * 恢复成 `maximized` 时显式设 maximized：`setWindowBounds(normal)` 对最大化窗口是「取消最大化」，
+ * 不能拿来当「恢复」。
+ */
+async function nudgeToFront(client, windowId, stateBefore) {
+  await client.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } });
+  await settle(140);
+  const back = normalizeState(stateBefore) === 'maximized' ? 'maximized' : 'normal';
+  await client.send('Browser.setWindowBounds', { windowId, bounds: { windowState: back } });
+  await settle(240);
 }
 
 /**

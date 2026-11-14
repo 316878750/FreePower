@@ -151,6 +151,15 @@ export const api = {
     method: 'POST',
     body: profileIds === undefined ? {} : { profile_ids: Array.isArray(profileIds) ? profileIds : [profileIds] },
   }),
+  /**
+   * 强制抬到前台（**只有用户点那个按钮才调**）：对 page_only 那批窗口做「最小化 → 恢复」，
+   * 会闪一下任务栏、每个窗口 0.6–1.0 秒。一次性动作，不写设置。
+   * 返回值 `confirmed: 'window_restored'`：能确认窗口已恢复正常，确认不了它在最前面。
+   */
+  syncShowForce: (profileIds) => call('/api/v2/sync/show/force', {
+    method: 'POST',
+    body: profileIds === undefined ? {} : { profile_ids: Array.isArray(profileIds) ? profileIds : [profileIds] },
+  }),
   /** 全局快捷键状态（managed=false 表示没有桌面壳在管，不是失败） */
   syncHotkey: () => call('/api/v2/sync/hotkey'),
   syncHotkeySet: (accelerator) => call('/api/v2/sync/hotkey', { method: 'POST', body: { accelerator } }),

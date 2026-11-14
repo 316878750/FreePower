@@ -308,6 +308,10 @@ export default async function renderSyncPanel({ head, page }) {
       const r = await api.syncShow();
       const s = r?.summary || {};
       toast(s.message || '已显示', s.failed ? 'bad' : '');
+      /* page_only 那批：给一个**显式**的补救按钮。默认绝不做「最小化→恢复」（会闪任务栏），
+       * 但用户点这个按钮的意图就是「我现在要看见它」，所以必须给他一个能真做完的手段。 */
+      const forceBox = h('div', { style: { marginTop: '6px' } });
+      const pageOnlyIds = (r?.shown || []).filter((x) => x.ok && x.raise === 'page_only').map((x) => x.profile_id);
       mount(resBox,
         s.failed
           ? h('div', { class: 'notice bad', style: { marginTop: '6px' } },
@@ -319,12 +323,46 @@ export default async function renderSyncPanel({ head, page }) {
           ? h('div', { class: 'notice warn', style: { marginTop: '6px' } },
             `有 ${s.page_only} 个窗口只做了页面级激活（可能仍被其它窗口盖住）。`
             + '最小化的窗口会真的到前台；没最小化、只是被盖住的，当前版本抬不上来。')
-          : null);
+          : null,
+        pageOnlyIds.length ? forceBox : null);
+      if (pageOnlyIds.length) {
+        mount(forceBox, h('button', {
+          class: 'btn sm',
+          onClick: () => forceShow(forceBox, pageOnlyIds),
+        }, '强制抬到前台（会闪一下）'));
+      }
     } catch (e) {
       toast(e.message, 'bad');
       mount(resBox, h('div', { class: 'notice bad', style: { marginTop: '6px' } }, e.message));
     }
     await reload(false);
+  }
+
+  /**
+   * 强制抬到前台：**一次性动作，不写设置、不做开关**。
+   *
+   * 手段是「最小化 → 恢复」，零依赖下唯一能真的把被盖住的窗口抬到 OS 前台的办法
+   * （实测会到前台，代价是任务栏闪一下、每个窗口 0.6–1.0 秒）。
+   * 产品里不调 Win32，所以**能确认的只有「窗口已恢复正常」，确认不了「它在最前面」** ——
+   * 文案因此是「已恢复显示并尝试置前」，不是「已置前」。
+   */
+  async function forceShow(resBox, ids) {
+    try {
+      const r = await api.syncShowForce(ids);
+      const s = r?.summary || {};
+      toast(s.message || '已恢复显示', s.failed ? 'bad' : '');
+      mount(resBox,
+        s.failed
+          ? h('div', { class: 'notice bad', style: { marginTop: '6px' } },
+            h('strong', null, s.message),
+            ...(s.details || []).map((x) => h('div', { class: 'muted small' },
+              `${nameOf(x.profile_id)}（${x.role === 'master' ? '主控' : '受控'}）：${x.reason || '未能确认'}`)))
+          : h('div', { class: 'muted small', style: { marginTop: '6px' } },
+            `${s.message}。窗口已恢复正常显示；这一版确认不了它是否在最前面。`));
+    } catch (e) {
+      toast(e.message, 'bad');
+      mount(resBox, h('div', { class: 'notice bad', style: { marginTop: '6px' } }, e.message));
+    }
   }
 
   /**

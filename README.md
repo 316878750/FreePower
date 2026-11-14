@@ -1855,8 +1855,8 @@ Windows 11 双屏：主屏 3440×1440、扩展屏 x=-1080..0 竖屏）：
 
 判据：
 ```
-npm run test:sync-show        → 39/39（A 层：分档 + 回读判定 + 文案 + 静态扫描，零 Chrome）
-npm run test:sync-show-kernel → 35/35（B 层：1 主 + 2 受控真内核 + Win32 ③ 层读数）
+npm run test:sync-show        → 55/55（A 层：分档 + 回读判定 + 文案 + 强制置前 + 静态扫描，零 Chrome）
+npm run test:sync-show-kernel → 42/42（B 层：1 主 + 2 受控真内核 + Win32 ③ 层读数）
 ```
 
 B 层实读（真机，3 个环境）：
@@ -1870,8 +1870,28 @@ C 主控挪到 -1000,200（扩展屏侧）→ 最小化 → 显示，回读仍�
   没被搬回主屏；同时也成了 ③ 前台
 D 受控 2 先最大化再最小化 → 显示后回 maximized(-8,-8 3456×1408)，回报 ok=true（不比尺寸）
 E profile_ids 只给一个 → 只恢复那一个，另一个仍 minimized；不传则两个都恢复
+G 强制置前：受控 1 是 normal（被另一个同位置窗口盖着）→ 默认档 page_only / os_foreground=false
+  → 点 force 后回读 900,120 700×480(normal)、**Win32 前台真的变成 fp-show-slave1**、
+  位置尺寸原样、汇总「已恢复显示并尝试置前 1 个窗口」、confirmed=window_restored
+  全屏窗口 force 直接 skip（fullscreen → fullscreen，一点没动）
 F 杀掉一个内核 → 那条 ok=false（原因「读不到窗口 id」），另一条仍 restored，"有 1 个窗口没能显示出来"
 ```
+
+**强制置前（显式按钮那一档）**：默认「显示窗口」抬不动被盖住的窗口，但用户点这个按钮的意图
+就是「我现在要看见它」，所以给他一个能真做完的手段 —— 面板在 `page_only` 档下多一个按钮
+**「强制抬到前台（会闪一下）」**，点了才对那批窗口做 `minimize → 恢复原状态`。
+
+四条边界（都是被要求钉住的）：
+1. **不是开关、不写设置**：一次性动作。每次点都闪任务栏、每个窗口 0.6–1.0 秒，窗口多了很难受，
+   所以只有显式触发才做。
+2. **默认路径绝不含 `minimize→restore`**：判据静态断言 `showWindows` 函数体里不许出现
+   `nudgeToFront` / `windowState: 'minimized'`，默认路由的 handler 也不许调 `forceShowWindows`。
+3. **判定复用同一处**：`verifyForced` 就是 `verifyShown(before, after, {strictRect:true})`，
+   不另立一套；`strictRect` 只多做一件——动过窗口就必须回到原位置尺寸（普通档没碰窗口，不比）。
+4. **能确认的只有「窗口已恢复正常」**：产品里不调 Win32（`src/` 与 `web/` 判据扫过，零引用），
+   所以文案是「已恢复显示并尝试置前」，返回值带 `confirmed: 'window_restored'` +
+   `os_foreground_confirmed: false`，**不写「已置前」**。B 层用 Win32 只读读数**证明了它确实到了前台**，
+   但那只是判据里的读数，不是产品能力声明。
 
 **先红后绿**（改坏 → 复跑 → 还原）：
 ```
@@ -1880,6 +1900,8 @@ F 杀掉一个内核 → 那条 ok=false（原因「读不到窗口 id」），�
 ② 把 page_focused.hasFocus 并进 entry.ok      → A 层红 1（entry.ok 赋值处不唯一）
 ③ 位置比对拿 rect_before.state==='normal' 当门槛 → A 层红 3（这就是真踩到的那个坑：(0,0)、尺寸、null 三条）
 ④ 汇总把 page_only 也算进「已恢复」            → A 层红 2（混合那条、全部 page_only 那条）
+⑤ 让默认 showWindows 也调 nudgeToFront          → A 层红 2（「默认行为不含 minimize→restore」+「page_only 走 bringToFront」）
+⑥ 让 verifyForced 自己造一套判定                → A 层红 3（strictRect 不比位置、读不到不算失败、静态「走同一处」）
 ```
 
 ### 连接策略
@@ -1918,6 +1940,7 @@ Target.createTarget({ url: 'about:blank' })
 | POST | `/api/v2/sync/unify-size` | 一键统一尺寸（只在用户点按钮时执行） |
 | POST | `/api/v2/sync/arrange` | 窗口排列：`{width,height,row,top,left,hs,vs,range,screenId,screenList}` 或 `{auto:true}`（一键排列）；摆完逐个回读，不一致如实报 |
 | POST | `/api/v2/sync/show` | 显示窗口：`{profile_ids?}`（省 = 所有同步窗口）；逐窗口回读，`raise` 分 `restored`（真到 OS 前台）/ `page_only`（只做页面级激活）/ `none`（全屏不动），`os_foreground` 只在全部 restored 时 true |
+| POST | `/api/v2/sync/show/force` | 强制抬到前台（**用户显式点按钮才调**）：对那批窗口做 `minimize → 恢复原状态`，会闪一下；`confirmed: 'window_restored'` = 只能确认窗口已恢复正常，不确认在最前面 |
 | GET | `/api/v2/sync/displays` | 显示器列表（桌面壳写、服务进程读；`managed:false` = 没有桌面壳，不是失败） |
 | POST | `/api/v2/sync/tab` | 打开网址：`{urls}`（数组或多行文本），每行一个、最多 10 个，超了报「一键最多打开10个网址」；走上面那条 about:blank 姿势 |
 | GET | `/api/v2/sync/tabs` | 各窗口标签列表 + 当前可见序号（`visible_confident:false` = 这条是猜的） |
@@ -1939,8 +1962,8 @@ npm run test:sync-window      → 22/22 （阶段 3 统一尺寸 A 层：状态�
 npm run test:sync-window-kernel → 17/17（阶段 3 统一尺寸 B 层：3 个真环境，含最大化与「改不了」）
 npm run test:sync-arrange     → 67/67 （阶段 3 窗口排列 A 层：三段公式 + 假读数判定 + 显示器交接）
 npm run test:sync-arrange-kernel → 28/28（阶段 3 窗口排列 B 层：3 个真环境，含换行/最大化和内核已死）
-npm run test:sync-show        → 39/39 （阶段 3 显示窗口 A 层：分档 + 回读判定 + 文案 + 静态扫描）
-npm run test:sync-show-kernel → 35/35 （阶段 3 显示窗口 B 层：3 个真环境 + Win32 OS 前台读数）
+npm run test:sync-show        → 55/55 （阶段 3 显示窗口 A 层：分档 + 回读判定 + 强制置前 + 静态扫描）
+npm run test:sync-show-kernel → 42/42 （阶段 3 显示窗口 B 层：3 个真环境 + Win32 OS 前台读数）
 ```
 
 **标签页 A 层 59 条**覆盖：空白判定六种写法（含 `chrome://new-tab-page/` 子路径）、URL 归一（补 https、只收 http/https）、序号映射（`same_tab` 两方向、越界返回 `null` 不猜）、关其它从大到小、关空白只关空白、

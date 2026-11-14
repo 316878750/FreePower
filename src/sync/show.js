@@ -51,7 +51,7 @@ export function planShow(windows) {
  * @param {{state_before:string, rect_before:object}} before
  * @param {object} after 回读到的 `{x,y,width,height,state}`
  */
-export function verifyShown(before, after) {
+export function verifyShown(before, after, opts = {}) {
   const stateBefore = normalizeState(before?.state_before);
   if (!after || typeof after !== 'object') {
     return {
@@ -74,27 +74,42 @@ export function verifyShown(before, after) {
      * 多屏窗口被搬回主屏这种硬伤就漏掉了。
      */
     if (stateAfter === 'normal' && normalizeState(before?.rect_before?.state) !== 'maximized') {
-      for (const f of ['x', 'y', 'width', 'height']) {
-        const want = before?.rect_before?.[f];
-        const got = after?.[f];
-        if (want === null || want === undefined) continue;
-        if (got === null || got === undefined || Math.round(Number(got)) !== Math.round(Number(want))) {
-          problems.push({
-            field: f,
-            expected: Math.round(Number(want)),
-            actual: got === null || got === undefined ? null : Math.round(Number(got)),
-          });
-        }
-      }
+      problems.push(...rectProblems(before?.rect_before, after));
     }
   } else if (stateBefore === 'fullscreen') {
     if (stateAfter !== 'fullscreen') problems.push({ field: 'windowState', expected: 'fullscreen', actual: after?.state ?? null });
-  } else if (stateAfter !== stateBefore) {
+  } else {
     // normal / maximized：不该被我们改掉状态（只做页面级激活）
-    problems.push({ field: 'windowState', expected: stateBefore, actual: after?.state ?? null });
+    if (stateAfter !== stateBefore) problems.push({ field: 'windowState', expected: stateBefore, actual: after?.state ?? null });
+    /*
+     * 强制置前那档（`opts.strictRect`）：窗口**确实被我们动过**（minimize → 恢复），
+     * 所以要额外钉住「动完位置尺寸回到原样」。普通 page_only 只做页面级激活、压根没碰窗口，
+     * 不比对（免得用户自己挪了一下就报失败）。maximized 照旧不比（边框补偿）。
+     */
+    if (opts.strictRect === true && stateAfter === 'normal') {
+      problems.push(...rectProblems(before?.rect_before, after));
+    }
   }
 
   return { ok: problems.length === 0, problems };
+}
+
+/** 位置尺寸比对（两处共用一份，别各写一份判定） */
+function rectProblems(want, got) {
+  const problems = [];
+  for (const f of ['x', 'y', 'width', 'height']) {
+    const w = want?.[f];
+    if (w === null || w === undefined) continue;
+    const g = got?.[f];
+    if (g === null || g === undefined || Math.round(Number(g)) !== Math.round(Number(w))) {
+      problems.push({
+        field: f,
+        expected: Math.round(Number(w)),
+        actual: g === null || g === undefined ? null : Math.round(Number(g)),
+      });
+    }
+  }
+  return problems;
 }
 
 /**
@@ -136,4 +151,76 @@ export function isMinimized(state) {
 /** 需要先恢复再操作？（给别的模块复用，避免各处自己判） */
 export function needsRestore(state) {
   return needsRestoreBeforeResize(state);
+}
+
+/* ========================================================================
+ * 强制置前（用户显式点「强制抬到前台（会闪一下）」才有；**默认行为绝不走这里**）
+ *
+ * 零依赖唯一能把「没最小化、只是被盖住」的窗口抬到 OS 前台的办法是
+ * 「最小化 → 恢复」：实测到前台耗时 634 / 967 / 968 / 1061ms，任务栏会闪一下。
+ * 它是**一次性的显式动作**，不是开关、不写进设置 —— 每次点都闪，窗口多了很难受，
+ * 所以只有用户明说要「现在就看这个窗口」时才做。
+ *
+ * **产品里不调 Win32**（Win32 只出现在测试用的前台读数脚本里，不进产品代码），
+ * 所以这一档能确认的只有「窗口已恢复正常」——**确认不了「它在最前面」**。
+ * 文案因此写「已恢复显示并尝试置前」，不写「已置前」。
+ * ====================================================================== */
+
+/**
+ * 哪些窗口需要强制置前。
+ * fullscreen 不动（它本来就盖住一切，动它反而把用户的沉浸状态弄没）；
+ * 其余（normal / maximized / minimized）都做一次 minimize → 恢复原状态。
+ * @param {Array<{profile_id:string, state:string|null}>} windows
+ */
+export function planForce(windows) {
+  const list = Array.isArray(windows) ? windows : [];
+  return list.map((w) => {
+    const state = normalizeState(w?.state);
+    if (state === 'fullscreen') {
+      return { profile_id: w.profile_id, action: 'skip', state_before: state, reason: '全屏窗口本来就在最前面，不动它' };
+    }
+    return { profile_id: w.profile_id, action: 'force', state_before: state };
+  });
+}
+
+/**
+ * 强制置前的判定：**完全复用 `verifyShown`**（`strictRect`），不另立一套。
+ * CEO 的要求：走的是同一处判定，别自己造一套 —— 所以这里只把 opts 传下去。
+ * @param {{state_before:string, rect_before:object}} before
+ * @param {object} after
+ */
+export function verifyForced(before, after) {
+  return verifyShown(before, after, { strictRect: true });
+}
+
+/**
+ * 强制置前的汇总。两说，不许混：
+ *   restored   回读窗口已恢复正常（`windowState: normal` 或回到最大化的原状态）
+ *   未能确认  恢复失败 / 读不到 / 位置被搬走
+ * 再加一条 `confirmed` 字段，明说这一档**只确认了窗口恢复**，没确认它在最前面。
+ */
+export function summarizeForce(results) {
+  const list = Array.isArray(results) ? results : [];
+  const failed = list.filter((r) => !r.ok);
+  const done = list.filter((r) => r.ok);
+  const skipped = list.filter((r) => r.action === 'skip');
+  const parts = [];
+  if (done.length) parts.push(`已恢复显示并尝试置前 ${done.length} 个窗口`);
+  if (failed.length) parts.push(`${failed.length} 个窗口未能确认置前`);
+  if (skipped.length) parts.push(`${skipped.length} 个全屏窗口没动`);
+  return {
+    total: list.length,
+    ok: failed.length === 0,
+    failed: failed.length,
+    restored: done.length,
+    skipped: skipped.length,
+    /** 这一档能证明到哪：窗口已恢复正常。**不代表它在最前面** */
+    confirmed: 'window_restored',
+    message: parts.join('；') || '没有需要强制置前的窗口',
+    details: failed.map((r) => ({
+      profile_id: r.profile_id,
+      role: r.role,
+      reason: r.reason || (r.problems || []).map((p) => `${p.field} 期望 ${p.expected} 实际 ${p.actual}`).join('；'),
+    })),
+  };
 }

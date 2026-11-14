@@ -31,7 +31,10 @@ const t = (name, fn) => {
   try { fn(); check(name, true); } catch (e) { check(name, false, e?.message || String(e)); }
 };
 
-const { planShow, verifyShown, summarizeShow, isMinimized, needsRestore } = await import('../src/sync/show.js');
+const {
+  planShow, verifyShown, summarizeShow, isMinimized, needsRestore,
+  planForce, verifyForced, summarizeForce,
+} = await import('../src/sync/show.js');
 
 /** 取一个函数/导出块在源码里的片段，静态扫描只在这个范围里看 */
 function slice(src, from, to) {
@@ -270,6 +273,93 @@ t('needsRestore：非 normal 都要先恢复（复用 window.js 的判定）', (
   assert.equal(needsRestore('normal'), false);
 });
 
+/* ============================ 4b. 强制置前（显式按钮那一档） ============================ */
+console.log('\n— 4b. 强制置前（planForce / verifyForced / summarizeForce）：只有点了才走 —');
+
+t('planForce：normal / maximized / minimized 都做一次 force', () => {
+  const p = planForce([
+    { profile_id: 'a', state: 'normal' },
+    { profile_id: 'b', state: 'maximized' },
+    { profile_id: 'c', state: 'minimized' },
+  ]);
+  assert.deepEqual(p.map((x) => x.action), ['force', 'force', 'force']);
+  assert.deepEqual(p.map((x) => x.state_before), ['normal', 'maximized', 'minimized']);
+});
+
+t('planForce：fullscreen 不动（它本来就在最前面，动它反而破坏沉浸状态）', () => {
+  const [p] = planForce([{ profile_id: 'a', state: 'fullscreen' }]);
+  assert.equal(p.action, 'skip');
+  assert.match(p.reason, /全屏/);
+});
+
+t('planForce：状态读不到当 normal，仍然 force（不猜）', () => {
+  const [p] = planForce([{ profile_id: 'a', state: null }]);
+  assert.equal(p.action, 'force');
+  assert.equal(p.state_before, 'normal');
+});
+
+t('verifyForced 复用 verifyShown 的判定：normal 动完回到原状态、位置尺寸原样 → ok', () => {
+  const v = verifyForced(
+    { state_before: 'normal', rect_before: rect(2400, 200, 900, 600, 'normal') },
+    rect(2400, 200, 900, 600, 'normal'));
+  assert.equal(v.ok, true);
+});
+
+t('verifyForced 比普通 verifyShown 更严：动过窗口就要求位置尺寸回原样', () => {
+  const before = { state_before: 'normal', rect_before: rect(2400, 200, 900, 600, 'normal') };
+  const moved = rect(0, 0, 900, 600, 'normal');
+  assert.equal(verifyShown(before, moved).ok, true, '默认档只做页面级激活、没碰窗口，不该因为位置报失败');
+  const v = verifyForced(before, moved);
+  assert.equal(v.ok, false, '强制档确实动过窗口，被搬走必须报出来');
+  assert.deepEqual(v.problems.map((p) => p.field).sort(), ['x', 'y']);
+});
+
+t('verifyForced：最大化窗口恢复后仍是 maximized 算 ok，不比尺寸', () => {
+  const v = verifyForced(
+    { state_before: 'maximized', rect_before: rect(-8, -8, 3456, 1408, 'maximized') },
+    rect(-8, -8, 3440, 1400, 'maximized'));
+  assert.equal(v.ok, true);
+});
+
+t('verifyForced：恢复失败（还是 minimized）或读不到 → 不 ok', () => {
+  const before = { state_before: 'normal', rect_before: rect(10, 10, 900, 600, 'normal') };
+  assert.equal(verifyForced(before, rect(10, 10, 900, 600, 'minimized')).ok, false);
+  assert.equal(verifyForced(before, null).ok, false);
+});
+
+t('summarizeForce：全成功说「已恢复显示并尝试置前 N 个窗口」，**不说「已置前」**', () => {
+  const s = summarizeForce([
+    { profile_id: 'a', role: 'slave', ok: true, action: 'force', raise: 'restored' },
+    { profile_id: 'b', role: 'master', ok: true, action: 'force', raise: 'restored' },
+  ]);
+  assert.equal(s.ok, true);
+  assert.equal(s.restored, 2);
+  assert.match(s.message, /已恢复显示并尝试置前 2 个窗口/);
+  assert.doesNotMatch(s.message, /已置前/);
+  assert.equal(s.confirmed, 'window_restored', '能确认的只有窗口恢复，不是在最前面');
+});
+
+t('summarizeForce：有失败 → 两说分开，失败明细带原因', () => {
+  const s = summarizeForce([
+    { profile_id: 'a', role: 'slave', ok: true, action: 'force' },
+    { profile_id: 'b', role: 'master', ok: false, action: 'force', reason: '读不到窗口 id' },
+  ]);
+  assert.equal(s.ok, false);
+  assert.equal(s.restored, 1);
+  assert.equal(s.failed, 1);
+  assert.match(s.message, /已恢复显示并尝试置前 1 个窗口/);
+  assert.match(s.message, /1 个窗口未能确认置前/);
+  assert.equal(s.details[0].reason, '读不到窗口 id');
+});
+
+t('summarizeForce：全屏跳过不算失败，单独说「没动」', () => {
+  const s = summarizeForce([{ profile_id: 'a', role: 'slave', ok: true, action: 'skip' }]);
+  assert.equal(s.ok, true);
+  assert.equal(s.failed, 0);
+  assert.equal(s.skipped, 1);
+  assert.match(s.message, /1 个全屏窗口没动/);
+});
+
 /* ============================ 5. 静态扫描 ============================ */
 console.log('\n— 5. 静态扫描：路由 / 分档落点 / page_only 不参与 ok / 面板 / 不引依赖 —');
 
@@ -348,6 +438,74 @@ t('面板把 page_only 的能力边界写出来（不假装都到前面了）', 
 
 t('面板初始渲染就把这块画出来（定义了却没人调用 = 界面上没有）', () => {
   assert.match(panelSrc, /\n {2}paintShow\(\);/, 'paintShow() 必须在初始化流程里被调用');
+});
+
+/* ---- CEO 点的两条：强制置前的按钮 + 默认行为不许偷偷做 ---- */
+
+t('① page_only 档下存在「强制抬到前台（会闪一下）」按钮，且点的是 force 路由', () => {
+  assert.match(panelSrc, /强制抬到前台（会闪一下）/, '按钮文案要写明代价');
+  assert.match(panelSrc, /api\.syncShowForce\(/, '必须调 /api/v2/sync/show/force');
+  assert.match(apiSrc, /syncShowForce:[\s\S]{0,140}\/api\/v2\/sync\/show\/force/);
+  assert.match(routesSrc, /add\(\['POST'\], \['\/api\/v2\/sync\/show\/force'\]/, 'force 要有独立路由');
+  /* 只在 page_only 那批存在时才出现，不是常驻按钮 */
+  assert.match(panelSrc, /pageOnlyIds\.length \? forceBox : null/);
+  assert.match(panelSrc, /filter\(\(x\) => x\.ok && x\.raise === 'page_only'\)/);
+});
+
+t('① force 的判定走同一处（复用 verifyShown，不另造一套）', () => {
+  assert.match(showSrc, /export function verifyForced\(before, after\) \{\s*return verifyShown\(before, after, \{ strictRect: true \}\);/,
+    'verifyForced 必须就是 verifyShown 加一个选项，不许自己再写一套比对');
+  assert.match(sessionSrc, /const v = verifyForced\(/);
+  /* 强制置前里也不许出现「自己算一遍位置对不对」 */
+  const forceBody = slice(sessionSrc, 'export async function forceShowWindows(', '/**\n * 最小化 → 恢复原状态');
+  assert.doesNotMatch(forceBody, /entry\.ok = [^;]*Math\.round/, '不许自己比位置');
+});
+
+t('① force 是一次性动作：不写设置、不是开关', () => {
+  const forceBody = slice(sessionSrc, 'export async function forceShowWindows(', '/**\n * 最小化 → 恢复原状态');
+  for (const bad of ['updateSettings', 'saveSettings', 'writeSettings', 'setSetting']) {
+    assert.ok(!forceBody.includes(bad), `force 不许写设置（出现「${bad}」）`);
+  }
+  /* 面板里这个按钮不是 checkbox/开关 */
+  const btn = panelSrc.match(/强制抬到前台（会闪一下）'[\s\S]{0,80}/)?.[0] || '';
+  assert.ok(!/checkbox|type: 'checkbox'/.test(btn), '一次性动作不许做成开关');
+});
+
+t('① 强制置前文案不写「已置前」：只能确认窗口恢复，确认不了在最前面', () => {
+  assert.match(showSrc, /已恢复显示并尝试置前/);
+  assert.doesNotMatch(showSrc, /message:[^\n]*已置前/, '产品里不调 Win32，不能声称已置前');
+  assert.match(showSrc, /confirmed: 'window_restored'/);
+  assert.match(sessionSrc, /os_foreground_confirmed: false/);
+});
+
+t('② 默认行为里不含 minimize→restore：showWindows 不许调 nudgeToFront', () => {
+  assert.doesNotMatch(showBody, /nudgeToFront/, '默认「显示窗口」不许走强制置前那套');
+  assert.doesNotMatch(showBody, /windowState: 'minimized'/);
+  /* 默认路由的 handler 只调 showWindows，不调 forceShowWindows */
+  const defaultRoute = slice(routesSrc, "add(['POST'], ['/api/v2/sync/show']", "add(['POST'], ['/api/v2/sync/show/force']");
+  assert.match(defaultRoute, /showWindows\(ids\)/);
+  assert.doesNotMatch(defaultRoute, /forceShowWindows/, '默认路由不许顺手做强制置前');
+});
+
+t('产品里不调 Win32：src/ 与 web/ 不引用 win-foreground.ps1 / user32 / koffi', () => {
+  const srcFiles = [];
+  const walk = (dir) => {
+    for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, ent.name);
+      if (ent.isDirectory()) walk(p);
+      else if (/\.(js|mjs)$/.test(ent.name)) srcFiles.push(p);
+    }
+  };
+  walk(path.join(ROOT, 'src'));
+  walk(path.join(ROOT, 'web'));
+  const hits = [];
+  for (const f of srcFiles) {
+    const txt = fs.readFileSync(f, 'utf8');
+    for (const bad of ['win-foreground.ps1', 'SetForegroundWindow', 'user32.dll', "from 'koffi'", 'require(\'koffi\')']) {
+      if (txt.includes(bad)) hits.push(`${path.relative(ROOT, f)}: ${bad}`);
+    }
+  }
+  assert.deepEqual(hits, [], '产品代码里出现了 Win32 / 原生依赖引用');
 });
 
 t('面板不自动抢焦点（同步时用户在主窗口打字）', () => {

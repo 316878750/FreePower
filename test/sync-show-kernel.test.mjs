@@ -258,6 +258,53 @@ try {
   check('E 不传 profile_ids 时全部处理，剩下那个也恢复', e2b.state === 'normal', e2b.state);
   check('E 全量那次的汇总 ok=true', rE2.summary?.ok === true, rE2.summary?.message);
 
+  /* ------------------ G. 强制置前（显式按钮那一档）：真的能到 ③ ------------------ */
+  console.log('\n— G. 强制抬到前台：默认那档抬不动，点了 force 之后真的到 ③ OS 前台 —');
+  /* 先把三个窗口都摆成 normal 且分开，别互相盖住，然后人为把「另一个程序」放到前面：
+     用记事本挡是不行的（判据不该依赖用户桌面上有什么），所以改用**另一个 Chrome 窗口**当遮挡物：
+     把受控 2 抬到前面（它现在也是 normal），受控 1 就在后面。 */
+  await setState(started[2], 'normal');
+  await setRect(started[1], 900, 120, 700, 480);
+  await setRect(started[2], 900, 120, 700, 480); // 故意重叠：谁后动谁在上面
+  await sleep(300);
+
+  /* 默认档：受控 1 是 normal，只做页面级激活 —— 这里先记一次基线 */
+  const g0 = await rectOf(started[1]);
+  const rG0 = await sync.showWindows([started[1]]);
+  check('G 前置：受控 1 是 normal（不是最小化）', g0.state === 'normal', g0.state);
+  check('G 默认档报 page_only（抬不动就不假装抬动了）',
+    rG0.shown?.[0]?.raise === 'page_only' && rG0.os_foreground === false,
+    JSON.stringify({ raise: rG0.shown?.[0]?.raise, os: rG0.os_foreground }));
+
+  const gBefore = await rectOf(started[1]);
+  const rG = await sync.forceShowWindows([started[1]]);
+  const gAfter = await rectOf(started[1]);
+  const gFg = fgTitleIs('fp-show-slave1');
+  console.log(`  force 前 ${rectStr(gBefore)} → force 后 ${rectStr(gAfter)}；OS 前台「${gFg.title}」`);
+
+  check('G force 回报 ok=true、raise=restored、state_after=normal',
+    rG.forced?.[0]?.ok === true && rG.forced?.[0]?.raise === 'restored' && rG.forced?.[0]?.state_after === 'normal',
+    JSON.stringify({ ok: rG.forced?.[0]?.ok, raise: rG.forced?.[0]?.raise, after: rG.forced?.[0]?.state_after }));
+  check('G force 之后**真的成了 ③ OS 前台**（Win32 读数）', gFg.hit, `前台「${gFg.title}」`);
+  check('G 位置尺寸原样（minimize→restore 不搬窗口）', sameRect(gBefore, gAfter),
+    `${rectStr(gBefore)} vs ${rectStr(gAfter)}`);
+  check('G 汇总：说「已恢复显示并尝试置前」，不说「已置前」，confirmed=window_restored',
+    /已恢复显示并尝试置前 1 个窗口/.test(rG.summary?.message || '')
+      && !/已置前/.test(rG.summary?.message || '')
+      && rG.summary?.confirmed === 'window_restored'
+      && rG.os_foreground_confirmed === false,
+    JSON.stringify({ msg: rG.summary?.message, c: rG.summary?.confirmed }));
+
+  /* 全屏窗口不该被 force 动 */
+  await setState(started[2], 'fullscreen');
+  const gFull = await rectOf(started[2]);
+  const rGf = await sync.forceShowWindows([started[2]]);
+  const gFullAfter = await rectOf(started[2]);
+  check('G 全屏窗口：force 直接跳过（action=skip），状态一点没动',
+    rGf.forced?.[0]?.action === 'skip' && gFullAfter.state === 'fullscreen',
+    `${gFull.state} → ${gFullAfter.state}`);
+  await setState(started[2], 'normal');
+
   /* ------------------ F. 内核死掉的窗口：如实报，不拖垮其它窗口 ------------------ */
   console.log('\n— F. 一个内核死掉：那条 ok=false 且有原因，其它窗口照常 —');
   const victim = started[2];
