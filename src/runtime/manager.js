@@ -1107,6 +1107,12 @@ export async function stopProfile(profileId) {
   const inst = running.get(profileId);
   if (!inst) return { profile_id: profileId, stopped: false, reason: 'not running' };
   log(profileId, 'stop');
+  // 同步会话挂在环境上：环境停了还留着会话，就是挂在死连接上的定时器和刷屏日志。
+  // 用动态 import 避免 manager ↔ sync 的循环依赖（sync/session.js 要 import manager）。
+  try {
+    const { detachProfile } = await import('../sync/session.js');
+    await detachProfile(profileId);
+  } catch { /* 没有会话或取不到，不影响停止 */ }
   try {
     // 先让 Chrome 优雅退出（cookie 落盘），再兜底杀进程树
     await inst.client.send('Browser.close').catch(() => {});

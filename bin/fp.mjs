@@ -54,6 +54,14 @@ if (!port && found.url) {
 if (!port) port = API_PORT;
 
 const base = `http://${API_HOST}:${port}`;
+/**
+ * key 从哪来（排错要靠这个说清是哪一环出问题）：
+ *   cli    命令行 -k
+ *   env    FREEPOWER_API_KEY
+ *   file   data/local_api 发现文件
+ *   none   都没有
+ */
+const keySource = args.key ? 'cli' : (process.env.FREEPOWER_API_KEY ? 'env' : (found.key ? 'file' : 'none'));
 const key = args.key || process.env.FREEPOWER_API_KEY || found.key || '';
 
 const USAGE = `FreePower CLI
@@ -102,13 +110,33 @@ async function call(method, apiPath, body, { retries = 3 } = {}) {
   }
 }
 
+/**
+ * 失败提示要**分清是哪一种失败**：
+ *   - key 根本没有 → 告诉用户怎么给；
+ *   - key 有但被拒（401）→ 告诉用户是「哪来的 key 被拒」，别让他以为没配置。
+ * 这两种混成一句，排障时会往完全错的方向走（比如以为要配 key，其实是连错了数据目录）。
+ */
 function fail(e) {
-  console.error(`失败：${e.message}`);
-  if (!key) console.error('提示：没读到 API key —— 传 -k，或确认 FreePower 桌面端在运行（它会写 data/local_api）。');
+  const msg = String(e?.message || e);
+  const rejected = /invalid api_key/i.test(msg) || /code -1/.test(msg) && /api_key/i.test(msg);
+  console.error(`失败：${msg}`);
+  if (keySource === 'none') {
+    console.error('提示：没找到 API key —— 传 -k，或确认 FreePower 桌面端在运行（它会写 data/local_api）。');
+  } else if (rejected) {
+    const where = { cli: '命令行 -k 传的', env: '环境变量 FREEPOWER_API_KEY 里的', file: `发现文件 ${path.join(DATA_DIR, 'local_api')} 里的` }[keySource];
+    console.error(`提示：${where} key 被拒（服务不认它）。常见原因：服务重启后换过 key、或这个数据目录不是桌面端正在用的那个。`);
+    console.error(`      正确的 key 在桌面端「API & MCP」页，或 ${path.join(DATA_DIR, 'local_api')}（如果目录对）。`);
+  }
   process.exit(1);
 }
 
 const pad = (s, n) => String(s ?? '').padEnd(n);
+
+/** 按**实际内容**算列宽：profile_id 是 36 字符的 UUID，写死 12 会把 ID 和编号粘在一起 */
+function columnWidths(header, rows) {
+  return header.map((h, i) => Math.max(...[h, ...rows.map((r) => r[i])].map((v) => String(v ?? '').length)));
+}
+const renderRow = (cells, widths) => cells.map((c, i) => pad(c, widths[i])).join('');
 
 async function main() {
   if (args.help || !args.cmd) {
@@ -122,10 +150,12 @@ async function main() {
       if (args.json) { process.stdout.write(`${JSON.stringify(data, null, 2)}\n`); break; }
       const list = data?.list || [];
       if (!list.length) { console.log('还没有环境。'); break; }
-      console.log(`${pad('ID', 12)}${pad('编号', 8)}${pad('名称', 24)}分组`);
-      for (const p of list) {
-        console.log(`${pad(p.profile_id, 12)}${pad(p.profile_no, 8)}${pad(p.name, 24)}${p.group_id ?? ''}`);
-      }
+      // 每列后面留一个空格，按实际内容算宽度（ID 是 36 字符的 UUID）
+      const header = ['ID', '编号', '名称', '分组'];
+      const rows = list.map((p) => [p.profile_id, p.profile_no, p.name, p.group_id ?? '']);
+      const widths = columnWidths(header, rows).map((w) => w + 2);
+      console.log(renderRow(header, widths).trimEnd());
+      for (const r of rows) console.log(renderRow(r, widths).trimEnd());
       console.log(`\n共 ${data.total ?? list.length} 个（本页 ${list.length} 个）`);
       break;
     }

@@ -48,7 +48,14 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .brand-text { display: flex; flex-direction: column; line-height: 1.2; }
 .brand-text strong { color: #fff; font-size: 14px; }
 .brand-text small { color: #7d8794; font-size: 11px; }
-.nav { display: flex; flex-direction: column; gap: 2px; }
+.nav { display: flex; flex-direction: column; gap: 14px; }
+/* 分组标题：「常用」不可折叠（这几项天天点，收起来只多一次点击）；
+   「自动化」这层先只做标题，折叠交互随侧栏改造一起上。 */
+.nav-group { display: flex; flex-direction: column; gap: 2px; }
+.nav-group-title {
+  font-size: 11px; color: #6d7783; letter-spacing: .6px;
+  padding: 2px 10px 4px; user-select: none;
+}
 .nav-item {
   color: #c3cad4; padding: 8px 10px; border-radius: 6px; font-size: 13px; display: block;
 }
@@ -204,3 +211,11 @@ details.advanced .form-grid { margin-top: 12px; }
 .checks { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; }
 .checks label { display: inline-flex; gap: 4px; align-items: center; }
 .code-block { font-family: var(--mono); font-size: 12px; background: #f7f9fb; border: 1px solid var(--line-2); border-radius: 6px; padding: 8px; overflow: auto; }
+/* ---- 窗口同步面板（独立置顶小窗，430px 宽）---- */
+/* 面板窗里没有侧栏的位置：单列铺满，字号不动，避免挤压 */
+body.panel-mode .shell { grid-template-columns: 1fr; }
+body.panel-mode .sidebar { display: none; }
+body.panel-mode .page { padding: 10px 12px 24px; }
+body.panel-mode .page-head { padding: 8px 12px; }
+body.panel-mode .page-head h1 { font-size: 14px; }
+body.panel-mode .panel { margin-bottom: 10px; }

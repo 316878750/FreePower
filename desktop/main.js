@@ -12,7 +12,7 @@
 // electron 是 CJS 包，ESM 下拿不到具名导出，只能整体引入再解构
 import electron from 'electron';
 
-const { app, BrowserWindow, Menu, Tray, nativeImage, shell, dialog, session } = electron;
+const { app, BrowserWindow, Menu, Tray, nativeImage, shell, dialog, session, globalShortcut } = electron;
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -49,6 +49,10 @@ function assetPath(...p) {
 }
 
 let win = null;
+let syncPanel = null;
+let syncSession = null;
+let syncHotkeyOk = null;
+let syncHotkeyError = '';
 let tray = null;
 let baseUrl = '';
 let server = null;
@@ -80,6 +84,8 @@ if (!gotLock) {
 async function main() {
   boot = await import('../src/boot.js');
   runtime = await import('../src/runtime/manager.js');
+  syncSession = await import('../src/sync/session.js');
+  hotkeyMod = await import('../src/sync/hotkey.js');
 
   await app.whenReady();
 
@@ -93,6 +99,10 @@ async function main() {
 
   createTray();
   createWindow();
+  // 用上次保存的快捷键（用户改过就用改过的），没有就用默认
+  const storedHotkey = hotkeyMod.readHotkeyStatus();
+  registerSyncHotkey(storedHotkey.managed ? storedHotkey.accelerator : SYNC_HOTKEY_DEFAULT);
+  watchHotkeyRequests();
 
   poller = setInterval(() => {
     const n = safeCount();
@@ -219,6 +229,135 @@ function showWindow() {
   win.focus();
 }
 
+/* ------------------------------ 窗口同步面板 ------------------------------ */
+
+/** 默认快捷键（与对手一致）；实际生效值可能被用户在面板里改过 */
+const SYNC_HOTKEY_DEFAULT = process.env.FREEPOWER_SYNC_HOTKEY || 'CommandOrControl+Alt+S';
+let syncHotkey = SYNC_HOTKEY_DEFAULT;
+let hotkeyMod = null;
+let hotkeyPoll = null;
+let lastHotkeyRequestAt = null;
+
+/**
+ * 面板是**独立小窗 + 始终置顶**，且同步过程中**绝不 focus()** ——
+ * 用户正在主窗口里打字，面板一抢焦点，按键就打到面板上，整个同步当场废掉。
+ * 所以显示一律走 `showInactive()`：出现、但不抢焦点。
+ */
+function syncPanelUrl(extra = '') {
+  return `${baseUrl}#/sync-panel${extra ? `?${extra}` : ''}`;
+}
+
+function createSyncPanel(extra = '') {
+  syncPanel = new BrowserWindow({
+    width: 430,
+    height: 620,
+    minWidth: 380,
+    minHeight: 420,
+    show: false,
+    title: 'FreePower 窗口同步',
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    resizable: true,
+    minimizable: false,
+    maximizable: false,
+    backgroundColor: '#171a1f',
+    icon: assetPath('tray.png'),
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      spellcheck: false,
+      devTools: !app.isPackaged,
+    },
+  });
+  syncPanel.setAlwaysOnTop(true, 'floating');
+  syncPanel.loadURL(syncPanelUrl(extra));
+  // 关面板 = 收起来，不销毁（同步可能还在跑，状态得留着）
+  syncPanel.on('close', (e) => {
+    if (quitting) return;
+    e.preventDefault();
+    syncPanel.hide();
+  });
+  syncPanel.on('closed', () => { syncPanel = null; });
+  syncPanel.webContents.setWindowOpenHandler(({ url }) => { openExternal(url); return { action: 'deny' }; });
+  return syncPanel;
+}
+
+/** 显示面板：只出现不抢焦点（这是本条最关键的语义，别改成 show()+focus()） */
+function showSyncPanel(extra = '') {
+  if (!syncPanel || syncPanel.isDestroyed()) createSyncPanel(extra);
+  else if (extra) syncPanel.loadURL(syncPanelUrl(extra));
+  syncPanel.showInactive();
+  syncPanel.setAlwaysOnTop(true, 'floating');
+  return syncPanel;
+}
+
+/**
+ * 注册全局快捷键。注册失败**不许静默**：用户按了没反应会以为功能坏了，
+ * 所以把结果写进 status 文件（界面读得到），面板上显示「快捷键注册失败，请在这里改一个」。
+ * `Ctrl+Alt+S` 在装了 AdsPower 的机器上大概率被占（实测 RegisterHotKey err=1409）。
+ */
+function registerSyncHotkey(accelerator) {
+  const want = accelerator || syncHotkey || SYNC_HOTKEY_DEFAULT;
+  try { globalShortcut.unregisterAll(); } catch { /* ignore */ }
+  syncHotkeyError = '';
+  try {
+    syncHotkeyOk = globalShortcut.register(want, () => {
+      toggleSyncFromHotkey().catch((e) => log('hotkey 失败', e.message));
+    });
+    if (!syncHotkeyOk) syncHotkeyError = '快捷键已被其他程序占用（可能是 AdsPower）';
+  } catch (e) {
+    syncHotkeyOk = false;
+    syncHotkeyError = e && e.message ? e.message : String(e);
+  }
+  syncHotkey = want;
+  log(`sync hotkey ${want} → ${syncHotkeyOk ? 'ok' : 'FAILED ' + syncHotkeyError}`);
+  try { hotkeyMod?.writeHotkeyStatus({ accelerator: want, ok: syncHotkeyOk, error: syncHotkeyError || null }); } catch { /* ignore */ }
+  if (!syncHotkeyOk && syncPanel && !syncPanel.isDestroyed()) {
+    // 已经开着面板：立刻把失败提示带进去
+    syncPanel.loadURL(syncPanelUrl('shortcut=failed'));
+  }
+  refreshMenu();   // 托盘里的文案要跟着变
+}
+
+/**
+ * 用户可能在面板里改快捷键：轮询请求文件（跨进程不走 IPC，见 `src/sync/hotkey.js`）。
+ * 1500ms 的轮询对「点保存」这种低频操作绰绰有余，也不值得为它开 IPC。
+ */
+function watchHotkeyRequests() {
+  hotkeyPoll = setInterval(() => {
+    try {
+      const req = hotkeyMod?.readHotkeyRequest?.();
+      if (!req?.accelerator) return;
+      if (req.at === lastHotkeyRequestAt) return;
+      lastHotkeyRequestAt = req.at;
+      if (req.accelerator === syncHotkey && syncHotkeyOk) return;
+      log(`hotkey 请求改为 ${req.accelerator}`);
+      registerSyncHotkey(req.accelerator);
+      if (syncPanel && !syncPanel.isDestroyed()) syncPanel.loadURL(syncPanelUrl(syncHotkeyOk === false ? 'shortcut=failed' : ''));
+    } catch (e) {
+      log('hotkey 轮询失败', e.message);
+    }
+  }, 1500);
+  hotkeyPoll.unref?.();
+}
+
+/**
+ * 快捷键语义：同步在跑 → 停；没在跑 → 把面板拿出来让用户选窗口。
+ * **不自动开始**：主窗口是谁、受控窗口有哪些，只有用户知道（猜错就是把输入发到别人窗口）。
+ */
+async function toggleSyncFromHotkey() {
+  let running = false;
+  try { running = !!syncSession?.getSession(); } catch { /* ignore */ }
+  if (running) {
+    await syncSession.stopSync();
+    log('hotkey: 已停止窗口同步');
+    return;
+  }
+  showSyncPanel(syncHotkeyOk === false ? 'shortcut=failed' : '');
+}
+
 /* ------------------------------ 托盘 ------------------------------ */
 function createTray() {
   const iconFile = assetPath('tray.png');
@@ -258,6 +397,10 @@ function refreshMenu() {
   const n = safeCount();
   const template = [
     { label: '打开控制台', click: () => showWindow() },
+    {
+      label: syncHotkeyOk === false ? '窗口同步面板（快捷键不可用）' : `窗口同步面板（${syncHotkey.replace('CommandOrControl', 'Ctrl')}）`,
+      click: () => showSyncPanel(syncHotkeyOk === false ? 'shortcut=failed' : ''),
+    },
     { label: `运行中：${n} 个环境`, enabled: false },
     {
       label: '停止全部环境',
@@ -351,6 +494,9 @@ async function quitApp(reason) {
   }
 
   try { if (poller) clearInterval(poller); } catch { /* ignore */ }
+  try { if (hotkeyPoll) clearInterval(hotkeyPoll); } catch { /* ignore */ }
+  try { globalShortcut.unregisterAll(); } catch { /* ignore */ }
+  try { if (syncPanel && !syncPanel.isDestroyed()) syncPanel.destroy(); } catch { /* ignore */ }
   try { if (tray) tray.destroy(); } catch { /* ignore */ }
   try { if (server) await new Promise((r) => { server.close(r); setTimeout(r, 2000).unref(); }); } catch { /* ignore */ }
 
@@ -399,6 +545,21 @@ async function runSelfTest() {
   steps.tray_bounds = tray ? tray.getBounds() : null;
   steps.tray_menu = menuLabels;
   steps.tray_host_window = steps.tray_alive;
+
+  // 同步面板：必须「出现但不抢焦点」。这几条只记录、不参与 ok ——
+  // 无头/远程会话里窗口焦点语义不稳定，拿它当硬闸会造出假失败。
+  steps.sync_hotkey = syncHotkey;
+  steps.sync_hotkey_ok = syncHotkeyOk;
+  try {
+    const p = showSyncPanel(syncHotkeyOk === false ? 'shortcut=failed' : '');
+    await new Promise((r) => setTimeout(r, 600));
+    steps.sync_panel_created = !!p && !p.isDestroyed();
+    steps.sync_panel_visible = !!p && p.isVisible();
+    steps.sync_panel_always_on_top = !!p && p.isAlwaysOnTop();
+    steps.sync_panel_focused_after_show = !!p && p.isFocused();   // 期望 false
+  } catch (e) {
+    steps.sync_panel_error = e && e.message ? e.message : String(e);
+  }
 
   win.close();
   await new Promise((r) => setTimeout(r, 700));

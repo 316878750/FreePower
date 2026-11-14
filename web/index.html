@@ -19,10 +19,19 @@
         </span>
       </div>
       <nav id="nav" class="nav">
-        <a class="nav-item" data-nav="profiles" href="#/profiles">环境管理</a>
-        <a class="nav-item" data-nav="proxies" href="#/proxies">代理管理</a>
-        <a class="nav-item" data-nav="agent" href="#/agent">AI Agent</a>
-        <a class="nav-item" data-nav="api" href="#/api">API &amp; MCP</a>
+        <!-- 「常用」不可折叠：这几项是每天要点的，收起来只是多一次点击。
+             分组与顺序对齐用户习惯的排法（常用在上、自动化在下）。 -->
+        <div class="nav-group">
+          <div class="nav-group-title">常用</div>
+          <a class="nav-item" data-nav="profiles" href="#/profiles">环境管理</a>
+          <a class="nav-item" data-nav="proxies" href="#/proxies">代理管理</a>
+        </div>
+        <div class="nav-group">
+          <div class="nav-group-title">自动化</div>
+          <a class="nav-item" data-nav="agent" href="#/agent">AI Agent</a>
+          <a class="nav-item" data-nav="sync" href="#/sync">窗口同步</a>
+          <a class="nav-item" data-nav="api" href="#/api">API &amp; MCP</a>
+        </div>
       </nav>
       <div class="sidebar-foot">
         <div id="foot-port" class="muted small">—</div>

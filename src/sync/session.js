@@ -1,0 +1,461 @@
+/**
+ * 窗口同步会话（阶段 1：键鼠捕获 → 回放 + 坐标映射 + 四个开关 + 延迟）。
+ *
+ * 连接策略（方案 Q6）：**每个环境另开一条浏览器级 CDP 连接**，只用显式 `attachToTarget`，
+ * **不碰 `Target.setAutoAttach`** —— `manager.js` 的 `applyToSession` 已经占了 auto-attach
+ * （`manager.js:630` / `:729`），两个客户端抢同一个 auto-attach 会让另一个收不到事件。
+ *
+ * 主窗口：`Runtime.addBinding` + `Page.addScriptToEvaluateOnNewDocument` 捕获键鼠；
+ * 受控窗口：**零注入**，只收 CDP `Input`。
+ */
+import crypto from 'node:crypto';
+import { CdpClient } from '../kernel/cdp.js';
+import { getInstance, getRunning } from '../runtime/manager.js';
+import { buildCaptureScript } from './agent-script.js';
+import { buildInputPlan, enabledBySwitch } from './replay.js';
+import { SyncScheduler, makeRng } from './scheduler.js';
+
+/** 一次只允许一个同步会话：两套同时往同一批窗口发输入必然是灾难 */
+let current = null;
+
+/**
+ * 上一次会话收尾的读数（判据用）。
+ * 为什么需要它：binding 名在页面里**抓完就 delete 了**，所以「stop 之后页面里查不到」
+ * 这件事在摘不摘 `removeBinding` 时都成立 —— 光看页面看不出来。这里记的是主进程侧
+ * 到底有没有真的摘掉，`removed:false` 就是「没摘」的铁证。
+ */
+let lastTeardown = null;
+
+export function getTeardown() {
+  return lastTeardown;
+}
+
+export function getSession() {
+  return current;
+}
+
+/** 默认设置：四个开关全开、无延迟（用户开了「延迟」才加） */
+export const DEFAULT_SETTINGS = Object.freeze({
+  input: true,
+  click: true,
+  scroll: true,
+  move: true,
+  delay_ms: 0,
+  jitter_ms: 0,
+});
+
+export function normalizeSettings(raw = {}) {
+  const bool = (v, dflt) => (v === undefined ? dflt : v === true || v === 'true' || v === 1 || v === '1');
+  const num = (v, dflt) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 0 ? Math.min(n, 5000) : dflt;
+  };
+  return {
+    input: bool(raw.input, true),
+    click: bool(raw.click, true),
+    scroll: bool(raw.scroll, true),
+    move: bool(raw.move, true),
+    delay_ms: num(raw.delay_ms, 0),
+    jitter_ms: num(raw.jitter_ms, 0),
+  };
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* ------------------------------ CDP 小工具 ------------------------------ */
+
+/** 连一条浏览器级 ws（实例里已有 `wsUrl`，见 manager.js:321） */
+async function connectInstance(profileId) {
+  const inst = getInstance(profileId);
+  if (!inst) throw new Error(`环境 ${profileId} 没有运行实例`);
+  if (!inst.wsUrl) throw new Error(`环境 ${profileId} 没有 CDP 地址`);
+  const client = await CdpClient.connect(inst.wsUrl, { timeoutMs: 8000 });
+  return { inst, client };
+}
+
+/** 选一张页面 target：优先真实 URL（跳过 about:blank / chrome://newtab），没有就取第一张 page */
+async function pickPageTarget(client) {
+  const { targetInfos } = await client.send('Target.getTargets');
+  const pages = (targetInfos || []).filter((t) => t.type === 'page');
+  if (!pages.length) return null;
+  const real = pages.find((t) => t.url && !t.url.startsWith('about:blank') && !t.url.startsWith('chrome://newtab'));
+  return real || pages[0];
+}
+
+async function attach(client, targetId) {
+  const { sessionId } = await client.send('Target.attachToTarget', { targetId, flatten: true });
+  return sessionId;
+}
+
+/** 受控窗口的可视视口（CSS px）。窗口最小化 / 还没布局时可能拿不到，返回 null 由调用方丢弃事件 */
+async function viewportOf(client, sessionId) {
+  try {
+    const m = await client.send('Page.getLayoutMetrics', {}, sessionId);
+    const v = m?.cssVisualViewport || m?.visualViewport;
+    const w = Number(v?.clientWidth);
+    const h = Number(v?.clientHeight);
+    if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return null;
+    return { vw: Math.round(w), vh: Math.round(h) };
+  } catch {
+    return null;
+  }
+}
+
+/** 窗口外框尺寸（给「尺寸不一致」提示用，8b 判据读它） */
+async function windowSizeOf(client, targetId) {
+  try {
+    const { windowId, bounds } = await client.send('Browser.getWindowForTarget', { targetId });
+    return { windowId, width: bounds?.width ?? null, height: bounds?.height ?? null, state: bounds?.windowState || null };
+  } catch {
+    return null;
+  }
+}
+
+/* ------------------------------ 启动 / 停止 ------------------------------ */
+
+/**
+ * 开始同步。
+ * @param {{masterId: string, slaveIds: string[], settings?: object, rngSeed?: number}} opt
+ */
+export async function startSync({ masterId, slaveIds = [], settings = {}, rngSeed = null } = {}) {
+  if (current) throw new Error('已经有一个同步会话在跑，先停止它');
+
+  const master = String(masterId || '');
+  if (!master) throw new Error('master_id is required');
+  if (!getRunning(master)) throw new Error(`主窗口环境 ${master} 没有在运行`);
+
+  const slaves = [...new Set(slaveIds.map(String))].filter((id) => id && id !== master);
+  if (!slaves.length) throw new Error('至少要选一个受控窗口（除主窗口外的运行中环境）');
+  for (const id of slaves) {
+    if (!getRunning(id)) throw new Error(`受控窗口环境 ${id} 没有在运行`);
+  }
+
+  const st = normalizeSettings(settings);
+  const bindingName = `__fpS_${crypto.randomBytes(4).toString('hex')}`;
+  const seed = rngSeed === null || rngSeed === undefined ? crypto.randomInt(1, 2 ** 31) : Number(rngSeed);
+  const scheduler = new SyncScheduler({ delayMs: st.delay_ms, jitterMs: st.jitter_ms, rng: makeRng(seed) });
+
+  const targets = new Map();   // profileId -> { client, sessionId, targetId, viewport, window }
+  const degraded = new Map();  // profileId -> reason
+
+  const session = {
+    id: crypto.randomUUID(),
+    master,
+    slaves,
+    settings: st,
+    binding_name: bindingName,
+    rng_seed: seed,
+    started_at: new Date().toISOString(),
+    events: 0,
+    dropped: 0,
+    scheduler,
+    targets,
+    degraded,
+    stopped: false,
+  };
+
+  let masterClient = null;
+  try {
+    /* 主窗口：连上、抓一张页面、装 binding + 捕获脚本 */
+    const m = await connectInstance(master);
+    masterClient = m.client;
+    const mTarget = await pickPageTarget(m.client);
+    if (!mTarget) throw new Error('主窗口没有页面 target（可能没有开任何标签）');
+    const mSession = await attach(m.client, mTarget.targetId);
+    targets.set(master, { client: m.client, sessionId: mSession, targetId: mTarget.targetId, viewport: null, window: await windowSizeOf(m.client, mTarget.targetId) });
+
+    await m.client.send('Page.enable', {}, mSession).catch(() => {});
+    await m.client.send('Runtime.enable', {}, mSession).catch(() => {});
+    await m.client.send('Runtime.addBinding', { name: bindingName }, mSession);
+
+    // 新文档：脚本自己轮询等 binding；主进程在 frameNavigated 时补装
+    await m.client.send('Page.addScriptToEvaluateOnNewDocument', { source: buildCaptureScript({ bindingName }) }, mSession);
+    // 当前文档：直接跑一遍（新文档脚本只对「下一个文档」生效）
+    await m.client.send('Runtime.evaluate', { expression: buildCaptureScript({ bindingName }) }, mSession).catch(() => {});
+
+    m.client.on('Page.frameNavigated', (params, sid) => {
+      if (sid !== mSession) return;
+      // 只认主帧：子帧导航不该重装 binding（子帧拿不到也无所谓，见 README 的 iframe 边界）
+      if (params?.frame?.parentId) return;
+      // binding 不跨文档存活（实测）：新文档要补装一次，脚本的轮询会把它抓走并 delete
+      m.client.send('Runtime.addBinding', { name: bindingName }, sid).catch(() => {});
+      refreshViewport(master).catch(() => {});
+    });
+
+    /* 受控窗口：连上、抓页面、读视口 */
+    for (const id of slaves) {
+      const s = await connectInstance(id);
+      const t = await pickPageTarget(s.client);
+      if (!t) { degraded.set(id, '没有页面 target'); s.client.close(); continue; }
+      const sid = await attach(s.client, t.targetId);
+      const viewport = await viewportOf(s.client, sid);
+      const win = await windowSizeOf(s.client, t.targetId);
+      targets.set(id, { client: s.client, sessionId: sid, targetId: t.targetId, viewport, window: win });
+      // 环境被外部关掉：连接断了就标降级，不静默继续
+      s.client.on('*', () => {});
+      s.client.socket?.on?.('close', () => { degraded.set(id, 'CDP 连接已断开'); });
+    }
+
+    /* 主窗口事件 → 受控窗口 */
+    m.client.on('Runtime.bindingCalled', async (params, sid) => {
+      if (sid !== mSession || params?.name !== bindingName) return;
+      let payload = null;
+      try { payload = JSON.parse(params.payload); } catch { return; }
+      const list = Array.isArray(payload?.e) ? payload.e : [];
+      for (const ev of list) {
+        session.events += 1;
+        // 开关必须读**会话当前的** settings：闭包里那个 `st` 是启动时的快照，
+        // 用户运行中关掉「输入」时它会一直是旧值（B 层判据抓到的真 bug）。
+        if (!enabledBySwitch(ev, session.settings)) { session.dropped += 1; continue; }
+        for (const id of session.slaves) {
+          const t = targets.get(id);
+          if (!t || degraded.has(id)) continue;
+          // 视口还没读到：丢这条（宁可漏一次移动，也不要在 (0,0) 乱点）
+          if (!t.viewport) continue;
+          const plan = buildInputPlan(ev, t.viewport);
+          if (!plan.length) continue;
+          scheduler.push(id, async () => {
+            for (const call of plan) {
+              await t.client.send(call.method, call.params, t.sessionId);
+            }
+          });
+        }
+      }
+    });
+  } catch (e) {
+    // 起不来就把已经连上的都关掉，不留半条连接
+    for (const [, t] of targets) { try { t.client.close(); } catch { /* ignore */ } }
+    throw e;
+  }
+
+  /**
+   * 异常结束（环境被杀 / 内核崩了 / 连接被拔）：连接已经没了，`removeBinding` 发不出去。
+   * 这时**如实记录没摘干净**，不要假装干净 —— 那个 binding 名会活到该环境关掉为止
+   * （名字是随机的，页面里也已 delete，实际暴露面极小，但读数必须是真话）。
+   */
+  masterClient?.socket?.on?.('close', () => {
+    if (session.stopped) return;
+    session.abnormal = '主窗口 CDP 连接已断开';
+    session.stopped = true;
+    scheduler.stop();
+    lastTeardown = {
+      binding_name: bindingName,
+      at: new Date().toISOString(),
+      removed: false,
+      error: session.abnormal,
+      reason: 'connection_lost',
+    };
+    // 别的连接也要断掉：会话已经废了，留着只是占资源
+    for (const [, t] of targets) { try { t.client.close(); } catch { /* ignore */ } }
+    targets.clear();
+    if (current === session) current = null;
+  });
+
+  async function refreshViewport(profileId) {
+    const t = targets.get(profileId);
+    if (!t) return null;
+    t.viewport = await viewportOf(t.client, t.sessionId);
+    return t.viewport;
+  }
+
+  session.refreshViewport = refreshViewport;
+  session.stop = async () => {
+    if (session.stopped) return;
+    session.stopped = true;
+    scheduler.stop();
+
+    /**
+     * 摘 binding 必须**先于**关连接，而且要记读数：
+     * 页面侧抓完引用就 `delete window[name]` 了，所以「stop 之后页面里查不到这个名字」
+     * 在摘不摘 removeBinding 时都成立 —— 光看页面看不出区别，只能看主进程这边摘没摘。
+     * `removed:false` 就是「没摘」的铁证（判据钉这条）。
+     */
+    const teardown = {
+      binding_name: bindingName,
+      at: new Date().toISOString(),
+      removed: false,
+      error: null,
+      reason: 'user_stop',
+    };
+    const mt = targets.get(master);
+    if (mt) {
+      try {
+        await mt.client.send('Runtime.removeBinding', { name: bindingName }, mt.sessionId);
+        teardown.removed = true;
+      } catch (e) {
+        teardown.error = e?.message || String(e);
+      }
+    } else {
+      teardown.error = '主窗口连接已不在（无法摘 binding）';
+    }
+    lastTeardown = teardown;
+
+    for (const [, t] of targets) {
+      try { t.client.close(); } catch { /* ignore */ }
+    }
+    targets.clear();
+    if (current === session) current = null;
+  };
+
+  session.status = () => statusOf(session);
+  current = session;
+  return statusOf(session);
+}
+
+function statusOf(session) {
+  const windows = [];
+  for (const [id, t] of session.targets) {
+    windows.push({
+      profile_id: id,
+      role: id === session.master ? 'master' : 'slave',
+      target_id: t.targetId,
+      viewport: t.viewport,
+      window: t.window,
+      degraded: session.degraded.get(id) || null,
+    });
+  }
+  // 「尺寸不一致」：按窗口外框宽比，>2% 就算不一致（视口差一点是滚动条造成的，不算）
+  const widths = windows.filter((w) => w.role === 'slave' && w.window?.width).map((w) => w.window.width);
+  const base = windows.find((w) => w.role === 'master')?.window?.width || null;
+  let sizeMismatch = false;
+  if (base && widths.length) {
+    sizeMismatch = widths.some((w) => Math.abs(w - base) / base > 0.02);
+  }
+  return {
+    running: !session.stopped,
+    session_id: session.id,
+    master_id: session.master,
+    slave_ids: session.slaves,
+    settings: session.settings,
+    binding_name: session.binding_name,
+    started_at: session.started_at,
+    events: session.events,
+    dropped: session.dropped,
+    abnormal: session.abnormal || null,
+    scheduler: session.scheduler.stats(),
+    windows,
+    size_mismatch: sizeMismatch,
+    last_teardown: lastTeardown,
+  };
+}
+
+/** 没在跑时给界面一个稳定的形状（不要返回 null，界面就不用到处判空） */
+export function syncStatus() {
+  if (!current) {
+    return {
+      running: false,
+      master_id: null,
+      slave_ids: [],
+      settings: DEFAULT_SETTINGS,
+      windows: [],
+      size_mismatch: false,
+      last_teardown: lastTeardown,
+    };
+  }
+  return current.status();
+}
+
+export async function stopSync() {
+  if (!current) return { running: false, teardown: lastTeardown };
+  await current.stop();
+  return { running: false, teardown: lastTeardown };
+}
+
+/** 环境被停掉时清会话（`manager.stopProfile` 会调它，别让会话挂在死连接上） */
+export async function detachProfile(profileId) {
+  if (!current) return false;
+  if (current.master !== profileId && !current.slaves.includes(profileId)) return false;
+  await stopSync();
+  return true;
+}
+
+/** 改设置：四个开关与延迟可以运行中改，不用重开会话 */
+export function updateSettings(raw) {
+  if (!current) throw new Error('没有正在运行的同步会话');
+  const st = normalizeSettings({ ...current.settings, ...raw });
+  current.settings = st;
+  current.scheduler.delayMs = st.delay_ms;
+  current.scheduler.jitterMs = st.jitter_ms;
+  return st;
+}
+
+/**
+ * 一键统一尺寸：把每个受控窗口的外框拉到主窗口的宽高。
+ *
+ * 为什么是**按钮**不是自动：改用户窗口是可见的操作，静默改会让人以为程序自己乱动。
+ * 为什么不改视口：外框是用户能看见、能自己调的那个量；视口差几像素是滚动条造成的。
+ */
+export async function unifySize() {
+  if (!current) throw new Error('没有正在运行的同步会话');
+  const s = current;
+  const ref = s.targets.get(s.master)?.window;
+  if (!ref?.width || !ref?.height) throw new Error('读不到主窗口尺寸');
+
+  const done = [];
+  for (const id of s.slaves) {
+    const t = s.targets.get(id);
+    if (!t) continue;
+    const win = await windowSizeOf(t.client, t.targetId);
+    if (!win?.windowId) { done.push({ profile_id: id, ok: false, reason: '读不到窗口 id' }); continue; }
+    try {
+      // 最大化 / 最小化下 setWindowBounds 会被忽略（实测）：必须先回 normal 再设宽高
+      await t.client.send('Browser.setWindowBounds', { windowId: win.windowId, bounds: { windowState: 'normal' } });
+      await t.client.send('Browser.setWindowBounds', {
+        windowId: win.windowId,
+        bounds: { width: ref.width, height: ref.height },
+      });
+      done.push({ profile_id: id, ok: true, width: ref.width, height: ref.height });
+    } catch (e) {
+      done.push({ profile_id: id, ok: false, reason: e?.message || String(e) });
+    }
+  }
+  await refreshAll();
+  return { resized: done, status: current.status() };
+}
+
+/**
+ * 在所有同步窗口里新开一个标签并访问 URL（「访问指定网站 → 新标签」）。
+ *
+ * **姿势不能错**：`Target.createTarget({url})` 会在 attach 之前就把首个文档建好，
+ * 注入脚本只对下一个文档生效 —— 那张标签的首帧就是原始指纹（`manager.js:807` 的实测）。
+ * 所以一律 `about:blank` → 登记 blank-reload 豁免 → attach → `Page.navigate`。
+ * 判据钉的就是这个：首个文档 `__fpApplied === 'object'` 且 `navigation.type === 'navigate'`。
+ */
+export async function openTabInAll(rawUrl) {
+  if (!current) throw new Error('没有正在运行的同步会话');
+  const url = String(rawUrl || '').trim();
+  let parsed = null;
+  try { parsed = new URL(url); } catch { /* 下面统一报错 */ }
+  if (!parsed || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) {
+    throw new Error('url 必须是 http/https 地址');
+  }
+  const opened = [];
+  for (const id of [current.master, ...current.slaves]) {
+    const t = current.targets.get(id);
+    if (!t) continue;
+    try {
+      const { targetId } = await t.client.send('Target.createTarget', { url: 'about:blank' });
+      const inst = getInstance(id);
+      inst?.exemptBlankReload?.(targetId);   // 别让 blank-reload 抢先刷这张页
+      const { sessionId } = await t.client.send('Target.attachToTarget', { targetId, flatten: true });
+      await t.client.send('Page.navigate', { url }, sessionId);
+      opened.push({ profile_id: id, target_id: targetId, url });
+    } catch (e) {
+      opened.push({ profile_id: id, target_id: null, url, error: e?.message || String(e) });
+    }
+  }
+  return { opened };
+}
+
+/** 重读所有窗口的视口（用户改了窗口尺寸之后调；8b 判据也用它） */
+export async function refreshAll() {
+  if (!current) return null;
+  for (const id of [current.master, ...current.slaves]) {
+    await current.refreshViewport(id).catch(() => {});
+    const t = current.targets.get(id);
+    if (t) t.window = await windowSizeOf(t.client, t.targetId).catch(() => t.window);
+  }
+  return current.status();
+}
+
+export { sleep };

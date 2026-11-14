@@ -37,6 +37,8 @@ import { readReportFile, summarize } from '../selfcheck/store.js';
 import { renderHtml } from '../selfcheck/html.js';
 import { issueTicket } from './tickets.js';
 import { apiInfoPayload, setApiVerify, resetStats } from './info.js';
+import { startSync, stopSync, syncStatus, updateSettings, refreshAll, unifySize, openTabInAll } from '../sync/session.js';
+import { readHotkeyStatus, requestHotkey } from '../sync/hotkey.js';
 import { resetApiKey } from '../store/db.js';
 import { listKernels } from '../kernel/chrome.js';
 import { runKernelDownload } from '../kernel/download.js';
@@ -880,6 +882,98 @@ export function buildRoutes() {
     if (typeof ctx.setApiKey === 'function') ctx.setApiKey(key);
     resetStats();
     return ok({ api_key: key });
+  });
+
+  /* ============================ 4.6 窗口同步（0.4.2） ============================ */
+  /**
+   * 开始窗口同步。**跑在主进程里的长会话**，不是一次请求做完的事：
+   * 这里只负责建连、装捕获、登记受控窗口，然后立刻回一份 status 给界面。
+   *
+   * 入参（v2 风格）：`{ master_id, slave_ids: [...], settings?: {...}, rng_seed? }`
+   * 出错一律 100002 —— 全是「参数/前置状态不对」，没有一种是服务端故障。
+   */
+  add(['POST'], ['/api/v2/sync/start'], async (ctx) => {
+    const b = ctx.body || {};
+    const masterId = String(b.master_id ?? b.masterId ?? '').trim();
+    const rawSlaves = b.slave_ids ?? b.slaveIds ?? b.window_ids ?? [];
+    if (!masterId) throw new ApiError(ERR.INVALID, 'master_id is required', 200, { field: 'master_id' });
+    if (!Array.isArray(rawSlaves) || !rawSlaves.length) {
+      throw new ApiError(ERR.INVALID, 'slave_ids must be a non-empty array', 200, { field: 'slave_ids' });
+    }
+    try {
+      return ok(await startSync({
+        masterId,
+        slaveIds: rawSlaves,
+        settings: b.settings && typeof b.settings === 'object' ? b.settings : {},
+        rngSeed: b.rng_seed ?? null,
+      }));
+    } catch (e) {
+      throw new ApiError(ERR.INVALID, e?.message || 'sync start failed');
+    }
+  });
+
+  /** 停止同步：没在跑也回 200（幂等），界面不用先查状态再关 */
+  add(['POST'], ['/api/v2/sync/stop'], async () => ok(await stopSync()));
+
+  /** 同步状态：没在跑也给稳定形状（running:false + 默认设置），界面不用到处判空 */
+  add(['GET'], ['/api/v2/sync/status'], () => ok(syncStatus()));
+
+  /**
+   * 运行中改设置（四个开关 / 延迟）。**不重开会话** —— 重开等于把用户已经打开的标签
+   * 重新挂一遍，按键会丢。参数非法也照默认值归一，不为了让开关生效而报错。
+   */
+  add(['POST'], ['/api/v2/sync/settings'], (ctx) => {
+    const b = ctx.body || {};
+    try {
+      return ok({ settings: updateSettings(b.settings && typeof b.settings === 'object' ? b.settings : b) });
+    } catch (e) {
+      throw new ApiError(ERR.INVALID, e?.message || 'sync is not running');
+    }
+  });
+
+  /** 重读各窗口视口/外框尺寸：用户拖动窗口大小之后，坐标映射得跟着更新 */
+  add(['POST'], ['/api/v2/sync/refresh'], async () => ok(await refreshAll()));
+
+  /**
+   * 一键统一尺寸：受控窗口拉到主窗口的宽高。
+   * **只在用户点按钮时执行** —— 不自动改人家的窗口（那是可见的副作用）。
+   */
+  add(['POST'], ['/api/v2/sync/unify-size'], async () => {
+    try {
+      return ok(await unifySize());
+    } catch (e) {
+      throw new ApiError(ERR.INVALID, e?.message || 'sync is not running');
+    }
+  });
+
+  /**
+   * 在所有同步窗口新开标签并访问同一 URL（「访问指定网站 → 新标签」）。
+   * 内部走 about:blank → 登记豁免 → attach → navigate，避免首帧原始指纹。
+   */
+  add(['POST'], ['/api/v2/sync/tab'], async (ctx) => {
+    const url = ctx.body?.url ?? ctx.query?.url;
+    try {
+      return ok(await openTabInAll(url));
+    } catch (e) {
+      throw new ApiError(ERR.INVALID, e?.message || 'sync is not running', 200, { field: 'url' });
+    }
+  });
+
+  /**
+   * 全局快捷键状态。`managed:false` = 没有桌面壳在管（命令行跑服务时没有全局快捷键），
+   * 这不是失败；`ok:false` 才是真的注册失败（被占用）。
+   */
+  add(['GET'], ['/api/v2/sync/hotkey'], () => ok(readHotkeyStatus()));
+
+  /**
+   * 改快捷键：写请求文件，桌面壳轮询到就重新注册，结果写回 status。
+   * 不在这里直接注册 —— 注册是 Electron 主进程的事，服务进程里没这个能力。
+   */
+  add(['POST'], ['/api/v2/sync/hotkey'], (ctx) => {
+    const raw = ctx.body?.accelerator ?? ctx.query?.accelerator;
+    const r = requestHotkey(raw);
+    if (!r.ok) throw new ApiError(ERR.INVALID, r.error, 200, { field: 'accelerator' });
+    return ok({ requested: r.accelerator, status: readHotkeyStatus() });
   });
 
   /* ============================ 5. 占位：明确不支持 ============================ */

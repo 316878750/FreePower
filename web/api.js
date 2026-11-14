@@ -127,6 +127,17 @@ export const api = {
   setVerify: (enabled) => call('/api/v2/api/verify', { method: 'POST', body: { enabled } }),
   resetKey: () => call('/api/v2/api/key/reset', { method: 'POST', body: {} }),
 
+  /* ---- 窗口同步（0.4.2） ---- */
+  syncStart: (body) => call('/api/v2/sync/start', { method: 'POST', body }),
+  syncStop: () => call('/api/v2/sync/stop', { method: 'POST', body: {} }),
+  syncStatus: () => call('/api/v2/sync/status'),
+  syncSettings: (body) => call('/api/v2/sync/settings', { method: 'POST', body }),
+  syncRefresh: () => call('/api/v2/sync/refresh', { method: 'POST', body: {} }),
+  syncUnifySize: () => call('/api/v2/sync/unify-size', { method: 'POST', body: {} }),
+  /** 全局快捷键状态（managed=false 表示没有桌面壳在管，不是失败） */
+  syncHotkey: () => call('/api/v2/sync/hotkey'),
+  syncHotkeySet: (accelerator) => call('/api/v2/sync/hotkey', { method: 'POST', body: { accelerator } }),
+
   /* ---- AI Agent（0.4.0） ---- */
   /** 一句话目标 → 工作流：等服务端调模型（默认 60s 超时），所以给足本端等待时间 */
   agentCreateFromGoal: (body) => call('/api/v1/agent/workflow/create-from-goal', { method: 'POST', body }),

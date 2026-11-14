@@ -141,6 +141,16 @@ check('托盘三件套（打开控制台/运行数/停止全部）', has(/打开
 check('托盘退出项', has(/退出 FreePower/));
 check('开机自启开关', has(/setLoginItemSettings/) && has(/openAtLogin/));
 
+/* ------------- 4b. 窗口同步面板：三条「改回去就废」的姿势 ------------- */
+check('同步面板是独立小窗且始终置顶', has(/alwaysOnTop:\s*true/) && has(/setAlwaysOnTop\(true/));
+// 关键语义：同步时用户在主窗口里打字，面板一抢焦点按键就打到面板上，同步当场废掉。
+// 所以面板只能用 showInactive()，**全文件不许出现针对面板的 focus()**。
+check('面板显示只走 showInactive（不抢焦点）', has(/showInactive\(\)/) && !/syncPanel[^\n]*\.focus\(\)/.test(mainSrc));
+check('快捷键注册失败不静默（有失败文案与状态落盘）',
+  has(/快捷键注册失败/) && has(/writeHotkeyStatus/));
+check('快捷键可改（读请求文件后重新注册）', has(/readHotkeyRequest/) && has(/watchHotkeyRequests/));
+check('退出时注销全局快捷键', has(/globalShortcut\.unregisterAll\(\)/));
+
 /* ------------------------- 5. 打包配置 ------------------------- */
 const yml = fs.readFileSync(path.join(ROOT, 'electron-builder.yml'), 'utf8');
 check('打包配置存在 appId/productName', /appId:\s*com\.freepower\.desktop/.test(yml) && /productName:\s*FreePower/.test(yml));

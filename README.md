@@ -274,6 +274,7 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 | 自检报告 | 评分、通过/告警/失败、覆盖度、四个噪声维度哈希与跨重启一致性、19 项逐条「声明值 vs 实测值」（含双 Realm 与 AudioWorklet） |
 | AI Agent（0.4.0） | 选环境 → 填目标 → 生成动作清单 → 逐步看动作/参数/digest 前 8 位 → 逐条批准或拒绝 → 运行 → 每步结果（`text` 结果、截图相对路径与图片、cookie 条数）；fill / cookie set 的值显示 `••••`，截图走 120 秒票据链接（master key 不进 URL） |
 | API & MCP（0.4.2） | 本地 API 状态（地址 / key 显示·复制·重置 / **验证开关** / 请求计数）、端点清单（从路由表派生，可搜可按分组筛，标出「不支持」那批）、MCP 配置（Claude Desktop / Cursor / Codex 三段，端口与 key 自动填，可一键复制） |
+| 窗口同步（0.4.2 阶段 1） | 选主窗口 + 受控窗口 → 开始/停止；四个同步开关（输入 / 点击 / 滚动 / 移动）与延迟、抖动，**运行中改立刻生效**；实时读数（转发条数、被开关拦下、已发出/待发）；**窗口尺寸不一致显著提示 + 一键统一尺寸**；另有独立置顶小面板（`#/sync-panel`，桌面壳里是单独小窗，全程不抢焦点）与全局快捷键（默认 `Ctrl+Alt+S`，可改） |
 
 三条设计约束（都不是口号，代码里能对得上）：
 
@@ -1029,6 +1030,11 @@ src/
   selfcheck/           自检：页面探针 / 报告 / 落盘 / 本地安全上下文服务 / HTML 渲染
   runtime/manager.js   启停、校验/预检/跟版、自动 attach 新标签页、自检、代理认证
   runtime/batch.js     批量启停：并发池、失败清单、中断
+  sync/agent-script.js 主窗口捕获脚本（字符串）：七类事件、抓引用后 delete、坐标归一（0.4.2 阶段 1）
+  sync/replay.js       事件 → CDP Input 计划：比例映射、修饰键、先移后按（0.4.2）
+  sync/scheduler.js    调度：延迟/抖动、逐目标串行保序、种子化 RNG、文本工具（0.4.2）
+  sync/session.js      同步会话：另开浏览器级连接、binding 生命周期、状态读数、统一尺寸、新标签（0.4.2）
+  sync/hotkey.js       全局快捷键：归一校验 + 跨进程请求/状态文件（不引 IPC）（0.4.2）
   agent/task.js        browser_task DSL：7 个动作的解析/校验、任务 digest、CDP 执行（runBrowserTask）
   agent/workflow.js    工作流容器：状态机、每步审批、落盘、执行器（runWorkflow）
   agent/cli.js         adspower_cli 调用层：只走本地 API + CDP，不调对手云
@@ -1051,6 +1057,8 @@ web/
   pages/selfcheck.js   自检报告
   pages/agent.js       AI Agent 面板：选环境 → 目标 → 生成 → 逐条批准 → 运行 → 每步结果（含截图票据链接）
   pages/api.js         API & MCP：状态/验证开关/请求计数、端点清单（可搜可按分组筛）、三段 MCP 配置（0.4.2）
+  pages/sync.js        窗口同步：选主窗口/受控窗口、四个开关与延迟、实时读数、尺寸不一致提示 + 一键统一（0.4.2）
+  pages/sync-panel.js  同步小面板（独立置顶小窗用）：选窗口、开始/停止、统一尺寸、快捷键状态与修改（0.4.2）
 mcp/
   server.mjs           MCP server（stdio JSON-RPC，零依赖，十个工具，只连 127.0.0.1）（0.4.2）
 bin/
@@ -1067,6 +1075,8 @@ test/desktop.test.mjs  桌面壳契约测试（54 项：启动引导、票据、
 test/workers.test.mjs  双 Realm 真机验证（24 项：三类 worker + 嵌套 + AudioWorklet）
 test/agent.test.mjs    AI Agent 判定门 A 层（15 项，假 CDP / 纯函数 / 本地 mock LLM，不启内核、不联网）
 test/api-mcp.test.mjs  API & MCP 判定门（46 项，起真服务 + 真起 MCP/CLI 子进程：端点自述 12 项 / MCP stdio 7 项 / CLI 3 项 / 验证开关 6 项 / key 重置 6 项 / 页面纯函数 9 项 / 静态入口 3 项；全离线）
+test/sync-rules.test.mjs   窗口同步判定门 A 层（90 项，纯函数 + 路由清单，不启内核：坐标映射 / 事件→CDP 计划 / 四个开关两方向 / 调度保序 / 捕获脚本形状 / 快捷键归一）
+test/sync-kernel.test.mjs  窗口同步判定门 B 层（36 项，真内核 + 两个环境 + CDP 派发模拟输入：8a 按元素 id 命中 / 开关两方向 / binding 生命周期 / stop 后 removed / 新标签首帧注入 / 8b 尺寸提示 / OOPIF）
 test/agent-smoke.test.mjs  AI Agent 判定门 B 层（30 项，真内核：七动作 / 失败即停 / 超时 / 跑完不关浏览器 / 目标→工作流 e2e）
 test/kernel-download.test.mjs  内核下载判定门（62 项，本地假源，不联网：正常/长度不符/大小写/Firefox/幂等/断线/续传/停顿重连/并发/自检不一致/404 + 镜像回落 14 项 + CRC 3 项 + 尺寸 11 项 + 巡检五条 4 项）
 test/session-restore.test.mjs  会话恢复真机判据（4 项：Preferences 落 1 / 两页都在 / 重启后按 URL 真恢复 / 用户改回 5 会被顶回 1）
@@ -1443,3 +1453,110 @@ FREEPOWER_KERNEL_DOWNLOAD_ATTEMPTS   续传最多重连几次（默认 12）
 - **只恢复标签页，不恢复标签内的历史**：Chrome 的「继续浏览上次打开的网页」恢复的是上次开着的那些 URL，单个标签的前进/后退历史不在保证范围内；
 - **`Preferences` 写不上时不阻断启动**：写失败（权限、盘满）只在 `warnings` 里点名 `session`，内核照样起 —— 代价是那一轮不保证「继续上次会话」，不假装成功。0.4.1 起控制台在启动成功后会把这条告警弹出来（黄色 toast，最多显示前两条），不再只躺在自检报告里等人翻。
 - **恢复成功时 `open_urls` 不生效**（0.4.1 起）：上次的标签已经回来了，再按 `open_urls` 新建就是「每次启动多一张」—— 0.4.0 的回归，`334ac5d` 带进来的。与 Chrome 自己的语义一致：「继续浏览上次打开的网页」时启动页本来就不生效。判定只看**真页面**（`about:blank` / `chrome://newtab` 不算恢复）：**首次启动**、**会话恢复失败**（内核没带 flag、session 损坏）、**用户上次把标签全关了** 这三种情况都会退回按 `open_urls` 开页 —— 宁可多开一次，也不要「恢复了却什么都不开」。判据在 `test/session-restore.test.mjs`：同一环境连起三次，`/a` 每次都只能有 1 张。
+
+## 十二、窗口同步（0.4.2 阶段 1）
+
+**这一节的状态**：阶段 1 打通了「主窗口键鼠 → 受控窗口」这条链路，包含坐标映射、四个开关、延迟/抖动、独立置顶面板、全局快捷键，以及一条新标签的正确开法。**字输入 / 粘贴 / 随机数字 / 标签批量同步 / 窗口网格排列**属于阶段 2–3，这一节不吹。
+
+`npm run test:sync`（纯逻辑，不需要 Chrome）+ `npm run test:sync-kernel`（真内核、两个环境、CDP 派发模拟输入）。
+
+### 为什么不用 OS 级全局钩子（与我们自己的实现选择）
+
+对手 Windows 侧是 `Dll2.dll` 里 `SetWindowsHookExW` 装低级钩子、`PostMessageW` 回放（`SendInput` / `SetCursorPos` / `mouse_event` 全 0 命中）。我们**不走那条路**，三条理由：
+
+1. `WH_KEYBOARD_LL` / `WH_MOUSE_LL` 是**全局**钩子 —— 装上去会捕获用户在所有程序里的按键，只能靠前台窗口过滤。为一个同步功能把全系统键盘过一遍，隐私面和出事面都不划算。
+2. 低级钩子回调里做重活会撞 `LowLevelHooksTimeout`，超时 Windows **静默摘钩**：用户看到「同步突然不动了」，没有任何报错。这个失败模式太毒。
+3. 本机没有 VS 编译链，靠 ffi 从 JS 注册钩子回调这条路没人验过。
+
+我们走**页面侧捕获 + CDP 回放**：`Runtime.addBinding` 把事件回传主进程，主进程按受控窗口视口还原成 `Input.dispatchMouseEvent` / `Input.dispatchKeyEvent` 派发过去。
+
+### 检测面：我们能压到多小，压不掉的是什么
+
+| 事实 | 读数 | 处理 |
+|---|---|---|
+| binding 不跨文档存活 | about:blank 上是 function，导航后 `typeof` = undefined | 脚本装到新文档时先**同步抓一次**引用，再轮询兜底（实测消失用时 **1 ms**） |
+| 抓引用后能删掉名字 | `delete window[NAME]` 后 `getOwnPropertyNames(window)` 里**查不到**；抓到的引用**仍能推消息** | 用 `delete`，**不用** `defineProperty`（后者名字会残留在 own names 里，是检测面） |
+| 浏览器级 addBinding 不存在 | 不带 sessionId 报 `'Runtime.addBinding' wasn't found` | 必须走 page session |
+| 名字每次会话随机 | `__fpS_<8位 hex>`，两次会话 `__fpS_44c36592 → __fpS_a981b2f5` | 主进程生成，同时给 `addBinding` 和脚本 |
+| **stop 时必须摘** | `Runtime.removeBinding`；`teardown.removed === true` | 先摘再关连接；异常结束（内核被杀）如实记 `removed:false / reason:connection_lost`，**不假装干净** |
+| 后台标签页定时器被节流 | 只靠轮询时残留可达 **1000 ms**（4 ms 的轮询被 Chrome 按后台标签页降到 1 s） | 脚本装上时**同步抓**，把窗口压到 1 ms；轮询只当兜底 |
+
+**压不掉的（如实写）**：从主进程补装 binding 到脚本 delete 掉它之间有一个**毫秒级**窗口，同一时刻枚举 own names 的脚本能看到这个名字。页面自己的 document-start inline script 实测看不到（`typeof` 为 undefined）。对手那条路页面里是**零**，我们不是零 —— 这是架构差异，不是没做。
+
+### 坐标：比例映射只是兜底，不是保证
+
+```
+nx = clientX / innerWidth  →  x = round(nx × 受控视口宽)
+```
+
+**同步能否对齐的前提是窗口同尺寸。** 同一网站在 1280 和 1920 宽下布局本来就不同（响应式），比例映射只在「布局不随宽度变」时成立。对手 Windows 侧坐标根本不做等比缩放 —— 它是先 `ReSizeAndShow` 把窗口拉成同尺寸再同步（也就是靠「先统一尺寸」保证对齐）。我们比它多做一层比例映射，但**不把兜底说成保证**。
+
+产品上的处置：开始同步时检测各窗口可视尺寸，不一致就在面板**显著提示 + 给「一键统一尺寸」按钮**（一等功能，不是角落按钮），**但不自动改用户窗口**（改窗口是可见操作，静默改会让人以为程序乱动）。已最大化/最小化的窗口要先回 `normal`，否则 `Browser.setWindowBounds` 会被忽略。
+
+### 四个开关与延迟
+
+- 开关：输入 / 点击 / 滚动 / 移动，**互相独立**（关掉点击不影响移动）；运行中改立即生效。
+- 延迟与抖动`delay_ms` / `jitter_ms`（0–5000）**全在主进程做**：页面里做延迟等于把定时器暴露给被检测站点，且 N 个受控窗口的节奏要统一调度。随机源是种子化 RNG（mulberry32），同种子同序列，判据可复现。
+- 受控窗口**零注入**：它们只收 CDP `Input`，`window` 上一个我们的东西都没有。
+- 每个目标一条**串行队列**：同一目标内严格保序（乱序会让「按下」跑到「抬起」后面），跨目标互不阻塞。
+
+### 连接策略
+
+**每个环境另开一条浏览器级 CDP 连接**，只用显式 `Target.attachToTarget`，**不碰 `Target.setAutoAttach`** —— `runtime/manager.js` 的 auto-attach 已经占了（`:630` / `:729`），两个客户端抢同一个 auto-attach 会让另一个收不到事件。
+
+### 新标签的正确开法（这条踩过坑，单独记）
+
+`Target.createTarget({url})` 会在 attach 之前就把首个文档建好，而 `addScriptToEvaluateOnNewDocument` 只对**下一个**文档生效 —— 那张页的首帧就是原始指纹（`runtime/manager.js:807` 有实测记录）。所以一律：
+
+```
+Target.createTarget({ url: 'about:blank' })
+  → instance.exemptBlankReload(targetId)     // 别让 blank-reload 抢
+  → Target.attachToTarget
+  → Page.navigate({ url })
+```
+
+判据钉死：新标签**首个文档** `window.__fpApplied === 'object'`、`navigation.type === 'navigate'`（不是 `reload`）、`performance.getEntriesByType('navigation').length === 1`（只加载一次文档）。
+
+### 面板与快捷键
+
+- 面板是**独立 Electron 小窗 + 始终置顶**，但**同步过程中绝不 `focus()`** —— 用户在主窗口里打字，面板一抢焦点按键就打到面板上，同步当场废掉。显示一律走 `showInactive()`。
+- 全局快捷键默认 `CommandOrControl+Alt+S`，可改；注册失败**不许静默**：面板顶部显示「快捷键注册失败，请手动开始」并给输入框改一个。
+  **在装了 AdsPower 的机器上这个组合大概率被它占着**（`RegisterHotKey` 实测 `err=1409`），所以失败提示是常态路径，不是异常路径。
+- 改快捷键跨进程靠两个 JSON 文件交接（`data/sync-hotkey.request.json` / `data/sync-hotkey.status.json`）：注册是 Electron 主进程的能力，界面走 Local API 没有 Node —— 不为一个按钮开 preload。
+
+### 路由（六条）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/v2/sync/start` | `{master_id, slave_ids[], settings?, rng_seed?}`；校验全部环境在跑，起不来 `100002` |
+| POST | `/api/v2/sync/stop` | 幂等；回报里带 `teardown`（`removed` / `reason`） |
+| GET | `/api/v2/sync/status` | 没在跑也给稳定形状（`running:false` + 默认设置） |
+| POST | `/api/v2/sync/settings` | 运行中改开关/延迟，不重开会话 |
+| POST | `/api/v2/sync/refresh` | 重读各窗口视口与外框尺寸 |
+| POST | `/api/v2/sync/unify-size` | 一键统一尺寸（只在用户点按钮时执行） |
+| POST | `/api/v2/sync/tab` | 在所有同步窗口新开标签并访问同一 URL（走上面那条 about:blank 姿势） |
+| GET/POST | `/api/v2/sync/hotkey` | 读/改全局快捷键（`managed:false` = 没有桌面壳在管，不是失败） |
+
+### 判据
+
+```
+npm run test:sync          → 90/90   （A 层：纯函数 + 路由清单，不需要 Chrome）
+npm run test:sync-kernel   → 36/36   （B 层：真内核 + 两个环境 + CDP 派发模拟输入）
+```
+
+**A 层 90 条**覆盖：坐标映射（两种视口给出不同坐标 —— 防「直传绝对像素」的实现；退化视口返回 null，宁可不发也不在 (0,0) 乱点）、事件→CDP 计划（down 必先发 `mouseMoved`；带 Ctrl 的 keyDown 不带 `text`，否则 Ctrl+A 变成插入 "a"）、四个开关**两个方向**、调度保序与 stop 后不补发、捕获脚本形状（用 delete 不用 defineProperty、不含 `__fpSync*`、不含 eval）、设置归一、快捷键归一（没有修饰键一律拒）、8 条路由存在性。
+
+**变异验证**（`.tmp/mutate-sync.mjs`，不入库）：把实现故意改坏，确认判据会红 —— mapPoint 去掉退化保护 / down 不先发 mouseMoved / Ctrl 也带 text / 开关恒真 / 用 defineProperty 代替 delete / 调度器不 await / stop() 停不干净，**7 个全部被抓住**；`removeBinding` 去掉会让 B 层红 2 条。
+
+**B 层 36 条**覆盖：注入前置、8a（视口统一后按**元素 id** 断言命中 `hits=["target"]`）、键盘同步与 `input:false` 两方向（含「被开关拦下的条数 > 0」，证明是拦下而非没捕获）、`move`/`scroll` 两方向、binding 名形状与页面 own names 里查不到、**stop 后 `typeof window[随机名] === undefined`**、暴露窗口 ≤1500ms（实测 1ms）、第二次 stop 也 `removed=true`、异常结束如实记 `connection_lost`、8b（2 倍尺寸差只断言提示与各窗口尺寸、会话仍在跑）、新标签三条、OOPIF 两条。
+
+### 已知限制（阶段 1）
+
+1. **跨进程 iframe（OOPIF）里的输入不同步**。实测：键事件打进 A 的跨进程 iframe 里（读回 `"oop"`），受控窗口的 iframe 里读回空 —— 捕获脚本装在主帧的 document 上，OOPIF 是**另一个 document、另一个进程**。判据里两条都断言（一条证明输入真落进去了，一条记录不同步这个事实），不是「没测到」。
+2. **标签同步只做了「在所有窗口新开同一个 URL」**，关当前标签 / 关其他标签 / 关空白标签属于阶段 2。
+3. **不做窗口网格排列、置前、自定义位置间距**（阶段 3，且要评估 Win32 依赖）。
+4. **8b 那条不能断言命中**：尺寸差 2 倍 + 响应式页面上比例映射本来就会点偏，断言命中就是假绿。只断言面板给出提示与 status 里各窗口实际尺寸。
+5. **`stopSync` 时若主窗口连接已经断了，binding 摘不掉**：如实记 `removed:false`，那个随机名会活到该环境关掉为止（页面里已 delete，实际暴露面极小）。
+6. **同步会话是单例**：同时只能有一个同步会话（两套同时往同一批窗口发输入必然是灾难），第二个 `start` 报 `100002`。
+7. **标签批量操作只做了「新开同一个 URL」**：阶段 2 补关当前/关其他/关空白标签时，**开与关是两组独立参数、各自生效**（对手的 `openTabList` 与 `closeTabList` 同时给时后者被前者覆盖，只有 `openTabList` 生效 —— 那是它的 bug，我们不复制）。
+8. **状态里 `role` 只有 `master` / `slave` 两个值**，是我们自己的字段；不复刻对手的 `identity` 命名，也不为它建枚举。
