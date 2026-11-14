@@ -150,6 +150,32 @@ CREATE TABLE IF NOT EXISTS profile_tags (
   PRIMARY KEY (profile_id, tag_id)
 );
 
+CREATE TABLE IF NOT EXISTS extensions (
+  -- 应用中心：扩展库。**文件全局共享一份**（\`<数据根>/ext_env/<id>/\`），
+  -- 每个环境启用哪些是环境级的（profile_extensions），见 docs/15。
+  id               TEXT PRIMARY KEY,
+  unique_id        TEXT,
+  name             TEXT NOT NULL,
+  version          TEXT,
+  description      TEXT,
+  manifest_version INTEGER,
+  path             TEXT NOT NULL,
+  status           TEXT NOT NULL DEFAULT '1',
+  source           TEXT,
+  files            INTEGER,
+  bytes            INTEGER,
+  sha256           TEXT,
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT
+);
+
+CREATE TABLE IF NOT EXISTS profile_extensions (
+  profile_id TEXT NOT NULL,
+  ext_id     TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (profile_id, ext_id)
+);
+
 CREATE TABLE IF NOT EXISTS profiles (
   -- 自研扩展
 ${extLines.join(',\n')},
@@ -167,6 +193,7 @@ CREATE INDEX IF NOT EXISTS idx_profiles_group ON profiles("group_id");
 CREATE INDEX IF NOT EXISTS idx_profiles_status ON profiles("status");
 CREATE INDEX IF NOT EXISTS idx_profiles_deleted ON profiles("deleted_at");
 CREATE INDEX IF NOT EXISTS idx_launches_profile ON launches(profile_id);
+CREATE INDEX IF NOT EXISTS idx_profile_extensions_ext ON profile_extensions(ext_id);
 `;
 
 /**

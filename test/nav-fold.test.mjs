@@ -5,7 +5,8 @@
  *  A. web/nav.js 的纯逻辑 —— 存下来的状态不可信（用户能改、旧版本能写脏），
  *     脏数据必须退化成「都没折」，不能让整个侧栏崩掉；
  *  B. 静态结构 —— 「常用」组**没有折叠入口**、「自动化」组有，
- *     顺序、以及「应用中心不放灰占位」这条。
+ *     顺序、以及「应用中心必须是真页面而不是灰占位」（0.4.3 之前它是「不许放占位」，
+ *     做出来之后这一条就改严成「导航项 + 路由 + 页面模块三样都得在」）。
  *
  * 这些是「便宜但一旦错了用户立刻踩到」的判据：侧栏是每天第一眼看到的东西。
  */
@@ -140,15 +141,20 @@ check('按钮带 data-fold-toggle="automation"', autoGroup.includes('data-fold-t
 check('按钮带 aria-expanded', autoGroup.includes('aria-expanded="true"'));
 
 // 14. 侧栏顺序（用户习惯的排法，不能乱）
-const order = ['data-nav="profiles"', 'data-nav="proxies"', 'data-nav="agent"', 'data-nav="sync"', 'data-nav="api"'];
+const order = ['data-nav="profiles"', 'data-nav="proxies"', 'data-nav="apps"', 'data-nav="agent"', 'data-nav="sync"', 'data-nav="api"'];
 const idx = order.map((k) => html.indexOf(k));
-check('5 个导航项都在', idx.every((i) => i >= 0), JSON.stringify(idx));
-check('顺序 环境→代理→Agent→同步→API', idx.every((v, i) => i === 0 || v > idx[i - 1]));
+check('6 个导航项都在', idx.every((i) => i >= 0), JSON.stringify(idx));
+check('顺序 环境→代理→应用中心→Agent→同步→API', idx.every((v, i) => i === 0 || v > idx[i - 1]));
 check('窗口同步在 AI Agent 之后、API 之前', html.indexOf('data-nav="sync"') > html.indexOf('data-nav="agent"')
   && html.indexOf('data-nav="sync"') < html.indexOf('data-nav="api"'));
 
-// 15. 应用中心还没做，不许放灰占位
-check('侧栏没有「应用中心」占位', !html.includes('应用中心'));
+// 15. 应用中心：0.4.3 已经做出来了，所以这一条从「不许放灰占位」改严成「必须是真页面」
+//     （原判据是「还没做就别放个点不动的灰条」，现在做了，就要求它真的接上路由与页面模块）
+check('应用中心在「常用」组里、是能点的链接', /<a class="nav-item" data-nav="apps" href="#\/apps">应用中心<\/a>/.test(primaryGroup));
+check('应用中心不是灰占位（没有 disabled / aria-disabled）',
+  !/data-nav="apps"[^>]*(disabled|aria-disabled)/.test(htmlClean));
+check('app.js 注册了 /apps 路由并 import 了页面模块',
+  /import appsPage from '\.\/pages\/apps\.js'/.test(appSrc) && /nav: 'apps', page: appsPage/.test(appSrc));
 
 // 16. CSS：折起来真的收走条目 + 小三角转向
 check('CSS 有 .nav-group.collapsed 隐藏条目', /\.nav-group\.collapsed\s+\.nav-item\s*\{[^}]*display:\s*none/.test(css));

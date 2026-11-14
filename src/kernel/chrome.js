@@ -322,10 +322,7 @@ export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, use
   // 两跳拼出来的（对手也是这么拼的，没有可配置的 hop 列表），解析全在 chain.js 里，这里刻意不重复判，
   // 免得两处口径不一致（旧实现这里会推一条「多级代理暂未实现」的告警，0.3.3 起已不成立）。
 
-  const merged = mergeLaunchArgs(args, userArgs, {
-    proxyBound,
-    fileExists: (p) => fs.existsSync(p),
-  });
+  const merged = mergeLaunchArgs(args, userArgs, { proxyBound });
   merged.warnings.push(...warnings);
   return merged;
 }

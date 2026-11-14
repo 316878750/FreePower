@@ -355,12 +355,20 @@ test('launch_args：绑定代理时禁止自定义 bypass（否则等于给直�
   assert.ok(r.args.includes('--proxy-bypass-list=<-loopback>'));
 });
 
-test('launch_args：load-extension 自动补 Chrome 137+ 需要的特性开关', () => {
+test('launch_args：命令行装扩展已失效 → 明确拒绝并指向应用中心（不再假装成功）', () => {
+  // 2026-11-14 真内核 157 实测：--load-extension 四组对照全部没装进来（见 src/kernel/extensions.js）
   const r = mergeLaunchArgs(BASE, ['--load-extension=C:\\ext'], { proxyBound: true });
-  assert.deepEqual(r.applied, ['--load-extension=C:\\ext']);
+  assert.deepEqual(r.applied, []);
+  assert.equal(r.rejected.length, 1);
+  assert.match(r.rejected[0].reason, /应用中心/);
+  assert.ok(!r.args.some((a) => a.startsWith('--load-extension=')));
+  // 连带的那条也别偷偷补进 --disable-features（补了也是空转，只会让命令行看起来像生效了）
   const line = r.args.find((a) => a.startsWith('--disable-features='));
-  assert.ok(line.includes('DisableLoadExtensionCommandLineSwitch'));
-  assert.ok(r.args.includes('--load-extension=C:\\ext'));
+  assert.ok(!String(line || '').includes('DisableLoadExtensionCommandLineSwitch'));
+
+  const r2 = mergeLaunchArgs(BASE, ['--disable-extensions-except=C:\\ext'], { proxyBound: true });
+  assert.deepEqual(r2.applied, []);
+  assert.match(r2.rejected[0].reason, /应用中心/);
 });
 
 test('launch_args：名单外的参数拒绝，不猜用户意图', () => {

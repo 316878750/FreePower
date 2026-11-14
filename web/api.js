@@ -173,6 +173,18 @@ export const api = {
   syncCopyTab: (index) => call('/api/v2/sync/tab-copy', { method: 'POST', body: index === undefined ? {} : { index } }),
   syncUnifyTabs: () => call('/api/v2/sync/tab-unify', { method: 'POST', body: {} }),
 
+  /* ---- 应用中心 / 扩展（0.4.3） ---- */
+  /**
+   * 扩展库。**文件全局共享一份**（`<数据根>/ext_env/<id>/`），环境只存勾选关系。
+   * 导入收的是**本机路径**（已解压目录或 .zip）：这是个本机程序，不走上传。
+   */
+  apps: () => call('/api/v2/app/list'),
+  appImport: (body) => call('/api/v2/app/import', { method: 'POST', body, timeoutMs: 120000 }),
+  appUpdate: (body) => call('/api/v2/app/update', { method: 'POST', body }),
+  appDelete: (ids) => call('/api/v2/app/delete', { method: 'POST', body: { ids } }),
+  appForProfile: (id) => call('/api/v2/app/profile', { query: { profile_id: id } }),
+  appSetForProfile: (id, extIds) => call('/api/v2/app/profile/set', { method: 'POST', body: { profile_id: id, ext_ids: extIds } }),
+
   /* ---- AI Agent（0.4.0） ---- */
   /** 一句话目标 → 工作流：等服务端调模型（默认 60s 超时），所以给足本端等待时间 */
   agentCreateFromGoal: (body) => call('/api/v1/agent/workflow/create-from-goal', { method: 'POST', body }),

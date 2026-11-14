@@ -4,6 +4,7 @@ import { api } from './api.js';
 import profilesList from './pages/profiles.js';
 import profileEdit from './pages/edit.js';
 import proxiesPage from './pages/proxies.js';
+import appsPage from './pages/apps.js';
 import selfcheckPage from './pages/selfcheck.js';
 import agentPage from './pages/agent.js';
 import apiPage from './pages/api.js';
@@ -17,6 +18,7 @@ const routes = [
   { re: /^\/profiles\/([^/]+)$/, nav: 'profiles', page: profileEdit, params: (m) => ({ id: m[1] }) },
   { re: /^\/profiles\/([^/]+)\/selfcheck$/, nav: 'profiles', page: selfcheckPage, params: (m) => ({ id: m[1] }) },
   { re: /^\/proxies$/, nav: 'proxies', page: proxiesPage },
+  { re: /^\/apps$/, nav: 'apps', page: appsPage },
   { re: /^\/api$/, nav: 'api', page: apiPage },
   { re: /^\/sync$/, nav: 'sync', page: syncPage },
   // 独立小窗（desktop/main.js 的置顶面板）加载的就是这一条

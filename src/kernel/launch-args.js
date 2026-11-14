@@ -2,17 +2,19 @@
  * FreePower · launch_args 白名单合并
  *
  * 环境里可以让用户加启动参数，但**只有白名单里的参数会真的进命令行**：
- *   - 白名单：能安全叠加的（扩展、feature 列表、窗口起始态…），feature 列表按并集合并，不覆盖系统值；
+ *   - 白名单：能安全叠加的（feature 列表、窗口起始态…），feature 列表按并集合并，不覆盖系统值；
  *   - 保护名单：会破坏隔离 / 指纹自洽 / fail-closed 的一律丢弃（不是静默丢弃，会回报原因）；
  *   - 名单外的：拒绝并回报，不猜用户意图。
+ *
+ * **0.4.3 起 `--load-extension` / `--disable-extensions-except` 从白名单挪到保护名单**：
+ * 它们在本机真内核 157 上已经不生效（四组隔离对照实测，见 src/kernel/extensions.js 顶部），
+ * 继续放行等于让用户以为装上了。扩展改由「应用中心」在启动后按环境勾选加载。
  *
  * 对外的 launch_args 契约不变（v1 是 JSON 字符串、v2 是数组）；这里只负责「怎么变成真实 argv」。
  */
 
-/** kind: flag 无值 | path-list 逗号路径 | feature-list 逗号特性 | bypass 绕过列表 */
+/** kind: flag 无值 | feature-list 逗号特性 | bypass 绕过列表 */
 const WHITELIST = new Map([
-  ['--load-extension', { kind: 'path-list', note: '扩展目录' }],
-  ['--disable-extensions-except', { kind: 'path-list', note: '只启用这些扩展' }],
   ['--disable-features', { kind: 'feature-list' }],
   ['--enable-features', { kind: 'feature-list' }],
   ['--disable-blink-features', { kind: 'feature-list' }],
@@ -22,6 +24,16 @@ const WHITELIST = new Map([
 ]);
 
 const PROTECTED = new Map([
+  /**
+   * 命令行装扩展：**不是我们不想支持，是它已经没用了**（2026-11-14 实测，真内核 157.0.8103.78）：
+   * 四组隔离对照（含 `--disable-features=DisableLoadExtensionCommandLineSwitch`、
+   * 含 `--enable-unsafe-extension-debugging`）全部没把扩展装进来 ——
+   * `Target.getTargets` 无 service_worker、`Default/Preferences` 的 `extensions.settings` 也是空的。
+   * 以前这里放行并「自动补特性开关」，等于告诉用户「装上了」，实际是空转。
+   * 现在明确拒绝，指向真正能用的路：应用中心（CDP `Extensions.loadUnpacked`，见 src/kernel/extensions.js）。
+   */
+  ['--load-extension', '命令行装扩展在 Chrome 137+ 已被移除（本机 157 实测不生效）：请用「应用中心」导入扩展，再在环境里勾选'],
+  ['--disable-extensions-except', '与 --load-extension 配套，同样已失效：请用「应用中心」的勾选控制环境加载哪些扩展'],
   ['--user-data-dir', '环境隔离目录由系统计算，不接受覆盖'],
   ['--remote-debugging-port', '调试端口由系统随机分配并回读 DevToolsActivePort'],
   ['--remote-debugging-pipe', '调试通道由系统管理'],
@@ -86,10 +98,10 @@ function mergeCsv(args, key, values) {
 /**
  * @param {string[]} baseArgs 系统生成的参数（顺序即优先级基线）
  * @param {string[]} userArgs 用户声明的 launch_args
- * @param {{proxyBound?:boolean, fileExists?:(p:string)=>boolean}} opts
+ * @param {{proxyBound?:boolean}} opts
  * @returns {{args:string[], applied:string[], rejected:{arg:string, reason:string}[], warnings:{field:string,message:string,severity:'soft'}[]}}
  */
-export function mergeLaunchArgs(baseArgs, userArgs, { proxyBound = false, fileExists = null } = {}) {
+export function mergeLaunchArgs(baseArgs, userArgs, { proxyBound = false } = {}) {
   const args = [...baseArgs];
   const applied = [];
   const rejected = [];
@@ -142,26 +154,6 @@ export function mergeLaunchArgs(baseArgs, userArgs, { proxyBound = false, fileEx
         continue;
       }
       mergeCsv(args, key, items);
-      applied.push(raw);
-      continue;
-    }
-
-    if (rule.kind === 'path-list') {
-      const paths = String(value ?? '').split(',').map((s) => s.trim()).filter(Boolean);
-      if (!paths.length) { rejected.push({ arg: raw, reason: '缺少路径' }); continue; }
-      const exists = typeof fileExists === 'function' ? fileExists : null;
-      if (exists) {
-        for (const p of paths) {
-          if (!exists(p)) {
-            warnings.push({ field: 'launch_args', message: `${key} 的路径不存在：${p}`, severity: 'soft' });
-          }
-        }
-      }
-      mergeCsv(args, key, paths);
-      if (key === '--load-extension') {
-        // Chrome 137 起 load-extension 默认被特性开关关掉，得显式把它关掉才算数
-        mergeCsv(args, '--disable-features', ['DisableLoadExtensionCommandLineSwitch']);
-      }
       applied.push(raw);
       continue;
     }

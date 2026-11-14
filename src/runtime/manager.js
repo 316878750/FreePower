@@ -14,6 +14,8 @@ import { alignProfileToKernel } from '../kernel/version.js';
 import { fingerprintView, geoPolicy } from '../fingerprint/view.js';
 import { ensureNoiseSeeds } from '../fingerprint/seeds.js';
 import { checkProfile, markStatus, applyProfileFields, persistEgress } from '../store/profiles.js';
+import { extensionsForProfile, rememberUniqueId } from '../store/extensions.js';
+import { loadUnpackedExtensions } from '../kernel/extensions.js';
 import { checkProxy, hasProxy, normalizeProxyConfig } from '../proxy/probe.js';
 import { resolveChain, startChain } from '../proxy/chain.js';
 import { pacInUse, pacMessage } from '../proxy/pac.js';
@@ -61,6 +63,8 @@ function toStartData(i, { alreadyRunning = false } = {}) {
     workers: i.workerStats || null,
     // P2 新增：启动后自动跑一次自检的摘要（完整报告走 selfcheck 接口）
     selfcheck: i.selfcheck || null,
+    // 应用中心：本次按环境勾选真的加载了哪些扩展（loaded/failed 都回，缺失不静默）
+    extensions: i.extensions || null,
   };
 }
 
@@ -226,6 +230,18 @@ export async function startProfile(profile, { force = false, systemProxy = null 
 
     // 3) 起内核：用户 launch_args 走白名单合并进真实 argv
     //    UA 跟版放在拿到 Browser.getVersion 之后做 —— 目录名不是版本真值（Application 里可能同时躺着两个版本）
+
+    /**
+     * 2.9) 应用中心：这个环境勾选了哪些扩展。
+     * 拼参数**不用它**（Chrome 157 起 `--load-extension` 已失效，见 src/kernel/extensions.js 顶部），
+     * 但「目录不见了」这件事要在这里就告警 —— 等启动完再报，用户看到的是一个安静的缺口。
+     */
+    const extForProfile = extensionsForProfile(id);
+    for (const miss of extForProfile.missing) {
+      warnings.push(soft('extensions', `扩展「${miss.name}」的目录不见了（${miss.path}），本次不加载`));
+    }
+    const extensions = extForProfile.extensions;
+
     let effective = profile;
     let view = fingerprintView(effective);
     let uaAligned = null;
@@ -337,6 +353,8 @@ export async function startProfile(profile, { force = false, systemProxy = null 
         warnings,
         selfcheck: null,
         selfcheckReport: null,
+        // 应用中心：加载结果（null = 这个环境没勾扩展）
+        extensions: null,
       };
       running.set(id, instance);
       markStatus(id, 'starting');
@@ -351,6 +369,42 @@ export async function startProfile(profile, { force = false, systemProxy = null 
         if (chainServer) { chainServer.close().catch(() => {}); chainServer = null; }
         try { if (client) client.close(); } catch { /* ignore */ }
       });
+
+      /**
+       * 4.5) 应用中心：按环境勾选逐个加载扩展。
+       * **必须在 injectAndOpen 之前** —— content script 只对「扩展加载之后才创建的文档」生效；
+       * 先开页面再装扩展，那一批页面就没有扩展的注入（实测）。
+       * 这条路是一堆真内核实测选出来的（`--load-extension` 在 157 上已失效），
+       * 理由与读数都在 src/kernel/extensions.js 顶部。
+       */
+      if (extensions.length) {
+        const r = await loadUnpackedExtensions(client, extensions);
+        instance.extensions = {
+          requested: extensions.length,
+          loaded: r.loaded.map((x) => ({ ext_id: x.ext_id, chrome_id: x.chrome_id, name: x.name })),
+          failed: r.failed,
+        };
+        for (const x of r.loaded) {
+          try {
+            // 导入时按路径推算的 ID 应等于内核报回来的；不等就是目录被搬过/改过名
+            const predicted = extensions.find((e) => e.id === x.ext_id)?.unique_id || null;
+            if (predicted && x.chrome_id && predicted !== x.chrome_id) {
+              warnings.push(soft('extensions',
+                `扩展「${x.name}」的 ID 与导入时推算的不一致（${predicted} → ${x.chrome_id}）：目录被搬动或改名过，扩展的本地存储会跟着分家`));
+            }
+            rememberUniqueId(x.ext_id, x.chrome_id);
+          } catch { /* 记不到观察值不影响加载 */ }
+        }
+        for (const f of r.failed) {
+          log(id, 'WARN 扩展加载失败', f.name, f.error);
+          warnings.push(soft('extensions', `扩展「${f.name}」加载失败：${f.error}`));
+        }
+        log(id, '扩展', `已加载 ${r.loaded.length}/${extensions.length}`,
+          r.loaded.map((x) => `${x.name}=${x.chrome_id}`).join(' '));
+        if (r.failed.length === 0 && r.loaded.length === 0) {
+          warnings.push(soft('extensions', '这个环境勾了扩展，但一个都没加载起来（详见启动日志）'));
+        }
+      }
 
       await injectAndOpen(instance, effective, view);
 

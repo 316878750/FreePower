@@ -15,6 +15,7 @@
  * （单一实现，不在这里造第二套）。
  */
 import { createProfile, getProfile, cookieToStorage } from './profiles.js';
+import { profileExtensionIds, setProfileExtensions } from './extensions.js';
 import { BY_NAME } from '../../packages/profile/src/fields.js';
 import { toCanonical } from '../../packages/profile/src/aliases.js';
 import { newSeed } from '../fingerprint/rng.js';
@@ -281,5 +282,14 @@ export function copyProfile(profileId, { name } = {}) {
   if (src.remark !== undefined) input.remark = `${src.remark ? src.remark + ' · ' : ''}复制自 ${src.profile_no}`;
 
   const created = createProfile(input);
+  /**
+   * 复制环境要把「勾了哪些扩展」一起复制（对手也是复制 appIds）。
+   * **不复制扩展文件** —— 文件是全局共享一份（`ext_env/<id>/`），这里只复制勾选关系。
+   * 复制失败不让整个复制失败：环境本身已经建好了，扩展少勾可以在界面上补。
+   */
+  try {
+    const extIds = profileExtensionIds(src.id);
+    if (extIds.length) setProfileExtensions(created.id, extIds);
+  } catch { /* 见上 */ }
   return { ...created, seeds_regenerated: true, copied_from: src.id };
 }

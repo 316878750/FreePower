@@ -264,7 +264,7 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 
 `npm start` 之后浏览器直接打开 `http://127.0.0.1:<端口>/`（端口看 `data/local_api`）。不用装任何东西，也没有第二套进程。
 
-六个页面，范围就这些（CEO 定的，不扩）：
+七个页面，范围就这些（CEO 定的，不扩）：
 
 | 页面 | 做什么 |
 |---|---|
@@ -275,6 +275,7 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 | AI Agent（0.4.0） | 选环境 → 填目标 → 生成动作清单 → 逐步看动作/参数/digest 前 8 位 → 逐条批准或拒绝 → 运行 → 每步结果（`text` 结果、截图相对路径与图片、cookie 条数）；fill / cookie set 的值显示 `••••`，截图走 120 秒票据链接（master key 不进 URL） |
 | API & MCP（0.4.2） | 本地 API 状态（地址 / key 显示·复制·重置 / **验证开关** / 请求计数）、端点清单（从路由表派生，可搜可按分组筛，标出「不支持」那批）、MCP 配置（Claude Desktop / Cursor / Codex 三段，端口与 key 自动填，可一键复制） |
 | 窗口同步（0.4.2 阶段 1） | 选主窗口 + 受控窗口 → 开始/停止；四个同步开关（输入 / 点击 / 滚动 / 移动）与延迟、抖动，**运行中改立刻生效**；实时读数（转发条数、被开关拦下、已发出/待发）；**窗口尺寸不一致显著提示 + 一键统一尺寸**；另有独立置顶小面板（`#/sync-panel`，桌面壳里是单独小窗，全程不抢焦点）与全局快捷键（默认 `Ctrl+Alt+S`，可改） |
+| 应用中心（0.4.3 ①） | 扩展库：导入（粘本机目录或 `.zip` 路径，**不是上传**）、启用/停用、改名、删除、看「被几个环境用」与落盘目录；环境编辑页里勾「这个环境用哪些」。文件全局共享一份，启用状态是环境级的，见 [15 号文档](docs/15-应用中心与扩展.md) |
 
 三条设计约束（都不是口号，代码里能对得上）：
 
@@ -287,6 +288,43 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 ![环境列表](docs/shots/01-list.png)
 
 更多：[编辑页](docs/shots/02-edit.png)、[后端校验原文回填](docs/shots/03-edit-invalid.png)、[噪声四维分栏](docs/shots/04-edit-noise.png)、[代理管理](docs/shots/05-proxies.png)、[自检报告](docs/shots/08-selfcheck.png)。完整操作清单见 [P5 文档](docs/06-P5-Web控制台.md)。
+
+### 应用中心与扩展（0.4.3 ①）
+
+拆解结论（`adspower-reverse/8.9.23/27b`）有两条直接决定了建模，照着做：
+
+1. **扩展文件全局共享一份**，按扩展 id 一个目录（`<数据根>/ext_env/<id>/`），**不是每个环境一份副本**
+   —— 对手 8.9.23 也不是（100 个 profile 里 `extensionCenter` 一个都没有，命令行里 `--load-extension` 0 命中）。
+2. **启用状态是环境级的**：共享的是文件，不是「开没开」。对手 `sysAppCateId==="0"` 那种
+   「库内启用的全加载」的隐式语义**我们不实现** —— 勾了才加载，界面上看得见。
+
+落成两张表：`extensions`（库：id / unique_id / name / version / path / status / sha256…）与
+`profile_extensions`（环境 ↔ 扩展，显式勾选）。`sha256` 是目录内容指纹，用来做导入去重
+（同一个包导两次不占两份盘）。**不写 `ext_env/record` 那种 JSON 索引** —— 对手两边
+`ext_env/record` 与 `ext/record` 的 `version` 就不一致、谁是权威连拆解都定不下来，我们不让库里出现第二份事实源。
+
+导入 = **复制**（源目录留着）：先落到 `.import-*` 临时目录 → 校验 manifest（`__MSG_` 本地化名会解析）
+→ 算内容指纹 → 去重 → `rename` 成 `<id>`。「要么整份，要么没有」。
+
+加载走 **CDP `Extensions.loadUnpacked`**（理由与四组对照实测见已知限制 46），发生在
+`injectAndOpen` **之前**，结果落在 `/start` 的 `extensions` 字段：
+
+```json
+{ "requested": 2,
+  "loaded": [{ "ext_id": "1000001", "chrome_id": "gffj…", "name": "FP One" }],
+  "failed": [] }
+```
+
+一个都没勾时是 `null`；加载失败的会同时进 `warnings`；**目录被人删了**的在启动一开始就进 warnings 并跳过
+——沉默的缺口比报错难查得多。
+
+六条路由（`/api/v2/app/*`：`list` / `import` / `update` / `delete` / `profile` / `profile/set`），
+错误码用 `100002`（参数非法）/ `100001`（找不到），不拿 `-1` 糊过去。
+`profile/set` 与 `delete` 会回 `restart_required` / `running_affected`：**正在跑的环境改扩展要重启才生效**，不假装立刻生效。
+
+和对手不一样的四处：只能本地导入（不转发别人的分发）、不能更新版本（换版本就删了重导，
+而**扩展 ID 是加载路径的函数**，目录改名 = 换 ID = 扩展存储分家）、`ext_env/record` 不写、
+MV2 装得上但 Chrome 137+ 可能不给跑（导入时明确告警）。完整设计与判据见 [15 号文档](docs/15-应用中心与扩展.md)。
 
 ## 六、桌面壳与安装包（P6）
 
@@ -703,6 +741,28 @@ Object.getOwnPropertyNames(window).some(n => /^__fp/.test(n))   // true → 这�
 45. **注入层的诊断标记不再是固定名**（接上面「已修：`__fp*` 固定名标记」）：自检页、宿主、判据读这些标记时，
     一律用 `markerNames(fp_seed)` 派生，**不许再写死名字**。判据里有一条静态扫描专门防回流：
     `inject.js` / `manager.js` / `probe.js` / `worker-probe.js` 的**代码行**里出现 `__fp` 字面量就红。
+
+46. **扩展靠 CDP 装，不靠命令行；`--load-extension` 现在是明确拒绝**（0.4.3 ①）：
+    Chrome 137+ 已经移除了命令行装扩展的开关。本机真内核 **157.0.8103.78** 四组隔离对照
+    （`--load-extension` / 加 `--disable-features=DisableLoadExtensionCommandLineSwitch` /
+    加 `--enable-unsafe-extension-debugging`）**全部没把扩展装进来** ——
+    `Target.getTargets` 没有 service_worker，`Default/Preferences` 的 `extensions.settings` 也是空的。
+    所以旧实现（白名单放行 + 自动补特性开关）是**静默空转**：参数进了命令行、`launch_args.applied` 写着成功，
+    实际什么都没发生。0.4.3 起这两条参数进保护名单，写了会拿到「请用应用中心」的拒绝原因。
+    真正能用的路是 CDP `Extensions.loadUnpacked`，**不需要**任何 debug 参数，在环境启动后、
+    页面装配之前逐个装（顺序反了，已开的页面就没有 content script）。设计见 [15 号文档](docs/15-应用中心与扩展.md)。
+
+47. **扩展的四个边界（0.4.3 ①，都不是「以后补」，是当前事实）**：
+    - **只能本地导入**：粘本机目录或 `.zip` 的路径（不是上传）。`.crx` 请先解压成目录 ——
+      解 CRX 要处理签名与版本化容器，为一个小众入口引一套解析不值。
+    - **不能更新版本**：要换版本就删了重导。而**扩展 ID 是加载路径的函数**
+      （`sha256(路径 UTF-16LE)` 前 16 字节 → `a-p`，实测与 CDP 返回值一致），
+      `<数据根>/ext_env/<id>` 目录名一变 ID 就变，扩展自己的 localStorage 也跟着分家。
+      同理：**搬数据目录会让所有扩展换 ID**。启动时会把 CDP 报回来的 ID 和导入时推算的比一次，不一致就告警。
+    - **Manifest V2 装得上、不一定跑得起来**：Chrome 137 起已不支持 MV2，导入时会给明确告警，
+      加载时可能被内核直接拒绝 —— 那时 `extensions.failed` 里会有它，别当成「没装」。
+    - **勾选改了要重启环境**：扩展是启动时装进去的，`/api/v2/app/profile/set` 会回 `restart_required`，
+      界面也照这个说。正在跑的环境删掉扩展不会崩，但要重启才真的没有。
 
 
 

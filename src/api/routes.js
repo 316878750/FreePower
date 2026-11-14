@@ -19,6 +19,10 @@ import {
   listRecycleBin, restoreProfiles, getRecycledProfile,
 } from '../store/profiles.js';
 import { listTags, createTags, updateTags, deleteTags, tagIdsOf } from '../store/tags.js';
+import {
+  listExtensions, importExtension, updateExtension, deleteExtensions,
+  profileExtensions, profileExtensionIds, setProfileExtensions,
+} from '../store/extensions.js';
 import { importProfiles, copyProfile } from '../store/transfer.js';
 import { parseAdspowerTxt, formatAdspowerTxt, txtFilename } from '../store/adspower-txt.js';
 import { readCookies, writeCookies, formatNetscape, parseNetscape, missingAfterWrite } from '../kernel/cookies.js';
@@ -1063,6 +1067,84 @@ export function buildRoutes() {
     const r = requestHotkey(raw);
     if (!r.ok) throw new ApiError(ERR.INVALID, r.error, 200, { field: 'accelerator' });
     return ok({ requested: r.accelerator, status: readHotkeyStatus() });
+  });
+
+  /* ============================ 4.8 应用中心：扩展管理（0.4.3） ============================ */
+  /**
+   * 对手这块在云端（`/api/v1/application/list`、下载走它家 CDN），我们没有也不转发别人的分发，
+   * 所以是**本地自己的一套**：库在本地（`<数据根>/ext_env/<id>/` 全局共享一份），
+   * 启用状态按环境勾选（`profile_extensions`）。加载发生在环境启动后（CDP Extensions.loadUnpacked），
+   * 不是 `--load-extension`（那条在 Chrome 157 已失效，见 src/kernel/extensions.js）。
+   */
+
+  add(['GET', 'POST'], ['/api/v2/app/list'], () => ok({ list: listExtensions() }));
+
+  add(['POST'], ['/api/v2/app/import'], (ctx) => {
+    try {
+      const r = importExtension(ctx.body.path ?? ctx.body.source_path, {
+        name: ctx.body.name,
+        status: ctx.body.status,
+      });
+      return ok({ ...r.extension, duplicate: r.duplicate, warnings: r.warnings });
+    } catch (e) {
+      throw new ApiError(ERR.INVALID, e.message);
+    }
+  });
+
+  add(['POST'], ['/api/v2/app/update'], (ctx) => {
+    const id = String(ctx.body.id ?? ctx.body.ext_id ?? ctx.body.ids ?? '');
+    if (!id) throw new ApiError(ERR.INVALID, 'id is required');
+    try {
+      const r = updateExtension(id, { status: ctx.body.status, name: ctx.body.name });
+      if (!r) throw new ApiError(ERR.NOT_FOUND, 'extension not found');
+      return ok(r);
+    } catch (e) {
+      if (e instanceof ApiError) throw e;
+      throw new ApiError(ERR.INVALID, e.message);
+    }
+  });
+
+  add(['POST'], ['/api/v2/app/delete'], (ctx) => {
+    const ids = idList(ctx.body.ids ?? ctx.body.id ?? ctx.body.ext_ids, 'v2');
+    if (!ids.length) throw new ApiError(ERR.INVALID, 'ids is required');
+    /**
+     * 正在跑的环境里可能正加载着它：**允许删**（文件删了内核不会崩），
+     * 但必须如实回「哪些运行中的环境要到重启才真的没有」，不能让用户以为立刻生效。
+     */
+    const running = listRunning().map((i) => i.profile_id);
+    const affected = new Set();
+    for (const pid of running) {
+      for (const extId of profileExtensionIds(pid)) if (ids.includes(extId)) affected.add(pid);
+    }
+    try {
+      return ok({ ...deleteExtensions(ids), running_affected: [...affected] });
+    } catch (e) {
+      throw new ApiError(ERR.INVALID, e.message);
+    }
+  });
+
+  /** 某个环境勾了哪些扩展（含库级停用的，用 enabled 区分；界面上不隐藏） */
+  add(['GET', 'POST'], ['/api/v2/app/profile'], (ctx) => {
+    const p = resolveProfile(ctx, 'v2');
+    const list = profileExtensions(p.id);
+    return ok({
+      profile_id: p.id,
+      list,
+      ext_ids: list.filter((x) => x.enabled).map((x) => x.id),
+      all_ext_ids: list.map((x) => x.id),
+    });
+  });
+
+  /** 全量替换某个环境启用的扩展。环境在跑时要重启才生效 —— 如实回 restart_required */
+  add(['POST'], ['/api/v2/app/profile/set'], (ctx) => {
+    const p = resolveProfile(ctx, 'v2');
+    const ids = idList(ctx.body.ext_ids ?? ctx.body.ids, 'v2');
+    try {
+      const saved = setProfileExtensions(p.id, ids);
+      return ok({ profile_id: p.id, ext_ids: saved, restart_required: !!getRunning(p.id) });
+    } catch (e) {
+      throw new ApiError(ERR.INVALID, e.message);
+    }
   });
 
   /* ============================ 5. 占位：明确不支持 ============================ */

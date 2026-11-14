@@ -43,20 +43,31 @@ export default async function renderEdit({ head, page, params }) {
   state.lastCheck = null;
   state.touched = new Set();
 
-  const [schema, groups, tags, proxies] = await Promise.all([
+  const [schema, groups, tags, proxies, apps] = await Promise.all([
     api.schema(),
     api.groups().catch(() => ({ list: [] })),
     api.tags().catch(() => ({ list: [] })),
     api.proxies().catch(() => ({ list: [] })),
+    api.apps().catch(() => ({ list: [] })),
   ]);
   state.schema = schema;
   state.groups = groups.list || [];
   state.tags = tags.list || [];
   state.proxies = proxies.list || [];
+  state.apps = apps.list || [];
 
   const id = params.id;
   state.editing = id || null;
   state.model = id ? await loadProfile(id) : newProfile();
+  /**
+   * 这个环境勾了哪些扩展。**不是** profile 表里的字段（扩展是独立的库 + 关系表，
+   * 见 src/store/extensions.js），所以单独取、单独存，不进 buildPayload。
+   */
+  state.extIds = new Set();
+  if (id) {
+    const owned = await api.appForProfile(id).catch(() => null);
+    for (const x of (owned?.ext_ids || [])) state.extIds.add(String(x));
+  }
   // 运行状态以运行时注册表为准（profile.status 是库里的快照，内核崩了会滞后）
   state.running = false;
   if (id) {
@@ -194,6 +205,7 @@ export default async function renderEdit({ head, page, params }) {
     if (g.id === 'identity') grid.appendChild(countryField());
     if (g.id === 'identity') grid.appendChild(groupField());
     if (g.id === 'identity') grid.appendChild(tagsField());
+    if (g.id === 'identity') grid.appendChild(appField());
     if (g.id === 'network') grid.appendChild(proxyField());
     for (const f of basics) grid.appendChild(field(f));
     formArea.appendChild(grid);
@@ -278,8 +290,36 @@ export default async function renderEdit({ head, page, params }) {
       } }, '新建标签')));
   }
 
-  function proxyField() {
-    const cur = state.model.proxy_id || '';
+  /**
+   * 扩展：从应用中心（扩展库）里勾选。**文件全局共享一份**，这里存的只是「这个环境用哪些」。
+   * 没勾的不会加载；改完勾选要重启环境才生效（扩展在启动后由 CDP 装进去，不是命令行参数）。
+   */
+  function appField() {
+    const enabled = state.apps.filter((x) => x.status !== '0');
+    const boxes = enabled.map((x) => h('label', null,
+      h('input', {
+        type: 'checkbox', checked: state.extIds.has(String(x.id)),
+        onChange: (e) => {
+          if (e.target.checked) state.extIds.add(String(x.id));
+          else state.extIds.delete(String(x.id));
+          markDirty();
+        },
+      }), `${x.name} ${x.version ? `v${x.version}` : ''}`.trim()));
+    const disabledCount = state.apps.length - enabled.length;
+    return h('label', { class: 'field wide' },
+      h('span', { class: 'lbl' }, '扩展'),
+      boxes.length
+        ? h('div', { class: 'checks' }, ...boxes)
+        : h('span', { class: 'muted small' }, '应用中心里还没有扩展'),
+      h('div', { class: 'row' },
+        h('a', { class: 'small', href: '#/apps' }, '打开应用中心 →'),
+        disabledCount ? h('span', { class: 'muted small' }, `（${disabledCount} 个扩展在应用中心里被停用，这里不显示）`) : null),
+      h('span', { class: 'hint' },
+        '扩展文件在本机只存一份，所有环境共用；这里选的是「这个环境启动时加载哪些」。' +
+        '环境正在运行时改这一项，保存后会重启才生效。'));
+  }
+
+  function proxyField() {    const cur = state.model.proxy_id || '';
     const hasCustom = !cur && state.model._has_custom_proxy;
     const sel = h('select', { onChange: (e) => setValue('proxy_id', e.target.value) },
       h('option', { value: '', selected: !cur }, hasCustom ? '自定义（列表外，编辑会覆盖）' : '直连（不绑代理）'),
@@ -485,6 +525,18 @@ export default async function renderEdit({ head, page, params }) {
 
   /* ------------------------------ 保存 ------------------------------ */
 
+  /**
+   * 扩展勾选的落库顺序**刻意放在环境保存之前**（编辑时）：
+   * 保存并重启这条路径里，重启时读的就是库里的勾选，后写就等于这次重启白跑一趟。
+   * 代价：勾选写成功、随后的字段保存被拒时，勾选已经改过了 —— 环境本身没变，用户改回来只需再点一次，
+   * 比「重启后扩展没生效、用户以为勾错了」好判断。
+   */
+  async function saveExtensions(profileId) {
+    const ids = [...state.extIds];
+    const r = await api.appSetForProfile(profileId, ids);
+    return r;
+  }
+
   async function save() {
     if (state.busy) return;
     // JSON 类字段先自己把格式问题拦下，否则发出去只会拿到一句 "must be an object"
@@ -509,6 +561,7 @@ export default async function renderEdit({ head, page, params }) {
         return;
       }
       if (state.editing) {
+        const extSave = await saveExtensions(state.editing);
         if (state.running) {
           // 运行中：stop → apply → start 由后端一个请求做完（前端不自己停，避免半路失败留下停着的环境）
           saveBtn.textContent = '重启中…';
@@ -517,10 +570,12 @@ export default async function renderEdit({ head, page, params }) {
           toast(n ? `已按新配置重启（变更 ${n} 项）` : '已重启（没有字段变化）', 'ok');
         } else {
           await api.update({ ...payload, profile_id: state.editing });
-          toast('已保存', 'ok');
+          toast(extSave.restart_required ? '已保存；扩展改动要重启环境后生效' : '已保存', 'ok');
         }
       } else {
         const p = await api.create(payload);
+        // 新环境：先把 id 拿到，再把勾选写进去（创建接口不收扩展字段）
+        await saveExtensions(p.profile_id);
         toast(`已创建 #${p.profile_no || ''}`, 'ok');
       }
       state.dirty = false;
