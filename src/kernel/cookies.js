@@ -309,6 +309,52 @@ export function planCookieWrite(existing = [], incoming = [], mode = 'restore') 
 }
 
 /**
+ * 逐条比对两个 cookie 集合（0.4.7 ①：撤销合并之后**证明**真的回到了合并前）。
+ *
+ * 为什么必须比到这个粒度：撤销最容易糊弄自己的地方就是「条数对上了」——
+ * 合并时新增 3 条、撤销时删掉 3 条，条数一样，但被覆盖的那条 `value` 可能还是新值。
+ * 所以身份用 `cookieKey`（name + domain + path + 分区），**并且逐条比 `value`**。
+ *
+ * 返回里的三个数组**不带 value**（那是登录凭据）：只回 name/domain/path，够定位、不够泄露。
+ *
+ * @param {object[]} expected 期望的集合（合并前的快照）
+ * @param {object[]} actual 现在的集合（撤销后从内核读回的）
+ * @returns {{ok:boolean, expected_total:number, actual_total:number,
+ *            missing:object[], extra:object[], changed:object[]}}
+ */
+export function compareCookieSets(expected = [], actual = []) {
+  const index = (list) => {
+    const m = new Map();
+    for (const c of list) m.set(cookieKey(c), c);
+    return m;
+  };
+  const want = index(expected);
+  const have = index(actual);
+  const brief = (c) => ({
+    name: String(c.name ?? ''),
+    domain: String(c.domain ?? ''),
+    path: String(c.path || '/'),
+  });
+  const missing = [];
+  const changed = [];
+  const extra = [];
+  for (const [key, c] of want) {
+    const cur = have.get(key);
+    if (!cur) { missing.push(brief(c)); continue; }
+    if (String(cur.value ?? '') !== String(c.value ?? '')) changed.push(brief(c));
+  }
+  for (const [key, c] of have) if (!want.has(key)) extra.push(brief(c));
+  return {
+    ok: missing.length === 0 && changed.length === 0 && extra.length === 0,
+    expected_total: want.size,
+    actual_total: have.size,
+    missing,
+    extra,
+    changed,
+  };
+}
+
+/**
  * 删 cookie：`Network.deleteCookies` 是**页面级**方法，所以要借一个页面会话。
  * 一条失败不拖整批（失败带 name/domain/reason 回来）。
  */

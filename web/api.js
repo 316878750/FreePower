@@ -233,6 +233,13 @@ export const api = {
    * restore = 覆盖、merge = 并集（同名以现有为准）。
    */
   batchCookie: (ids, body) => call('/api/v2/browser-profile/batch/cookie', { method: 'POST', body: { profile_ids: ids, ...body }, timeoutMs: 180000 }),
+  /**
+   * 撤销最近一次「合并 Cookie」（0.4.7 ①）。只保留最近一次合并的记录 —— 撤销过一次就没了。
+   * `preview:true` 只算不写（会告诉你「将写回几条、删掉几条」）。
+   */
+  batchCookieUndo: (ids, body = {}) => call('/api/v2/browser-profile/batch/cookie/undo', { method: 'POST', body: { profile_ids: ids, ...body }, timeoutMs: 180000 }),
+  /** 这些环境现在有没有可撤销的合并（只读，不碰内核） */
+  batchCookieUndoStatus: (ids) => call('/api/v2/browser-profile/batch/cookie/undo', { query: { profile_ids: ids.join(',') } }),
 
   /* ---- 应用中心 / 扩展（0.4.3） ---- */
   /**

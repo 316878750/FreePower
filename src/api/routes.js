@@ -25,7 +25,8 @@ import {
 } from '../store/extensions.js';
 import { importProfiles, copyProfile } from '../store/transfer.js';
 import { parseAdspowerTxt, formatAdspowerTxt, txtFilename } from '../store/adspower-txt.js';
-import { readCookies, writeCookies, formatNetscape, parseNetscape, missingAfterWrite, planCookieWrite, applyCookiePlan } from '../kernel/cookies.js';
+import { readCookies, writeCookies, formatNetscape, parseNetscape, missingAfterWrite, planCookieWrite, applyCookiePlan, compareCookieSets } from '../kernel/cookies.js';
+import { saveMergeSnapshot, readMergeSnapshot, clearMergeSnapshot, hasMergeSnapshot } from '../store/cookie-undo.js';
 import {
   createProxies, updateProxy, listProxies, deleteProxies, rememberProxyCheck, getProxy,
 } from '../store/proxies.js';
@@ -1249,6 +1250,31 @@ export function buildRoutes() {
         };
         if (preview) { results.push({ ...base, applied: false }); continue; }
 
+        /*
+         * 合并前先落「可撤销记录」（0.4.7 ①）。
+         *
+         * 只对 `merge` 做：`restore` 的语义本来就是「写完之后以文件为准」，而且它自己已经
+         * 走 preview + 确认两道；`merge` 不一样 —— 它是**往现有集合里加东西**，用户看不见
+         * 「加了之后原来那些还在不在」，合错了又没有别的回退路径。
+         *
+         * **写不进快照就不合并**（fail-closed）：一次没有回滚记录的合并，就是一次不可回退的
+         * 破坏性操作。宁可这一条失败并说明原因，也不做「先合了再说」。
+         */
+        let undoInfo = null;
+        if (plan.mode === 'merge') {
+          try {
+            const snap = saveMergeSnapshot(p.id, existing, { incoming_total: plan.incoming_total });
+            undoInfo = { saved: true, total: snap.total, taken_at: snap.taken_at };
+          } catch (e) {
+            skipped.push({
+              profile_id: p.id, profile_no: p.profile_no, name: p.name,
+              reason: 'snapshot_failed',
+              error_message: `无法写入撤销记录，已放弃这次合并（合并将不可回退）：${e.message}`,
+            });
+            continue;
+          }
+        }
+
         const done = await applyCookiePlan(inst.client, plan);
         // 写后回读：报告「实际生效了几条」，不假装全成
         let verified = null;
@@ -1277,6 +1303,10 @@ export function buildRoutes() {
           failed_detail: [...done.deleted.failed, ...done.written.failed].slice(0, 20),
           verified,
           warnings,
+          // 合并可撤销（0.4.7）：告诉界面「这一个环境现在能撤销」，以及撤销回到哪一刻
+          undo_available: plan.mode === 'merge' ? true : false,
+          undo_before_total: undoInfo ? undoInfo.total : null,
+          undo_taken_at: undoInfo ? undoInfo.taken_at : null,
         });
       } catch (e) {
         skipped.push({ profile_id: p.id, profile_no: p.profile_no, name: p.name, reason: 'read_failed', error_message: e.message });
@@ -1300,6 +1330,199 @@ export function buildRoutes() {
         will_delete: results.reduce((n, r) => n + r.will_delete, 0),
         will_keep: results.reduce((n, r) => n + r.will_keep, 0),
         skipped: skipped.length,
+      },
+    });
+  });
+
+  /**
+   * 哪些环境**现在**有可撤销的合并（只读，不碰内核、不读 cookie 内容）。
+   *
+   * 给界面用：撤销只在最近一次合并有效，所以「有没有得撤」要在点之前就知道，
+   * 不能让人点了确认才被告知「没有可撤销的合并」。
+   * `?profile_ids=a,b` 或 `?profile_id=a`。
+   */
+  add(['GET'], ['/api/v2/browser-profile/batch/cookie/undo'], (ctx) => {
+    const raw = ctx.query.profile_ids ?? ctx.query.profile_id;
+    const ids = raw === undefined || raw === null || raw === ''
+      ? []
+      : idList(Array.isArray(raw) ? raw : String(raw).split(',').map((s) => s.trim()).filter(Boolean), 'v2');
+    const list = ids.map((id) => {
+      const p = getProfile(id) || getProfileByNo(id);
+      if (!p) {
+        const recycled = getRecycledProfile({ profile_id: String(id) }) || getRecycledProfile({ profile_no: Number(id) });
+        return { profile_id: String(id), exists: false, available: false, reason: recycled ? 'in_recycle_bin' : 'not_found' };
+      }
+      // **读一遍而不是只判存在**：记录损坏时撤销会失败，这时候说「可撤销」就是骗人。
+      // 损坏要单独报 `snapshot_corrupt`（与「没有可撤销的合并」是两种不同的问题）。
+      let snap = null;
+      try {
+        snap = readMergeSnapshot(p.id);
+      } catch (e) {
+        return {
+          profile_id: p.id, profile_no: p.profile_no, name: p.name,
+          exists: true, available: false, reason: 'snapshot_corrupt', error_message: e.message,
+        };
+      }
+      if (!snap) {
+        return { profile_id: p.id, profile_no: p.profile_no, name: p.name, exists: true, available: false, reason: 'no_merge_to_undo' };
+      }
+      return {
+        profile_id: p.id,
+        profile_no: p.profile_no,
+        name: p.name,
+        exists: true,
+        available: true,
+        reason: null,
+        merged_at: snap.taken_at,
+        before_total: snap.total,
+      };
+    });
+    return ok({ list, available_count: list.filter((x) => x.available).length, total: list.length });
+  });
+
+  /**
+   * 撤销最近一次「合并 Cookie」（0.4.7 ①）。
+   *
+   * 合并是往环境里**加** cookie 的批量操作，选错环境 / 拿错文件就污染一片，而且原来没有回退路径。
+   * 这里把合并前落下的那份快照写回去：**写回快照里的每一条、删掉快照里没有的**，
+   * 然后逐条比对（name/value/domain/path）确认真的回到了合并前。
+   *
+   * 五条边界，都写清（这些是「撤销」最容易骗自己的地方）：
+   *   1. **只撤销最近一次合并**。一个环境只留一份记录，新的合并会覆盖旧的。界面上明说。
+   *      撤销成功后记录立刻删掉 → 第二次撤销如实回 `no_merge_to_undo`，不假装又撤了一次。
+   *   2. **比对的是 cookie 本身**，不是条数。条数一样但值被换了，判 `changed` 并如实报失败。
+   *   3. **合并之后新产生的 cookie 会被删掉** —— 「回到合并前」就是这个意思，不是 bug。
+   *   4. **环境不在跑就撤不了**（cookie 在内核里，与合并同一条口径，不为撤销偷偷起内核）。
+   *   5. **环境被删了要如实报**：彻底删了 → `not_found`；在回收站里 → `in_recycle_bin`
+   *      （先从回收站恢复再撤销）。不许因为「记录还在、环境没了」崩掉。
+   *
+   * 撤销失败时**保留快照**（用户还能重试），成功才删。
+   */
+  add(['POST'], ['/api/v2/browser-profile/batch/cookie/undo'], async (ctx) => {
+    const ids = batchTargets(ctx);
+    const preview = (ctx.body || {}).preview === undefined
+      ? true
+      : ['1', 'true', 'yes'].includes(String((ctx.body || {}).preview).toLowerCase());
+    const list = [];
+    const failed = [];
+
+    for (const id of ids) {
+      const p = getProfile(id) || getProfileByNo(id);
+      if (!p) {
+        // 环境没了：先分清「在回收站」还是「彻底删了」—— 两种给出的下一步不一样
+        const recycled = getRecycledProfile({ profile_id: String(id) }) || getRecycledProfile({ profile_no: Number(id) });
+        failed.push({
+          profile_id: String(id),
+          reason: recycled ? 'in_recycle_bin' : 'not_found',
+          error_message: recycled
+            ? '这个环境在回收站里，先从回收站恢复再撤销合并'
+            : '这个环境已经被彻底删除，撤销记录里没有可写回的目标',
+        });
+        continue;
+      }
+
+      let snapshot;
+      try {
+        snapshot = readMergeSnapshot(p.id);
+      } catch (e) {
+        failed.push({ profile_id: p.id, profile_no: p.profile_no, name: p.name, reason: 'snapshot_corrupt', error_message: e.message });
+        continue;
+      }
+      if (!snapshot) {
+        failed.push({
+          profile_id: p.id, profile_no: p.profile_no, name: p.name,
+          reason: 'no_merge_to_undo',
+          error_message: '这个环境没有可撤销的合并（只保留最近一次合并的记录，撤销过一次就没有了）',
+        });
+        continue;
+      }
+
+      const inst = getInstance(p.id);
+      if (!inst) {
+        failed.push({
+          profile_id: p.id, profile_no: p.profile_no, name: p.name,
+          reason: 'not_running',
+          error_message: '环境没在运行；cookie 在内核里，撤销需要环境在跑（与合并同一条口径）',
+        });
+        continue;
+      }
+
+      try {
+        const now = await readCookies(inst.client);
+        // 写回快照 = 覆盖：快照里有的是目标状态，快照里没有的要删掉
+        const plan = planCookieWrite(now, snapshot.cookies, 'restore');
+
+        // 预览：只算不写。撤销会把「合并之后新产生的 cookie」删掉，这一点必须先让用户看见条数。
+        if (preview) {
+          list.push({
+            profile_id: p.id,
+            profile_no: p.profile_no,
+            name: p.name,
+            merged_at: snapshot.taken_at,
+            before_total: snapshot.total,
+            now_total: now.length,
+            will_add: plan.will_add,
+            will_update: plan.will_update,
+            will_delete: plan.will_delete,
+            unchanged: plan.unchanged,
+            preview: true,
+            restored: false,
+          });
+          continue;
+        }
+
+        const done = await applyCookiePlan(inst.client, plan);
+        const after = await readCookies(inst.client);
+        const diff = compareCookieSets(snapshot.cookies, after);
+
+        const base = {
+          profile_id: p.id,
+          profile_no: p.profile_no,
+          name: p.name,
+          merged_at: snapshot.taken_at,
+          before_total: snapshot.total,
+          now_total: after.length,
+          written: done.written.written.length,
+          deleted: done.deleted.deleted.length,
+          write_failed: done.written.failed.length + done.deleted.failed.length,
+          failed_detail: [...done.deleted.failed, ...done.written.failed].slice(0, 20),
+          verified: diff.ok,
+          diff: {
+            missing: diff.missing.slice(0, 20),
+            extra: diff.extra.slice(0, 20),
+            changed: diff.changed.slice(0, 20),
+            missing_count: diff.missing.length,
+            extra_count: diff.extra.length,
+            changed_count: diff.changed.length,
+          },
+        };
+
+        if (!diff.ok) {
+          // 没回到合并前：**保留快照**（还能再试），如实报差在哪几条
+          failed.push({
+            ...base,
+            reason: 'verify_failed',
+            error_message: `撤销后与合并前不一致：缺 ${diff.missing.length} 条、多 ${diff.extra.length} 条、值不同 ${diff.changed.length} 条`,
+          });
+          continue;
+        }
+        // 真回到了合并前 → 记录作废（第二次撤销就该说「没有可撤销的合并」）
+        clearMergeSnapshot(p.id);
+        list.push({ ...base, restored: true });
+      } catch (e) {
+        failed.push({ profile_id: p.id, profile_no: p.profile_no, name: p.name, reason: 'restore_failed', error_message: e.message });
+      }
+    }
+
+    return ok({
+      preview,
+      list,
+      failed,
+      summary: {
+        targets: ids.length,
+        restored: preview ? 0 : list.length,
+        planned: preview ? list.length : 0,
+        failed: failed.length,
       },
     });
   });

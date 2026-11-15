@@ -141,7 +141,8 @@ export default async function renderProfiles({ head, page }) {
       item('显示窗口', () => batchShow()),
       item('检查代理', () => batchCheckProxy()),
       item('还原 Cookie（覆盖）', () => batchCookie('restore'), { title: '写完之后以文件为准：文件里没有的会被删掉。先预览再确认' }),
-      item('合并 Cookie（并集）', () => batchCookie('merge'), { title: '只补文件里有、环境里没有的；同名以环境现有为准，不动登录态' }));
+      item('合并 Cookie（并集）', () => batchCookie('merge'), { title: '只补文件里有、环境里没有的；同名以环境现有为准，不动登录态。合并后可撤销（只保留最近一次）' }),
+      item('撤销上次合并 Cookie', () => batchCookieUndo(), { title: '只撤销最近一次合并；撤销过一次就没有了（不做无限历史）' }));
     wrap.appendChild(btn);
     wrap.appendChild(panel);
     // 点别处收起（一次性监听，页面切走也无所谓）
@@ -192,6 +193,12 @@ export default async function renderProfiles({ head, page }) {
       not_archived: '本来就没有归档',
       read_failed: '读取现况失败',
       not_in_sync: '不在同步会话里',
+      // 0.4.7 ① 撤销合并
+      no_merge_to_undo: '没有可撤销的合并（只保留最近一次）',
+      snapshot_failed: '写不进撤销记录，已放弃这次合并',
+      snapshot_corrupt: '撤销记录已损坏',
+      restore_failed: '撤销时出错',
+      verify_failed: '撤销后与合并前不一致',
     })[reason] || String(reason);
   }
 
@@ -831,8 +838,8 @@ export default async function renderProfiles({ head, page }) {
         body: h('div', { class: 'stack' },
           h('div', null, `合计：新增 ${s.will_add || 0} 条、修改 ${s.will_update || 0} 条、删除 ${s.will_delete || 0} 条${s.will_keep ? `、保留现有 ${s.will_keep} 条` : ''}。`),
           mode === 'restore'
-            ? h('div', { class: 'notice warn' }, '「还原」是**覆盖**：写完以文件为准，文件里没有的 cookie 会被删掉。')
-            : h('div', { class: 'notice' }, '「合并」是**并集**：只补文件里有、环境里没有的；同名以环境现有为准，不会覆盖登录态。'),
+            ? h('div', { class: 'notice warn' }, '「还原」是**覆盖**：写完以文件为准，文件里没有的 cookie 会被删掉。**这一步不可撤销**（只有「合并」有撤销）。')
+            : h('div', { class: 'notice' }, '「合并」是**并集**：只补文件里有、环境里没有的；同名以环境现有为准，不会覆盖登录态。合并之后可以用「撤销上次合并 Cookie」退回来（**只保留最近一次**）。'),
           h('div', { class: 'code-block', style: { whiteSpace: 'pre-wrap', maxHeight: '40vh', overflow: 'auto' } }, lines.join('\n') || '（没有明细）'),
           h('div', { class: 'muted small' }, '预览里不显示 cookie 的值（那是登录凭据）。')),
         okLabel: `确认${mode === 'restore' ? '覆盖' : '合并'}`,
@@ -845,6 +852,65 @@ export default async function renderProfiles({ head, page }) {
       for (const sk of r.skipped || []) rows.push(`- 跳过 ${String(sk.profile_id).slice(0, 8)}：${skipReason(sk.reason)}${sk.error_message ? `（${sk.error_message}）` : ''}`);
       resultDrawer(`${label} · 结果`, `${(r.summary || {}).applied} 个环境已处理`, rows);
     } catch (e) { toast(`${label}失败：${e.message}`, 'bad'); }
+  }
+
+  /**
+   * 撤销最近一次「合并 Cookie」（0.4.7 ①）。
+   *
+   * 三步，一步都不省：
+   *   1. 先问服务端「这些环境里哪几个有得撤」—— 只保留最近一次合并，所以要先知道有没有，
+   *      不能让人点了确认才被告知「没有可撤销的合并」；
+   *   2. 预览：会写回几条、会删掉几条。**「删掉」必须说清楚** —— 合并之后新产生的 cookie
+   *      会被一起删掉，这正是「回到合并前」的意思，但用户得先知道；
+   *   3. 真撤销，然后逐个报「回读确认」结果。
+   */
+  async function batchCookieUndo() {
+    const ids = picked();
+    if (!ids) return;
+    let st;
+    try {
+      st = await api.batchCookieUndoStatus(ids);
+    } catch (e) { toast(`查撤销记录失败：${e.message}`, 'bad'); return; }
+    const avail = (st.list || []).filter((x) => x.available);
+    const notAvail = (st.list || []).filter((x) => !x.available);
+    if (!avail.length) {
+      const why = notAvail.slice(0, 5).map((x) => `· ${String(x.profile_id).slice(0, 8)}：${skipReason(x.reason)}`).join('\n');
+      await confirmDialog({
+        title: '撤销上次合并 Cookie',
+        body: h('div', { class: 'stack' },
+          h('div', null, '选中的环境里**没有**可撤销的合并。'),
+          h('div', { class: 'muted small' }, '撤销只保留**最近一次**合并的记录：合并过一次又撤销过、或者根本没合并过，都会是这里。'),
+          why ? h('div', { class: 'code-block', style: { whiteSpace: 'pre-wrap' } }, why) : null),
+        okLabel: '知道了', cancelLabel: null,
+      });
+      return;
+    }
+    const availIds = avail.map((x) => x.profile_id);
+    let pv;
+    try {
+      pv = await api.batchCookieUndo(availIds, { preview: true });
+    } catch (e) { toast(`预览失败：${e.message}`, 'bad'); return; }
+    const lines = (pv.list || []).map((x) => `· ${String(x.profile_id).slice(0, 8)}${x.name ? ` ${x.name}` : ''}：合并前 ${x.before_total} 条、现在 ${x.now_total} 条 → 写回 ${x.will_add + x.will_update} 条 / 删掉 ${x.will_delete} 条`);
+    for (const f of pv.failed || []) lines.push(`- 跳过 ${String(f.profile_id).slice(0, 8)}：${skipReason(f.reason)}`);
+    const yes = await confirmDialog({
+      title: '撤销上次合并 Cookie · 预览',
+      body: h('div', { class: 'stack' },
+        h('div', null, `${availIds.length} 个环境有可撤销的合并${notAvail.length ? `，另有 ${notAvail.length} 个没有（会被跳过）` : ''}。`),
+        h('div', { class: 'notice warn' },
+          '撤销会把 cookie 恢复成**合并前那一刻**的样子：合并之后新产生的 cookie 会被删掉。'),
+        h('div', { class: 'muted small' },
+          '撤销只对**最近一次**合并有效，撤完就没有了（不做无限历史）。撤销本身不再可撤销 —— 但可以用「合并 Cookie」再合一次。'),
+        h('div', { class: 'code-block', style: { whiteSpace: 'pre-wrap', maxHeight: '40vh', overflow: 'auto' } }, lines.join('\n') || '（没有明细）')),
+      okLabel: '确认撤销',
+      danger: true,
+    });
+    if (!yes) { toast('已取消，一条都没动'); return; }
+    try {
+      const r = await api.batchCookieUndo(availIds, { preview: false });
+      const rows = (r.list || []).map((x) => `✓ ${String(x.profile_id).slice(0, 8)}${x.name ? ` ${x.name}` : ''}：写回 ${x.written} 条、删掉 ${x.deleted} 条、逐条比对${x.verified ? '一致（真的回到合并前）' : '不一致'}${(x.diff && (x.diff.missing_count || x.diff.extra_count || x.diff.changed_count)) ? `\n   ⚠ 缺 ${x.diff.missing_count} / 多 ${x.diff.extra_count} / 值不同 ${x.diff.changed_count}` : ''}`);
+      for (const f of r.failed || []) rows.push(`- 未撤销 ${String(f.profile_id).slice(0, 8)}：${skipReason(f.reason)}${f.error_message ? `（${f.error_message}）` : ''}`);
+      resultDrawer('撤销上次合并 Cookie · 结果', `${(r.summary || {}).restored} 个环境已恢复`, rows);
+    } catch (e) { toast(`撤销失败：${e.message}`, 'bad'); }
   }
 
   async function stopAll() {
