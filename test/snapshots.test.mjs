@@ -562,9 +562,10 @@ try {
     check('静态：`SNAPSHOT_SCOPE` 里同时写了「包含」和「不包含」（文案只有一份）',
       /SNAPSHOT_SCOPE = Object\.freeze/.test(src) && /excluded: \[/.test(src));
     check('静态：快照范围里明说**内核本体不备份**', /内核本体/.test(src));
-    check('静态：**轮转支持保护名单**（`rotate` 收 `protect`，恢复时用它保住正在恢复的那份）',
-      /export function rotate\(profileId, \{ keep = KEEP_SNAPSHOTS, fsx = fs, protect = \[\] \}/.test(src)
-      && /protect: \[snapId\]/.test(src));
+    check('静态：**轮转支持保护名单**（`rotate` 收 `protect`；恢复时保住正在恢复的那份，拍照时保住刚拍的这份）',
+      /export function rotate\(profileId, \{/.test(src) && /protect = \[\]/.test(src)
+      && /protect: \[snapId\]/.test(src)
+      && /protect: \[\.\.\.\(protect \|\| \[\]\), snapId\]/.test(src));
     check('静态：快照声称有 userdata 而盘上没有 → `snapshot_userdata_missing` 硬失败（不是 `if (existsSync)` 静默跳过）',
       /snapshot_userdata_missing/.test(src) && /const claimsUserdata = /.test(src));
     check('静态：`verified` 同时要求记录与数据（`verifiedRecord && verifiedData`）',

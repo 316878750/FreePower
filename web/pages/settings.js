@@ -156,6 +156,53 @@ export default async function settingsPage({ head, page }) {
         '三档行高 30 / 44 / 64 px 是我们选的值：对手界面只给了「紧凑 / 标准 / 超高」三个名字，没给数字。'));
   }
 
+  /* ======================= 3b. 备份：关闭环境时自动备份（0.4.7 ③） ======================= */
+  const snapBox = h('div', { class: 'stack' });
+  body.appendChild(panel('备份：关闭环境时自动备份', snapBox,
+    h('div', { class: 'muted small' },
+      '默认是关。开着的话，每次停止环境会自动给那个环境存一份快照（和手动备份一样：含 Cookie/登录态与'
+      + '指纹配置，不含缓存和内核），同样受「每个环境最多 5 份」限制。')));
+
+  function paintSnapOnClose(st) {
+    const on = st?.enabled === true;
+    const last = st?.state;
+    mount(snapBox,
+      h('label', { class: 'checks', style: { display: 'inline-flex' } },
+        h('input', {
+          type: 'checkbox',
+          checked: on,
+          onChange: async (e) => {
+            const want = e.target.checked;
+            try {
+              const r = await api.setSnapshotOnClose(want);
+              toast(r.enabled ? '已开启：下次停止环境会自动备份一份' : '已关闭：停止环境不再自动备份', 'ok');
+              await loadSettings(false);
+            } catch (err) { toast(`改不了：${err.message}`, 'bad'); paintSnapOnClose(st); }
+          },
+        }),
+        h('span', null, '关闭环境时自动备份一份'),
+        h('span', { class: 'muted small' }, on ? '　当前：开' : '　当前：关（默认）')),
+      h('div', { class: 'muted small' },
+        on
+          ? '开着的时候磁盘会持续增长：每个环境最多 5 份，每份是数据目录的一份拷贝（缓存已排除）。'
+            + '不再需要时请关掉，或到环境编辑页「备份快照」里手动删。'
+          : '关着的时候停止环境不会创建任何快照。要备份请到环境编辑页「备份快照」里手动点。'),
+      // 上次自动备份的结果：失败必须看得见，不许只在日志里
+      last
+        ? (last.ok
+          ? h('div', { class: 'muted small' },
+            `上次自动备份：成功（${String(last.at || '').slice(0, 19).replace('T', ' ')}）`)
+          : h('div', { class: 'notice bad' },
+            h('strong', null, '上次自动备份失败'),
+            `：${last.reason || '未知原因'}${last.message ? `（${last.message}）` : ''}`
+            + `　${String(last.at || '').slice(0, 19).replace('T', ' ')}。`
+            + '环境本身照常关掉了，只是这次没有备份。'))
+        : null,
+      st?.broken
+        ? h('div', { class: 'notice warn' }, '这个开关在库里存坏了，已按「关」处理（重新勾选一次就会覆盖坏数据）。')
+        : null);
+  }
+
   /* ======================= 4. 本地 API（只读摘要） ======================= */
   const apiBox = h('div', { class: 'stack' });
   body.appendChild(panel('本地 API', apiBox,
@@ -218,6 +265,12 @@ export default async function settingsPage({ head, page }) {
       const r = await api.settings();
       defaults = r.sync_defaults;
       paintSync();
+      paintSnapOnClose({
+        enabled: r.snapshot_on_close === true,
+        saved: r.snapshot_on_close_saved,
+        broken: r.snapshot_on_close_broken === true,
+        state: r.snapshot_on_close_state || null,
+      });
       if (r.sync_defaults_broken) {
         toast('库里的同步默认设置存坏了，已回内置默认（保存一次就会覆盖掉坏数据）', 'warn');
       }

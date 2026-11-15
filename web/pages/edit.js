@@ -331,6 +331,18 @@ export default async function renderEdit({ head, page, params }) {
           h('strong', null, '不能恢复'),
           '，恢复前先停止。')
         : null,
+      // 0.4.7 ③：关环境自动备份的开关状态就摆在这里，用户不用跑到设置页去查
+      data.on_close
+        ? h('div', { class: 'muted small' },
+          data.on_close.enabled
+            ? '「关闭环境时自动备份」已开启：每次停止这个环境会自动存一份（类型「关闭环境时自动」），同样最多 5 份。'
+            : '「关闭环境时自动备份」是关的：停止环境不会自动存快照。要改去「设置」页。')
+        : null,
+      data.on_close && data.on_close.last && data.on_close.last.ok !== true
+        ? h('div', { class: 'notice bad' },
+          h('strong', null, '上次关闭时自动备份失败'),
+          `：${data.on_close.last.reason || '未知原因'}。环境本身正常关掉了，这次没有备份。`)
+        : null,
       list.length
         ? h('table', { class: 'grid' },
           h('thead', null, h('tr', null,

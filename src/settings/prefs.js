@@ -90,3 +90,123 @@ export function syncDefaultsDiff() {
   }
   return out;
 }
+
+/* ==================== 关闭环境时自动备份（0.4.7 ③） ====================
+ *
+ * **默认必须是关**。理由不是「实现简单」，是这个开关会让磁盘持续增长：
+ * 每个环境留 5 份、每份是真 userdata 的拷贝（实测 14.7 MB → 2.5 MB，真实环境带
+ * LocalStorage/IndexedDB 只会更大），几十个环境就是几百 MB 到 GB 级。
+ * **替用户决定占磁盘是不可接受的**，所以没存过就是关。
+ *
+ * 存在库里（meta 表）而不是 localStorage：备份是**服务端**在关环境时做的
+ * （`manager.stopProfile`），浏览器 localStorage 服务端读不到 —— 和 `sync_defaults` 同一个理由。
+ *
+ * 键名不许改（改名等于把用户的选择丢掉）。
+ */
+export const SNAPSHOT_ON_CLOSE_KEY = 'snapshot_on_close';
+
+/** 上一次自动备份的结果（界面要能显示「上次自动备份失败」） */
+export const SNAPSHOT_ON_CLOSE_STATE_KEY = 'snapshot_on_close_state';
+
+/**
+ * 读「关环境自动备份」开关。
+ * @returns {{enabled:boolean, saved:boolean, broken:boolean}}
+ *   - `saved:false` = 没存过（**默认关**）或存坏了；`broken:true` = 存坏了，界面要如实说
+ */
+export function readSnapshotOnClose() {
+  let raw = null;
+  try {
+    raw = getMeta(SNAPSHOT_ON_CLOSE_KEY);
+  } catch {
+    return { enabled: false, saved: false, broken: false };
+  }
+  if (raw === null || raw === undefined || String(raw).trim() === '') {
+    return { enabled: false, saved: false, broken: false };
+  }
+  const text = String(raw).trim();
+  // 只认明确的开：'true' / '1'。其余（含脏数据、'yes'、空）**一律当关** ——
+  // 这是会占磁盘的开关，读不懂就必须偏向「不占」。
+  if (text === 'true' || text === '1') return { enabled: true, saved: true, broken: false };
+  if (text === 'false' || text === '0') return { enabled: false, saved: true, broken: false };
+  return { enabled: false, saved: false, broken: true };
+}
+
+/**
+ * 写开关。只接受布尔（或 'true'/'false' 字符串），别的一律拒 —— 不猜用户意图。
+ * @returns {{enabled:boolean, saved:true, changed:boolean}}
+ */
+export function writeSnapshotOnClose(value) {
+  const prev = readSnapshotOnClose();
+  let next;
+  if (value === true || value === 'true' || value === 1 || value === '1') next = true;
+  else if (value === false || value === 'false' || value === 0 || value === '0') next = false;
+  else {
+    const e = new Error('enabled must be a boolean');
+    e.code = 'INVALID_ENABLED';
+    throw e;
+  }
+  setMeta(SNAPSHOT_ON_CLOSE_KEY, next ? 'true' : 'false');
+  return { enabled: next, saved: true, changed: prev.enabled !== next };
+}
+
+/**
+ * 自动备份的结果，**按环境存**（一个 map），因为界面上是在某个环境的「备份快照」页里看「上次失败」。
+ *
+ * @param {string} [profileId] 给 id 就取这个环境的；不给就取**最近一次**（设置页那句汇总用）
+ * @returns {{at:string, ok:boolean, reason?:string, snap_id?:string, message?:string}|null}
+ */
+export function readSnapshotOnCloseState(profileId) {
+  let raw = null;
+  try {
+    raw = getMeta(SNAPSHOT_ON_CLOSE_STATE_KEY);
+  } catch {
+    return null;
+  }
+  if (raw === null || raw === undefined || String(raw).trim() === '') return null;
+  let parsed = null;
+  try {
+    parsed = JSON.parse(String(raw));
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  if (profileId !== undefined && profileId !== null) {
+    const one = parsed[String(profileId)];
+    return one && typeof one === 'object' ? one : null;
+  }
+  // 不给 id：取时间最新的那条（设置页「上次自动备份失败」用）
+  let best = null;
+  for (const v of Object.values(parsed)) {
+    if (!v || typeof v !== 'object') continue;
+    if (!best || String(v.at || '') > String(best.at || '')) best = v;
+  }
+  return best;
+}
+
+/** 记一次自动备份的结果（成功也记：界面要能显示「上次自动备份成功」） */
+export function writeSnapshotOnCloseState(profileId, state = {}) {
+  const payload = {
+    at: state.at || new Date().toISOString(),
+    ok: state.ok === true,
+    ...(state.reason ? { reason: String(state.reason) } : {}),
+    ...(state.snap_id ? { snap_id: String(state.snap_id) } : {}),
+    ...(state.message ? { message: String(state.message).slice(0, 300) } : {}),
+  };
+  try {
+    let map = {};
+    try {
+      const raw = getMeta(SNAPSHOT_ON_CLOSE_STATE_KEY);
+      const parsed = raw ? JSON.parse(String(raw)) : null;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) map = parsed;
+    } catch { map = {}; }
+    map[String(profileId)] = payload;
+    // 只留最近 200 个环境的结果：这是「上次怎样」的提示，不是历史日志，不能无限长
+    const keys = Object.keys(map);
+    if (keys.length > 200) {
+      keys.sort((a, b) => String(map[a]?.at || '').localeCompare(String(map[b]?.at || '')));
+      for (const k of keys.slice(0, keys.length - 200)) delete map[k];
+    }
+    setMeta(SNAPSHOT_ON_CLOSE_STATE_KEY, JSON.stringify(map));
+  } catch { /* 记不下来不影响关环境；下次还会再记 */ }
+  return payload;
+}

@@ -270,9 +270,10 @@ export function takeSnapshot(profile, {
   }
 
   // 4) 轮转：只留最近 keep 个，多出来的**真删目录**
-  //    被 `protect` 点名的（恢复时正在恢复的那份）跳过，改删更旧的一份 ——
-  //    否则「恢复最旧那份」会先被自己的「恢复前」快照挤掉，导致半恢复还报成功。
-  const evicted = rotate(profileId, { keep, fsx, protect });
+  //    `protect` 里除了调用方点名的（恢复时正在恢复的那份），**必须再加上刚拍的这一份**：
+  //    淘汰顺序按「先普通快照、`before_restore` 最后」，如果池子里其余全是恢复点，
+  //    不保护自己的话第一个被淘汰的就是**刚拍好的这份** —— 备份白做了。
+  const evicted = rotate(profileId, { keep, fsx, protect: [...(protect || []), snapId] });
   return { ok: true, snapshot: meta, evicted, userdata };
 }
 
@@ -282,18 +283,48 @@ export function takeSnapshot(profile, {
  * `protect`：这次**不许删**的 snap_id 列表。被保护的跳过（它仍占一个名额），所以会往下再删一份
  * 更旧的 —— 总份数照样回到 `keep`，只是死的不是被保护那份。全都受保护时宁可超上限也不删。
  *
+ * **淘汰顺序按「这份备份有多有用」排，不按时间**（0.4.7 ③ 加的）。三档，从先死到后死：
+ *
+ *   1. **没有 userdata 的 `before_restore`** —— 只剩记录、登录态根本没有。它是「记录的回退点」，
+ *      但拿来当数据兜底是假的。所以最先淘汰它，**排在普通快照之前**。
+ *      （真实踩到的场景：数据被删掉之后又恢复了一次，那次拍的 `before_restore` 就是没有 userdata 的；
+ *      如果只按「恢复点最后动」，这份空壳会长期占着名额，把一份完整的手动备份挤掉。）
+ *   2. **普通快照**（手动 / 关环境自动），从旧到新。
+ *   3. **带 userdata 的 `before_restore`** —— 这是「恢复错了还能退回来」的真正退路，最后才动。
+ *
+ * 结果里每一条都带 `restore_point` 与 `has_userdata`，接口/界面据此说清「这次动的是恢复点」。
+ *
  * 为什么「挤不掉也要保留新快照」：删不掉通常是文件被占用（杀毒、资源管理器缩略图），
  * 那一刻拒绝备份等于把用户刚做的操作变成「没有兜底」。宁可暂时多占一份，也要把备份留下，
  * 并把 `removed:false` 如实报给界面 —— 界面会说「有 N 份没删掉，暂时超过 5 份」。
  */
-export function rotate(profileId, { keep = KEEP_SNAPSHOTS, fsx = fs, protect = [] } = {}) {
+export function rotate(profileId, {
+  keep = KEEP_SNAPSHOTS, fsx = fs, protect = [], keepRestorePoints = true,
+} = {}) {
   const protectedSet = new Set((protect || []).map((x) => String(x)));
   const all = listSnapshots(profileId, { fsx }); // 新的在前
   const evicted = [];
   let remaining = all.length;
-  for (let i = all.length - 1; i >= 0 && remaining > keep; i -= 1) {
-    const s = all[i];
-    if (protectedSet.has(String(s.snap_id))) continue; // 跳过但**不**减 remaining：要再多删一份更旧的
+
+  // 候选：从旧到新，去掉被 protect 点名的
+  const candidates = [];
+  for (let i = all.length - 1; i >= 0; i -= 1) {
+    if (protectedSet.has(String(all[i].snap_id))) continue;
+    candidates.push(all[i]);
+  }
+  const isRestorePoint = (s) => String(s.reason) === 'before_restore';
+  // `includes.userdata === true` 才算有数据；老 meta 缺这个键也当「没有」（宁可先淘汰，不误留）
+  const hasUserdata = (s) => s?.includes?.userdata === true;
+  const tier = (s) => {
+    if (!isRestorePoint(s)) return 2;            // 普通快照
+    return hasUserdata(s) ? 3 : 1;               // 空壳恢复点最先死，真恢复点最后死
+  };
+  const ordered = keepRestorePoints
+    ? [...candidates].sort((a, b) => tier(a) - tier(b)) // sort 是稳定的：同一档内保持「从旧到新」
+    : candidates;
+
+  for (const s of ordered) {
+    if (remaining <= keep) break;
     const dir = snapshotDirFor(profileId, s.snap_id);
     let removed = false;
     let error = null;
@@ -305,7 +336,17 @@ export function rotate(profileId, { keep = KEEP_SNAPSHOTS, fsx = fs, protect = [
       error = e.message;
     }
     if (removed) remaining -= 1;
-    evicted.push({ snap_id: s.snap_id, taken_at: s.taken_at, removed, error });
+    evicted.push({
+      snap_id: s.snap_id,
+      taken_at: s.taken_at,
+      reason: s.reason,
+      // true = 这次动的是「恢复点」（普通快照都淘汰光了才轮到它）
+      restore_point: isRestorePoint(s),
+      // false = 这份本来就没存 userdata（只剩记录）。界面可以说清「被挤掉的是一份只有记录的快照」
+      has_userdata: hasUserdata(s),
+      removed,
+      error,
+    });
   }
   return evicted;
 }

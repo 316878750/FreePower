@@ -50,7 +50,8 @@ import { renderHtml } from '../selfcheck/html.js';
 import { issueTicket } from './tickets.js';
 import { apiInfoPayload, setApiVerify, resetStats } from './info.js';
 import { startSync, stopSync, restartSync, syncStatus, updateSettings, refreshAll, unifySize, arrangeWindows, showWindows, forceShowWindows, openTabInAll, tabState, closeTabs, copyTabToSlaves, unifyTabs, DEFAULT_SETTINGS } from '../sync/session.js';
-import { readSyncDefaults, writeSyncDefaults, resetSyncDefaults, syncDefaultsDiff, mergeSyncSettings } from '../settings/prefs.js';
+import { readSyncDefaults, writeSyncDefaults, resetSyncDefaults, syncDefaultsDiff, mergeSyncSettings,
+  readSnapshotOnClose, writeSnapshotOnClose, readSnapshotOnCloseState } from '../settings/prefs.js';
 import { networkSnapshot, probeBoundProxies } from './diagnose.js';
 import { readDisplays } from '../sync/displays.js';
 import { readHotkeyStatus, requestHotkey } from '../sync/hotkey.js';
@@ -1761,6 +1762,13 @@ export function buildRoutes() {
       reasons: SNAPSHOT_REASONS.map((r) => ({ reason: r, label: reasonLabel(r) })),
       // 快照里有什么、没什么 —— 文案只有服务端这一份，界面直接渲染
       scope: SNAPSHOT_SCOPE,
+      // 0.4.7 ③：关环境自动备份的开关状态 + **这个环境**上一次自动备份的结果（失败要看得见）
+      on_close: {
+        enabled: readSnapshotOnClose().enabled,
+        saved: readSnapshotOnClose().saved,
+        broken: readSnapshotOnClose().broken,
+        last: readSnapshotOnCloseState(p.id),
+      },
     });
   });
 
@@ -1906,16 +1914,47 @@ export function buildRoutes() {
    * 服务端读不到、也不需要读（见 web/density.js / web/nav.js 的头注释）。
    */
 
-  /** 读设置：一次给全（目前只有同步默认），并如实说「存过没有 / 存坏了没有」 */
+  /** 读设置：一次给全（同步默认 + 关环境自动备份），并如实说「存过没有 / 存坏了没有」 */
   add(['GET'], ['/api/v2/settings'], () => {
     const r = readSyncDefaults();
+    const onClose = readSnapshotOnClose();
     return ok({
       sync_defaults: r.settings,
       sync_defaults_saved: r.saved,
       // 存坏了：界面要显式提示「已回默认」，不能静默当没事
       sync_defaults_broken: r.broken,
       sync_defaults_diff: syncDefaultsDiff(),
+      // 0.4.7 ③：关闭环境时自动备份（**默认关**，没存过就是 false）
+      snapshot_on_close: onClose.enabled,
+      snapshot_on_close_saved: onClose.saved,
+      snapshot_on_close_broken: onClose.broken,
+      // 上一次自动备份的结果：界面要能显示「上次自动备份失败」
+      snapshot_on_close_state: readSnapshotOnCloseState(),
     });
+  });
+
+  /**
+   * 关环境自动备份开关（0.4.7 ③）。
+   *
+   * 语义只有一条：`enabled:true` 之后，`manager.stopProfile` 会给这个环境拍一份
+   * `reason:'on_close'` 的快照，同样受 5 份上限约束；`false` 时**一次都不造**。
+   * 只接受布尔 —— 别的一律 `100002` + `field:'enabled'`，不猜用户意图（这是会占磁盘的开关）。
+   */
+  add(['POST'], ['/api/v2/settings/snapshot-on-close'], (ctx) => {
+    const b = ctx.body || {};
+    if (b.enabled === undefined) {
+      throw new ApiError(ERR.INVALID, 'enabled is required（true / false）', 200, { field: 'enabled' });
+    }
+    let r;
+    try {
+      r = writeSnapshotOnClose(b.enabled);
+    } catch (e) {
+      if (e.code === 'INVALID_ENABLED') {
+        throw new ApiError(ERR.INVALID, 'enabled must be a boolean', 200, { field: 'enabled' });
+      }
+      throw e;
+    }
+    return ok({ enabled: r.enabled, saved: true, changed: r.changed });
   });
 
   /**

@@ -14,7 +14,7 @@ import { writeCookies } from '../kernel/cookies.js';
 import { alignProfileToKernel } from '../kernel/version.js';
 import { fingerprintView, geoPolicy } from '../fingerprint/view.js';
 import { ensureNoiseSeeds } from '../fingerprint/seeds.js';
-import { checkProfile, markStatus, markLaunched, applyProfileFields, persistEgress } from '../store/profiles.js';
+import { checkProfile, markStatus, markLaunched, applyProfileFields, persistEgress, getProfile } from '../store/profiles.js';
 import { extensionsForProfile, rememberUniqueId } from '../store/extensions.js';
 import { loadUnpackedExtensions } from '../kernel/extensions.js';
 import { checkProxy, hasProxy, normalizeProxyConfig } from '../proxy/probe.js';
@@ -1355,6 +1355,63 @@ export function scheduleCachePurgeOnClose(instance, delayMs = 2000) {
   return true;
 }
 
+/**
+ * 关闭环境时自动备份（0.4.7 ③）。
+ *
+ * 三条纪律：
+ *   1. **默认关**。开关没存过就是关，关着的时候**一次都不许造**（连快照目录都不该多一个）。
+ *      会持续占磁盘的事不许替用户决定 —— 见 `src/settings/prefs.js` 的说明。
+ *   2. **失败不许影响关环境**：这个函数把异常全吃掉，只记一行日志 + 记一次状态，
+ *      让界面（设置页 + 环境「备份快照」页）能显示「上次自动备份失败」。
+ *   3. 必须**排在 `scheduleCachePurgeOnClose` 之前**：`clear_cache_after_closing` 会在 2 秒后
+ *      删掉整个 userdata，排在后面就等于备份了一个空目录。
+ *
+ * 动态 import：`store/snapshots.js` 要 import 本模块的 `userDataDirFor`，静态 import 会成环。
+ *
+ * @param {{takeSnapshotImpl?:Function}} [opts] `takeSnapshotImpl` 只给判据用：注入一个会抛的实现，
+ *   证明「异常不会冒泡到关环境」这条路真的有 try 兜着（真实失败走的是 `ok:false`，不会抛）
+ * @returns {{created:boolean, reason?:string, snapshot?:object, evicted?:object[]}}
+ */
+export async function autoSnapshotOnClose(profileId, { takeSnapshotImpl } = {}) {
+  let enabled = false;
+  let writeState = null;
+  try {
+    const prefs = await import('../settings/prefs.js');
+    enabled = prefs.readSnapshotOnClose().enabled === true;
+    writeState = prefs.writeSnapshotOnCloseState;
+  } catch (e) {
+    log(profileId, `snapshot_on_close - pref_read_failed - ${e.message}`);
+    return { created: false, reason: 'pref_read_failed' };
+  }
+  if (!enabled) return { created: false, reason: 'disabled' };
+
+  try {
+    let takeSnapshot = takeSnapshotImpl;
+    if (!takeSnapshot) ({ takeSnapshot } = await import('../store/snapshots.js'));
+    const profile = getProfile(profileId);
+    if (!profile) {
+      writeState(profileId, { ok: false, reason: 'profile_not_found' });
+      log(profileId, 'snapshot_on_close - fail - profile_not_found');
+      return { created: false, reason: 'profile_not_found' };
+    }
+    // 环境刚停：内核已退出、数据是静的，所以 running:false（与「运行中拍摄」区分开）
+    const r = takeSnapshot(profile, { reason: 'on_close', running: false });
+    if (!r.ok) {
+      writeState(profileId, { ok: false, reason: r.reason, message: r.error_message });
+      log(profileId, `snapshot_on_close - fail - ${r.reason}${r.error_message ? ` - ${r.error_message}` : ''}`);
+      return { created: false, reason: r.reason };
+    }
+    writeState(profileId, { ok: true, snap_id: r.snapshot.snap_id });
+    log(profileId, `snapshot_on_close - ok - ${r.snapshot.snap_id}`);
+    return { created: true, snapshot: r.snapshot, evicted: r.evicted || [] };
+  } catch (e) {
+    // 任何意外都不许冒泡到停止流程：关环境失败比没有备份严重得多
+    try { writeState(profileId, { ok: false, reason: 'exception', message: e.message }); } catch { /* ignore */ }
+    log(profileId, `snapshot_on_close - exception - ${e.message}`);
+    return { created: false, reason: 'exception' };
+  }
+}
+
 export async function stopProfile(profileId) {
   const inst = running.get(profileId);
   if (!inst) return { profile_id: profileId, stopped: false, reason: 'not running' };
@@ -1376,9 +1433,18 @@ export async function stopProfile(profileId) {
   if (inst.chain) { await inst.chain.close().catch(() => {}); inst.chain = null; }
   running.delete(profileId);
   markStatus(profileId, 'idle');
+  // 关闭时自动备份（0.4.7 ③，**默认关**）：必须在清缓存之前，否则备份到的是被删空的目录。
+  // 它自己吞掉所有异常，这里再兜一层，保证关环境不受影响。
+  let snapshotOnClose = { created: false, reason: 'disabled' };
+  try {
+    snapshotOnClose = await autoSnapshotOnClose(profileId);
+  } catch (e) {
+    log(profileId, `snapshot_on_close - unexpected - ${e.message}`);
+    snapshotOnClose = { created: false, reason: 'exception' };
+  }
   // 关闭后清缓存（0.4.6）：排在停止流程末尾、延迟 2 秒执行，见 scheduleCachePurgeOnClose
   scheduleCachePurgeOnClose(inst);
-  return { profile_id: profileId, stopped: true };
+  return { profile_id: profileId, stopped: true, snapshot_on_close: snapshotOnClose };
 }
 
 export async function stopAll() {

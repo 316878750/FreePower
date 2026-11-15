@@ -272,6 +272,8 @@ export const api = {
    * @param {{profile_id?:string[]|string, all?:boolean}} body
    */
   snapshotPurgePreview: (body) => call('/api/v2/browser-profile/snapshot/purge-preview', { method: 'POST', body }),
+  /** 关环境自动备份开关（0.4.7 ③，**默认关**）。只接受布尔 */
+  setSnapshotOnClose: (enabled) => call('/api/v2/settings/snapshot-on-close', { method: 'POST', body: { enabled } }),
 
   /* ---- 应用中心 / 扩展（0.4.3） ---- */
   /**
