@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 回收站 tab（环境管理页内，0.4.3 ②）。
  *
  * 语义来自两处：
@@ -17,6 +17,14 @@ import { api } from '../api.js';
 import { tabBar } from '../tabs.js';
 
 const PAGE_SIZE = 100; // 服务端 limit 上限就是 100
+
+/** 快照占用的显示格式（彻底删除确认框里要说清「占 X MB」） */
+function fmtBytes(b) {
+  if (b === null || b === undefined) return '—';
+  if (b >= 1048576) return `${(b / 1048576).toFixed(1)} MB`;
+  if (b >= 1024) return `${(b / 1024).toFixed(1)} KB`;
+  return `${b} B`;
+}
 
 export default async function renderRecycle({ head, page }) {
   let pageNo = 1;
@@ -282,32 +290,72 @@ export default async function renderRecycle({ head, page }) {
   }
 
   async function purgeOne(r) {
+    /*
+     * 彻底删除前必须先问一次「会连多少份备份一起删」。
+     *
+     * 用户如果以为「删环境还留着备份」，那才是真误导 —— 环境记录一删，快照就再也没入口恢复了
+     * （`restoreSnapshot` 需要 profile 记录）。所以确认框里把份数和占用直接写出来。
+     * 预览是只读的；拿不到也不拦着删，只是那句话不说（不许因此假装「没有备份」）。
+     */
+    let snapInfo = null;
+    try {
+      const pv = await api.snapshotPurgePreview({ profile_id: [r.profile_id] });
+      snapInfo = { count: pv.total_count || 0, bytes: pv.total_bytes || 0 };
+    } catch { snapInfo = null; }
+
     const yes = await confirmDialog({
       title: '彻底删除',
       body: h('div', { class: 'stack' },
         h('div', null, '即将彻底删除 ', h('strong', null, r.name || r.profile_id)),
         h('div', { class: 'notice bad' },
-          '这一步不可恢复：会删掉这条记录和它的 user-data 目录（cookie、登录态、缓存）。')),
+          '这一步不可恢复：会删掉这条记录和它的 user-data 目录（cookie、登录态、缓存）。'),
+        snapInfo && snapInfo.count > 0
+          ? h('div', { class: 'notice bad' },
+            '会一并删掉这个环境的 ',
+            h('strong', null, `${snapInfo.count} 份备份快照`),
+            `（占 ${fmtBytes(snapInfo.bytes)}）。`,
+            '环境记录删掉之后这些快照就再也恢复不了了，所以要留着备份请先取消、把环境从回收站恢复。')
+          : null,
+        snapInfo && snapInfo.count === 0
+          ? h('div', { class: 'muted small' }, '这个环境没有备份快照。')
+          : null),
       okLabel: '彻底删除', danger: true,
     });
     if (!yes) return;
     try {
       const res = await api.recyclePurge({ profile_id: [r.profile_id] });
       const okN = (res.purged || []).length;
-      if (okN) toast('已彻底删除', 'ok');
+      const snapGone = res.snapshots_removed || 0;
+      const snapKept = res.snapshots_kept || 0;
       // 盘删不掉时后端不删库（留个还能再点的入口），这里必须如实说，不能报成功
-      else toast(`没能删掉：${skipReason(res.skipped)}`, 'bad');
+      if (!okN) { toast(`没能删掉：${skipReason(res.skipped)}`, 'bad'); await load(); return; }
+      const tail = [
+        snapGone ? `，连同 ${snapGone} 份备份快照` : '',
+        snapKept ? `，但有 ${snapKept} 份备份没删掉（被占用，占着磁盘）` : '',
+      ].join('');
+      toast(`已彻底删除${tail}`, snapKept ? 'warn' : 'ok');
       await load();
     } catch (e) { toast(`彻底删除失败：${e.message}`, 'bad'); }
   }
 
   async function emptyAll() {
     if (!rows.length && pageNo === 1) { toast('回收站已经是空的'); return; }
+    let snapInfo = null;
+    try {
+      const pv = await api.snapshotPurgePreview({ all: true });
+      snapInfo = { count: pv.total_count || 0, bytes: pv.total_bytes || 0 };
+    } catch { snapInfo = null; }
     const yes = await confirmDialog({
       title: '清空回收站',
       body: h('div', { class: 'stack' },
         h('div', null, '会彻底删除回收站里的全部环境（不只是这一页）。'),
-        h('div', { class: 'notice bad' }, '不可恢复：记录和每个环境的 user-data 目录都会被删掉。')),
+        h('div', { class: 'notice bad' }, '不可恢复：记录和每个环境的 user-data 目录都会被删掉。'),
+        snapInfo && snapInfo.count > 0
+          ? h('div', { class: 'notice bad' },
+            '还会一并删掉 ',
+            h('strong', null, `${snapInfo.count} 份备份快照`),
+            `（占 ${fmtBytes(snapInfo.bytes)}）—— 环境记录没了，这些备份就再也恢复不了。`)
+          : null),
       okLabel: '清空', danger: true,
     });
     if (!yes) return;
@@ -315,8 +363,13 @@ export default async function renderRecycle({ head, page }) {
       const res = await api.recyclePurge({ all: true });
       const okN = (res.purged || []).length;
       const badN = (res.skipped || []).length;
+      const snapGone = res.snapshots_removed || 0;
+      const snapKept = res.snapshots_kept || 0;
       // 「没删掉几个」不够：得说为什么没删掉，否则用户只能干瞪眼
-      toast(`已彻底删除 ${okN} 个${badN ? `，${badN} 个没删掉：${skipReason(res.skipped)}` : ''}`, badN ? 'bad' : 'ok');
+      toast(`已彻底删除 ${okN} 个${snapGone ? `、连同 ${snapGone} 份备份快照` : ''}`
+        + `${snapKept ? `，有 ${snapKept} 份备份没删掉（被占用）` : ''}`
+        + `${badN ? `，${badN} 个环境没删掉：${skipReason(res.skipped)}` : ''}`,
+      (badN || snapKept) ? 'bad' : 'ok');
       pageNo = 1;
       await load();
     } catch (e) { toast(`清空失败：${e.message}`, 'bad'); }

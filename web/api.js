@@ -266,6 +266,12 @@ export const api = {
    */
   snapshotRestore: (profileId, snapId) => call('/api/v2/browser-profile/snapshot/restore', { method: 'POST', body: { profile_id: profileId, snap_id: snapId, confirm: true }, timeoutMs: 180000 }),
   snapshotDelete: (profileId, snapId) => call('/api/v2/browser-profile/snapshot/delete', { method: 'POST', body: { profile_id: profileId, snap_id: snapId } }),
+  /**
+   * 彻底删除前问一句「会连多少份备份一起删」（**只读**）。
+   * 环境记录一删，快照就再也没入口恢复了，所以确认框必须先说清。
+   * @param {{profile_id?:string[]|string, all?:boolean}} body
+   */
+  snapshotPurgePreview: (body) => call('/api/v2/browser-profile/snapshot/purge-preview', { method: 'POST', body }),
 
   /* ---- 应用中心 / 扩展（0.4.3） ---- */
   /**

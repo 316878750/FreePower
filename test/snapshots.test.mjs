@@ -425,6 +425,122 @@ try {
     check('缺 profile_id → 100002 + field=profile_id（快照是按环境存的，没有「全部一份」）',
       noProfile.json?.code === 100002 && noProfile.json?.data?.field === 'profile_id',
       JSON.stringify(noProfile.json?.data));
+
+    /* ==================== 11b. 彻底删除要把旁挂数据一起清掉 ====================
+     *
+     * 不清的话它们不是「小垃圾」，是**够不着的垃圾**：环境记录从库里删掉之后，
+     * `restoreSnapshot` 需要 profile 记录，界面上没有任何入口能恢复 ——
+     * 看着像备份、实际永远用不上，比没有备份更坏。
+     */
+    console.log('\n— 11b. 彻底删除：快照与撤销记录一起清（软删除/归档不许动） —');
+    const { saveMergeSnapshot, undoFileFor } = await import('../src/store/cookie-undo.js');
+    const { spawn } = await import('node:child_process');
+    const sleepA = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    // --- (a) 软删除（放回收站）与归档：**一个快照都不许动** ---
+    {
+      const pSoft = prof.createProfile({ name: `snap-soft-${Date.now()}`, group_id: '0' });
+      makeUserdata(pSoft);
+      for (let i = 0; i < 2; i += 1) snap.takeSnapshot(prof.getProfile(pSoft.profile_id), { reason: 'manual' });
+      const softSnapDir = snap.profileSnapshotsDir(pSoft.profile_id);
+      check('（前提）进回收站前有 2 份快照', snap.listSnapshots(pSoft.profile_id).length === 2,
+        String(snap.listSnapshots(pSoft.profile_id).length));
+
+      // 走**真实的 HTTP 软删除路由**（不是 store 层），否则「清理被挂到软删除上」抓不住
+      const softDel = await api('POST', '/api/v2/browser-profile/delete', { profile_id: [pSoft.profile_id] });
+      check('（前提）软删除路由返回 code=0', softDel.json?.code === 0, JSON.stringify(softDel.json?.code));
+      check('**放回收站（软删除）不动快照**：2 份还在、目录还在',
+        snap.listSnapshots(pSoft.profile_id).length === 2 && fs.existsSync(softSnapDir),
+        String(snap.listSnapshots(pSoft.profile_id).length));
+
+      prof.restoreProfiles([pSoft.profile_id], '0');
+      const arch = await api('POST', '/api/v2/browser-profile/batch/archive', { profile_ids: [pSoft.profile_id] });
+      check('（前提）归档路由返回 code=0', arch.json?.code === 0, JSON.stringify(arch.json?.code));
+      check('**归档也不动快照**：2 份还在（否则用户一归档备份就没了）',
+        snap.listSnapshots(pSoft.profile_id).length === 2 && fs.existsSync(softSnapDir),
+        String(snap.listSnapshots(pSoft.profile_id).length));
+      snap.purgeProfileSnapshots(pSoft.profile_id); // 收拾掉，别影响后面的计数
+    }
+
+    // --- (b) 彻底删除：快照 + 撤销记录一起清，响应里报清了几份 ---
+    {
+      const pGone = prof.createProfile({ name: `snap-gone-${Date.now()}`, group_id: '0' });
+      makeUserdata(pGone);
+      for (let i = 0; i < 3; i += 1) snap.takeSnapshot(prof.getProfile(pGone.profile_id), { reason: 'manual' });
+      saveMergeSnapshot(pGone.profile_id, [{ name: 'sid', value: 'v', domain: 'example.com', path: '/' }]);
+      const snapDir = snap.profileSnapshotsDir(pGone.profile_id);
+      const undoFile = undoFileFor(pGone.profile_id);
+      check('（前提）3 份快照 + 撤销记录都在盘上',
+        snap.listSnapshots(pGone.profile_id).length === 3 && fs.existsSync(snapDir) && fs.existsSync(undoFile),
+        JSON.stringify({ snaps: snap.listSnapshots(pGone.profile_id).length, undo: fs.existsSync(undoFile) }));
+
+      // 确认框要用的只读预览：先知道会删几份
+      const pv = await api('POST', '/api/v2/browser-profile/snapshot/purge-preview', { profile_id: [pGone.profile_id] });
+      check('purge-preview（只读）报出这个环境有 3 份快照 + 字节数，且**没删任何东西**',
+        pv.json?.code === 0 && pv.json?.data?.total_count === 3 && pv.json?.data?.total_bytes > 0
+        && snap.listSnapshots(pGone.profile_id).length === 3,
+        JSON.stringify(pv.json?.data));
+
+      prof.deleteProfiles([pGone.profile_id]);
+      const purged = await api('POST', '/api/v2/browser-profile/recycle-bin/purge', { profile_id: [pGone.profile_id] });
+      check('彻底删除成功（记录进 purged）', (purged.json?.data?.purged || []).includes(pGone.profile_id),
+        JSON.stringify({ purged: purged.json?.data?.purged }));
+      check('**快照目录真的从磁盘消失**（不是只删库记录）', !fs.existsSync(snapDir));
+      check('**撤销记录（cookie-undo）也一起清了**', !fs.existsSync(undoFile));
+      check('响应里如实报 `snapshots_removed:3` + `undo_removed:1`',
+        purged.json?.data?.snapshots_removed === 3 && purged.json?.data?.undo_removed === 1,
+        JSON.stringify({ snaps: purged.json?.data?.snapshots_removed, undo: purged.json?.data?.undo_removed }));
+      check('响应里 `snapshots_kept:0`（没有删不掉的）', purged.json?.data?.snapshots_kept === 0,
+        String(purged.json?.data?.snapshots_kept));
+    }
+
+    // --- (c) 快照目录被占用：环境照样删掉，如实报 `snapshots_kept` ---
+    {
+      const pLock = prof.createProfile({ name: `snap-lock-${Date.now()}`, group_id: '0' });
+      makeUserdata(pLock);
+      for (let i = 0; i < 2; i += 1) snap.takeSnapshot(prof.getProfile(pLock.profile_id), { reason: 'manual' });
+      const snapDir = snap.profileSnapshotsDir(pLock.profile_id);
+      prof.deleteProfiles([pLock.profile_id]);
+
+      // 真锁：子进程把 cwd 设在快照目录里（Windows 下该目录的 rename 会 EBUSY）
+      const locker = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 60000)'], {
+        cwd: snapDir, stdio: 'ignore', windowsHide: true,
+      });
+      await sleepA(800);
+      try {
+        const locked = await api('POST', '/api/v2/browser-profile/recycle-bin/purge', { profile_id: [pLock.profile_id] });
+        check('快照目录删不掉 → **环境照样彻底删掉**（不许因为备份清理失败就拦着删环境）',
+          (locked.json?.data?.purged || []).includes(pLock.profile_id),
+          JSON.stringify({ purged: locked.json?.data?.purged, skipped: locked.json?.data?.skipped }));
+        check('删不掉的数量**如实报** `snapshots_kept:2`（不许静默）',
+          locked.json?.data?.snapshots_kept === 2 && locked.json?.data?.snapshots_removed === 0,
+          JSON.stringify({ kept: locked.json?.data?.snapshots_kept, removed: locked.json?.data?.snapshots_removed }));
+        check('快照目录还在盘上（没被删一半）', fs.existsSync(snapDir));
+        check('`artifacts` 里点名这个环境 + 失败原因',
+          (locked.json?.data?.artifacts || []).some((x) => x.profile_id === pLock.profile_id && x.snapshots_kept === 2),
+          JSON.stringify(locked.json?.data?.artifacts));
+      } finally {
+        try { locker.kill(); } catch { /* 可能已经退了 */ }
+        await sleepA(700);
+        try { fs.rmSync(snapDir, { recursive: true, force: true }); } catch { /* 留给系统 */ }
+      }
+    }
+
+    // --- (d) 清空回收站：`all:true` 的预览要把全部环境的份数加起来 ---
+    {
+      const pA = prof.createProfile({ name: `snap-all-a-${Date.now()}`, group_id: '0' });
+      makeUserdata(pA);
+      snap.takeSnapshot(prof.getProfile(pA.profile_id), { reason: 'manual' });
+      prof.deleteProfiles([pA.profile_id]);
+      const pvAll = await api('POST', '/api/v2/browser-profile/snapshot/purge-preview', { all: true });
+      check('清空回收站的预览：`total_count` ≥ 1（会连备份一起删，确认框要说清）',
+        pvAll.json?.code === 0 && pvAll.json?.data?.total_count >= 1,
+        JSON.stringify({ total: pvAll.json?.data?.total_count }));
+      const gone = await api('POST', '/api/v2/browser-profile/recycle-bin/purge', { all: true });
+      check('清空之后快照目录也没了',
+        (gone.json?.data?.purged || []).includes(pA.profile_id)
+        && !fs.existsSync(snap.profileSnapshotsDir(pA.profile_id)));
+    }
   } finally {
     server.close();
   }
@@ -479,6 +595,27 @@ try {
       /r\.evicted/.test(editSrc) && /挤掉/.test(editSrc));
     check('静态：列表上给「运行中拍摄」一行**可见文字**（不是 title / hover）',
       /运行时拍摄/.test(editSrc));
+
+    /*
+     * 旁挂数据清理：只有**彻底删除**那条路许调，软删除（回收站）/归档一律不许。
+     * 这条最容易在重构时被挂错位置 —— 挂到 `deleteProfiles` 上就等于「一放回收站备份全没」。
+     */
+    const purgeAt = routesSrc.indexOf("'/api/v2/browser-profile/recycle-bin/purge'");
+    const purgeBlock = routesSrc.slice(purgeAt, purgeAt + 9000);
+    check('静态：彻底删除路径里真调了 `purgeProfileSnapshots` + `clearMergeSnapshot`',
+      /purgeProfileSnapshots\(profileId\)/.test(purgeBlock) && /clearMergeSnapshot\(profileId\)/.test(purgeBlock));
+    check('静态：清理**只在记录真的删掉之后**调（`r.purged.includes(target.id)` 门控）',
+      /if \(r\.purged\.includes\(target\.id\)\) cleanArtifacts\(target\.id\);/.test(purgeBlock));
+    check('静态：彻底删除响应里报 `snapshots_removed` / `snapshots_kept`（不许静默）',
+      /snapshots_removed: snapshotsRemovedCount/.test(purgeBlock) && /snapshots_kept: snapshotsKeptCount/.test(purgeBlock));
+
+    const softDelAt = routesSrc.indexOf("both('user/delete', 'browser-profile/delete')");
+    const softDelBlock = routesSrc.slice(softDelAt, softDelAt + 1200);
+    check('静态：**软删除（进回收站）路径里没有**任何旁挂数据清理（用户一放回收站备份就没了）',
+      softDelAt > 0 && !/cleanArtifacts|purgeProfileSnapshots|clearMergeSnapshot/.test(softDelBlock));
+    check('静态：`purgeProfileSnapshots` 在整个路由文件里只被 `cleanArtifacts` 调一次（+ 一行 import）',
+      (routesSrc.match(/purgeProfileSnapshots/g) || []).length === 2,
+      String((routesSrc.match(/purgeProfileSnapshots/g) || []).length));
   }
 } catch (e) {
   check('A 层跑完没有抛异常', false, `${e && e.message}`);

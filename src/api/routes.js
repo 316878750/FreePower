@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 本地 API 路由表。
  *
  * 分三类（对齐拆解手 07 号清单）：
@@ -36,6 +36,7 @@ import { planCacheCleanup, applyCacheCleanup } from '../runtime/cache-cleanup.js
 import {
   takeSnapshot, listSnapshots, readSnapshot, deleteSnapshot, restoreSnapshot,
   snapshotUsage, SNAPSHOT_SCOPE, SNAPSHOT_REASONS, KEEP_SNAPSHOTS, reasonLabel,
+  purgeProfileSnapshots, snapshotFootprint,
 } from '../store/snapshots.js';
 import { batchStart, batchStop } from '../runtime/batch.js';
 import { profileFormSchema } from './schema.js';
@@ -775,6 +776,46 @@ export function buildRoutes() {
     const purged = [];
     const skipped = [];
     let userdataRemoved = 0;
+    /*
+     * 彻底删除之后，这个环境的**旁挂数据**（0.4.7 ② 的快照、① 的撤销记录）必须一起清掉。
+     *
+     * 不清的话它们不是「小垃圾」，是**够不着的垃圾**：环境记录从库里删掉之后，
+     * `restoreSnapshot` 需要 profile 记录，界面上没有任何入口能恢复这些快照 ——
+     * 看着像备份、实际永远用不上，比没有备份更坏。而且量不小：一个环境 5 份，
+     * 删 20 个环境就是几百 MB 到 GB 级，界面上一个字节都看不到。
+     *
+     * 三条纪律：
+     *   1. **只有彻底删除才清**。软删除（放回收站）/归档**一律不碰** —— 用户一放回收站备份就没了，
+     *      那比不清更糟。所以这段只在记录真的被删掉之后调。
+     *   2. **删不掉不许让整个删除失败**：环境照删，`kept` 如实报（`snapshots_kept`）。
+     *   3. 撤销记录确实是小的，同一处顺手清干净。
+     */
+    const artifacts = [];
+    let snapshotsRemovedCount = 0;
+    let snapshotsKeptCount = 0;
+    let snapshotsFreedBytes = 0;
+    let undoRemoved = 0;
+    const cleanArtifacts = (profileId) => {
+      const snapRes = purgeProfileSnapshots(profileId);
+      snapshotsRemovedCount += snapRes.removed || 0;
+      snapshotsKeptCount += snapRes.kept || 0;
+      snapshotsFreedBytes += snapRes.freed_bytes || 0;
+      let undoGone = false;
+      try {
+        undoGone = clearMergeSnapshot(profileId);
+      } catch { undoGone = false; }
+      if (undoGone) undoRemoved++;
+      artifacts.push({
+        profile_id: String(profileId),
+        snapshots_removed: snapRes.removed || 0,
+        snapshots_kept: snapRes.kept || 0,
+        snapshots_bytes: snapRes.bytes || 0,
+        snapshots_freed_bytes: snapRes.freed_bytes || 0,
+        snapshots_detached_path: snapRes.detached_path || null,
+        undo_removed: undoGone,
+        ...(snapRes.ok ? {} : { snapshots_error: snapRes.error_message || snapRes.reason }),
+      });
+    };
     for (const id of ids) {
       const target = getRecycledProfile({ profile_id: id });
       if (!target) { skipped.push({ profile_id: String(id), reason: 'not_in_recycle_bin' }); continue; }
@@ -793,6 +834,8 @@ export function buildRoutes() {
         const r = purgeProfiles([target.id]);
         purged.push(...r.purged);
         for (const s of r.skipped) skipped.push(s);
+        // 记录真删掉了 → 旁挂数据一起清（软删除/归档不会走到这里）
+        if (r.purged.includes(target.id)) cleanArtifacts(target.id);
         continue;
       }
 
@@ -804,6 +847,7 @@ export function buildRoutes() {
          */
         const r = purgeProfiles([target.id]);
         purged.push(...r.purged);
+        if (r.purged.includes(target.id)) cleanArtifacts(target.id);
         skipped.push({
           profile_id: target.id,
           reason: data.reason,
@@ -823,7 +867,17 @@ export function buildRoutes() {
         error_message: data.error_message,
       });
     }
-    return ok({ purged, skipped, userdata_removed: userdataRemoved });
+    return ok({
+      purged,
+      skipped,
+      userdata_removed: userdataRemoved,
+      // 旁挂数据清了多少：界面要能说「N 份快照没删掉」，不能静默
+      snapshots_removed: snapshotsRemovedCount,
+      snapshots_kept: snapshotsKeptCount,
+      snapshots_freed_bytes: snapshotsFreedBytes,
+      undo_removed: undoRemoved,
+      artifacts,
+    });
   });
 
   /* ==================== 4.8 批量菜单（0.4.3 ③） ====================
@@ -1787,6 +1841,46 @@ export function buildRoutes() {
       taken_while_running: r.snapshot && r.snapshot.taken_while_running === true,
       list: listSnapshots(p.id),
       usage: snapshotUsage(p.id),
+    });
+  });
+
+  /**
+   * `POST /snapshot/purge-preview`（**只读**）：彻底删除前，先让界面知道会连多少份备份一起删。
+   *
+   * 为什么要有这条：用户如果以为「删环境还留着备份」，那才是真误导 —— 事实上环境记录一删，
+   * 这些快照就再也没入口恢复了。所以确认框里必须先说清「会一并删掉 N 份（占 X MB）」。
+   *
+   * 入参：`profile_id`（数组或单个）或 `all: true`（清空回收站）。
+   * 出参：`{ total_count, total_bytes, items: [{profile_id, count, bytes}] }`。
+   * **一个字节都不动**（只用 `snapshotFootprint` 读目录）。
+   */
+  add(['POST'], ['/api/v2/browser-profile/snapshot/purge-preview'], (ctx) => {
+    const src = ctx.body || {};
+    let ids;
+    if (src.all === true) {
+      ids = [];
+      for (let page = 1; page <= 1000; page++) {
+        const r = listRecycleBin({ page, page_size: 100 });
+        ids.push(...r.list.map((x) => x.profile_id));
+        if (r.list.length < 100) break;
+      }
+    } else {
+      const raw = src.profile_id ?? src.ids;
+      ids = Array.isArray(raw) ? raw : (raw === undefined || raw === null || raw === '' ? [] : [raw]);
+      if (!ids.length) {
+        throw new ApiError(ERR.INVALID, 'profile_id is required（清空回收站请显式传 all:true）', 200, { field: 'profile_id' });
+      }
+    }
+    const items = ids.map((raw) => {
+      const key = String(raw);
+      const target = getRecycledProfile({ profile_id: key }) || getProfile(key);
+      const fp = snapshotFootprint(target ? target.id : key);
+      return { profile_id: target ? target.id : key, count: fp.count, bytes: fp.bytes };
+    });
+    return ok({
+      total_count: items.reduce((n, x) => n + x.count, 0),
+      total_bytes: items.reduce((n, x) => n + x.bytes, 0),
+      items,
     });
   });
 

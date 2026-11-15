@@ -257,6 +257,44 @@ try {
     await manager.stopProfile(p.profile_id);
     await sleep(600);
   }
+
+  /* ---------------- 9. 彻底删除：真环境的数据目录 + 快照一起消失，环境记录也没了 ---------------- */
+  console.log('\n— 9. 彻底删除真环境 → 快照目录一起消失（不留够不着的垃圾） —');
+  {
+    // 现造一个真环境（起一次内核、种 cookie、停掉、拍 2 份），再彻底删除
+    const pd = profiles.createProfile({ name: `snap-del-${Date.now()}`, group_id: '0' });
+    ids.push(pd.profile_id);
+    const st = await startAndOpen(pd.profile_id);
+    check('（前提）这个环境真启动过（userdata 里有内核落的文件）',
+      !!st.started.real_version && fs.existsSync(dirOf(pd)), `pid=${st.started.pid}`);
+    await manager.stopProfile(pd.profile_id);
+    await sleep(600);
+
+    for (let i = 0; i < 2; i += 1) {
+      const r = snap.takeSnapshot(profiles.getProfile(pd.profile_id), { reason: 'manual' });
+      if (!r.ok) check('（前提）拍快照成功', false, JSON.stringify(r));
+    }
+    const snapDir = snap.profileSnapshotsDir(pd.profile_id);
+    check('（前提）快照目录里有 2 份', snap.listSnapshots(pd.profile_id).length === 2 && fs.existsSync(snapDir),
+      String(snap.listSnapshots(pd.profile_id).length));
+
+    // 软删除 → 快照**必须还在**（回收站里还能恢复，备份不能跟着没）
+    profiles.deleteProfiles([pd.profile_id]);
+    check('**放回收站不动快照**（软删除之后 2 份仍在盘上）',
+      snap.listSnapshots(pd.profile_id).length === 2 && fs.existsSync(snapDir),
+      String(snap.listSnapshots(pd.profile_id).length));
+
+    // 彻底删除（走真实清理函数，与路由里调的是同一个）
+    const purged = snap.purgeProfileSnapshots(pd.profile_id);
+    check('彻底删除时快照清理成功（removed:2 / kept:0）',
+      purged.ok === true && purged.removed === 2 && purged.kept === 0, JSON.stringify(purged));
+    check('**快照目录真的从磁盘消失**（不是只从索引里删）', !fs.existsSync(snapDir));
+    check('没有留 `.fp-purge-` 墓碑', fs.readdirSync(path.join(dataDir, 'snapshots'))
+      .filter((n) => n.includes('.fp-purge-')).length === 0,
+    JSON.stringify(fs.readdirSync(path.join(dataDir, 'snapshots'))));
+    check('别的环境的快照没被连坐（主环境那份还在）',
+      fs.existsSync(snap.profileSnapshotsDir(p.profile_id)));
+  }
 } catch (e) {
   check('B 层跑完没有抛异常', false, `${e && e.message}`);
   console.error(e);

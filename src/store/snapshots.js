@@ -571,6 +571,83 @@ export function writeRecord(profileId, record = {}) {
 }
 
 /**
+ * 彻底删除环境时，把这个环境的快照目录整份清掉（**只有彻底删除才调**）。
+ *
+ * 为什么必须清：环境记录从库里删掉之后，`restoreSnapshot` 需要 `profile` 记录，
+ * 没有任何入口能恢复这些快照 —— 它们**看着像备份、实际永远用不上**，
+ * 比没有备份更坏（让人误以为有兜底）。而量不小：一个环境 5 份，删 20 个环境就是几百 MB
+ * 到 GB 级，界面上一个字节都看不到。
+ *
+ * 删盘走 **先改名再删** 的两阶段（与 `purge-data.js` 同一条纪律）：直接 `rmSync(recursive)`
+ * 是「先删内容、再删目录」，目录被占住时会内容删光了才报错 —— 报的和做的正好相反。
+ * 改名失败 = 一个字节都没动，如实报 `kept`。
+ *
+ * **删不掉不许让整个删除失败**：调用方（彻底删除路由）照样删环境记录，把 `kept` 如实报给用户。
+ *
+ * @returns {{ok:boolean, existed:boolean, removed:number, kept:number,
+ *            bytes:number, freed_bytes:number, detached_path?:string,
+ *            path:string, reason?:string, error_message?:string}}
+ *   - `removed`：真正清掉的份数（改名成功就算清掉 —— 原路径上已经没有了）
+ *   - `kept`：没清掉的份数（改名失败时是全部）
+ *   - `detached_path`：改名成功但墓碑删不掉时的路径（磁盘没腾出来，但环境侧已经够不着了）
+ */
+export function purgeProfileSnapshots(profileId, { fsx = fs } = {}) {
+  const root = profileSnapshotsDir(profileId);
+  if (!fsx.existsSync(root)) {
+    return { ok: true, existed: false, removed: 0, kept: 0, bytes: 0, freed_bytes: 0, path: root };
+  }
+  const list = listSnapshots(profileId, { fsx });
+  const bytes = dirBytes(root, { fsx }).bytes;
+  const count = list.length;
+
+  const tomb = `${root}.fp-purge-${crypto.randomBytes(3).toString('hex')}`;
+  try {
+    fsx.renameSync(root, tomb);
+  } catch (e) {
+    return {
+      ok: false,
+      existed: true,
+      removed: 0,
+      kept: count,
+      bytes,
+      freed_bytes: 0,
+      path: root,
+      reason: 'rename_failed',
+      error_message: e.message,
+    };
+  }
+
+  let detachedPath;
+  try {
+    fsx.rmSync(tomb, { recursive: true, force: true });
+  } catch {
+    detachedPath = tomb;
+  }
+  if (!detachedPath && fsx.existsSync(tomb)) detachedPath = tomb;
+
+  return {
+    ok: true,
+    existed: true,
+    removed: count,
+    kept: 0,
+    bytes,
+    freed_bytes: detachedPath ? 0 : bytes,
+    detached_path: detachedPath,
+    path: root,
+  };
+}
+
+/** 这个环境的快照有多少份、占多少字节（**只读**，彻底删除前给确认框看） */
+export function snapshotFootprint(profileId, { fsx = fs } = {}) {
+  const root = profileSnapshotsDir(profileId);
+  let list = [];
+  try { list = listSnapshots(profileId, { fsx }); } catch { list = []; }
+  let bytes = 0;
+  try { bytes = dirBytes(root, { fsx }).bytes; } catch { bytes = 0; }
+  return { count: list.length, bytes };
+}
+
+/**
  * 界面上要显示的那段「快照里有什么、没什么」——**文案只有这一份**，
  * 文档与界面都引用它，免得两处说法不一样（用户最恨的就是「备份了」其实没备）。
  */
