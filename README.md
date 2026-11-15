@@ -546,6 +546,20 @@ B 层 `npm run test:import-large` **15 PASS / 0 FAIL**（合成 18.9 MB / 50 块
 位置校验改成「有保存值就用」→ 3 条红）。**真窗口那三条本机验不了**（agent shell 里 Electron 起不来），
 `desktop:selftest` 里报 skip，清单见已知限制第 45 条。设计与边界见 [20 号文档](docs/20-窗口同步操作台.md)。
 
+### 编辑页的「本版不支持」（0.4.6）
+
+用户的原话是「配了没反应，等我在使用中才发现」。0.4.6 起，编辑页里凡是本版做不到的字段：
+
+- 控件 `disabled`，**旁边一行小字「本版不支持 · <一句人话>」** —— 不是 `title`、不用悬停；
+  文案来自后端字段表（`overrides.mjs` 的 `UNSUPPORTED`，71 条），前端只加统一前缀，不自己编理由；
+- 页面顶部一句「本页 N 项在本版不可用」，每个 tab 上标「N 项不可用」，不用逐个找灰格子；
+- 灰格子不再整格降透明度（降了那行原因是灰的，等于白写），只压标签与控件本身；
+- `win_x` / `win_y` 做**联动禁用**：`window_position` 不是 `topLeft` 时这两个数不会被用，直接禁用并说明；
+- `sync_password` / `fb_cloud_password_manager` 从「隐私开关」挪到「启动与缓存」（它们是「要不要跟云端同步」，
+  不是指纹开关，位置错了比禁用更误导）。
+
+哪些字段被禁用、为什么、证据引哪一节，见 [docs/23-假字段清理.md](docs/23-假字段清理.md)。
+
 ## 六、桌面壳与安装包（P6）
 
 同一个服务，套了一层 Electron：主进程内起的就是上面那个 `node:http`，窗口 `loadURL` 到 `127.0.0.1:<port>/`。
@@ -1082,6 +1096,16 @@ Object.getOwnPropertyNames(window).some(n => /^__fp/.test(n))   // true → 这�
     `data/sync-console.request.json` 界面写、桌面壳 400ms 轮询读），与全局快捷键同一套姿势。
     代价是**点「收起」到真的收起来最多差 400ms**；好处是渲染进程拿不到任何 IPC 能力，操作台页面即使被换掉也打不开别的通道。
     主进程侧仍校验 `event.sender === win.webContents`，非主窗口的调用一律拒绝并记日志。
+57. **「能配但不生效」这件事，从 0.4.6 起由判据兜住**（`test/fields-invariant.test.mjs`，5 条，已进 `npm test`）：
+    可配字段必须在行为层有读取点（A）、禁用字段必须有页面上看得见的理由（B）、138 个字段必须三桶全覆盖（B′）、
+    本版接线的四个字段消费路径不许被回退（C）。逐条裁决与证据见 [docs/23-假字段清理.md](docs/23-假字段清理.md)。
+    **它挡得住「零读取」，挡不住「读了但接错层」** —— 语义级数据流分析我们没做，不假装做了。
+58. **0.4.6 有两处「读了但不生效」是照抄对手语义，不是漏做**：`clear_cache_after_closing` 删失败
+    只记一行日志、不弹错（对手就是静默的）；`disable_video` 走 CDP 请求拦截而不是内核 `NetFilters`。
+    前者等 0.4.7 的丢数据兜底再加强提示。
+59. **0.4.6 没跑真 Chrome 套件**：`npm run smoke` 与 `test/switches.test.mjs` 需要单租户窗口（团队规矩），
+    这一版只跑了 `npm test`（25 个脚本、全离线）。`cookie` 启动写入与 `clear_cache_after_closing`
+    的**真窗口读数都没有**，不许当已验证。
 
 
 
@@ -1113,7 +1137,7 @@ npm run test
 npm run smoke
 ```
 
-当前实测（2026-11-15，本机）：`npm run test` = schema **10** + net-rules **56** + chain-rules **31** + recycle **44** + apps **54** + profiles-tabs **60** + batch **74** + settings-diagnose **56** + unit **85** + agent **15** + api **122** + api-mcp **46** + sync-rules **95** + sync-text **51** + sync-tabs **59** + sync-window **22** + sync-arrange **68** + sync-show **56** + sync-console **62** + markers **34** + nav-fold **60** + ui **46** + desktop **60** + kernel-download **62**（`package.json` 里那条脚本就是这二十四组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（proxy-chain，两跳代理链）+ **24/24**（workers）+ **30/30**（agent-smoke）+ **9/9**（session-restore）+ **12/12**（startup-tabs）+ **17/17**（block-page，全离线）+ **18/18**（markers-kernel）+ **39/39**（sync-kernel）+ **21/21**（sync-text-kernel）+ **39/39**（sync-tabs-kernel）+ **17/17**（sync-window-kernel）+ **28/28**（sync-arrange-kernel）+ **42/42**（sync-show-kernel）+ **15/15**（apps-kernel）+ **14/14**（purge-lock-kernel）+ **18/18**（batch-cookie-kernel）+ **13/13**（batch-show-kernel）+ **15/15**（import-large，大文件真 HTTP 端到端），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测（2026-11-15，本机）：`npm run test` = schema **10** + net-rules **56** + chain-rules **31** + recycle **44** + apps **54** + profiles-tabs **60** + batch **74** + settings-diagnose **56** + fields-invariant **5** + unit **85** + agent **15** + api **122** + api-mcp **46** + sync-rules **95** + sync-text **51** + sync-tabs **59** + sync-window **22** + sync-arrange **68** + sync-show **56** + sync-console **62** + markers **34** + nav-fold **60** + ui **46** + desktop **60** + kernel-download **62**（`package.json` 里那条脚本就是这二十五组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（proxy-chain，两跳代理链）+ **24/24**（workers）+ **30/30**（agent-smoke）+ **9/9**（session-restore）+ **12/12**（startup-tabs）+ **17/17**（block-page，全离线）+ **18/18**（markers-kernel）+ **39/39**（sync-kernel）+ **21/21**（sync-text-kernel）+ **39/39**（sync-tabs-kernel）+ **17/17**（sync-window-kernel）+ **28/28**（sync-arrange-kernel）+ **42/42**（sync-show-kernel）+ **15/15**（apps-kernel）+ **14/14**（purge-lock-kernel）+ **18/18**（batch-cookie-kernel）+ **13/13**（batch-show-kernel）+ **15/15**（import-large，大文件真 HTTP 端到端），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 > 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：

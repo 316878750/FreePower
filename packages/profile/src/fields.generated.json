@@ -85,6 +85,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -112,6 +114,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": "分组：列表分组、筛选与导入导出都按它组织",
       "note": "必填，缺则 group_id is required",
       "evidence": "实测"
     },
@@ -139,6 +143,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": "需要 AdsPower 云端账号；FreePower 是纯本地产品，分组请用上面的「分组」",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -166,6 +172,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": "标签：标签接口与列表筛选读它（真消费，见 docs/21 §5.5）",
       "note": null,
       "evidence": "实测"
     },
@@ -193,6 +201,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": "备注：只用于显示与导出",
       "note": null,
       "evidence": "实测"
     },
@@ -220,6 +230,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": "目标域名：v1 `platform` 参数的落点，导入/导出按它映射",
       "note": null,
       "evidence": "实测"
     },
@@ -247,6 +259,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -273,7 +287,9 @@
       "coverage": "n/a",
       "effect": null,
       "effectSites": [],
-      "inert": null,
+      "inert": "零读取：打开哪些页面只看 open_urls（与对手的启动标签页语义重叠，不自己发明）",
+      "unsupported": "启动时打开哪些页面只看「启动打开的网址」，这一项不读",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -300,7 +316,9 @@
       "coverage": "n/a",
       "effect": null,
       "effectSites": [],
-      "inert": null,
+      "inert": "零读取：重复环境检测没有实现，字段只进 csv 列",
+      "unsupported": "本版不提供重复环境检测，这一项不参与",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -328,6 +346,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": "需要 AdsPower 云端账号；FreePower 没有云端平台绑定",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -355,6 +375,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": "必须是 JSON 字符串，服务端会校验 cookie must be list string",
       "evidence": "实测"
     },
@@ -382,6 +404,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -409,6 +433,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -436,6 +462,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": "2FA 密钥：只保存（本版不生成动态验证码），API 可读",
       "note": null,
       "evidence": "实测"
     },
@@ -463,6 +491,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": "登录用户备注：没有专门代码读它，按字段表的通用列收放（flattenFingerprint / checkProfile 都走 BY_NAME），只在详情与导出里显示",
       "note": null,
       "evidence": "实测"
     },
@@ -490,6 +520,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": "同上：备注类字段，通用列收放，只保存与显示，不进内核也不进注入",
       "note": null,
       "evidence": "实测"
     },
@@ -520,6 +552,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": "保存时按它重算整套指纹并写回 0（真消费，见 docs/21 §5.5）",
       "note": null,
       "evidence": "实测"
     },
@@ -547,6 +581,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": "需要 AdsPower 云端账号；FreePower 没有云端应用市场",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -574,6 +610,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": "需要 AdsPower 云端账号；FreePower 是纯本地产品，没有云端账号",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -601,6 +639,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": "需要 AdsPower 云端账号；FreePower 没有云端团队",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -628,6 +668,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": "邀请码是云端注册用的；FreePower 没有云端",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -655,6 +697,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -683,7 +727,9 @@
       "coverage": "n/a",
       "effect": null,
       "effectSites": [],
-      "inert": null,
+      "inert": "零读取：值域只有 \"chrome\"，内核解析走 kernel_version + ua_auto，没有按它分支的代码",
+      "unsupported": "本版只有 Chrome 内核（Firefox 内核不支持），这一项固定为 Chrome",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -714,6 +760,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取：内核版本走 kernel_version + ua_auto，这份 JSON 只是照字段表存着",
+      "unsupported": "内核版本由实际启动的 Chrome 决定，这份配置不参与启动",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -741,6 +789,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取（表单能填，启动与注入都不读）",
+      "unsupported": "本版不改浏览器头部标识，这一项不生效",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -779,6 +829,8 @@
         "src/kernel/inject.js#CFG.platform"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": "v1 API 的 `platform` 参数映射到 domain_name，不是本字段（本字段 = navigator.platform）",
       "evidence": "实测"
     },
@@ -809,6 +861,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取（移动端模式没有对应启动参数，也没有 CDP 分支）",
+      "unsupported": "本版没有移动端模式（Chrome 没有对应参数），这一项不生效",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -835,7 +889,9 @@
       "coverage": "n/a",
       "effect": null,
       "effectSites": [],
-      "inert": null,
+      "inert": "零读取：内核沙箱只有 FREEPOWER_KERNEL_NO_SANDBOX 这一个环境变量兜底，没有按环境切换的分支",
+      "unsupported": "内核沙箱默认开启；受限环境只能用环境变量 FREEPOWER_KERNEL_NO_SANDBOX=1 兜底，不按环境切换",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -865,7 +921,9 @@
       "coverage": "n/a",
       "effect": null,
       "effectSites": [],
-      "inert": null,
+      "inert": "零读取：兼容模式是内核级渲染开关，我们走原生 Chrome",
+      "unsupported": "本版用原生 Chrome，没有兼容渲染模式",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -893,6 +951,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取：GPU 相关只有 webgl_config.webgpu_switch 与用户白名单里的 --disable-gpu",
+      "unsupported": "GPU 厂商串请填 WebGL 的 vendor/renderer（噪声四维里的「WebGL 配置」），这一项不参与注入",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -920,6 +980,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取：--disable-gpu 只能由用户在 launch_args 里手填，开关字段本身没有读取点",
+      "unsupported": "本版没有 GPU 模式切换；要关 GPU 请在「额外启动参数」里填 --disable-gpu",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -947,6 +1009,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取：--remote-debugging-port 是启动必需，没有「隐藏 CDP 特征」的分支读它",
+      "unsupported": "本版无法隐藏调试端口（启动内核必须用它），这一项不生效",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -977,6 +1041,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取：禁用 DevTools 是内核级能力（对手自编译内核），我们没有对应参数",
+      "unsupported": "本版无法在内核层禁用开发者工具",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1003,7 +1069,9 @@
       "coverage": "n/a",
       "effect": null,
       "effectSites": [],
-      "inert": null,
+      "inert": "零读取：无障碍树是内核/启动参数层面的事，没有对应旋钮",
+      "unsupported": "本版改不了无障碍树，这一项不生效",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1034,6 +1102,8 @@
         "src/runtime/manager.js#deviceScaleFactor: view.device_scale_factor"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": "0 < x < 2.1",
       "evidence": "实测"
     },
@@ -1064,6 +1134,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取（虚拟摄像头是内核级特性，CDP/启动参数做不到）",
+      "unsupported": "本版不提供虚拟摄像头",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测",
       "alsoIn": [
@@ -1100,6 +1172,8 @@
         "src/runtime/manager.js#Emulation.setUserAgentOverride"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1139,6 +1213,8 @@
         "src/runtime/manager.js#userAgentMetadata: view.ua_metadata"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1172,6 +1248,8 @@
         "src/kernel/inject.js#CFG.language"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1202,6 +1280,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取：生成器只把 \"0\" 写进默认值，没有任何分支按它选语言（语言由 country/geo 表生成）",
+      "unsupported": "语言由环境的国家/地区自动生成，这个开关不改变结果；要指定语言请直接填「语言列表」",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1229,6 +1309,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1266,6 +1348,8 @@
         "src/runtime/manager.js#Emulation.setLocaleOverride"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1296,6 +1380,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取：生成器只写默认值，页面语言由 country/geo 表直接生成",
+      "unsupported": "页面语言由环境的国家/地区自动生成，这个开关不改变结果",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1325,6 +1411,8 @@
         "src/runtime/manager.js#Emulation.setTimezoneOverride"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": "IANA 名，空格转下划线",
       "evidence": "实测"
     },
@@ -1355,6 +1443,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取：生成器只写默认值，时区由 country/geo 表直接生成",
+      "unsupported": "时区由环境的国家/地区自动生成，这个开关不改变结果；要指定时区请直接填「时区」",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1387,6 +1477,8 @@
         "src/kernel/inject.js#CFG.canvas"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1414,6 +1506,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1446,6 +1540,8 @@
         "src/kernel/inject.js#CFG.webgl_image"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1473,6 +1569,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1506,6 +1604,8 @@
         "src/kernel/inject.js#CFG.webgl"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": "只有 \"0\" 和 \"2\" 两个值，没有 \"1\"；2 才是手动掩码 vendor/renderer",
       "evidence": "实测"
     },
@@ -1545,6 +1645,8 @@
         "src/fingerprint/view.js#p.webgl_config"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": "webgpu.webgpu_switch 是服务端自动补的，客户端也会塞，转存时不要当脏数据",
       "evidence": "实测"
     },
@@ -1577,6 +1679,8 @@
         "src/kernel/inject.js#CFG.audio"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1604,6 +1708,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1636,6 +1742,8 @@
         "src/kernel/inject.js#CFG.client_rects"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1663,6 +1771,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1689,7 +1799,9 @@
       "coverage": "n/a",
       "effect": null,
       "effectSites": [],
-      "inert": null,
+      "inert": "零读取：canvas 噪声不按 URL 分流",
+      "unsupported": "本版 canvas 噪声不按域名分流，这一项不生效",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1721,6 +1833,8 @@
         "src/kernel/inject.js#Object.defineProperty(window, MK.fontsDeclared"
       ],
       "inert": "注入层只把列表挂成一条按种子的派生名（不可枚举，自检页拿它比对「声明的字体」），没有禁用/过滤；页面能枚举到的字体一条不变",
+      "unsupported": "本版只能把字体列表挂成声明值，页面能枚举到的字体一条不变",
+      "metadataWhy": null,
       "note": "[\"all\"] 是特殊值（不过滤）；语义是黑名单 DisabledFonts",
       "evidence": "实测"
     },
@@ -1748,6 +1862,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "全 src 零读取（只在校验与详情视图里出现）",
+      "unsupported": "本版做不到禁用字体（要改内核层）",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1782,6 +1898,8 @@
         "src/kernel/inject.js#CFG.screen"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1827,6 +1945,8 @@
         "src/kernel/inject.js#hardwareConcurrency: fp.hardware_concurrency"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1865,6 +1985,8 @@
         "src/kernel/inject.js#deviceMemory: fp.device_memory"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1892,6 +2014,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取：device_name_switch 有默认值，device_name 本身没有任何读取点",
+      "unsupported": "设备名不会出现在网页能读到的任何接口里，本版只保存不注入",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1923,6 +2047,8 @@
       "effect": null,
       "effectSites": [],
       "inert": "字段表登记但 src 零消费，连开关本身都没搭生效路径",
+      "unsupported": "本版没有可注入的设备名，这个开关没有作用对象",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1953,6 +2079,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取（storage=fp，只存不注入）",
+      "unsupported": "网页读不到真实 MAC，本版只保存不注入",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -1982,6 +2110,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取：传感器是内核级设备面，CDP 没有对应域，页面注入也改不了",
+      "unsupported": "本版伪造不了陀螺仪（内核设备层能力）",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2009,6 +2139,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取：NetInfo 走 networkInformation.type，启动参数与 CDP 都没有对应旋钮",
+      "unsupported": "本版改不了 navigator.connection 报的网络类型",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2043,6 +2175,8 @@
         "src/kernel/inject.js#CFG.media"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2074,6 +2208,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "只进 CFG.media.counts：注入层不按它造设备（P9-C 起列表来自内核真实枚举），只有自检页拿它比「声明值」",
+      "unsupported": "设备列表来自内核真实枚举，不按数量造设备；这个数量只用于自检页对比「声明值」",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2104,6 +2240,8 @@
         "src/kernel/inject.js#CFG.media"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2131,6 +2269,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取：生效的是 media_devices_config，v2 设备列表没人读",
+      "unsupported": "本版用的是「媒体设备」里的设备列表，v2 这一份不读取",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2164,6 +2304,8 @@
         "src/kernel/inject.js#CFG.speech"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2191,6 +2333,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取：speech_switch 只投影 getVoices() 的启用状态，音色列表没人读",
+      "unsupported": "本版只用「语音合成」开关，音色列表不参与（页面枚举到的语音不变）",
+      "metadataWhy": null,
       "note": "音色列表，移动端/内核能力相关",
       "evidence": "实测"
     },
@@ -2227,6 +2371,8 @@
         "src/kernel/chrome.js#view.webrtc"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2257,6 +2403,8 @@
         "src/kernel/chrome.js#--proxy-server"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2284,6 +2432,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2311,6 +2461,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2338,6 +2490,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2365,6 +2519,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2391,7 +2547,9 @@
       "coverage": "n/a",
       "effect": null,
       "effectSites": [],
-      "inert": null,
+      "inert": "零读取：出口 IP 走内置探测（启动预检那条），不支持自定义检测服务",
+      "unsupported": "本版出口 IP 用内置探测（启动预检里那条），不支持自定义检测服务",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2424,6 +2582,8 @@
         "src/proxy/chain.js#profile.is_multi_level_proxy"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2456,6 +2616,8 @@
         "src/proxy/chain.js#profile.mutli_level_proxy"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2486,6 +2648,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2516,6 +2680,8 @@
         "src/proxy/pac.js#input.full_pac_url"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2546,6 +2712,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取；端口扫描是内核级特性，我们走 CDP/启动参数做不了",
+      "unsupported": "端口扫描检测是内核层能力，本版没有",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2573,6 +2741,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取；同上",
+      "unsupported": "端口扫描放行是内核层能力，本版没有",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2607,6 +2777,8 @@
         "src/runtime/manager.js#geoMode.permission"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2637,6 +2809,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "对手客户端不消费此字段：\"1\"=按 IP 是服务端填充坐标，无本地生效路径；真正的拒绝定位是 location=\"block\"",
+      "unsupported": "「按 IP 定位」是云端按 IP 填坐标，本地没有这条路径；要拒绝定位请把「地理位置权限」设成拒绝",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2667,6 +2841,8 @@
         "src/runtime/manager.js#geo.longitude"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2697,6 +2873,8 @@
         "src/runtime/manager.js#geo.latitude"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2727,6 +2905,8 @@
         "src/runtime/manager.js#geo.accuracy"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2764,6 +2944,8 @@
         "src/runtime/manager.js#Network.setExtraHTTPHeaders"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2791,6 +2973,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取（同名 tls 在代理代码里是协议名 node:tls，不是这个字段）",
+      "unsupported": "TLS 指纹是内核握手层的事，本版改不了",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2821,6 +3005,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取：只有生成器写默认值，没有分支读它",
+      "unsupported": "本版没有 TLS 指纹开关（TLS 握手由内核决定）",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2850,7 +3036,9 @@
       "coverage": "n/a",
       "effect": null,
       "effectSites": [],
-      "inert": null,
+      "inert": "零读取：Chrome 已移除 Flash，没有可开关的对象",
+      "unsupported": "Chrome 早已不再支持 Flash，本版没有可开关的 Flash",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2888,6 +3076,8 @@
         "src/kernel/inject.js#CFG.automationControlled"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2920,6 +3110,8 @@
         "src/kernel/chrome.js#profile.disable_image"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2952,6 +3144,8 @@
         "src/kernel/net-rules.js#profile.disable_video"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -2975,10 +3169,12 @@
       "default": null,
       "defaultSource": null,
       "domainNote": null,
-      "coverage": "n/a",
-      "effect": null,
+      "coverage": "none",
+      "effect": "none",
       "effectSites": [],
-      "inert": "零读取",
+      "inert": "零读取：按字节数挡图要内核 NetFilters（定制内核私有键），官方内核不读；CDP 等价拦截未实测，不做",
+      "unsupported": "本版不支持按大小限制图片；只能整页关图（见「禁用图片」）",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3008,7 +3204,9 @@
       "coverage": "partial",
       "effect": "none",
       "effectSites": [],
-      "inert": "零读取；禁用控制台是内核级特性，我们走 CDP/启动参数做不了",
+      "inert": "零读取：禁用控制台是内核级特性；对手侧也是死链（IS_DISABLE_CONSOLE 只有默认赋值、无读取者，见 30- §3）",
+      "unsupported": "本版无法禁用浏览器控制台（要改内核层）",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3041,6 +3239,8 @@
         "src/kernel/chrome.js#profile.disable_save_password"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3071,12 +3271,14 @@
       "effect": "none",
       "effectSites": [],
       "inert": "API 边界有归一与落库，chrome.js 零消费",
+      "unsupported": "本版没有能单独关掉密码填充的 Chrome 参数；要关请用「禁用保存密码」",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
     {
       "name": "sync_password",
-      "group": "privacy_switches",
+      "group": "launch_and_cache",
       "type": "string",
       "storage": "column",
       "sqlType": "TEXT",
@@ -3097,13 +3299,15 @@
       "coverage": "n/a",
       "effect": null,
       "effectSites": [],
-      "inert": null,
+      "inert": "零读取：环境密码/云端同步密码，本版没有云端",
+      "unsupported": "本版没有云端同步，也就没有同步密码",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
     {
       "name": "fb_cloud_password_manager",
-      "group": "privacy_switches",
+      "group": "launch_and_cache",
       "type": "string",
       "storage": "column",
       "sqlType": "TEXT",
@@ -3125,6 +3329,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": "需要 AdsPower 云端账号；FreePower 没有云端密码管理器",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3155,6 +3361,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取：Google API 密钥注入是客户端内建能力，我们没有对应入口",
+      "unsupported": "Google API 密钥是客户端内建能力，本版没有",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3185,6 +3393,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取：内置翻译只在启动参数里禁掉了 Translate 特性，这个开关本身没人读",
+      "unsupported": "本版只把 Chrome 内置翻译关掉，不提供翻译开关",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3214,6 +3424,8 @@
         "src/kernel/net-rules.js#profile.blacklist"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3243,6 +3455,8 @@
         "src/kernel/net-rules.js#profile.whitelist"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3270,6 +3484,8 @@
       "effect": null,
       "effectSites": [],
       "inert": "零读取（白名单本体走 whitelist + net-rules）",
+      "unsupported": "本版的白名单放行表用「域名白名单」，这一项不参与判定",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3300,6 +3516,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取：HTTPS 强制跳转是请求级规则，我们没有实现（黑白名单只做阻断）",
+      "unsupported": "本版黑白名单只做阻断，不做 HTTPS 强制跳转",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3329,7 +3547,9 @@
       "coverage": "n/a",
       "effect": null,
       "effectSites": [],
-      "inert": null,
+      "inert": "零读取：对手的标签助手扩展，本版没有这个扩展",
+      "unsupported": "本版没有标签助手扩展",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3361,7 +3581,9 @@
       "coverage": "n/a",
       "effect": null,
       "effectSites": [],
-      "inert": null,
+      "inert": "零读取：同上，扩展功能位没有落点",
+      "unsupported": "本版没有标签助手扩展，这些功能位没有落点",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3388,10 +3610,14 @@
       "default": null,
       "defaultSource": null,
       "domainNote": null,
-      "coverage": "n/a",
-      "effect": null,
-      "effectSites": [],
-      "inert": "基线不带 --enable-automation，本来就没有「受自动化控制」横幅可消（基线已覆盖）",
+      "coverage": "partial",
+      "effect": "inject",
+      "effectSites": [
+        "src/kernel/inject.js#CFG.hiddenNotification"
+      ],
+      "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3422,6 +3648,8 @@
         "src/kernel/launch-args.js#WHITELIST.get(key)"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3449,6 +3677,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取：v1 的旧别名，合并参数用的是 launch_args",
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3479,6 +3709,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取（v1 的参数开关，启动链路没有对应分支）",
+      "unsupported": "v1 的旧参数开关，本版不读；要加参数请用「额外启动参数」",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3509,6 +3741,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取（同上，启动链路没有对应分支）",
+      "unsupported": "v1 的旧参数开关，本版不读；要加参数请用「额外启动参数」",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3542,6 +3776,8 @@
         "src/kernel/chrome.js#profile.headless"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3571,7 +3807,9 @@
       "coverage": "n/a",
       "effect": null,
       "effectSites": [],
-      "inert": null,
+      "inert": "零读取：启动优化是客户端自己的预热策略，本版启动链路没有对应分支",
+      "unsupported": "启动优化是客户端自己的预热策略，本版启动链路没有对应分支",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3601,7 +3839,9 @@
       "coverage": "n/a",
       "effect": null,
       "effectSites": [],
-      "inert": null,
+      "inert": "零读取：同上",
+      "unsupported": "本版没有启动优化开关，这一项不生效",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3632,6 +3872,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取：打开哪些页面只看 open_urls，没有「开几个标签」的实现",
+      "unsupported": "本版打开哪些页面只看「启动打开的网址」，这一项不读",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3659,6 +3901,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取：启动页没有实现（启动打开的仍然是 open_urls）",
+      "unsupported": "启动页没有单独设置；要开哪些页面请填「启动打开的网址」",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3688,6 +3932,8 @@
         "src/kernel/chrome.js#profile.window_position"
       ],
       "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3711,10 +3957,14 @@
       "default": null,
       "defaultSource": null,
       "domainNote": null,
-      "coverage": "none",
-      "effect": "none",
-      "effectSites": [],
-      "inert": "零读取：窗口只有 window_position（maximize/default），X/Y 没人读",
+      "coverage": "partial",
+      "effect": "args",
+      "effectSites": [
+        "src/kernel/chrome.js#position.x"
+      ],
+      "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3738,10 +3988,14 @@
       "default": null,
       "defaultSource": null,
       "domainNote": null,
-      "coverage": "none",
-      "effect": "none",
-      "effectSites": [],
-      "inert": "零读取：同上",
+      "coverage": "partial",
+      "effect": "args",
+      "effectSites": [
+        "src/kernel/chrome.js#position.y"
+      ],
+      "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3768,10 +4022,14 @@
       "default": null,
       "defaultSource": null,
       "domainNote": null,
-      "coverage": "none",
-      "effect": "none",
-      "effectSites": [],
-      "inert": "零读取：关闭后清缓存没有实现（缓存清理走的是另一条显式接口）",
+      "coverage": "partial",
+      "effect": "local",
+      "effectSites": [
+        "src/runtime/manager.js#effective.clear_cache_after_closing"
+      ],
+      "inert": null,
+      "unsupported": null,
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3801,7 +4059,9 @@
       "coverage": "n/a",
       "effect": null,
       "effectSites": [],
-      "inert": null,
+      "inert": "零读取：缓存备份没有实现（备份/快照排在 0.4.7）",
+      "unsupported": "本版没有缓存备份（备份与快照排在后续版本）",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3829,6 +4089,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取：存储策略是内核级的目录布局，我们没有对应实现",
+      "unsupported": "存储目录布局是内核层的事，本版没有这个选项",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3856,6 +4118,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": "需要 AdsPower 云端账号；FreePower 的环境数据都存在本机",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3886,6 +4150,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": "需要 AdsPower 云端账号；FreePower 没有云端同步",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3916,6 +4182,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": "需要 AdsPower 云端账号；FreePower 没有云端同步",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3946,6 +4214,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": "需要 AdsPower 云端账号；FreePower 没有云端同步",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -3976,6 +4246,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": "需要 AdsPower 云端账号；FreePower 没有云端同步",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -4006,6 +4278,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": "需要 AdsPower 云端账号；FreePower 没有云端同步",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -4036,6 +4310,8 @@
       "effect": "none",
       "effectSites": [],
       "inert": "零读取：环境密码锁没有实现（API 与启动链路都不读）",
+      "unsupported": "本版没有环境密码锁（打开环境不需要密码）",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -4062,7 +4338,9 @@
       "coverage": "n/a",
       "effect": null,
       "effectSites": [],
-      "inert": null,
+      "inert": "零读取：环境密码锁没有实现，配套的忽略清单同样没人读",
+      "unsupported": "本版没有环境密码锁，配套的忽略清单也不生效",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -4092,7 +4370,9 @@
       "coverage": "n/a",
       "effect": null,
       "effectSites": [],
-      "inert": null,
+      "inert": "零读取：v1 参数合并开关，本版 API 不走那条路",
+      "unsupported": "v1 的参数合并开关，本版 API 不走那条路",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -4123,6 +4403,8 @@
       "effect": null,
       "effectSites": [],
       "inert": null,
+      "unsupported": "需要 AdsPower 云端账号；FreePower 没有云端网络加速",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     },
@@ -4152,7 +4434,9 @@
       "coverage": "n/a",
       "effect": null,
       "effectSites": [],
-      "inert": null,
+      "inert": "零读取：忽略 Agent 配置是客户端自己的开关，本版没有对应分支",
+      "unsupported": "忽略 Agent 配置是客户端自己的开关，本版没有对应分支",
+      "metadataWhy": null,
       "note": null,
       "evidence": "实测"
     }

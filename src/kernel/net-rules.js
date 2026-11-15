@@ -70,8 +70,8 @@ function escapeRe(s) {
 
 /**
  * @param {object} profile 环境记录（扁平字段）
- * @returns {{active:boolean, blockMedia:boolean, blacklist:string[], whitelist:string[],
- *            matchers:{blacklist:Function[], whitelist:Function[]}}}
+ * @returns {{active:boolean, blockMedia:boolean, blacklist:string[],
+ *            whitelist:string[], matchers:{blacklist:Function[], whitelist:Function[]}}}
  */
 export function compileNetRules(profile = {}) {
   // 门 2（逆向 `21-` §1，对手 `main-v2.9.0.1.pretty.js:454`）：`url_list_user_role_active === "0"`

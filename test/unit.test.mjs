@@ -1549,17 +1549,26 @@ test('空转字段：标了必须说清原因，BASIC 里一个都不许漏标',
     return f.coverage !== 'n/a' || f.idle;
   }), [], '这些字段在清单里，却不是「n/a 且不空转」');
 
-  // ⑥ 数量对得上（0.4.0 effect 注册表那批：从 24 变 43 个**表单可见**的空转字段 —— +19 个
-  //    「内核层零读取」的假 full/partial 纠错（browser_kernel_config / cdp_mask / ban_dev_tools /
-  //    language_switch / page_language_switch / automatic_timezone / browser_run_args / no_args /
-  //    cover_args / open_tabs / new_startup_page / win_x / win_y / clear_cache_after_closing /
-  //    browser_security_lock / gpu / gpu_switch / speech_voices / media_devices_config_v2）、
-  //    +1 个 media_devices_num（数量字段 P9-C 起不再造设备）。注册表里总共 44 个空转，
-  //    其中 browser_run_args 是 HIDDEN（launch_args 的旧别名，不进表单）。少一个或多一个都要先问清楚
-  assert.equal(idle.length, 43, `idle 字段 ${idle.length} 个：${idle.map((f) => f.name).join(',')}`);
-  // ⑦ 单独钉一条：hidden_notification 的原因是「基线已覆盖」，不是「还没做」
-  const hn = idle.find((f) => f.name === 'hidden_notification');
-  assert.match(hn.idle_reason, /基线/, 'hidden_notification 的原因是「基线已覆盖」，不是「还没做」');
+  // ⑥ 数量对得上（0.4.6 假字段清理后从 43 变 57 个**表单可见**的空转字段）：
+  //    +15 个是「coverage n/a、表单能填、全仓库零消费」的漏网字段补登记（见 INERT_EXTRA）；
+  //    +3 个是 0.4.6 裁决禁用、且没有可接消费路径的（browser / tabs / flash）；
+  //    +1 个是 image_size（裁决禁用：按字节挡图要定制内核的 NetFilters）；
+  //    -3 个接线了（clear_cache_after_closing / hidden_notification / win_x+win_y）。
+  //    disable_video 复核后**保持接线**（CDP 等价拦截，有 switches.test.mjs 真内核读数），不进空转。
+  //    注册表里总共 58 个空转，其中 browser_run_args 是 HIDDEN（launch_args 的旧别名，不进表单）。
+  //    少一个或多一个都要先问清楚
+  assert.equal(idle.length, 57, `idle 字段 ${idle.length} 个：${idle.map((f) => f.name).join(',')}`);
+  // ⑦ 0.4.6 接线的四个字段不许再出现在空转里（接线了还灰着 = 两边打架）
+  assert.deepEqual(['clear_cache_after_closing', 'hidden_notification', 'win_x', 'win_y']
+    .filter((n) => idle.some((f) => f.name === n)), [], '这四个 0.4.6 已接线，不该再标空转');
+  // ⑧ 0.4.6 裁决禁用的这几个：必须有「读了不生效」的原因，且原因说清是内核能力问题
+  for (const n of ['image_size', 'disable_console', 'device_name', 'mac_address_config']) {
+    const f = idle.find((x) => x.name === n);
+    assert.ok(f, `${n} 应当禁用（0.4.6 裁决）`);
+    assert.match(f.idle_reason, /内核|零读取/, `${n} 的原因要说清为什么做不到`);
+  }
+  // ⑨ disable_video 保持接线：它走 CDP 拦截（不是内核私有键），禁用会是能力倒退
+  assert.ok(!idle.some((f) => f.name === 'disable_video'), 'disable_video 应当仍生效（CDP Fetch 拦截）');
   // ⑧ overrides.mjs（coverage 的事实源）与 idle 不许互相矛盾：idle 的字段不许标 full。
   //    判据是「不是 full」而不是「必须是 none|partial」：overrides 里还有 n/a（不是指纹维度），
   //    现有 idle 里 hidden_notification / whitelist_open / image_size / device_name_switch 就是 n/a，
@@ -1659,7 +1668,10 @@ test('effect 注册表：每个字段说清在哪一层生效，登记与代码�
   // 判定用**全量注册表**（138）：schema 出参里有 HIDDEN 字段（launch_args 的旧别名等），
   // 拿它判覆盖范围会把 user_proxy_config / browser_run_args 误判成「n/a 却登记了」。
   const scoped = REGISTRY_FIELDS.filter((f) => f.coverage !== 'n/a').map((f) => f.name);
-  const VALID = new Set(['args', 'cdp', 'inject', 'none']);
+  // `local` = 本地运行时动作（0.4.6 新增档）：不经内核也不经页面，但真的改变行为
+  // （`clear_cache_after_closing` 关环境后删数据目录）。它不是「args/cdp/inject」任何一种，
+  // 但也不是空转 —— 所以必须单独成一档，不能塞进 none。
+  const VALID = new Set(['args', 'cdp', 'inject', 'none', 'local']);
   const kindsOf = (e) => (Array.isArray(e.effect) ? e.effect : [e.effect]);
 
   // ① 覆盖范围：指纹/隐私字段一个不许漏、n/a 字段一个不许进
@@ -1776,15 +1788,17 @@ test('effect 注册表：每个字段说清在哪一层生效，登记与代码�
   );
 
   // ⑥ 各档数量钉死（改一个字段就得改数字，防「悄悄加一个」）
-  const census = { none: 0, args: 0, cdp: 0, inject: 0, multi: 0 };
+  const census = { none: 0, args: 0, cdp: 0, inject: 0, local: 0, multi: 0 };
   for (const e of Object.values(OVERRIDES_EFFECT)) {
     const kinds = kindsOf(e);
     if (kinds.length > 1) census.multi += 1;
     else census[kinds[0]] += 1;
   }
-  assert.deepEqual(census, { none: 39, args: 10, cdp: 10, inject: 11, multi: 8 },
+  assert.deepEqual(census, { none: 37, args: 12, cdp: 10, inject: 12, local: 1, multi: 8 },
     `生效层分布变了：${JSON.stringify(census)} —— 新增/删除字段时同步这条与 README 第 41 条`);
-  assert.equal(scoped.length, 78, `指纹/隐私字段 ${scoped.length} 个`);
+  // 0.4.6 收尾：image_size 回到 none（裁决禁用），clear_cache_after_closing 与 hidden_notification
+  // 接线进 scoped（原来 coverage 是 n/a），所以 78 → 80
+  assert.equal(scoped.length, 80, `指纹/隐私字段 ${scoped.length} 个`);
 });
 
 

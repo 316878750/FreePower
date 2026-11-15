@@ -183,6 +183,21 @@ export function compareVersion(a, b) {
  * 启动参数：只放「参数级真实行为」的东西（UA/时区等走 CDP Emulation，不在这伪造）。
  * 返回 {args, applied, rejected, warnings}：argv 是系统基线与用户白名单参数合并后的结果。
  */
+/**
+ * `win_x` / `win_y` → 窗口坐标。两个都是有限整数才返回（缺一个就返回 null，见 buildArgs 那条注释）。
+ *
+ * 取整数而不是 `Number()` 直接吃：字段是 REAL 列，脏数据（`0.5` / `"abc"` / `NaN`）传进
+ * `--window-position` 会让内核启动参数解析失败 —— 宁可当作没填。
+ */
+export function windowPositionOf(profile = {}) {
+  const x = Number(profile.win_x);
+  const y = Number(profile.win_y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  if (!Number.isInteger(x) || !Number.isInteger(y)) return null;
+  // 负坐标是合法值（副屏在主屏左边/上面），别在这里拦
+  return { x, y };
+}
+
 export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, userArgs = [] } = {}) {
   const fp = profile.fingerprint_config || {};
   const view = fingerprintView(profile);
@@ -268,6 +283,20 @@ export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, use
   }
   if (profile.window_position === 'maximize') args.push('--start-maximized');
 
+  // 窗口坐标（0.4.6 接线）：`win_x` / `win_y` 两个字段合成一条 `--window-position=x,y`。
+  // 依据：逆向 `30-假字段消费机制.md` §7（`setWindowPosition` @5192）——**只有
+  // `window_position === "topLeft"` 才推这两个数**，maximize 推 `--start-maximized`、
+  // lastPosition 什么都不推。这就是「填了 win_x 但窗口位置是 maximize = 数字被静默忽略」
+  // 的来源；我们在界面上把这两个输入框联动禁用（web/pages/edit.js 的 linkageNote）。
+  // 空值按对手的默认口径当 topLeft（`e.windowPosition||"topLeft"`），不是我们自己定的默认。
+  // 与对手的两处**故意不同**，都写在这里免得被当成漏做：
+  //   ① 两个数都必须是有限整数才发（对手 `winX||0` 会把没填的当 0，我们宁可什么都不发）；
+  //   ② 不照抄兜底分支 `--window-position=0,0`（那会把窗口钉在左上角、可能被任务栏压住），
+  //      window_position 是别的值时我们什么都不加，让窗口管理器自己摆。
+  const windowPos = String(profile.window_position || '').trim() || 'topLeft';
+  const position = windowPos === 'topLeft' ? windowPositionOf(profile) : null;
+  if (position) args.push(`--window-position=${position.x},${position.y}`);
+
   const warnings = [];
 
   /**
@@ -288,6 +317,9 @@ export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, use
    * 禁用图片：Blink 层直接不请求图片（`img.complete` 恒为 false，服务器侧零请求）。
    * 视频/域名黑白名单是请求级规则，走 CDP Fetch 拦截（见 src/kernel/net-rules.js 与
    * manager.js 的 installRequestGating）—— 内核没有「不加载视频」的等价开关。
+   *
+   * `image_size`（按大小挡图）**不在这里**：0.4.6 裁决为禁用 —— 对手机制是定制内核的
+   * `StaticConfig.NetFilters`，官方内核不读；CDP 等价拦截未实测，不宣称接上（见 overrides.mjs）。
    */
   if (String(profile.disable_image) === '1') {
     args.push('--blink-settings=imagesEnabled=false');

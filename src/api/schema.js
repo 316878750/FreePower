@@ -164,6 +164,16 @@ export function profileFormSchema() {
       // 空转字段：填了能存、但不影响内核。表单按它灰显 + 浮层，别让用户以为「配了就有用」
       idle: inertReason(f) !== null,
       idle_reason: inertReason(f),
+      /**
+       * 用户可见的「本版不支持 · …」（0.4.6）：界面**直接显示**在控件旁边一行小字，
+       * 不用 title / hover。事实源是 `overrides.mjs` 的 `UNSUPPORTED`（生成进字段表）。
+       * 没有这一条的被禁用字段，`test/fields-invariant.test.mjs` 直接红 —— 灰格子不许没理由。
+       */
+      unsupported_reason: f.unsupported || null,
+      /** 元信息字段的说明：可填，但本来就不改变浏览器行为（如备注、标签） */
+      metadata_note: f.metadataWhy || null,
+      /** 控件是否禁用：空转（读了不生效）或云端专属（本版永远拿不到值） */
+      disabled: inertReason(f) !== null || CLOUD_ONLY.has(f.name),
       // 生效层（args / cdp / inject / none，或它们的数组）：注册表的原样，给 UI/脚本看「这条走哪条路」
       effect: f.effect ?? null,
       effectSites: Array.isArray(f.effectSites) ? f.effectSites : [],

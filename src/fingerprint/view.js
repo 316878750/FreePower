@@ -74,12 +74,27 @@ function uaMetadata(clientHints) {
   };
 }
 
+/**
+ * 噪点种子字段：**逐个显式读**，不用 `profile[field + '_id']` 这种拼接。
+ *
+ * 为什么写成显式映射（0.4.6）：拼接出来的属性名在静态扫描里看不见，于是 `canvas_id` /
+ * `webgl_image_id` / `audio_id` / `client_rects_id` 四个字段被判成「界面能配、行为层零读取」
+ * 的假字段（`test/fields-invariant.test.mjs` 的不变式 A）。它们其实是真的种子来源 ——
+ * 问题在「写得太隐晦」，不在「没接」。这里改成显式读，判据就能看见，也不给后来人留
+ * 「这段是不是没人用」的疑问。见下面 noiseConfig 里的 seeds 表。
+ */
+
 /** 噪点维度：关掉返回 null；种子取各自入库的 *_id，缺省才回落到 fp_seed */
 function noiseConfig(profile, field, strength = 1) {
   if (String(profile[field]) !== '1') return null;
-  const idField = `${field}_id`;
+  const seeds = {
+    canvas: profile.canvas_id,
+    webgl_image: profile.webgl_image_id,
+    audio: profile.audio_id,
+    client_rects: profile.client_rects_id,
+  };
   return {
-    seed: String(profile[idField] ?? profile.fp_seed ?? profile.id ?? 'freepower'),
+    seed: String(seeds[field] ?? profile.fp_seed ?? profile.id ?? 'freepower'),
     strength,
   };
 }
@@ -171,6 +186,8 @@ export function fingerprintView(profile) {
     // P2 `do_not_track`：只有 "true" 做两半（navigator.doNotTrack="1" + 请求头 DNT: 1）。
     // "false" / "default" 在对手那边完全不可区分、都是不下发 —— 我们也什么都不做（不发明第三种状态）。
     doNotTrack: String(p.do_not_track) === 'true' ? '1' : null,
+    // hidden_notification（0.4.6）：只有 "1" 才改写 Notification.requestPermission（见 inject.js）
+    hiddenNotification: String(p.hidden_notification ?? '0') === '1',
     media: mediaView(p),
     speech: speechView(p),
     fonts: stringList(p.fonts, ['all']),

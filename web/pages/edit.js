@@ -96,6 +96,7 @@ export default async function renderEdit({ head, page, params }) {
           h('div', null, h('strong', null, '这个环境正在运行')),
           h('div', null, '代理 / 时区 / 指纹的改动要重启内核才生效。点「保存并重启」会先停掉当前内核、落库、再按新配置启动；重启期间该环境会短暂离线，页面会重新加载。'))
         : null,
+      unsupportedSummary(),
       checkBox,
       h('div', { class: 'panel' }, tabBar, formArea)));
 
@@ -182,20 +183,47 @@ export default async function renderEdit({ head, page, params }) {
 
   /* ------------------------------ 渲染 ------------------------------ */
 
+  /**
+   * 页面顶部的汇总：「本页 N 项在本版不可用」。
+   *
+   * 为什么要这一条：48 个假字段修完之后，界面上会出现一批灰格子。用户不该靠逐个去找
+   * 哪格是灰的 —— 先告诉他总数，再让他按需看某一格旁边的理由。
+   */
+  function unsupportedSummary() {
+    const all = state.schema?.fields || [];
+    const off = all.filter((f) => f.disabled);
+    if (!off.length) return null;
+    return h('div', { class: 'notice warn' },
+      h('div', null,
+        h('strong', null, `本页 ${off.length} 项在本版不可用`),
+        h('span', { class: 'muted' }, `（共 ${all.length} 项字段；灰显的每一项旁边都写了原因，不用悬停）`)),
+      h('div', { class: 'muted small' },
+        '这些字段仍然能被 API 读写、也会存进库（导入导出的字段映射不变），只是本版不会因为它们改变浏览器行为。'));
+  }
+
   function paintTabs(tabBar, formArea) {
     clear(tabBar);
     for (const g of state.schema.groups) {
+      const off = g.fields.filter((f) => f.disabled).length;
       tabBar.appendChild(h('button', {
         class: `tab ${state.active === g.id ? 'active' : ''}`,
         onClick: () => { state.active = g.id; paintTabs(tabBar, formArea); },
-      }, g.label, h('span', { class: 'cnt' }, String(g.total))));
+      }, g.label,
+        h('span', { class: 'cnt' }, String(g.total)),
+        off ? h('span', { class: 'cnt off' }, `${off} 项不可用`) : null));
     }
     paintGroup(formArea);
+  }
+
+  /** 重画当前分组（联动禁用要跟着「窗口位置」的改动即时变化） */
+  function repaintGroup() {
+    if (state.formArea) paintGroup(state.formArea);
   }
 
   function paintGroup(formArea) {
     const g = state.schema.groups.find((x) => x.id === state.active);
     state.refs = {};
+    state.formArea = formArea;
     clear(formArea);
     if (!g) return;
     const grid = h('div', { class: 'form-grid' });
@@ -207,6 +235,7 @@ export default async function renderEdit({ head, page, params }) {
     if (g.id === 'identity') grid.appendChild(tagsField());
     if (g.id === 'identity') grid.appendChild(appField());
     if (g.id === 'network') grid.appendChild(proxyField());
+    if (g.id === 'network') grid.appendChild(ipOriginField());
     for (const f of basics) grid.appendChild(field(f));
     formArea.appendChild(grid);
 
@@ -319,8 +348,7 @@ export default async function renderEdit({ head, page, params }) {
         '环境正在运行时改这一项，保存后会重启才生效。'));
   }
 
-  function proxyField() {    const cur = state.model.proxy_id || '';
-    const hasCustom = !cur && state.model._has_custom_proxy;
+  function proxyField() {    const cur = state.model.proxy_id || '';    const hasCustom = !cur && state.model._has_custom_proxy;
     const sel = h('select', { onChange: (e) => setValue('proxy_id', e.target.value) },
       h('option', { value: '', selected: !cur }, hasCustom ? '自定义（列表外，编辑会覆盖）' : '直连（不绑代理）'),
       ...state.proxies.map((p) => h('option', { value: p.proxy_id, selected: String(cur) === String(p.proxy_id) },
@@ -331,15 +359,69 @@ export default async function renderEdit({ head, page, params }) {
       h('span', { class: 'hint' }, '没绑定代理时出口就是本机 IP，跑真实账号务必绑。绑定后启动会先预检，坏代理不会起内核。'));
   }
 
+  /**
+   * 出口 IP 归属（只读，0.4.6）：`ip` / `ip_country` / `ip_region` / `ip_city` 这四个字段
+   * 原来属于「API 可写、界面不显示」那批 —— 写进去没人读，也没人看得见。
+   *
+   * 它们的语义不是配置而是**记录**（导入 txt 时服务端会带上），所以正确的归宿是只读展示：
+   * 看得见值、改不了、也不会让人以为「填了会生效」。本版不主动探测归属地。
+   */
+  function ipOriginField() {
+    const pick = (k) => {
+      const v = state.model[k];
+      return v === undefined || v === null || v === '' ? '' : String(v);
+    };
+    const ip = pick('ip');
+    const place = [pick('ip_country'), pick('ip_region'), pick('ip_city')].filter(Boolean).join(' / ');
+    const text = ip || place ? [ip, place].filter(Boolean).join('  ·  ') : '（还没有记录）';
+    return h('label', { class: 'field wide', dataset: { field: 'ip' } },
+      h('span', { class: 'lbl' }, '出口 IP 归属（只读）'),
+      h('div', { class: 'mono small' }, text),
+      h('span', { class: 'hint' },
+        '这一项不是配置：值来自导入文件或 API 写入，本版不主动探测归属地，也改不了。真实出口 IP 看启动预检的结果。'));
+  }
+
   function hintOf(f) {
     const bits = [];
     if (f.note) bits.push(f.note);
     if (f.range) bits.push(`范围 ${f.range}`);
     if (f.max) bits.push(`最长 ${f.max}`);
-    if (f.cloudOnly) bits.push('云端字段：FreePower 本地不生效，改了也只是存着');
-    // 空转字段：字段表收着（脚本能按名字读写），但这一版代码不消费 —— 说清原因，不装能配
-    if (f.idle) bits.push(`字段表声明，当前版本未生效${f.idle_reason ? `：${f.idle_reason}` : ''}`);
     return bits.join(' · ');
+  }
+
+  /**
+   * 「本版不支持」那一行小字 —— **必须是页面上看得见的文字，不是 title / hover**（0.4.6 规矩）。
+   * 文案来自后端字段表（`overrides.mjs` 的 UNSUPPORTED），前端只加统一前缀，不自己编理由。
+   */
+  function unsupportedLine(f) {
+    if (!f.disabled) return null;
+    const why = f.unsupported_reason;
+    return h('span', { class: 'unsupported' }, why ? `本版不支持 · ${why}` : '本版不支持 · （字段表没写原因，这是缺陷）');
+  }
+
+  /** 元信息字段（备注/标签这类）的说明：能填，但本来就不改变浏览器行为 */
+  function metadataLine(f) {
+    if (f.disabled || !f.metadata_note) return null;
+    return h('span', { class: 'hint' }, `只保存与显示，不改变浏览器行为 · ${f.metadata_note}`);
+  }
+
+  /**
+   * 联动禁用（0.4.6）：`win_x` / `win_y` 只有在「窗口位置」是 topLeft 时才会被用上。
+   *
+   * 为什么必须做：对手那边填了 `win_x=800` 但窗口位置是 maximize 时，这两个数被**静默忽略**
+   * （逆向 `30-假字段消费机制.md` §7：只有 topLeft 分支才推 `--window-position=`）。
+   * 用户看到的正是「填了没用」—— 假字段感的来源之一。我们做得比对手好：不静默，
+   * 直接禁用这两个输入框，并说清「为什么现在不生效、要改成什么才生效」。
+   *
+   * 空值按对手的默认口径当 topLeft（`e.windowPosition||"topLeft"`），所以没填窗口位置时可用。
+   * @returns {string|null} 不生效的原因；null = 现在可用
+   */
+  function linkageNote(f) {
+    if (f.name !== 'win_x' && f.name !== 'win_y') return null;
+    if (f.disabled) return null;
+    const wp = String(state.model.window_position || '').trim() || 'topLeft';
+    if (wp === 'topLeft') return null;
+    return `当前「窗口位置」是 ${wp}，这两个坐标不会被使用；要按坐标摆放，请把窗口位置改成 topLeft`;
   }
 
   function field(f) {
@@ -408,19 +490,25 @@ export default async function renderEdit({ head, page, params }) {
     }
     if (f.cloudOnly) input.disabled = true;
     if (f.idle) input.disabled = true;
+    // 联动禁用：窗口位置不是 topLeft 时，win_x / win_y 填了也不会被用（见 linkageNote）
+    const link = linkageNote(f);
+    if (link) input.disabled = true;
+    // 改了「窗口位置」要重画这一栏 —— win_x / win_y 的可用状态跟着它变（change 而非 input，避免打字时丢焦点）
+    if (f.name === 'window_position') input.addEventListener('change', () => repaintGroup());
 
     const errEl = h('div', { class: 'field-error', style: { display: 'none' } });
     const wrap = h('label', {
-      class: `field ${wide ? 'wide' : ''}${f.idle ? ' idle' : ''}`,
+      class: `field ${wide ? 'wide' : ''}${f.disabled || link ? ' idle' : ''}`,
       dataset: { field: f.name },
-      // 灰显之外再给一个浮层：鼠标停在整格上就能看到「为什么未生效」
-      title: f.idle ? `字段表声明，当前版本未生效${f.idle_reason ? `：${f.idle_reason}` : ''}` : null,
     },
       h('span', { class: 'lbl' },
         f.label,
         f.required ? h('span', { class: 'req' }, '*') : null,
         f.coverage !== 'n/a' && f.coverage ? h('span', { class: 'tag' }, f.coverage) : null),
       input,
+      unsupportedLine(f),
+      link ? h('span', { class: 'unsupported' }, `当前不生效 · ${link}`) : null,
+      metadataLine(f),
       hintOf(f) ? h('span', { class: 'hint' }, hintOf(f)) : null,
       extra,
       errEl);

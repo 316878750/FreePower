@@ -10,6 +10,7 @@ import { buildInjectionSource, buildWorkerInjectionSource } from '../kernel/inje
 import { markerNames, installedExpression, workerRealmExpression } from '../kernel/markers.js';
 import { compileNetRules, decideRequest } from '../kernel/net-rules.js';
 import { blockPageResponse } from '../kernel/block-page.js';
+import { writeCookies } from '../kernel/cookies.js';
 import { alignProfileToKernel } from '../kernel/version.js';
 import { fingerprintView, geoPolicy } from '../fingerprint/view.js';
 import { ensureNoiseSeeds } from '../fingerprint/seeds.js';
@@ -355,6 +356,8 @@ export async function startProfile(profile, { force = false, systemProxy = null 
         selfcheckReport: null,
         // 应用中心：加载结果（null = 这个环境没勾扩展）
         extensions: null,
+        // 关闭后清缓存（0.4.6）：在启动时定死，关闭时不再回读库（库可能已经被改过）
+        cache_purge_on_close: String(effective.clear_cache_after_closing) === '1',
       };
       running.set(id, instance);
       markStatus(id, 'starting');
@@ -365,6 +368,8 @@ export async function startProfile(profile, { force = false, systemProxy = null 
         if (cur && cur.pid === pid) {
           running.delete(id);
           markStatus(id, 'idle');
+          // 用户直接关窗口（没走 stopProfile）也算「关闭环境」：对手的关闭任务同样覆盖这条路径
+          scheduleCachePurgeOnClose(cur);
         }
         if (chainServer) { chainServer.close().catch(() => {}); chainServer = null; }
         try { if (client) client.close(); } catch { /* ignore */ }
@@ -806,9 +811,12 @@ async function injectAndOpen(instance, profile, view) {
       }
     }
   }
+  // 登录 cookie 落进内核（0.4.6 接线）：**必须早于第一张页面的导航**，否则首帧就是未登录态，
+  // 站点会把用户当成游客、甚至先把「未登录」写进 sessionStorage。所以放在 open_urls 之前。
+  await seedLoginCookies(client, profile, profileId).catch((e) => log(profileId, 'WARN 登录 cookie 写入失败', e.message));
+
   const initialTargets = (await client.send('Target.getTargets').catch(() => ({ targetInfos: [] }))).targetInfos || [];
   await prepareExistingTabs(initialTargets);
-
   // 会话恢复（0.4.1 起每次启动强制开，见 runtime/prefs.js）会把上次的标签带回来。
   // 这时候再按 open_urls 新建，就是「每次启动 = 恢复 N 张 + 新建 M 张」，越积越多（0.4.0 的回归）。
   // 与 Chrome 自己的语义一致：「继续浏览上次打开的网页」时启动页本来就不生效。
@@ -1110,6 +1118,95 @@ function instance_profile(p) {
 }
 
 /**
+ * 登录 cookie 的**存储形状** → 能直接喂 `Storage.setCookies` 的 cookie 数组（纯函数，可单测）。
+ *
+ * 存储形状（`src/store/profiles.js:cookieToStorage`）：JSON 数组，元素两种 ——
+ *   - 结构化对象（AdsPower 形状：`{name,value,domain,path,httpOnly,secure,sameSite,expires}`）；
+ *   - 原始串（`"sid=xxx; uid=7"`，txt 导入里的 `cookie` 列常见这种）。
+ *
+ * 原始串**没有域名**，必须挂到某个 host 上才写得进去：取这个环境的第一个启动网址
+ * （`open_urls[0]`）的 host，退一步用 `domain_name`。两个都没有就没法写 —— 如实记一条
+ * `failed`，**不猜**（写成 `.example.com` 或者乱挂一个域，等于把登录态发给别的站点）。
+ *
+ * @returns {{cookies:object[], failed:{reason:string, sample:string}[], source:'object'|'raw'|'mixed'|'none'}}
+ */
+export function loginCookiePlan(profile = {}) {
+  const raw = profile.cookie;
+  const text = typeof raw === 'string' ? raw.trim() : '';
+  if (!text) return { cookies: [], failed: [], source: 'none' };
+  let arr = null;
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) arr = parsed;
+  } catch { /* 不是 JSON 数组：下面按「单个原始串」处理 */ }
+  if (!arr) arr = [text];
+
+  // 原始串的落点：第一个启动网址的 host，其次 domain_name
+  let fallbackUrl = '';
+  const first = (Array.isArray(profile.open_urls) ? profile.open_urls : [])
+    .map((u) => String(u || '').trim()).filter(Boolean)[0];
+  const domainName = String(profile.domain_name || '').trim();
+  for (const candidate of [first, domainName]) {
+    if (!candidate) continue;
+    try {
+      const u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(candidate) ? candidate : `https://${candidate}`);
+      fallbackUrl = `${u.protocol}//${u.host}`;
+      break;
+    } catch { /* 换下一个 */ }
+  }
+
+  const cookies = [];
+  const failed = [];
+  let sawObject = false;
+  let sawRaw = false;
+  for (const item of arr) {
+    if (item && typeof item === 'object' && !Array.isArray(item)) {
+      sawObject = true;
+      const hasDomain = String(item.domain ?? '').trim() || String(item.url ?? '').trim();
+      cookies.push(hasDomain || !fallbackUrl ? item : { ...item, url: fallbackUrl });
+      continue;
+    }
+    const s = String(item ?? '').trim();
+    if (!s) continue;
+    sawRaw = true;
+    if (!fallbackUrl) {
+      failed.push({ reason: '没有域名可挂（这个环境没填启动网址，也没有目标域名）', sample: s.slice(0, 24) });
+      continue;
+    }
+    for (const pair of s.split(/;\s*/)) {
+      const i = pair.indexOf('=');
+      if (i <= 0) continue;
+      cookies.push({ name: pair.slice(0, i).trim(), value: pair.slice(i + 1).trim(), url: fallbackUrl });
+    }
+  }
+  return { cookies, failed, source: sawObject && sawRaw ? 'mixed' : sawObject ? 'object' : sawRaw ? 'raw' : 'none' };
+}
+
+/**
+ * 把环境的登录 cookie 写进内核（0.4.6）。
+ *
+ * 为什么必须做：`cookie` 是基础页上最常用的字段之一（txt 导入整批带着它），但 0.4.5 之前
+ * **启动链路一次都没读它** —— 导入完 cookie 存在库里，一启动还是游客态。对手的行为是把
+ * cookie 写进 `CookiesFile` 由内核启动时加载（逆向 `25-隐私开关落点核对.md` §1.2 的
+ * 7 个排除键里就有 `CookiesFile`），我们是启动后经 CDP 写进同一个内核，落点不同、效果一致。
+ *
+ * 失败**不拦启动**：cookie 坏了不该让环境起不来（那是「导入的脏数据把环境锁死」）。
+ * 但也不许静默 —— 逐条失败原因进日志，条数进返回值。
+ */
+async function seedLoginCookies(client, profile, profileId) {
+  const plan = loginCookiePlan(profile);
+  if (!plan.cookies.length) {
+    if (plan.failed.length) log(profileId, 'WARN 登录 cookie 没写进去', plan.failed.map((f) => f.reason).join('；'));
+    return { written: 0, failed: plan.failed.length };
+  }
+  const r = await writeCookies(client, plan.cookies);
+  if (r.written.length) log(profileId, '登录 cookie 已写入', `${r.written.length} 条（来源 ${plan.source}）`);
+  const failed = r.failed.length + plan.failed.length;
+  if (failed) log(profileId, 'WARN 登录 cookie 有失败', `${failed} 条`);
+  return { written: r.written.length, failed };
+}
+
+/**
  * 请求级闸门：代理认证 + 环境级网络开关（`disable_video` / `blacklist` / `whitelist`）。
  *
  * 两件事都必须走 CDP 的 `Fetch` 域，所以**合成一次 enable、一个处理点**：分两次
@@ -1205,6 +1302,50 @@ async function installRequestGating(client, sessionId, profile, proxy, { proxyAu
   });
 }
 
+/**
+ * `clear_cache_after_closing`（0.4.6 接线）：关闭环境后删掉这个环境的内核数据目录。
+ *
+ * 对手机制（逆向 `30-假字段消费机制.md` §1，@187439 / @337200）：关闭流程末尾起一个 2 秒
+ * 定时器，`isExists(cacheFloder)` 为真才 `rm(cacheFloder)`，删失败**只记日志、不抛错**。
+ * 这是纯磁盘操作、零内核依赖，所以照抄得起 —— 三个细节照抄，一个都不「优化」：
+ *   ① 2 秒延迟（给内核落盘与句柄释放留时间；立刻删在 Windows 上必然撞占用）；
+ *   ② 先判存在再删（不存在就当无事发生，不刷日志）；
+ *   ③ 失败静默（一行日志），不弹错、不拦停止流程 —— 用户关环境时不该看到「删不掉」的报错。
+ *
+ * 删的是**整个内核数据目录**（`userdata`：cache + cookie + localStorage + 书签），
+ * 不是 `Default/Cache` 这种子目录 —— 与对手「删整个 cacheFloder，含 cookie/tabs/bookmark
+ * 落盘文件」同范围（`30-` §1 复刻风险②）。
+ *
+ * 后果在界面上写明（edit.js 那一项的 hint）：删完之后下次启动是全新浏览器，登录态只有
+ * `cookie` 字段里存着的那些会被重新写回去（见 seedLoginCookies）。
+ *
+ * @param {{cache_purge_on_close?:boolean, user_data_dir?:string, profile_id?:string}} instance
+ * @param {number} delayMs 只有单测会传别的值，生产恒为 2000（对手就是 2e3）
+ * @returns {boolean} 是否真的安排了清理
+ */
+export function scheduleCachePurgeOnClose(instance, delayMs = 2000) {
+  if (!instance || !instance.cache_purge_on_close) return false;
+  const dir = String(instance.user_data_dir || '');
+  if (!dir) return false;
+  // 停止流程与「内核自己退出」两条路都会走到这里，只排一次（重复删只是噪音日志）
+  if (instance.purge_scheduled) return false;
+  instance.purge_scheduled = true;
+  const id = instance.profile_id;
+  const timer = setTimeout(() => {
+    try {
+      if (!fs.existsSync(dir)) return;
+      fs.promises.rm(dir, { recursive: true, force: true })
+        .then(() => log(id, 'clear_cache_after_closing', `已删除内核数据目录 ${dir}`))
+        .catch((e) => log(id, `clear_cache_after_closing - rm - ${dir} - ${e.message}`));
+    } catch (e) {
+      log(id, `clear_cache_after_closing - rm - ${dir} - ${e.message}`);
+    }
+  }, delayMs);
+  // 定时器不许把进程吊着：stopAll 之后 node 要能正常退出
+  if (typeof timer.unref === 'function') timer.unref();
+  return true;
+}
+
 export async function stopProfile(profileId) {
   const inst = running.get(profileId);
   if (!inst) return { profile_id: profileId, stopped: false, reason: 'not running' };
@@ -1226,6 +1367,8 @@ export async function stopProfile(profileId) {
   if (inst.chain) { await inst.chain.close().catch(() => {}); inst.chain = null; }
   running.delete(profileId);
   markStatus(profileId, 'idle');
+  // 关闭后清缓存（0.4.6）：排在停止流程末尾、延迟 2 秒执行，见 scheduleCachePurgeOnClose
+  scheduleCachePurgeOnClose(inst);
   return { profile_id: profileId, stopped: true };
 }
 

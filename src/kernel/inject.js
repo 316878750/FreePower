@@ -49,6 +49,11 @@ function injectionConfig(fp) {
     /** P2 `do_not_track`：只有 `"true"` 才是 `'1'`（这里把 `navigator.doNotTrack` 固定成 `"1"`）。 */
     doNotTrack: fp.doNotTrack || null,
     /**
+     * `hidden_notification`（0.4.6）：把 `Notification.requestPermission` 换成永远拒绝。
+     * 与对手同一机制（逆向 `30-假字段消费机制.md` §2，CDP evaluateOnNewDocument），不需要自编译内核。
+     */
+    hiddenNotification: fp.hiddenNotification === true,
+    /**
      * 屏幕尺寸 + 可用区（avail*）。CDP 的 setDeviceMetricsOverride 只能设 screen 尺寸，
      * availWidth/availHeight 会被撑成和它一样 —— 而「没有任务栏」正是 headless 的特征。
      */
@@ -319,6 +324,26 @@ const PAGE_BODY = `
   // P2 do_not_track="true"：固定 navigator.doNotTrack="1"（"false"/"default" 什么都不做）
   if (CFG.doNotTrack === '1') {
     try { if (navigator.doNotTrack !== '1') defGetter(Navigator.prototype, 'doNotTrack', '1'); } catch (e) {}
+  }
+  /* ---------- hidden_notification：通知权限永远拒绝 ----------
+   * 照抄对手的机制（逆向 30-假字段消费机制.md §2，@481626）：
+   *   ① **前置判断**：原始 requestPermission.toString() 里必须含 "native code" 才替换 ——
+   *      这是防重复注入 / 不跟页面自己的 polyfill 打架的保护，漏了这一行就变成「谁先到谁赢」；
+   *   ② 改后的行为是回调给 false + resolve(null)，**不是**返回 "denied" 字符串、也不是假对话框；
+   *   ③ 只改 requestPermission，**不动 Notification 构造函数**（new Notification() 仍能构造）。
+   * 我们用 native() 包一层，让 Function.prototype.toString 看到的是原生字面量（比对手更干净）。
+   * Notification.requestPermission 原生 length 是 0（回调是可选参数），name 是 'requestPermission'。
+   * 注意：这段在 PAGE_BODY 里（模板串），注释里不许出现反引号与美元花括号。 */
+  if (CFG.hiddenNotification) {
+    try {
+      if (typeof Notification !== 'undefined' && Notification.requestPermission
+        && -1 !== Notification.requestPermission.toString().indexOf('native code')) {
+        defMethod(Notification, 'requestPermission', native(function requestPermission(e) {
+          return new Promise(function (resolve) { if (e) e(false); resolve(null); });
+        }, 'requestPermission', 0));
+        mark('hiddenNotification');
+      }
+    } catch (e) {}
   }
   try { if (navigator.vendor !== 'Google Inc.') defGetter(Navigator.prototype, 'vendor', 'Google Inc.'); } catch (e) {}
 

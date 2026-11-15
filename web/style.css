@@ -164,10 +164,14 @@ label.field > span.hint { font-size: 11px; color: var(--ink-3); }
 .req { color: var(--bad); }
 .field-error { font-size: 11px; color: var(--bad); }
 label.field.has-error input, label.field.has-error select, label.field.has-error textarea { border-color: var(--bad); background: #fffafa; }
-/* 空转字段：字段表收了但这一版不生效 —— 灰显 + 禁用，浮层（title）说明原因 */
-label.field.idle { opacity: .55; }
-label.field.idle input, label.field.idle select, label.field.idle textarea { cursor: not-allowed; background: var(--line-2); }
-label.field.idle > span.lbl::after { content: '未生效'; margin-left: 6px; font-size: 10px; padding: 0 4px; border-radius: 3px; background: var(--line-2); color: var(--ink-3); }
+/* 空转字段：字段表收了但这一版不生效 —— 控件灰显禁用，**原因写在控件旁边一行小字里**（不是 title）。
+   0.4.6 起不再给整格降透明度：降了之后那行原因是灰的，等于白写。只压标签与控件本身。 */
+label.field.idle > span.lbl { opacity: .55; }
+label.field.idle input, label.field.idle select, label.field.idle textarea { cursor: not-allowed; background: var(--line-2); color: var(--ink-3); }
+label.field.idle > span.lbl::after { content: '不可用'; margin-left: 6px; font-size: 10px; padding: 0 4px; border-radius: 3px; background: var(--line-2); color: var(--ink-3); }
+/* 「本版不支持 · 原因」那一行：必须看得清，所以不跟着标签一起褪色 */
+label.field > span.unsupported { font-size: 11px; color: var(--warn); background: var(--warn-soft); padding: 2px 6px; border-radius: 4px; }
+.tab .cnt.off { color: var(--warn); }
 
 /* ---------------- 卡片 / 表格 ---------------- */
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }

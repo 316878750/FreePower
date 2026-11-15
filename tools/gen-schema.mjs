@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { STORAGE, COVERAGE, EFFECT, INERT_EXTRA, DEFAULTS, DEFAULT_SOURCE, DOMAIN_NOTES, NOTES, VALUES_EXTRA } from '../packages/profile/reference/overrides.mjs';
+import { STORAGE, COVERAGE, EFFECT, INERT_EXTRA, UNSUPPORTED, METADATA, GROUP_OVERRIDE, DEFAULTS, DEFAULT_SOURCE, DOMAIN_NOTES, NOTES, VALUES_EXTRA } from '../packages/profile/reference/overrides.mjs';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const refPath = path.join(root, 'packages/profile/reference/ads-8.9.23-fields.json');
@@ -27,7 +27,9 @@ for (const [group, defs] of Object.entries(ref.profile)) {
     const storage = STORAGE[name] ?? (def.type.startsWith('array') || def.type === 'object' ? 'json' : 'column');
     const entry = {
       name,
-      group,
+      // 分组可以让 overrides.mjs 改写（0.4.6）：`sync_*` 那一簇被塞在隐私开关里，用户会以为
+      // 在改指纹；它们其实是「缓存/存储要不要跟云端同步」的开关，应该和 storage_strategy 同栏。
+      group: GROUP_OVERRIDE[name] ?? group,
       type: def.type,
       storage,
       sqlType: storage === 'column' ? (INT_FIELDS.has(name) ? 'INTEGER' : SQL_TYPE[def.type] ?? 'TEXT') : 'TEXT',
@@ -51,6 +53,11 @@ for (const [group, defs] of Object.entries(ref.profile)) {
       effect: EFFECT[name]?.effect ?? null,
       effectSites: EFFECT[name]?.sites ?? [],
       inert: EFFECT[name]?.inert ?? INERT_EXTRA[name] ?? null,
+      // 用户可见的「本版不支持 · …」（0.4.6）：界面上直接显示在控件旁边那一行小字。
+      // 与 inert 的分工：inert 是给维护者的技术口径，unsupported 是给用户的一句人话。
+      unsupported: UNSUPPORTED[name] ?? null,
+      // 元信息字段的说明（可填、但本来就不改变浏览器行为）；判据的唯一豁免来源。
+      metadataWhy: METADATA[name]?.why ?? null,
       note: NOTES[name] ?? null,
       evidence: '实测',
     };
