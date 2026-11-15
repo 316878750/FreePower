@@ -47,6 +47,7 @@ import { readSyncDefaults, writeSyncDefaults, resetSyncDefaults, syncDefaultsDif
 import { networkSnapshot, probeBoundProxies } from './diagnose.js';
 import { readDisplays } from '../sync/displays.js';
 import { readHotkeyStatus, requestHotkey } from '../sync/hotkey.js';
+import { readConsoleState, requestConsole, consoleBarModel } from '../sync/console.js';
 import { showWindowsOfProfiles } from '../sync/batch-show.js';
 import { resetApiKey } from '../store/db.js';
 import { listKernels } from '../kernel/chrome.js';
@@ -1632,6 +1633,49 @@ export function buildRoutes() {
     } catch (e) {
       throw new ApiError(ERR.INVALID, e?.message || 'sync is not running');
     }
+  });
+
+  /**
+   * 操作台（对手的 Console 桌面小组件）：读形态与设置。
+   *
+   * `managed:false` = 没有桌面壳在管（纯网页跑服务）—— 这时操作台这个能力不存在，
+   * 界面据此把按钮禁用并写明「桌面版才有操作台」，**不摆一个点了没反应的入口**。
+   *
+   * `model` 是收起条上那五项（状态词/主控/受控数/停止/展开），由纯函数算出来，
+   * 界面只负责摆位置 —— 这样「收起条显示什么」能被 A 层判据直接钉住，不用起窗口。
+   */
+  add(['GET'], ['/api/v2/sync/console'], () => {
+    const st = readConsoleState();
+    const sync = syncStatus();
+    const masterId = sync.master_id || '';
+    let masterName = '';
+    if (masterId) {
+      try { masterName = getProfile(masterId)?.name || ''; } catch { masterName = ''; }
+    }
+    return ok({
+      ...st,
+      model: consoleBarModel({ status: sync, masterName }),
+      sync_running: sync.running === true,
+    });
+  });
+
+  /**
+   * 操作台：请求收起/展开、改设置、复位位置。真正动手的是桌面壳（写请求文件，它轮询到就执行）。
+   * 没有桌面壳时**不写请求文件**（写了也没人读，等于说了没做），如实回 `requested:false`。
+   */
+  add(['POST'], ['/api/v2/sync/console'], (ctx) => {
+    const b = ctx.body && typeof ctx.body === 'object' ? ctx.body : {};
+    const r = requestConsole({
+      mode: b.mode,
+      prefs: b.prefs,
+      reset_position: b.reset_position === true,
+    });
+    if (!r.ok) {
+      // `managed:false` 不是参数错误，是「这个能力在这里不存在」：code 0 + 说明，界面照实显示
+      if (r.managed === false) return ok({ requested: false, managed: false, reason: 'no_desktop_shell', message: r.error });
+      throw new ApiError(ERR.INVALID, r.error || 'request failed');
+    }
+    return ok({ requested: true, managed: true, state: readConsoleState() });
   });
 
   /** 显示器列表（桌面壳写、服务进程读）：多屏排列要用 workArea */

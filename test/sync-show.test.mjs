@@ -367,6 +367,12 @@ const sessionSrc = readSrc('src/sync/session.js');
 const routesSrc = readSrc('src/api/routes.js');
 const apiSrc = readSrc('web/api.js');
 const panelSrc = readSrc('web/pages/sync-panel.js');
+/**
+ * 「显示窗口」区块 0.4.5 起搬进了共用组件 `web/sync-widgets.js`（操作台与「窗口同步」页各摆一份，
+ * CEO 要求复用组件、不许另写一套）。所以下面扫的是**共用组件**，并额外钉住两个页面都 import 它。
+ */
+const widgetSrc = readSrc('web/sync-widgets.js');
+const syncPageSrc = readSrc('web/pages/sync.js');
 const showSrc = readSrc('src/sync/show.js');
 const showBody = slice(sessionSrc, 'export async function showWindows(', '/** 页面文档有没有焦点');
 const routesBlock = slice(routesSrc, '显示窗口（`viewWin`', "add(['POST'], ['/api/v2/sync/tab']");
@@ -426,30 +432,39 @@ t('show.js 零原生依赖：不碰 electron / koffi / child_process / Win32', (
 });
 
 t('面板有「显示窗口」按钮，且调 /api/v2/sync/show', () => {
-  assert.match(panelSrc, /显示窗口/);
-  assert.match(panelSrc, /api\.syncShow\(\)/);
+  assert.match(widgetSrc, /显示窗口/);
+  assert.match(widgetSrc, /api\.syncShow\(\)/);
   assert.match(apiSrc, /syncShow:[\s\S]{0,120}\/api\/v2\/sync\/show/);
 });
 
+t('两个页面用的是同一份「显示窗口」组件（不是各写一套）', () => {
+  assert.match(widgetSrc, /export function buildShowPanel/);
+  assert.match(syncPageSrc, /buildShowPanel/);
+  assert.match(panelSrc, /buildShowPanel/);
+});
+
 t('面板把 page_only 的能力边界写出来（不假装都到前面了）', () => {
-  assert.match(panelSrc, /只做了页面级激活/);
-  assert.match(panelSrc, /盖住/);
+  assert.match(widgetSrc, /只做了页面级激活/);
+  assert.match(widgetSrc, /盖住/);
 });
 
 t('面板初始渲染就把这块画出来（定义了却没人调用 = 界面上没有）', () => {
-  assert.match(panelSrc, /\n {2}paintShow\(\);/, 'paintShow() 必须在初始化流程里被调用');
+  // 组件被两个页面 import 并且真的 mount 进页面；组件内部建好就画
+  assert.match(widgetSrc, /mount\(el,/, '组件内部必须先画一次');
+  assert.match(syncPageSrc, /showPanel\.el/, '「窗口同步」页要把它 mount 出来');
+  assert.match(panelSrc, /showPanel\.el/, '操作台要把它 mount 出来');
 });
 
 /* ---- CEO 点的两条：强制置前的按钮 + 默认行为不许偷偷做 ---- */
 
 t('① page_only 档下存在「强制抬到前台（会闪一下）」按钮，且点的是 force 路由', () => {
-  assert.match(panelSrc, /强制抬到前台（会闪一下）/, '按钮文案要写明代价');
-  assert.match(panelSrc, /api\.syncShowForce\(/, '必须调 /api/v2/sync/show/force');
+  assert.match(widgetSrc, /强制抬到前台（会闪一下）/, '按钮文案要写明代价');
+  assert.match(widgetSrc, /api\.syncShowForce\(/, '必须调 /api/v2/sync/show/force');
   assert.match(apiSrc, /syncShowForce:[\s\S]{0,140}\/api\/v2\/sync\/show\/force/);
   assert.match(routesSrc, /add\(\['POST'\], \['\/api\/v2\/sync\/show\/force'\]/, 'force 要有独立路由');
   /* 只在 page_only 那批存在时才出现，不是常驻按钮 */
-  assert.match(panelSrc, /pageOnlyIds\.length \? forceBox : null/);
-  assert.match(panelSrc, /filter\(\(x\) => x\.ok && x\.raise === 'page_only'\)/);
+  assert.match(widgetSrc, /pageOnlyIds\.length \? forceBox : null/);
+  assert.match(widgetSrc, /filter\(\(x\) => x\.ok && x\.raise === 'page_only'\)/);
 });
 
 t('① force 的判定走同一处（复用 verifyShown，不另造一套）', () => {
@@ -467,7 +482,7 @@ t('① force 是一次性动作：不写设置、不是开关', () => {
     assert.ok(!forceBody.includes(bad), `force 不许写设置（出现「${bad}」）`);
   }
   /* 面板里这个按钮不是 checkbox/开关 */
-  const btn = panelSrc.match(/强制抬到前台（会闪一下）'[\s\S]{0,80}/)?.[0] || '';
+  const btn = widgetSrc.match(/强制抬到前台（会闪一下）'[\s\S]{0,80}/)?.[0] || '';
   assert.ok(!/checkbox|type: 'checkbox'/.test(btn), '一次性动作不许做成开关');
 });
 

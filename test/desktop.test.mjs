@@ -130,7 +130,25 @@ const has = (re) => re.test(mainSrc);
 check('renderer 没有 Node 能力（nodeIntegration 关）', has(/nodeIntegration:\s*false/));
 check('contextIsolation 开着', has(/contextIsolation:\s*true/));
 check('sandbox 开着', has(/sandbox:\s*true/));
-check('不挂 preload', !has(/preload\s*:/));
+/**
+ * preload 从「一律不挂」变成「**只挂主窗口**」（0.4.5 起）：
+ * 主窗口要一个「打开操作台」的入口，操作台小窗不需要（它改形态走 Local API + 请求文件）。
+ * 所以断言必须**按窗口分别扫**，而不是全文件搜 `preload:` —— 后者会漏掉「顺手也给小窗挂了」这种错。
+ */
+{
+  const bodyOf = (header) => {
+    const at = mainSrc.indexOf(header);
+    if (at < 0) return '';
+    const rest = mainSrc.slice(at + header.length);
+    const end = rest.search(/\n\}/);
+    return end < 0 ? rest : rest.slice(0, end);
+  };
+  const stripC = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const mainWin = stripC(bodyOf('function createWindow()'));
+  const consoleWin = stripC(bodyOf('function createSyncPanel('));
+  check('preload 只挂主窗口', mainWin.length > 200 && /preload:\s*PRELOAD_FILE/.test(mainWin));
+  check('操作台小窗不挂 preload', consoleWin.length > 200 && !/preload/.test(consoleWin));
+}
 check('window.open 一律拒', has(/setWindowOpenHandler/) && has(/action:\s*'deny'/));
 check('外链丢系统浏览器', has(/shell\.openExternal/));
 check('导航到外部地址被拦', has(/will-navigate/) && has(/event\.preventDefault\(\)/));

@@ -158,6 +158,13 @@ export const api = {
   /* ---- 窗口同步（0.4.2） ---- */
   syncStart: (body) => call('/api/v2/sync/start', { method: 'POST', body }),
   syncStop: () => call('/api/v2/sync/stop', { method: 'POST', body: {} }),
+  /**
+   * 操作台（Console 桌面小组件）：`{managed, mode, prefs, model, sync_running}`。
+   * `managed:false` = 没有桌面壳在管（纯网页跑服务），这时操作台不存在，界面要如实说。
+   */
+  syncConsole: () => call('/api/v2/sync/console'),
+  /** 收起/展开、改设置、复位位置：真正动手的是桌面壳（它轮询请求文件） */
+  syncConsoleSet: (body) => call('/api/v2/sync/console', { method: 'POST', body }),
   syncStatus: () => call('/api/v2/sync/status'),
   syncSettings: (body) => call('/api/v2/sync/settings', { method: 'POST', body }),
   syncRefresh: () => call('/api/v2/sync/refresh', { method: 'POST', body: {} }),

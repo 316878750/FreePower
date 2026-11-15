@@ -1,14 +1,22 @@
 /**
- * 窗口同步面板（独立小窗 `#/sync-panel`，始终置顶）。
+ * 窗口同步**操作台**（对手的 Console 桌面小组件；独立小窗 `#/sync-panel`，始终置顶）。
  *
- * 三条硬约束（来自实际使用场景，不是审美）：
+ * 两种形态（由桌面壳用 `setBounds` 真改窗口尺寸，不是在一个大窗里换布局）：
+ *   · 展开态 430×620：完整面板（选择 / 状态 / 排列 / 显示 / 快捷键）；
+ *   · 收起态 360×56：**只有五项** —— 状态词、主控环境名、受控几个、停止、展开。
+ *     收起态存在的意义就是「不挡主控窗口，但还看得见在同步」，所以别的读数一律不进来。
+ *
+ * 四条硬约束（来自实际使用场景，不是审美）：
  *   1. **不抢焦点**：面板由主进程 `showInactive()` 打开；同步时你是在主窗口里打字的，
  *      面板一旦拿到焦点，按键就打到面板上，同步当场废掉。所以这里**不做任何自动 focus**。
  *   2. **快捷键注册失败必须显示**：否则用户按了没反应会以为功能坏了。
  *   3. 尺寸不一致要显著提示，并把「一键统一尺寸」放在伸手可及的地方。
+ *   4. **纯网页跑服务时没有操作台**：形态切换是桌面壳的能力，按钮禁用并写明原因，
+ *      不摆一个点了没反应的入口。
  */
 import { h, mount, toast, pill } from '../ui.js';
 import { api } from '../api.js';
+import { buildArrangePanel, buildShowPanel } from '../sync-widgets.js';
 
 const state = {
   status: null,
@@ -17,13 +25,9 @@ const state = {
   masterId: '',
   slaves: new Set(),
   timer: null,
-  /* 窗口排列的参数：只有用户点「排列」时才用，不做自动重排（改窗口是可见副作用） */
-  arrange: {
-    mode: 'auto', // 'auto'（一键排列 sync90）| 'custom'（自定义排列 customRange）
-    left: 0, top: 0, width: 1000, height: 700, hs: 0, vs: 0, row: 2,
-    screenId: null, // null = 主屏；-1 = 全部屏幕
-  },
   displays: [],
+  console: null,       // GET /sync/console 的结果（managed / mode / prefs / model）
+  mode: null,          // 当前渲染的形态（null = 还没画过）
 };
 
 function hashQuery() {
@@ -41,35 +45,156 @@ export default async function renderSyncPanel({ head, page }) {
   const banner = h('div');
   const pickBox = h('div');
   const statusBox = h('div');
-  const arrangeBox = h('div');
-  const showBox = h('div');
+  const consoleBox = h('div');
   const hotkeyBox = h('div');
+  const collapsedBar = h('div');
 
-  mount(head, h('h1', null, '窗口同步'));
-  mount(page,
-    banner,
-    h('div', { class: 'panel' }, h('div', { class: 'panel-body' }, pickBox)),
-    h('div', { class: 'panel' }, h('div', { class: 'panel-body' }, statusBox)),
-    h('div', { class: 'panel' }, h('div', { class: 'panel-body' }, arrangeBox)),
-    h('div', { class: 'panel' }, h('div', { class: 'panel-body' }, showBox)),
-    h('div', { class: 'panel' }, h('div', { class: 'panel-body' }, hotkeyBox)));
+  /** 环境 id → 名字（共用组件要它；必须在使用之前定义，别挪到后面去） */
+  const nameOf = (id) => state.profiles.get(id)?.name || id;
 
-  if (shortcutFailed) {
-    mount(banner, h('div', { class: 'notice bad' },
-      h('strong', null, '快捷键注册失败，请手动开始。'),
-      h('div', { class: 'muted small' }, '多半是 Ctrl+Alt+S 被别的程序占着（装了 AdsPower 的话就是它）。在下面改一个就能用。')));
-  }
+  // 共用组件：操作台与「窗口同步」页用的是同一份代码、同两条路由
+  const arrangePanel = buildArrangePanel({ nameOf, getDisplays: () => state.displays });
+  const showPanel = buildShowPanel({ nameOf });
 
   await reload(true);
   await loadDisplays();
-  paintArrange();
-  paintShow();
-  await paintHotkey();
+  await loadConsole();
+  paintShell();
+  try { await paintHotkey(); } catch { /* 快捷键读不到不影响操作台 */ }
+
   state.timer = setInterval(() => { tick().catch(() => {}); }, 1000);
   window.addEventListener('hashchange', () => {
     clearInterval(state.timer);
-    document.body.classList.remove('panel-mode');
+    document.body.classList.remove('panel-mode', 'console-collapsed');
   }, { once: true });
+
+  /** 形态切换时整页重画（两种形态的内容差别就是全部内容，没必要增量 diff） */
+  function paintShell() {
+    const collapsed = state.mode === 'collapsed';
+    document.body.classList.toggle('console-collapsed', collapsed);
+    if (collapsed) {
+      mount(head, null);
+      mount(page, collapsedBar);
+      paintCollapsed();
+      return;
+    }
+    document.body.classList.remove('console-collapsed');
+    mount(head, h('h1', null, '窗口同步'));
+    mount(page,
+      banner,
+      h('div', { class: 'panel' }, h('div', { class: 'panel-body' }, consoleBox)),
+      h('div', { class: 'panel' }, h('div', { class: 'panel-body' }, pickBox)),
+      h('div', { class: 'panel' }, h('div', { class: 'panel-body' }, statusBox)),
+      h('div', { class: 'panel' }, h('div', { class: 'panel-body' }, arrangePanel.el)),
+      h('div', { class: 'panel' }, h('div', { class: 'panel-body' }, showPanel.el)),
+      h('div', { class: 'panel' }, h('div', { class: 'panel-body' }, hotkeyBox)));
+    paintConsoleSettings();
+    paintPick();
+    paintStatus();
+    if (shortcutFailed && !banner.firstChild) {
+      mount(banner, h('div', { class: 'notice bad' },
+        h('strong', null, '快捷键注册失败，请手动开始。'),
+        h('div', { class: 'muted small' }, '多半是 Ctrl+Alt+S 被别的程序占着（装了 AdsPower 的话就是它）。在下面改一个就能用。')));
+    }
+  }
+
+  /** 收起条：**只放五项**（服务端 `consoleBarModel` 算的，界面不自己拼文案） */
+  function paintCollapsed() {
+    const model = state.console?.model || { items: ['同步已停止', '未选主窗口', '受控 0 个', '展开'], actions: [{ id: 'expand', label: '展开' }] };
+    const actions = (model.actions || []).map((a) => h('button', {
+      class: `btn sm${a.id === 'stop' ? ' danger' : ''}`,
+      onClick: () => runConsoleAction(a.id),
+    }, a.label));
+    mount(collapsedBar,
+      h('div', { class: 'console-bar' },
+        h('span', { class: `console-dot ${model.tone || 'ok'}` }),
+        h('span', { class: 'console-title', title: model.detail || '' }, model.title),
+        h('span', { class: 'console-master', title: model.master }, model.master),
+        h('span', { class: 'console-slaves' }, model.slaves),
+        h('span', { class: 'spacer' }),
+        ...actions));
+  }
+
+  async function runConsoleAction(id) {
+    if (id === 'stop') {
+      try { await api.syncStop(); toast('已停止'); } catch (e) { toast(e.message, 'bad'); }
+      await reload(true);
+      return;
+    }
+    if (id === 'expand') {
+      try {
+        const r = await api.syncConsoleSet({ mode: 'expanded' });
+        if (r?.requested === false) toast(r.message || '没有桌面壳在管，无法展开', 'bad');
+      } catch (e) { toast(e.message, 'bad'); }
+    }
+  }
+
+  /* ------------------------------ 操作台设置 ------------------------------ */
+
+  function paintConsoleSettings() {
+    const con = state.console || { managed: false, prefs: { auto_shrink: true } };
+    const autoShrink = h('input', {
+      type: 'checkbox', checked: con.prefs?.auto_shrink === true, disabled: !con.managed,
+      onChange: (e) => setPrefs({ auto_shrink: e.target.checked }),
+    });
+    mount(consoleBox,
+      h('div', { class: 'row' },
+        h('span', { class: 'muted small' }, '操作台'),
+        con.managed ? pill('桌面小组件', 'ok') : pill('没有桌面壳在管', 'idle'),
+        h('span', { class: 'spacer' }),
+        h('button', {
+          class: 'btn sm', disabled: !con.managed || state.mode === 'collapsed',
+          onClick: () => collapse(),
+        }, '收起')),
+      h('label', { class: 'check', style: { marginTop: '6px' } },
+        autoShrink, h('span', null, '同步开始时自动收起'),
+        h('span', { class: 'muted small' }, '　默认开启：展开态置顶会挡住主控窗口（我们的选择，对手默认值无证据）')),
+      h('div', { class: 'row', style: { marginTop: '6px' } },
+        h('button', {
+          class: 'btn sm', disabled: !con.managed,
+          onClick: () => resetPosition(),
+        }, '操作台复位到默认位置')),
+      con.managed
+        ? null
+        : h('div', { class: 'muted small', style: { marginTop: '6px' } },
+          '当前是纯网页（没有桌面壳）：操作台形态与位置由桌面版管理，这里只能看内容。'));
+  }
+
+  async function collapse() {
+    try {
+      const r = await api.syncConsoleSet({ mode: 'collapsed' });
+      if (r?.requested === false) toast(r.message || '没有桌面壳在管，无法收起', 'bad');
+    } catch (e) { toast(e.message, 'bad'); }
+  }
+
+  async function setPrefs(patch) {
+    try {
+      const r = await api.syncConsoleSet({ prefs: patch });
+      if (r?.requested === false) toast(r.message || '没有桌面壳在管，设置没有生效', 'bad');
+      else toast('已保存');
+      await loadConsole();
+      paintConsoleSettings();
+    } catch (e) {
+      toast(e.message, 'bad');
+      await loadConsole();
+      paintConsoleSettings();
+    }
+  }
+
+  async function resetPosition() {
+    try {
+      const r = await api.syncConsoleSet({ reset_position: true });
+      if (r?.requested === false) toast(r.message || '没有桌面壳在管，无法复位', 'bad');
+      else toast('已请求复位到主屏中央');
+    } catch (e) { toast(e.message, 'bad'); }
+  }
+
+  async function loadConsole() {
+    state.console = await api.syncConsole().catch(() => null);
+    state.mode = state.console?.managed && state.console?.mode === 'collapsed' ? 'collapsed' : 'expanded';
+  }
+
+  /* ------------------------------ 数据 ------------------------------ */
 
   async function reload(full) {
     if (full) {
@@ -87,6 +212,9 @@ export default async function renderSyncPanel({ head, page }) {
     if (state.status?.running) {
       state.masterId = state.status.master_id || '';
       state.slaves = new Set(state.status.slave_ids || []);
+    } else {
+      // 停止后收起条要显示「同步已停止」，模型必须跟着刷新（服务端按真实状态算）
+      state.console = await api.syncConsole().catch(() => state.console);
     }
     paintPick();
     paintStatus();
@@ -94,10 +222,17 @@ export default async function renderSyncPanel({ head, page }) {
 
   async function tick() {
     state.status = await api.syncStatus().catch(() => null);
-    paintStatus();
+    const con = await api.syncConsole().catch(() => null);
+    if (con) state.console = con;
+    const nextMode = con?.managed && con?.mode === 'collapsed' ? 'collapsed' : 'expanded';
+    if (nextMode !== state.mode) {
+      state.mode = nextMode;
+      paintShell();
+      return;
+    }
+    if (state.mode === 'collapsed') paintCollapsed();
+    else paintStatus();
   }
-
-  const nameOf = (id) => state.profiles.get(id)?.name || id;
 
   /**
    * 读显示器列表（桌面壳写的）。读不到不是错误：命令行跑服务时 `managed:false`，
@@ -106,6 +241,7 @@ export default async function renderSyncPanel({ head, page }) {
   async function loadDisplays() {
     const r = await api.syncDisplays().catch(() => null);
     state.displays = Array.isArray(r?.displays) ? r.displays : [];
+    arrangePanel.refresh();
   }
 
   function paintPick() {
@@ -141,6 +277,7 @@ export default async function renderSyncPanel({ head, page }) {
 
   function paintStatus() {
     const st = state.status;
+    if (state.mode === 'collapsed') return;
     if (!st?.running) { mount(statusBox, h('div', { class: 'muted small' }, '同步没在跑')); return; }
     const sizes = (st.windows || []).filter((w) => w.window?.width)
       .map((w) => `${w.role === 'master' ? '主' : '受控'} ${w.window.width}×${w.window.height}`).join('，');
@@ -182,187 +319,6 @@ export default async function renderSyncPanel({ head, page }) {
       toast(bad.length ? `${bad.length} 个窗口没改成` : '已统一尺寸', bad.length ? 'bad' : '');
     } catch (e) { toast(e.message, 'bad'); }
     await reload(false);
-  }
-
-  /**
-   * 窗口排列面板（对手的 `tileWin`）。参数逐项对齐 `toRangeBrowser`：
-   *   排列方式 `syncOperateArrangement` → 一键排列 `sync90` / 自定义排列 `customRange`
-   *   起始位置 `startSide` → left / top
-   *   窗口大小 `windowSize` → width / height
-   *   窗口间距 `windowMarge` → hs / vs
-   *   窗口数量 `windowNum` + `syncOperate5`「个/行」→ row
-   *   显示器 `sync84` → screenId（-1 = 全部屏幕）
-   * **只在用户点按钮时改窗口** —— 改窗口是可见副作用，不能自己动。
-   */
-  function paintArrange() {
-    const a = state.arrange;
-    const field = (label, ...inputs) => h('div', { class: 'row', style: { marginTop: '6px' } },
-      h('span', { class: 'muted small', style: { minWidth: '56px' } }, label), ...inputs);
-    const num = (key, { min = 0, max = 20000, w = '68px' } = {}) => h('input', {
-      type: 'number', min, max, value: String(a[key]), style: { width: w },
-      onInput: (e) => { a[key] = Number(e.target.value) || 0; },
-    });
-
-    const modeSel = h('select', {
-      onChange: (e) => { a.mode = e.target.value; paintArrange(); },
-    },
-      h('option', { value: 'auto', selected: a.mode === 'auto' }, '一键排列'),
-      h('option', { value: 'custom', selected: a.mode === 'custom' }, '自定义排列'));
-
-    const screenOpts = [];
-    if (!state.displays.length) {
-      // 没有桌面壳在管（命令行跑服务）时只有一项，并如实说明按原点算
-      screenOpts.push(h('option', { value: 'primary', selected: a.screenId === null }, '内置屏幕'));
-    } else {
-      state.displays.forEach((d, i) => {
-        screenOpts.push(h('option', {
-          value: String(d.id),
-          selected: String(a.screenId) === String(d.id),
-        }, `${d.primary ? '内置屏幕' : `扩展屏幕 ${i}`} ${d.work_area.width}×${d.work_area.height}`));
-      });
-      screenOpts.push(h('option', { value: '-1', selected: a.screenId === -1 }, '全部屏幕'));
-    }
-    const screenSel = h('select', {
-      onChange: (e) => {
-        const v = e.target.value;
-        a.screenId = v === '-1' ? -1 : (v === 'primary' ? null : Number(v));
-      },
-    }, ...screenOpts);
-
-    const resBox = h('div');
-    const runBtn = h('button', {
-      class: 'btn primary sm',
-      onClick: () => arrange(resBox),
-    }, '窗口排列');
-
-    mount(arrangeBox,
-      h('div', { class: 'row' },
-        h('span', { class: 'muted small' }, '排列方式'), modeSel,
-        h('span', { class: 'spacer' }), runBtn),
-      a.mode === 'custom'
-        ? h('div', null,
-          field('起始位置', num('left'), num('top')),
-          field('窗口大小', num('width', { min: 516 }), num('height', { min: 200 })),
-          field('窗口间距', num('hs'), num('vs')),
-          field('窗口数量', num('row', { min: 0, max: 20, w: '56px' }), h('span', { class: 'muted small' }, '个/行')),
-          field('显示器', screenSel))
-        : h('div', null,
-          field('显示器', screenSel)),
-      h('div', { class: 'muted small', style: { marginTop: '6px' } },
-        a.mode === 'auto'
-          ? '根据显示器的分辨率自动排列所选窗口'
-          : '跨屏同步：建议使用【自定义排列】设置相同的窗口大小'),
-      resBox);
-  }
-
-  async function arrange(resBox) {
-    const a = state.arrange;
-    const body = a.mode === 'auto'
-      ? { auto: true, screenId: a.screenId === null ? undefined : a.screenId }
-      : {
-        width: a.width, height: a.height, row: a.row, hs: a.hs, vs: a.vs,
-        left: a.left, top: a.top, range: 0,
-        screenId: a.screenId === null ? undefined : a.screenId,
-      };
-    try {
-      const r = await api.syncArrange(body);
-      const bad = (r?.placed || []).filter((x) => !x.ok);
-      const warn = (r?.warnings || []).slice();
-      toast(bad.length ? `有 ${bad.length} 个窗口没能排到位` : `已排列 ${r?.placed?.length ?? 0} 个窗口`, bad.length ? 'bad' : '');
-      mount(resBox,
-        bad.length
-          ? h('div', { class: 'notice bad', style: { marginTop: '6px' } },
-            h('strong', null, `有 ${bad.length} 个窗口没能排到位：`),
-            ...bad.map((x) => h('div', { class: 'muted small' }, `${nameOf(x.profile_id)}（${x.role === 'master' ? '主控' : '受控'}）：${x.reason || '位置不符'}`)))
-          : h('div', { class: 'muted small', style: { marginTop: '6px' } },
-            `已排列 ${r?.placed?.length ?? 0} 个窗口${r?.auto ? `（每行 ${r.auto.cols} 个，${r.auto.width}×${r.auto.height}）` : ''}`),
-        warn.length
-          ? h('div', { class: 'notice warn', style: { marginTop: '6px' } }, ...warn.map((w) => h('div', { class: 'muted small' }, w)))
-          : null);
-    } catch (e) {
-      toast(e.message, 'bad');
-      mount(resBox, h('div', { class: 'notice bad', style: { marginTop: '6px' } }, e.message));
-    }
-    await reload(false);
-  }
-
-  /**
-   * 显示窗口（对手的 `viewWin`，行内叫 `displayWin`）。
-   *
-   * **它的能力边界必须写在界面上**：最小化的窗口恢复后实测会真的到 OS 前台；
-   * 只是被别的窗口盖住（没最小化）的窗口，零依赖只能把**页面**激活，窗口可能仍在后面。
-   * 所以按钮下面那行小字是「恢复最小化并把窗口放到前面」，结果显示 `page_only` 时
-   * 明确写「有 N 个窗口只做了页面级激活（可能仍被其它窗口盖住）」，不假装都到前面了。
-   */
-  function paintShow() {
-    const resBox = h('div');
-    mount(showBox,
-      h('div', { class: 'row' },
-        h('button', { class: 'btn primary sm', onClick: () => showAll(resBox) }, '显示窗口'),
-        h('span', { class: 'muted small' }, '恢复最小化的窗口，并把它放到前面')),
-      resBox);
-  }
-
-  async function showAll(resBox) {
-    try {
-      const r = await api.syncShow();
-      const s = r?.summary || {};
-      toast(s.message || '已显示', s.failed ? 'bad' : '');
-      /* page_only 那批：给一个**显式**的补救按钮。默认绝不做「最小化→恢复」（会闪任务栏），
-       * 但用户点这个按钮的意图就是「我现在要看见它」，所以必须给他一个能真做完的手段。 */
-      const forceBox = h('div', { style: { marginTop: '6px' } });
-      const pageOnlyIds = (r?.shown || []).filter((x) => x.ok && x.raise === 'page_only').map((x) => x.profile_id);
-      mount(resBox,
-        s.failed
-          ? h('div', { class: 'notice bad', style: { marginTop: '6px' } },
-            h('strong', null, s.message),
-            ...(s.details || []).map((x) => h('div', { class: 'muted small' },
-              `${nameOf(x.profile_id)}（${x.role === 'master' ? '主控' : '受控'}）：${x.reason || '没显示出来'}`)))
-          : h('div', { class: 'muted small', style: { marginTop: '6px' } }, s.message),
-        s.ok && s.page_only
-          ? h('div', { class: 'notice warn', style: { marginTop: '6px' } },
-            `有 ${s.page_only} 个窗口只做了页面级激活（可能仍被其它窗口盖住）。`
-            + '最小化的窗口会真的到前台；没最小化、只是被盖住的，当前版本抬不上来。')
-          : null,
-        pageOnlyIds.length ? forceBox : null);
-      if (pageOnlyIds.length) {
-        mount(forceBox, h('button', {
-          class: 'btn sm',
-          onClick: () => forceShow(forceBox, pageOnlyIds),
-        }, '强制抬到前台（会闪一下）'));
-      }
-    } catch (e) {
-      toast(e.message, 'bad');
-      mount(resBox, h('div', { class: 'notice bad', style: { marginTop: '6px' } }, e.message));
-    }
-    await reload(false);
-  }
-
-  /**
-   * 强制抬到前台：**一次性动作，不写设置、不做开关**。
-   *
-   * 手段是「最小化 → 恢复」，零依赖下唯一能真的把被盖住的窗口抬到 OS 前台的办法
-   * （实测会到前台，代价是任务栏闪一下、每个窗口 0.6–1.0 秒）。
-   * 产品里不调 Win32，所以**能确认的只有「窗口已恢复正常」，确认不了「它在最前面」** ——
-   * 文案因此是「已恢复显示并尝试置前」，不是「已置前」。
-   */
-  async function forceShow(resBox, ids) {
-    try {
-      const r = await api.syncShowForce(ids);
-      const s = r?.summary || {};
-      toast(s.message || '已恢复显示', s.failed ? 'bad' : '');
-      mount(resBox,
-        s.failed
-          ? h('div', { class: 'notice bad', style: { marginTop: '6px' } },
-            h('strong', null, s.message),
-            ...(s.details || []).map((x) => h('div', { class: 'muted small' },
-              `${nameOf(x.profile_id)}（${x.role === 'master' ? '主控' : '受控'}）：${x.reason || '未能确认'}`)))
-          : h('div', { class: 'muted small', style: { marginTop: '6px' } },
-            `${s.message}。窗口已恢复正常显示；这一版确认不了它是否在最前面。`));
-    } catch (e) {
-      toast(e.message, 'bad');
-      mount(resBox, h('div', { class: 'notice bad', style: { marginTop: '6px' } }, e.message));
-    }
   }
 
   /**

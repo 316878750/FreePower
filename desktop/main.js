@@ -5,15 +5,16 @@
  * 窗口只是一个浏览器视图，loadURL 到 127.0.0.1:<port>/。所以四页界面、
  * Local API、静态托管全都还是原来那一份，壳塌了用户仍能用 API 兜底。
  *
- * 安全姿势：renderer 不需要任何 Node 能力 —— contextIsolation 开、nodeIntegration 关、
- * sandbox 开、不挂 preload。window.open 一律拒（同源链接交给系统浏览器），
- * 页面试图导航到别处也拦下来。
+ * 安全姿势：renderer 不需要任何 Node 能力 —— contextIsolation 开、nodeIntegration 关、sandbox 开。
+ * **preload 只挂在主窗口上**，且只暴露 `isDesktop` 与 `openSyncPanel()` 两个东西（见 ./preload.cjs）；
+ * 操作台小窗不挂 preload（它改形态走 Local API + 请求文件，不走 IPC）。
+ * window.open 一律拒（同源链接交给系统浏览器），页面试图导航到别处也拦下来。
  */
 // electron 是 CJS 包，ESM 下拿不到具名导出，只能整体引入再解构
 import electron from 'electron';
 
 const {
-  app, BrowserWindow, Menu, Tray, nativeImage, shell, dialog, session, globalShortcut, screen,
+  app, BrowserWindow, Menu, Tray, nativeImage, shell, dialog, session, globalShortcut, screen, ipcMain,
 } = electron;
 import fs from 'node:fs';
 import path from 'node:path';
@@ -22,6 +23,17 @@ import { ensureNoChrome } from './residue.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const APP_ROOT = path.resolve(HERE, '..');
+
+/**
+ * preload 路径：**只给主窗口用**。
+ *
+ * 后缀是 `.cjs` 而不是 `.js`：`package.json` 里有 `"type": "module"`，`.js` 在 Electron 里
+ * 可能被当 ESM 解析，而 sandboxed preload **只能**是 CommonJS。用 `.cjs` 把这件事钉死，
+ * 不依赖 Electron 版本对「`.js` + type:module」的处理方式。
+ *
+ * 打包后它在 app.asar 里（preload 从 asar 加载是支持的），所以直接用 `__dirname` 拼即可。
+ */
+const PRELOAD_FILE = path.join(HERE, 'preload.cjs');
 
 app.setName('FreePower');
 app.setAppUserModelId('com.freepower.desktop');
@@ -89,6 +101,7 @@ async function main() {
   syncSession = await import('../src/sync/session.js');
   hotkeyMod = await import('../src/sync/hotkey.js');
   displaysMod = await import('../src/sync/displays.js');
+  consoleMod = await import('../src/sync/console.js');
 
   await app.whenReady();
 
@@ -112,6 +125,23 @@ async function main() {
   const storedHotkey = hotkeyMod.readHotkeyStatus();
   registerSyncHotkey(storedHotkey.managed ? storedHotkey.accelerator : SYNC_HOTKEY_DEFAULT);
   watchHotkeyRequests();
+
+  // 操作台：恢复上次的形态/设置/位置；主窗口「打开操作台」走这一个 IPC 通道
+  const storedConsole = consoleMod.readConsoleState();
+  consoleMode = consoleMod.normalizeConsoleMode(storedConsole.mode);
+  consolePrefs = consoleMod.normalizeConsolePrefs(storedConsole.prefs);
+  consolePos = storedConsole.rects || {};
+  ipcMain.handle('fp:open-sync-panel', (event) => {
+    // 只认主窗口的渲染进程：别让任意 webContents（哪怕是我们自己的操作台）拉起浮窗
+    if (!win || win.isDestroyed() || event.sender !== win.webContents) {
+      log('拒绝非主窗口的 open-sync-panel');
+      return { ok: false, error: '只允许主窗口打开操作台' };
+    }
+    showSyncPanel();
+    return { ok: true };
+  });
+  watchConsoleRequests();
+  log(`console 恢复 mode=${consoleMode} open=${consolePrefs.open} auto_shrink=${consolePrefs.auto_shrink} pos=${JSON.stringify(consolePos)}`);
 
   poller = setInterval(() => {
     const n = safeCount();
@@ -175,6 +205,8 @@ function createWindow() {
       webSecurity: true,
       spellcheck: false,
       devTools: !app.isPackaged,
+      // 只挂主窗口：暴露 isDesktop + openSyncPanel()，见 ./preload.cjs
+      preload: PRELOAD_FILE,
     },
   });
 
@@ -238,15 +270,34 @@ function showWindow() {
   win.focus();
 }
 
-/* ------------------------------ 窗口同步面板 ------------------------------ */
+/* ------------------------------ 窗口同步操作台 ------------------------------ */
 
 /** 默认快捷键（与对手一致）；实际生效值可能被用户在面板里改过 */
 const SYNC_HOTKEY_DEFAULT = process.env.FREEPOWER_SYNC_HOTKEY || 'CommandOrControl+Alt+S';
 let syncHotkey = SYNC_HOTKEY_DEFAULT;
 let hotkeyMod = null;
 let displaysMod = null;
+let consoleMod = null;
 let hotkeyPoll = null;
 let lastHotkeyRequestAt = null;
+
+/**
+ * 操作台的形态与位置（对手叫 Console 桌面小组件）。
+ *
+ * 两种形态**靠真改窗口尺寸**实现（`setBounds`），不是在一个大窗里换布局 ——
+ * 展开态 430×620 始终置顶，同步时正好挡住主控窗口要点的位置；
+ * 收起态 360×56 只剩一条横条。尺寸与默认值都是**我们选的**（对手无证据，README 已标）。
+ */
+let consoleMode = 'expanded';
+let consolePrefs = { open: true, auto_shrink: true };
+/** 两种形态各记各的左上角（共用会让「收起 → 展开」每次都跳位置） */
+let consolePos = {};
+let consolePoll = null;
+let consoleReqAt = null;
+let consoleHeartbeatAt = 0;
+let lastSyncRunning = false;
+let autoCollapsed = false;
+let consoleSaveTimer = null;
 
 /**
  * 面板是**独立小窗 + 始终置顶**，且同步过程中**绝不 focus()** ——
@@ -257,21 +308,84 @@ function syncPanelUrl(extra = '') {
   return `${baseUrl}#/sync-panel${extra ? `?${extra}` : ''}`;
 }
 
+function consoleSize(mode) {
+  return consoleMod?.consoleSizeOf ? consoleMod.consoleSizeOf(mode) : (mode === 'collapsed' ? { width: 360, height: 56 } : { width: 430, height: 620 });
+}
+
+function safeDisplays() {
+  try { return screen.getAllDisplays(); } catch { return []; }
+}
+
+/** 当前该用哪个 rect：有保存值且还在屏幕上就用保存的，否则回主屏居中（纯函数在 src/sync/console.js） */
+function pickRect(mode) {
+  const saved = consolePos[mode] || null;
+  if (consoleMod?.pickConsoleRect) {
+    return consoleMod.pickConsoleRect({ saved, displays: safeDisplays(), mode });
+  }
+  const size = consoleSize(mode);
+  return { rect: { x: 80, y: 80, ...size }, source: 'reset', reason: 'no_module' };
+}
+
+function persistConsoleState() {
+  try {
+    consoleHeartbeatAt = Date.now();
+    consoleMod?.writeConsoleState?.({
+      mode: consoleMode,
+      prefs: consolePrefs,
+      rect: syncPanel && !syncPanel.isDestroyed() ? syncPanel.getBounds() : null,
+      rects: consolePos,
+      displays_count: safeDisplays().length,
+    });
+  } catch (e) {
+    log('console state 写入失败', e && e.message ? e.message : String(e));
+  }
+}
+
+/**
+ * 切换形态：**真改窗口尺寸**（`setBounds`），改完**回读**（CEO 的硬约束：改窗口必回读验证）。
+ *
+ * 两个坑：
+ *   · `setBounds` 受最小尺寸约束 —— 收起态 360×56 会被展开态的 `minWidth 380` 挡住，
+ *     所以先把最小尺寸降下来，再 setBounds；
+ *   · 收起态不许用户拉大（`setResizable(false)`），否则一拉就露馅成一个奇怪的大窗。
+ */
+function applyConsoleMode(mode, reason = 'manual') {
+  consoleMode = consoleMod?.normalizeConsoleMode ? consoleMod.normalizeConsoleMode(mode) : (mode === 'collapsed' ? 'collapsed' : 'expanded');
+  if (!syncPanel || syncPanel.isDestroyed()) { persistConsoleState(); return null; }
+  const pick = pickRect(consoleMode);
+  try {
+    syncPanel.setResizable(consoleMode === 'expanded');
+    if (consoleMode === 'collapsed') syncPanel.setMinimumSize(320, 48);
+    else syncPanel.setMinimumSize(380, 420);
+    syncPanel.setBounds(pick.rect);
+    const got = syncPanel.getBounds();
+    const ok = Math.abs(got.width - pick.rect.width) <= 2 && Math.abs(got.height - pick.rect.height) <= 2;
+    consolePos[consoleMode] = { x: got.x, y: got.y };
+    log(`console mode=${consoleMode} reason=${reason} source=${pick.reason} want=${pick.rect.width}x${pick.rect.height}@${pick.rect.x},${pick.rect.y} got=${got.width}x${got.height}@${got.x},${got.y} ${ok ? 'ok' : 'MISMATCH'}`);
+  } catch (e) {
+    log('console setBounds 失败', e && e.message ? e.message : String(e));
+  }
+  persistConsoleState();
+  return syncPanel.getBounds();
+}
+
 function createSyncPanel(extra = '') {
+  const size = consoleSize(consoleMode);
   syncPanel = new BrowserWindow({
-    width: 430,
-    height: 620,
-    minWidth: 380,
-    minHeight: 420,
+    width: size.width,
+    height: size.height,
+    minWidth: consoleMode === 'collapsed' ? 320 : 380,
+    minHeight: consoleMode === 'collapsed' ? 48 : 420,
     show: false,
-    title: 'FreePower 窗口同步',
+    title: 'FreePower 窗口同步操作台',
     alwaysOnTop: true,
     skipTaskbar: true,
-    resizable: true,
+    resizable: consoleMode === 'expanded',
     minimizable: false,
     maximizable: false,
     backgroundColor: '#171a1f',
     icon: assetPath('tray.png'),
+    // 操作台小窗**不挂 preload**：它要改形态走 Local API + 请求文件，不走 IPC
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -290,17 +404,101 @@ function createSyncPanel(extra = '') {
     syncPanel.hide();
   });
   syncPanel.on('closed', () => { syncPanel = null; });
+
+  /** 用户拖动 / 拉大 → 记住这个形态的位置（400ms 防抖，拖的过程不写盘） */
+  const remember = () => {
+    if (consoleSaveTimer) clearTimeout(consoleSaveTimer);
+    consoleSaveTimer = setTimeout(() => {
+      consoleSaveTimer = null;
+      try {
+        if (!syncPanel || syncPanel.isDestroyed()) return;
+        const b = syncPanel.getBounds();
+        consolePos[consoleMode] = { x: b.x, y: b.y };
+        persistConsoleState();
+      } catch { /* ignore */ }
+    }, 400);
+    consoleSaveTimer.unref?.();
+  };
+  syncPanel.on('moved', remember);
+  syncPanel.on('resized', remember);
+
   syncPanel.webContents.setWindowOpenHandler(({ url }) => { openExternal(url); return { action: 'deny' }; });
+  // 建出来就按当前形态摆到该在的位置（保存值 / 回主屏居中）
+  applyConsoleMode(consoleMode, 'create');
   return syncPanel;
 }
 
-/** 显示面板：只出现不抢焦点（这是本条最关键的语义，别改成 show()+focus()） */
+/** 显示操作台：只出现不抢焦点（这是本条最关键的语义，别改成 show()+focus()） */
 function showSyncPanel(extra = '') {
   if (!syncPanel || syncPanel.isDestroyed()) createSyncPanel(extra);
   else if (extra) syncPanel.loadURL(syncPanelUrl(extra));
   syncPanel.showInactive();
   syncPanel.setAlwaysOnTop(true, 'floating');
   return syncPanel;
+}
+
+/**
+ * 轮询界面请求（收起/展开、设置、复位）并盯着「同步开始」这个时刻。
+ *
+ * 为什么走请求文件而不是 IPC：渲染进程没有 Node、没有 preload（**操作台小窗不挂 preload**），
+ * 与快捷键同一套姿势（见 `src/sync/hotkey.js`）。400ms 的延迟对「点收起」这种低频操作够用。
+ *
+ * 自动收起（`automaticShrink`）在这里生效：**同步从没跑变成在跑的那一下**，按设置进收起态。
+ * 只在状态跳变时动手 —— 用户手动展开后不会被下一轮轮询又收回去。
+ */
+function watchConsoleRequests() {
+  consolePoll = setInterval(() => {
+    try {
+      const req = consoleMod?.readConsoleRequest?.();
+      if (req && req.at !== consoleReqAt) {
+        consoleReqAt = req.at;
+        if (req.prefs) {
+          consolePrefs = req.prefs;
+          log(`console prefs → open=${consolePrefs.open} auto_shrink=${consolePrefs.auto_shrink}`);
+        }
+        if (req.reset_position === true) {
+          consolePos = {};
+          log('console 复位位置 → 主屏居中');
+        }
+        if (req.mode && req.mode !== consoleMode) {
+          if (!syncPanel || syncPanel.isDestroyed()) showSyncPanel();
+          applyConsoleMode(req.mode, 'request');
+        } else if (req.reset_position === true) {
+          applyConsoleMode(consoleMode, 'reset_position');
+        } else {
+          persistConsoleState();
+        }
+      }
+
+      let running = false;
+      try { running = !!syncSession?.getSession?.(); } catch { running = false; }
+      if (running && !lastSyncRunning) {
+        lastSyncRunning = true;
+        if (!consolePrefs.open) {
+          // 「操作台」关掉 = 同步开始时不弹这个小组件
+          if (syncPanel && !syncPanel.isDestroyed()) syncPanel.hide();
+          log('console: 操作台已关闭，同步开始时不显示');
+        } else if (consolePrefs.auto_shrink) {
+          showSyncPanel();
+          applyConsoleMode('collapsed', 'auto_shrink');
+          autoCollapsed = true;
+        }
+      } else if (!running && lastSyncRunning) {
+        lastSyncRunning = false;
+        if (autoCollapsed) {
+          autoCollapsed = false;
+          applyConsoleMode('expanded', 'auto_restore');
+          log('console: 同步结束，恢复展开态');
+        }
+      }
+
+      // 心跳：状态文件太旧界面会以为「没有桌面壳在管」
+      if (Date.now() - consoleHeartbeatAt > 10000) persistConsoleState();
+    } catch (e) {
+      log('console 轮询失败', e && e.message ? e.message : String(e));
+    }
+  }, 400);
+  consolePoll.unref?.();
 }
 
 /**
@@ -441,7 +639,7 @@ function refreshMenu() {
   const template = [
     { label: '打开控制台', click: () => showWindow() },
     {
-      label: syncHotkeyOk === false ? '窗口同步面板（快捷键不可用）' : `窗口同步面板（${syncHotkey.replace('CommandOrControl', 'Ctrl')}）`,
+      label: syncHotkeyOk === false ? '窗口同步操作台（快捷键不可用）' : `窗口同步操作台（${syncHotkey.replace('CommandOrControl', 'Ctrl')}）`,
       click: () => showSyncPanel(syncHotkeyOk === false ? 'shortcut=failed' : ''),
     },
     { label: `运行中：${n} 个环境`, enabled: false },
@@ -538,6 +736,9 @@ async function quitApp(reason) {
 
   try { if (poller) clearInterval(poller); } catch { /* ignore */ }
   try { if (hotkeyPoll) clearInterval(hotkeyPoll); } catch { /* ignore */ }
+  try { if (consolePoll) clearInterval(consolePoll); } catch { /* ignore */ }
+  try { if (consoleSaveTimer) clearTimeout(consoleSaveTimer); } catch { /* ignore */ }
+  try { ipcMain.removeHandler('fp:open-sync-panel'); } catch { /* ignore */ }
   try { globalShortcut.unregisterAll(); } catch { /* ignore */ }
   try { if (syncPanel && !syncPanel.isDestroyed()) syncPanel.destroy(); } catch { /* ignore */ }
   try { if (tray) tray.destroy(); } catch { /* ignore */ }
@@ -610,6 +811,64 @@ async function runSelfTest() {
     steps.sync_panel_focused_after_show = !!p && p.isFocused();   // 期望 false
   } catch (e) {
     steps.sync_panel_error = e && e.message ? e.message : String(e);
+  }
+
+  // 操作台（桌面小组件）：两种形态是不是**真改窗口尺寸**、位置校验会不会把窗口拽回屏幕内。
+  // 本机 agent shell 里 Electron 起不来（0x80000003），这类环境下面这些条目报 skip，不报失败。
+  steps.console = { skipped: true, reason: 'no_panel' };
+  if (syncPanel && !syncPanel.isDestroyed()) {
+    const c = { skipped: false };
+    steps.console = c;
+    const startMode = consoleMode;
+    const got = (mode, reason) => {
+      const r = applyConsoleMode(mode, reason);
+      return r || (syncPanel && !syncPanel.isDestroyed() ? syncPanel.getBounds() : null);
+    };
+    try {
+      const exGot = got('expanded', 'selftest');
+      await new Promise((r) => setTimeout(r, 300));
+      const exReal = syncPanel.getBounds();
+      c.expanded = { want: consoleMod.CONSOLE_EXPANDED, got: exReal, readback: exGot };
+      const coGot = got('collapsed', 'selftest');
+      await new Promise((r) => setTimeout(r, 300));
+      const coReal = syncPanel.getBounds();
+      c.collapsed = { want: consoleMod.CONSOLE_COLLAPSED, got: coReal, readback: coGot };
+      // 收起态必须**真的**矮 —— 只换布局不改尺寸的话这条会红
+      c.collapsed_shorter = coReal.height < exReal.height;
+      c.collapsed_matches = coReal.height === consoleMod.CONSOLE_COLLAPSED.height
+        && coReal.width === consoleMod.CONSOLE_COLLAPSED.width;
+      c.expanded_matches = exReal.width === consoleMod.CONSOLE_EXPANDED.width
+        && exReal.height === consoleMod.CONSOLE_EXPANDED.height;
+      c.collapsed_not_resizable = syncPanel.isResizable() === false;
+
+      const displays = safeDisplays();
+      const primary = displays.find((d) => d.primary === true) || displays[0] || null;
+      const wa = (primary && primary.workArea) || { x: 0, y: 0, width: 1920, height: 1080 };
+      c.displays_count = displays.length;
+      // 位置记忆：屏幕上能看见的点，校验后应当沿用保存值
+      const kept = consoleMod.pickConsoleRect({ saved: { x: wa.x + 40, y: wa.y + 40 }, displays, mode: 'collapsed' });
+      c.pos_kept = { source: kept.source, reason: kept.reason };
+      // 副屏拔掉 / 缩放变化：保存值落在屏幕外 → 必须回主屏居中
+      const offSaved = { x: wa.x + 3000, y: wa.y + 3000 };
+      const off = consoleMod.pickConsoleRect({ saved: offSaved, displays, mode: 'collapsed' });
+      c.pos_off_screen = { source: off.source, reason: off.reason, rect: off.rect };
+      // 真窗口版：把保存位置写成屏幕外，再走一次形态应用，窗口必须回到可见区
+      consolePos.collapsed = offSaved;
+      const back = got('collapsed', 'selftest_offscreen');
+      const backReal = syncPanel.getBounds();
+      c.off_screen_recovered = !!backReal
+        && backReal.x >= wa.x && backReal.y >= wa.y
+        && backReal.x + backReal.width <= wa.x + wa.width
+        && backReal.y + backReal.height <= wa.y + wa.height;
+      c.off_screen_bounds = { saved: offSaved, got: backReal, readback: back };
+      // 自动收起的默认值（对手无证据，是我们选的 true）
+      c.prefs_default = consoleMod.DEFAULT_CONSOLE_PREFS;
+      c.auto_shrink_default_on = consoleMod.DEFAULT_CONSOLE_PREFS.auto_shrink === true;
+    } catch (e) {
+      c.error = e && e.message ? e.message : String(e);
+    }
+    // 自检不能把用户的形态改掉：跑完回到进来时的样子
+    try { applyConsoleMode(startMode, 'selftest_restore'); } catch { /* ignore */ }
   }
 
   win.close();

@@ -390,6 +390,13 @@ console.log('\n— 11. 接线（静态扫描）—');
   const routeSrc = read('src/api/routes.js');
   const sessionSrc = read('src/sync/session.js');
   const panelSrc = read('web/pages/sync-panel.js');
+  /**
+   * 排列区块 0.4.5 起搬进了共用组件 `web/sync-widgets.js`（操作台与「窗口同步」页各摆一份，
+   * CEO 要求「复用组件、不许另写一套」）。所以下面这些断言扫的是**共用组件**，
+   * 并且额外钉住「两个页面都 import 它」—— 比原来只扫一个页面更严。
+   */
+  const widgetSrc = read('web/sync-widgets.js');
+  const syncPageSrc = read('web/pages/sync.js');
   const apiSrc = read('web/api.js');
   const desktopSrc = read('desktop/main.js');
   const arrangeSrc = read('src/sync/arrange.js');
@@ -400,16 +407,22 @@ console.log('\n— 11. 接线（静态扫描）—');
   check('路由真把 arrangeWindows / readDisplays 引进来了（不是只写在字符串里）',
     /import \{[^}]*arrangeWindows[^}]*\} from '\.\.\/sync\/session\.js'/.test(routeSrc)
     && /import \{ readDisplays \} from '\.\.\/sync\/displays\.js'/.test(routeSrc));
-  check('界面有「窗口排列」按钮并接上 API', panelSrc.includes('窗口排列') && panelSrc.includes('syncArrange'));
+  check('界面有「窗口排列」按钮并接上 API', widgetSrc.includes('窗口排列') && widgetSrc.includes('syncArrange'));
+  check('两个页面用的是同一份排列组件（不是各写一套）',
+    /import \{[^}]*buildArrangePanel[^}]*\} from '\.\.\/sync-widgets\.js'/.test(panelSrc)
+    && /import \{[^}]*buildArrangePanel[^}]*\} from '\.\.\/sync-widgets\.js'/.test(syncPageSrc));
   check('界面的参数名对齐对手（排列方式/起始位置/窗口大小/窗口间距/窗口数量/个\\/行/显示器）',
     ['排列方式', '起始位置', '窗口大小', '窗口间距', '窗口数量', '个/行', '显示器', '一键排列', '自定义排列']
-      .every((k) => panelSrc.includes(k)));
+      .every((k) => widgetSrc.includes(k)));
   check('界面用对手原文提示语（rangeTips / sync85）',
-    panelSrc.includes('根据显示器的分辨率自动排列所选窗口')
-    && panelSrc.includes('跨屏同步：建议使用【自定义排列】设置相同的窗口大小'));
+    widgetSrc.includes('根据显示器的分辨率自动排列所选窗口')
+    && widgetSrc.includes('跨屏同步：建议使用【自定义排列】设置相同的窗口大小'));
   check('界面把「没能排到位」如实显示（读 placed[].ok，不是自己拼成功）',
-    panelSrc.includes('placed') && /没能排到位/.test(panelSrc));
-  check('界面会读显示器列表（多屏选择不是摆设）', apiSrc.includes('syncDisplays') && panelSrc.includes('syncDisplays'));
+    widgetSrc.includes('placed') && /没能排到位/.test(widgetSrc));
+  check('界面会读显示器列表（多屏选择不是摆设）',
+    apiSrc.includes('syncDisplays')
+    && panelSrc.includes('syncDisplays') && syncPageSrc.includes('syncDisplays')
+    && /getDisplays/.test(widgetSrc));
   check('排列用 screensForArrange（服务进程侧读显示器）', /screensForArrange\(/.test(code(sessionSrc)));
   check('排列把窗口原状态交给 placeOne（非 normal 下宽高会被静默忽略）',
     /needsRestoreBeforeResize\(/.test(code(arrangeSrc)) && /stateBefore:/.test(code(sessionSrc)));

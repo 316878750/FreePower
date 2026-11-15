@@ -307,3 +307,21 @@ body.panel-mode .page { padding: 10px 12px 24px; }
 body.panel-mode .page-head { padding: 8px 12px; }
 body.panel-mode .page-head h1 { font-size: 14px; }
 body.panel-mode .panel { margin-bottom: 10px; }
+
+/* ---- 操作台收起态（桌面小组件：窗口被桌面壳真改成 360×56）----
+   收起态**只放五项**：状态词、主控名、受控数、停止、展开。
+   所以这里把页头与内边距全去掉，一行横条铺满整个窗口；横条本身可拖动（-webkit-app-region: drag），
+   按钮必须 no-drag，否则点不动。 */
+body.console-collapsed .page { padding: 0; height: 100vh; display: flex; align-items: stretch; }
+body.console-collapsed .page-head { display: none; }
+.console-bar {
+  flex: 1; display: flex; align-items: center; gap: 8px; padding: 0 10px;
+  background: #171a1f; color: #e6ebf2; -webkit-app-region: drag; overflow: hidden;
+}
+.console-bar .btn { -webkit-app-region: no-drag; height: 26px; padding: 0 10px; font-size: 12px; }
+.console-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex: 0 0 auto; }
+.console-dot.warn { background: #e0a63a; }
+.console-dot.idle { background: #6b7683; }
+.console-title { font-weight: 600; font-size: 12px; white-space: nowrap; }
+.console-master { max-width: 96px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #9fb0c4; font-size: 12px; }
+.console-slaves { color: #9fb0c4; font-size: 12px; white-space: nowrap; }
