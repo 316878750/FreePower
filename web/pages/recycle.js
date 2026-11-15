@@ -53,7 +53,159 @@ export default async function renderRecycle({ head, page }) {
         pager,
         h('div', { class: 'muted small', style: { marginTop: '8px' } },
           '回收站里的环境不会自动清理（对手写的是「保留 30 天」）。要腾磁盘，用「彻底删除」或「清空回收站」——'
-          + '那一步会真的删掉记录和 user-data 目录，不可恢复。'))));
+          + '那一步会真的删掉记录和 user-data 目录，不可恢复。'))),
+    cacheCleanupPanel());
+
+  /**
+   * 按天数删缓存（0.4.7 ④）。
+   *
+   * 为什么放在回收站页：这一页本来就是「腾磁盘」的地方。但它和回收站**不是一回事** ——
+   * 回收站删的是**记录**，这里删的是**还在用的环境的数据目录**（环境本身留着）。
+   *
+   * 三步，一步都不省（不可逆操作的标准姿势）：
+   *   1. 选天数 → 预览：**列出将删哪些、每个多大、哪些不删以及为什么**；
+   *   2. 用户逐条看过、勾掉不想删的；
+   *   3. 真删，报「删了几个、释放多少、哪几个没删掉以及为什么」。
+   *
+   * 天数只认我们自己记录的「最后启动时间」，**不看文件时间** —— 所以清单里那一列是真的，
+   * 而「判定不了」的环境会单独列出来并说明「不删」。
+   */
+  function cacheCleanupPanel() {
+    const daysInput = h('input', { type: 'number', min: '0', step: '1', value: '30', style: { width: '90px' } });
+    const resultBox = h('div', { class: 'stack', style: { marginTop: '10px' } });
+
+    async function preview() {
+      const days = Number(daysInput.value);
+      if (!Number.isFinite(days) || days < 0) { toast('天数要填 ≥0 的整数', 'bad'); return; }
+      let r;
+      try { r = await api.cacheCleanupPreview({ days }); } catch (e) { toast(`预览失败：${e.message}`, 'bad'); return; }
+      const del = r.will_delete || [];
+      const keep = r.keep || [];
+      const fmt = (b) => (b === null || b === undefined ? '—' : `${(b / 1048576).toFixed(1)} MB`);
+
+      if (!del.length) {
+        mount(resultBox,
+          h('div', { class: 'notice' }, `没有 ${days} 天以上没启动过的环境（扫了 ${r.summary.scanned} 个）。`),
+          keep.length ? keepList(keep) : null);
+        return;
+      }
+
+      const checks = new Map();
+      const rows = del.map((x) => {
+        const cb = h('input', { type: 'checkbox', checked: true });
+        checks.set(x.profile_id, cb);
+        return h('tr', null,
+          h('td', null, cb),
+          h('td', null, h('div', null, x.name || '(未命名)'), h('span', { class: 'muted small mono' }, `#${x.profile_no ?? '—'}`)),
+          h('td', null, `${x.days_unused} 天前`),
+          h('td', { class: 'muted small' }, x.last_launch_at ? x.last_launch_at.slice(0, 19).replace('T', ' ') : '—'),
+          h('td', null, fmt(x.size_bytes)));
+      });
+
+      mount(resultBox,
+        h('div', { class: 'notice warn' },
+          `将删除 ${del.length} 个环境的数据目录，共 ${fmt(r.total_bytes)}。删掉的是 cache / cookie / localStorage / 书签 / 登录态 —— `,
+          h('strong', null, '下次启动是全新浏览器'),
+          '，环境本身（记录、代理、指纹配置）都还在。'),
+        h('div', { class: 'muted small' },
+          '「多久没开」用的是我们自己记录的「最后启动时间」，不是文件时间（文件时间会被备份、复制、杀毒软件改掉，拿它判断会删错）。'),
+        (r.unknown_count > 0)
+          ? h('div', { class: 'notice' },
+            `其中 ${r.unknown_count} 个环境没有「最后启动时间」的记录（0.4.7 之前启动过的都是这样），`,
+            h('strong', null, '判定不了多久没开，一律不删'),
+            ' —— 它们在环境里真启动一次之后才会有记录。')
+          : null,
+        h('table', { class: 'grid' },
+          h('thead', null, h('tr', null,
+            h('th', { style: { width: '40px' } }, ''),
+            h('th', null, '环境'),
+            h('th', { style: { width: '110px' } }, '未启动'),
+            h('th', { style: { width: '170px' } }, '最后启动'),
+            h('th', { style: { width: '100px' } }, '占用'))),
+          h('tbody', null, ...rows)),
+        keep.length ? keepList(keep) : null,
+        h('div', { class: 'toolbar', style: { marginTop: '10px' } },
+          h('button', {
+            class: 'btn danger',
+            onClick: () => confirmAndRun(days, del.filter((x) => checks.get(x.profile_id)?.checked), fmt),
+          }, '删除勾选的这些数据目录')));
+
+      async function confirmAndRun(d, list, fmtSize) {
+        if (!list.length) { toast('一个都没勾'); return; }
+        const yes = await confirmDialog({
+          title: '按天数删缓存 · 确认',
+          body: h('div', { class: 'stack' },
+            h('div', null, `将删除 ${list.length} 个环境的数据目录，共 ${fmtSize(list.reduce((n, x) => n + (x.size_bytes || 0), 0))}。`),
+            h('div', { class: 'notice bad' },
+              h('strong', null, '这一步不可恢复'),
+              '。删掉的是整个环境数据目录：cache、cookie、localStorage、书签、登录态。'
+              + '下次启动是全新浏览器，要重新登录。'),
+            h('div', { class: 'muted small' },
+              '环境本身不会被删：记录、代理、指纹配置都还在，只是浏览器里的东西没了。'),
+            h('div', { class: 'code-block', style: { whiteSpace: 'pre-wrap', maxHeight: '30vh', overflow: 'auto' } },
+              list.map((x) => `· ${x.name || x.profile_id}（#${x.profile_no ?? '—'}）：${x.days_unused} 天未启动，${fmtSize(x.size_bytes)}`).join('\n'))),
+          okLabel: '确认删除', danger: true,
+        });
+        if (!yes) { toast('已取消，一个字节都没动'); return; }
+        let res;
+        try {
+          res = await api.cacheCleanup({
+            days: d,
+            confirm_ids: list.map((x) => x.profile_id),
+          });
+        } catch (e) { toast(`删除失败：${e.message}`, 'bad'); return; }
+        const s = res.summary || {};
+        const failed = res.failed || [];
+        mount(resultBox,
+          h('div', { class: failed.length ? 'notice warn' : 'notice ok' },
+            `已删除 ${s.deleted} 个环境的数据目录，释放 ${fmtSize(s.freed_bytes)}。`
+            + (failed.length ? `${failed.length} 个没删掉。` : '')),
+          failed.length ? h('div', { class: 'code-block', style: { whiteSpace: 'pre-wrap' } },
+            failed.map((f) => `· ${f.name || f.profile_id}：${f.intact ? '一个字节都没动（被占用，关掉占用后可以再试）' : '数据已不在原位置'}${f.error_code ? `（${f.error_code}）` : ''}`).join('\n')) : null,
+          (res.kept_after_confirm || []).length
+            ? h('div', { class: 'muted small' }, `有 ${res.kept_after_confirm.length} 个在你确认之后状态变了（比如刚被启动），已经跳过没删。`)
+            : null,
+          h('button', { class: 'btn sm', onClick: () => preview() }, '重新扫一遍'));
+      }
+    }
+
+    function keepList(keep) {
+      const byReason = new Map();
+      for (const k of keep) {
+        if (!byReason.has(k.reason)) byReason.set(k.reason, []);
+        byReason.get(k.reason).push(k);
+      }
+      const LABEL = {
+        recent: '最近启动过，不够天数',
+        unknown: '判定不了多久没开（没有「最后启动时间」的记录）—— 一律不删',
+        running: '现在就在运行',
+        no_data: '天数够了，但没有数据目录',
+      };
+      return h('details', { style: { marginTop: '10px' } },
+        h('summary', { class: 'muted small' }, `不删的 ${keep.length} 个（点开看原因）`),
+        h('div', { class: 'stack', style: { marginTop: '6px' } },
+          ...[...byReason].map(([reason, list]) => h('div', null,
+            h('div', { class: 'muted small' }, `${LABEL[reason] || reason}：${list.length} 个`),
+            h('div', { class: 'code-block', style: { whiteSpace: 'pre-wrap', maxHeight: '160px', overflow: 'auto' } },
+              list.slice(0, 50).map((x) => `· ${x.name || x.profile_id}${x.why ? `：${x.why}` : ''}`).join('\n'))))));
+    }
+
+    return h('div', { class: 'panel', style: { marginTop: '14px' } },
+      h('div', { class: 'panel-body' },
+        h('div', { class: 'toolbar' },
+          h('strong', null, '按天数清理未开环境的缓存'),
+          h('span', { class: 'grow' })),
+        h('div', { class: 'muted small', style: { marginBottom: '8px' } },
+          '环境多了 data\\profiles 会占很多磁盘。这里按「多久没启动」筛出可以清掉的数据目录 —— ',
+          h('strong', null, '会先列出将删哪些、各占多少'),
+          '，你确认之后才真删。'),
+        h('div', { class: 'toolbar' },
+          h('span', null, '删除'),
+          daysInput,
+          h('span', null, '天以上没启动的环境数据'),
+          h('button', { class: 'btn sm', onClick: () => preview() }, '先看看会删哪些')),
+        resultBox));
+  }
 
   await loadGroups();
   await load();

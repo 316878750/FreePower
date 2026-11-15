@@ -600,6 +600,58 @@ export function markStatus(profileId, status) {
 }
 
 /**
+ * 记一次「这个环境真的启动过」（0.4.7 ④ 的事实源）。
+ *
+ * 为什么必须自己记：`last_launch_at` 这个列一直存在，但**从来没人写过**（0.4.6 之前是空列）。
+ * 而「按天数删缓存」要判「多久没开过」，唯一可信的来源就是这个时间戳 ——
+ * **不能拿文件 mtime 猜**：mtime 会被备份、复制、杀毒软件、解压工具改掉，删错就是不可逆的数据损失。
+ *
+ * 什么时候写：**内核真的起来、页面装配完之后**（不是"开始启动"就写）——
+ * 启动失败的那次不该算「开过」，否则一个起不来的环境会永远删不掉。
+ */
+export function markLaunched(profileId, at = new Date()) {
+  getDb().prepare('UPDATE profiles SET last_launch_at = ? WHERE id = ?').run(at.toISOString(), String(profileId));
+}
+
+/**
+ * 「最后启动时间」的只读视图，给「按天数删缓存」用（0.4.7 ④）。
+ *
+ * 三类，**必须分开**，因为「判定不了」和「很久没开」是完全不同的结论：
+ *   - `known`   ：有 `last_launch_at` 记录 → 用它算天数；
+ *   - `unknown` ：没有记录（这一版之前创建/启动过的环境都是这种）→ **不删**，如实报「判定不了」；
+ *   - `running` ：现在就在跑 → **不删**（不能删一个正在用的环境的数据）。
+ *
+ * @returns {{profile_id:string, profile_no:number, name:string, state:'known'|'unknown'|'running',
+ *            last_launch_at:string|null, days:number|null, reason:string|null}}
+ */
+export function lastLaunchOf(profile, { now = new Date() } = {}) {
+  const at = String(profile.last_launch_at || '').trim();
+  const base = {
+    profile_id: profile.id || profile.profile_id,
+    profile_no: profile.profile_no ?? null,
+    name: profile.name ?? '',
+    last_launch_at: at || null,
+  };
+  if (String(profile.status || '') === 'running') {
+    return { ...base, state: 'running', days: null, reason: '这个环境现在就在运行，不参与清理' };
+  }
+  if (!at) {
+    return {
+      ...base,
+      state: 'unknown',
+      days: null,
+      reason: '没有「最后启动时间」的记录（这一版之前启动过的环境都没有），无法判定多久没开 —— 不删',
+    };
+  }
+  const t = Date.parse(at);
+  if (!Number.isFinite(t)) {
+    return { ...base, state: 'unknown', days: null, reason: `「最后启动时间」不是合法时间（${at}），无法判定 —— 不删` };
+  }
+  const days = Math.floor((now.getTime() - t) / 86400000);
+  return { ...base, state: 'known', days: Math.max(days, 0), reason: null };
+}
+
+/**
  * 启动前一致性校验。分两级（见 packages/profile/src/validate.js）：
  *   - 字段级错误（值域非法）+ 硬冲突 → 阻断
  *   - 软冲突（语言↔时区、核数↔内存、没绑代理…）→ 只告警

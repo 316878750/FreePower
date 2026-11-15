@@ -241,6 +241,18 @@ export const api = {
   /** 这些环境现在有没有可撤销的合并（只读，不碰内核） */
   batchCookieUndoStatus: (ids) => call('/api/v2/browser-profile/batch/cookie/undo', { query: { profile_ids: ids.join(',') } }),
 
+  /* ---- 按天数删缓存（0.4.7 ④） ---- */
+  /**
+   * 先看会删哪些。**这一步一个字节都不动**，只返回清单 + 每个多大 + 不删的及原因。
+   * 不给 `profile_ids` = 全部环境参与筛选（归档的也算，归档只是移出主列表，照样占磁盘）。
+   */
+  cacheCleanupPreview: (body) => call('/api/v2/browser-profile/cache-cleanup/preview', { method: 'POST', body, timeoutMs: 120000 }),
+  /**
+   * 真删。只删 `confirm_ids` 里、且**现在的计划里还在**的那些（确认之后状态变了的会跳过并报回来）。
+   * 删的是整个 user-data 目录，环境记录不删 —— 下次启动是全新浏览器。
+   */
+  cacheCleanup: (body) => call('/api/v2/browser-profile/cache-cleanup', { method: 'POST', body, timeoutMs: 300000 }),
+
   /* ---- 应用中心 / 扩展（0.4.3） ---- */
   /**
    * 扩展库。**文件全局共享一份**（`<数据根>/ext_env/<id>/`），环境只存勾选关系。

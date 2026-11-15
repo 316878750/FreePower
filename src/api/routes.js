@@ -32,6 +32,7 @@ import {
 } from '../store/proxies.js';
 import { startProfile, stopProfile, listRunning, getRunning, getInstance, userDataDirFor } from '../runtime/manager.js';
 import { purgeProfileData } from '../runtime/purge-data.js';
+import { planCacheCleanup, applyCacheCleanup } from '../runtime/cache-cleanup.js';
 import { batchStart, batchStop } from '../runtime/batch.js';
 import { profileFormSchema } from './schema.js';
 import { validateProfile } from '../../packages/profile/src/validate.js';
@@ -1523,6 +1524,120 @@ export function buildRoutes() {
         restored: preview ? 0 : list.length,
         planned: preview ? list.length : 0,
         failed: failed.length,
+      },
+    });
+  });
+
+  /* ==================== 0.4.7 ④ 按天数删缓存 ====================
+   *
+   * **两阶段，不许合并成一步**：
+   *   - `POST /api/v2/browser-profile/cache-cleanup/preview`（默认）→ 只读，回「将删哪些、各多大、
+   *     哪些不删以及为什么」；
+   *   - `POST /api/v2/browser-profile/cache-cleanup` + `preview:false` → 真删，**只删清单里那些**。
+   *
+   * 为什么必须两阶段：这是**不可逆**的（删掉 cache + cookie + localStorage + 书签 + 登录态）。
+   * 用户看到的必须是「将删哪些」，不是「已删除 N 个」。
+   *
+   * 天数只认 `profiles.last_launch_at`（我们自己记的最后启动时间），**不拿文件 mtime 猜** ——
+   * mtime 会被备份/复制/解压/杀毒改掉，拿它判「多久没开」会删掉天天在用的环境。
+   * 没有记录的环境如实归到 `unknown`（判定不了、不删），并在清单里说明原因。
+   */
+  const cacheCleanupTargets = (ctx) => {
+    const body = ctx.body || {};
+    const raw = body.profile_ids ?? body.profile_id;
+    if (raw === undefined || raw === null || raw === '') {
+      // 不给 profile_ids = 「全部环境参与筛选」，这是这条路由的本意（按天数筛）。
+      // 与批量动作不同：这里「没给」有明确含义，不是拼错。
+      const all = listProfiles({ page: 1, page_size: 500, archived: 'include' });
+      let list = all.list;
+      // 超过 500 个时分页取全（环境多的时候这条才有意义）
+      let page = 2;
+      while (all.total > list.length && page <= 20) {
+        const next = listProfiles({ page, page_size: 500, archived: 'include' });
+        if (!next.list.length) break;
+        list = list.concat(next.list);
+        page += 1;
+      }
+      return list;
+    }
+    const ids = idList(Array.isArray(raw) ? raw : String(raw).split(',').map((s) => s.trim()).filter(Boolean), 'v2');
+    const out = [];
+    for (const id of ids) {
+      const p = getProfile(id) || getProfileByNo(id);
+      if (p) out.push(p);
+    }
+    return out;
+  };
+
+  add(['POST'], ['/api/v2/browser-profile/cache-cleanup/preview'], (ctx) => {
+    const days = Number((ctx.body || {}).days);
+    if (!Number.isFinite(days) || days < 0) {
+      throw new ApiError(ERR.INVALID, 'days 必须是 ≥0 的数字（删「N 天未开环境」的缓存）', 200, { field: 'days' });
+    }
+    const profiles = cacheCleanupTargets(ctx);
+    const plan = planCacheCleanup(profiles, { days });
+    return ok({
+      preview: true,
+      days: plan.days,
+      // 清单里带 size_bytes 与 days_unused：用户要能判断「删掉能省多少、这些真的很久没开了吗」
+      will_delete: plan.will_delete,
+      keep: plan.keep,
+      total_bytes: plan.total_bytes,
+      // 「判定不了」单独计数：这类环境不删，但要让用户知道有多少个是「不知道多久没开」的
+      unknown_count: plan.unknown_count,
+      summary: {
+        scanned: profiles.length,
+        will_delete: plan.will_delete.length,
+        keep: plan.keep.length,
+        unknown: plan.unknown_count,
+        total_bytes: plan.total_bytes,
+      },
+    });
+  });
+
+  add(['POST'], ['/api/v2/browser-profile/cache-cleanup'], (ctx) => {
+    const body = ctx.body || {};
+    const days = Number(body.days);
+    if (!Number.isFinite(days) || days < 0) {
+      throw new ApiError(ERR.INVALID, 'days 必须是 ≥0 的数字（删「N 天未开环境」的缓存）', 200, { field: 'days' });
+    }
+    const profiles = cacheCleanupTargets(ctx);
+    const plan = planCacheCleanup(profiles, { days });
+
+    /*
+     * 真要删时，**必须带上用户确认过的那份清单**（`profile_ids` 或 `confirm_ids`）。
+     * 为什么：计划是「算」出来的，而用户点确认到服务端执行之间，环境状态可能变了
+     * （比如某个环境刚被启动）。这时候「按新计划删」就会删到用户没看见的东西。
+     * 所以：实际删的集合 = 用户确认的集合 ∩ 现在的计划 —— 两边都同意才删。
+     */
+    const confirmedRaw = body.confirm_ids ?? body.profile_ids;
+    let targetIds = null;
+    if (confirmedRaw !== undefined && confirmedRaw !== null && confirmedRaw !== '') {
+      targetIds = new Set(idList(Array.isArray(confirmedRaw) ? confirmedRaw : String(confirmedRaw).split(',').map((s) => s.trim()).filter(Boolean), 'v2').map(String));
+    }
+    const toDelete = targetIds
+      ? plan.will_delete.filter((x) => targetIds.has(String(x.profile_id)))
+      : plan.will_delete;
+    // 用户确认了但现在已经不该删的（刚启动 / 刚有记录）：如实报，不删
+    const nowKept = targetIds
+      ? plan.keep.filter((x) => targetIds.has(String(x.profile_id)))
+      : [];
+
+    const r = applyCacheCleanup(toDelete);
+    return ok({
+      preview: false,
+      days,
+      deleted: r.deleted,
+      failed: r.failed,
+      kept_after_confirm: nowKept,
+      freed_bytes: r.freed_bytes,
+      unknown_count: plan.unknown_count,
+      summary: {
+        scanned: profiles.length,
+        deleted: r.deleted.length,
+        failed: r.failed.length,
+        kept_after_confirm: nowKept.length,
+        freed_bytes: r.freed_bytes,
       },
     });
   });

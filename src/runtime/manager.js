@@ -14,7 +14,7 @@ import { writeCookies } from '../kernel/cookies.js';
 import { alignProfileToKernel } from '../kernel/version.js';
 import { fingerprintView, geoPolicy } from '../fingerprint/view.js';
 import { ensureNoiseSeeds } from '../fingerprint/seeds.js';
-import { checkProfile, markStatus, applyProfileFields, persistEgress } from '../store/profiles.js';
+import { checkProfile, markStatus, markLaunched, applyProfileFields, persistEgress } from '../store/profiles.js';
 import { extensionsForProfile, rememberUniqueId } from '../store/extensions.js';
 import { loadUnpackedExtensions } from '../kernel/extensions.js';
 import { checkProxy, hasProxy, normalizeProxyConfig } from '../proxy/probe.js';
@@ -458,6 +458,10 @@ export async function startProfile(profile, { force = false, systemProxy = null 
 
       instance.status = 'running';
       markStatus(id, 'running');
+      // 「最后启动时间」（0.4.7 ④）：**成功之后**才写。启动失败的那次不该算「开过」，
+      // 否则一个起不来的环境会永远删不掉。它是「按天数删缓存」唯一可信的时间来源 ——
+      // 不拿文件 mtime 猜（mtime 会被备份/复制/杀毒改掉）。
+      try { markLaunched(id); } catch (e) { log(id, 'WARN 记录最后启动时间失败', e.message); }
       return toStartData(instance);
     } catch (err) {
       log(id, 'start failed', err.message);
