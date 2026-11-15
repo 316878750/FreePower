@@ -194,6 +194,10 @@ export const COVERAGE = {
   domain_https: 'partial',
   tabAssistantExt: 'n/a',
   tabAssistantFeatures: 'n/a',
+  // hidden_notification（0.4.6 接线）：对手机制是 CDP `evaluateOnNewDocument` 改写
+  // `Notification.requestPermission`（逆向 `30-假字段消费机制.md` §2），**不需要自编译内核** ——
+  // 与我们同一套机制，所以它不属于「内核不读私有键」那一类，禁用才是漏做。
+  // 标 partial：JS 层改写（带 `native code` 前置判断，防重复注入），有注入痕迹但页面可见效果一致。
   hidden_notification: 'partial',
 
   // 启动 / 缓存
@@ -224,10 +228,6 @@ export const COVERAGE = {
   // 标 partial：延迟窗口内目录若被占用，Windows 上会删不掉 —— 那时「日志里只有一行失败」，
   // 与对手的静默行为一致，不报错、也不假装删掉了。
   clear_cache_after_closing: 'partial',
-  // hidden_notification（0.4.6 接线）：对手机制是 CDP `evaluateOnNewDocument` 改写
-  // `Notification.requestPermission`（逆向 `30-` §2），**不需要自编译内核**，与我们同一机制。
-  // 标 partial：JS 层改写（带 `native code` 前置判断，防重复注入），有注入痕迹但页面可见效果一致。
-  hidden_notification: 'partial',
   cache_backup: 'n/a',
   storage_strategy: 'partial',
   storage_cloud_option: 'n/a',

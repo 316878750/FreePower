@@ -1567,7 +1567,11 @@ test('空转字段：标了必须说清原因，BASIC 里一个都不许漏标',
     assert.ok(f, `${n} 应当禁用（0.4.6 裁决）`);
     assert.match(f.idle_reason, /内核|零读取/, `${n} 的原因要说清为什么做不到`);
   }
-  // ⑨ disable_video 保持接线：它走 CDP 拦截（不是内核私有键），禁用会是能力倒退
+  // ⑨ disable_video 保持接线：它走 CDP 拦截（不是内核私有键），禁用会是能力倒退。
+  //    **为什么它和 image_size 待遇不同**（CEO 2026-11-15 复核过，别再搞混）：
+  //      disable_video / disable_image → CDP `Fetch` 拦截，官方 Chrome for Testing 就能做 → 接线；
+  //      image_size（按字节限制）      → `StaticConfig.NetFilters.maxSize`，**需定制内核** → 禁用。
+  //    两者不是一回事：image_size 禁用**不**意味着 disable_video 也该禁。
   assert.ok(!idle.some((f) => f.name === 'disable_video'), 'disable_video 应当仍生效（CDP Fetch 拦截）');
   // ⑧ overrides.mjs（coverage 的事实源）与 idle 不许互相矛盾：idle 的字段不许标 full。
   //    判据是「不是 full」而不是「必须是 none|partial」：overrides 里还有 n/a（不是指纹维度），

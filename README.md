@@ -560,6 +560,20 @@ B 层 `npm run test:import-large` **15 PASS / 0 FAIL**（合成 18.9 MB / 50 块
 
 哪些字段被禁用、为什么、证据引哪一节，见 [docs/23-假字段清理.md](docs/23-假字段清理.md)。
 
+**本版真正改变运行时行为的只有两处接线**（其余 71 个是禁用），所以这两处各有一条真内核判据：
+
+```
+node --no-warnings test/close-purge-kernel.test.mjs → 16 PASS / 0 FAIL （B 层真内核，进 npm run smoke）
+node --no-warnings test/login-cookie-kernel.test.mjs → 19 PASS / 0 FAIL （B 层真内核，进 npm run smoke）
+```
+
+- `clear_cache_after_closing`：**开着 → 停止后约 2 秒数据目录真的没了；关着 → 6 秒后仍在**。
+  两条必须成对，否则「目录没了」可能来自别的路径。另外钉住「1 秒时还在」（照抄对手的 2 秒延迟）、
+  「只删 `userdata` 这一层、父目录不动」（防删过头）、「清完还能再启动」。
+- `cookie`：判的是**页面自己看得见的 `document.cookie`**，不是「CDP 里存着一条」。对照组不配就没有；
+  乱码 cookie **不许把环境锁死**（照常起、日志有 WARN）；txt 导入常见的原始串 `a=b; c=d` 按启动网址挂域名。
+  日志里**只出现条数、不出现 cookie 的值**（登录凭据不进日志，判据反查断言）。
+
 ## 六、桌面壳与安装包（P6）
 
 同一个服务，套了一层 Electron：主进程内起的就是上面那个 `node:http`，窗口 `loadURL` 到 `127.0.0.1:<port>/`。
@@ -1096,16 +1110,21 @@ Object.getOwnPropertyNames(window).some(n => /^__fp/.test(n))   // true → 这�
     `data/sync-console.request.json` 界面写、桌面壳 400ms 轮询读），与全局快捷键同一套姿势。
     代价是**点「收起」到真的收起来最多差 400ms**；好处是渲染进程拿不到任何 IPC 能力，操作台页面即使被换掉也打不开别的通道。
     主进程侧仍校验 `event.sender === win.webContents`，非主窗口的调用一律拒绝并记日志。
-57. **「能配但不生效」这件事，从 0.4.6 起由判据兜住**（`test/fields-invariant.test.mjs`，5 条，已进 `npm test`）：
+57. **「能配但不生效」这件事，从 0.4.6 起由判据兜住**（`test/fields-invariant.test.mjs`，**6 条**，已进 `npm test`）：
     可配字段必须在行为层有读取点（A）、禁用字段必须有页面上看得见的理由（B）、138 个字段必须三桶全覆盖（B′）、
-    本版接线的四个字段消费路径不许被回退（C）。逐条裁决与证据见 [docs/23-假字段清理.md](docs/23-假字段清理.md)。
+    本版接线的字段消费路径不许被回退 + 「不看就会踩坑」的必须有可见提示（C）、
+    `overrides.mjs` 每张注册表的**顶层键不许重复**（D，按大括号深度判，嵌套键不算）。
+    逐条裁决与证据见 [docs/23-假字段清理.md](docs/23-假字段清理.md)。
     **它挡得住「零读取」，挡不住「读了但接错层」** —— 语义级数据流分析我们没做，不假装做了。
 58. **0.4.6 有两处「读了但不生效」是照抄对手语义，不是漏做**：`clear_cache_after_closing` 删失败
     只记一行日志、不弹错（对手就是静默的）；`disable_video` 走 CDP 请求拦截而不是内核 `NetFilters`。
     前者等 0.4.7 的丢数据兜底再加强提示。
-59. **0.4.6 没跑真 Chrome 套件**：`npm run smoke` 与 `test/switches.test.mjs` 需要单租户窗口（团队规矩），
-    这一版只跑了 `npm test`（25 个脚本、全离线）。`cookie` 启动写入与 `clear_cache_after_closing`
-    的**真窗口读数都没有**，不许当已验证。
+59. **0.4.6 没整条跑 `npm run smoke`**（需要单租户窗口，团队规矩）：`npm test` 25 个脚本全过（全离线），
+    **本版唯一两处改变运行时行为的接线各自补了真内核判据并实跑**（`close-purge-kernel` 16 PASS /
+    `login-cookie-kernel` 19 PASS，内核 157.0.8103.78）。`test/switches.test.mjs` 的 `disable_video`
+    读数**没有重跑**，引的是既有读数 —— 这一条别当已验证。
+    仍然没验的：`cookie` 启动写入路上的 `httpOnly` / `secure` / 分区 cookie；以及所有**界面观感**
+    （本机 agent shell 里 Electron 起不来，没有截图）。
 
 
 

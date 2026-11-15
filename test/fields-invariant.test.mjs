@@ -271,3 +271,104 @@ test('不变式 C：本轮接上的四个字段（clear_cache_after_closing / hi
     assert.ok(f.note && re.test(f.note), `${n} 已接线但界面没有可见提示（f.note 为空或不含关键信息）—— 用户不看就会踩坑`);
   }
 });
+
+/* ============================================================================
+ * D · 注册表里不许有重复键（JS 会静默让最后一次覆盖，看不出来）
+ * ==========================================================================*/
+
+/**
+ * 把源码变成「只有代码、没有注释与字符串内容」的文本，**换行一个不丢**（行号才对得上）。
+ *
+ * 为什么不能拿正则凑：`overrides.mjs` 的注释里满是反引号与中文括号（`30-假字段消费机制.md`
+ * 那种引用），直接 `^  key:` 数行会把注释里的示例也算成键；而字符串里的 `{` `}` 会把深度带偏。
+ * 所以这里逐字符走一遍：注释整段丢掉、字符串只留引号骨架、换行保留。
+ */
+function codeOnly(src) {
+  let out = '';
+  let mode = null;
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
+    const n = src[i + 1];
+    if (mode) {
+      if (c === '\\') { i++; continue; }
+      if (c === mode) { mode = null; continue; }
+      if (c === '\n') out += '\n';
+      continue;
+    }
+    if (c === '/' && n === '/') { while (i < src.length && src[i] !== '\n') i++; out += '\n'; continue; }
+    if (c === '/' && n === '*') {
+      i += 2;
+      while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) { if (src[i] === '\n') out += '\n'; i++; }
+      i++;
+      continue;
+    }
+    if (c === "'" || c === '"' || c === '`') { mode = c; continue; }
+    out += c;
+  }
+  return out;
+}
+
+/**
+ * 扫出每个 `export const X = { … }` 的**顶层键**（大括号深度 === 1 时才收），
+ * 返回 `[{ table, keys: [{ key, line }] }]`。
+ *
+ * 为什么必须按深度：`EFFECT` / `UNSUPPORTED` 里的值是嵌套对象
+ * （`{ effect: 'local', sites: [...] }`），顶层键和嵌套键用同一条规则数会把
+ * `effect` / `sites` 也算成顶层键，一有第二处就误报重复。
+ */
+function topLevelKeys(src) {
+  const lines = codeOnly(src).split('\n');
+  const tables = [];
+  let depth = 0;
+  let cur = null;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const exp = /^\s*export const ([A-Za-z_$][\w$]*)\s*=\s*\{/.exec(line);
+    if (exp) {
+      cur = { table: exp[1], keys: [] };
+      tables.push(cur);
+    } else if (cur && depth === 1) {
+      const k = /^\s*(?:['"]([A-Za-z_$][\w$]*)['"]|([A-Za-z_$][\w$]*))\s*:/.exec(line);
+      if (k) cur.keys.push({ key: k[1] || k[2], line: i + 1 });
+    }
+    for (const ch of line) {
+      if (ch === '{' || ch === '[') depth++;
+      else if (ch === '}' || ch === ']') depth--;
+    }
+    if (exp) depth = 1; // `export const X = {` 这一行自己把深度带到 1
+    if (depth <= 0) { depth = 0; cur = null; }
+  }
+  return tables;
+}
+
+test('不变式 D：overrides.mjs 的注册表里不许有重复键（重复键会被静默覆盖，行为变了没人报）', () => {
+  const src = fs.readFileSync(new URL('packages/profile/reference/overrides.mjs', ROOT), 'utf8');
+  const tables = topLevelKeys(src);
+
+  // ① 先证明扫描器真的扫到东西了 —— 扫空了的判据永远是绿的，比没有更坏
+  const names = tables.map((t) => t.table);
+  for (const must of ['COVERAGE', 'EFFECT', 'UNSUPPORTED', 'METADATA']) {
+    assert.ok(names.includes(must), `扫描器没扫到 ${must} 这张表（判据自己坏了）`);
+  }
+  const totalKeys = tables.reduce((a, t) => a + t.keys.length, 0);
+  assert.ok(totalKeys > 200, `只扫到 ${totalKeys} 个顶层键，明显不对（判据自己坏了）`);
+  // COVERAGE 是「逐字段给 coverage」的那张表（138 个字段里有一部分不属于指纹维度、不在这张表里，
+  // 所以是 115 不是 138）；这里钉个下限，只为了抓「扫描器自己坏了、扫出个空表也算绿」
+  const cov = tables.find((t) => t.table === 'COVERAGE');
+  assert.ok(cov.keys.length >= 110, `COVERAGE 只扫到 ${cov.keys.length} 个键`);
+
+  // ② 同一个对象里同一个键出现两次 → 红，并点名「哪个对象、哪个键、哪几行」
+  const dups = [];
+  for (const t of tables) {
+    const seen = new Map();
+    for (const { key, line } of t.keys) {
+      if (!seen.has(key)) { seen.set(key, [line]); continue; }
+      seen.get(key).push(line);
+    }
+    for (const [key, lines] of seen) {
+      if (lines.length > 1) dups.push(`${t.table}.${key}（第 ${lines.join(' / ')} 行，共 ${lines.length} 处）`);
+    }
+  }
+  assert.deepEqual(dups, [],
+    `注册表里有重复键，JS 会让最后一次静默覆盖前面的 —— 改一处另一处不生效，判据也看不出来：${dups.join('；')}`);
+});

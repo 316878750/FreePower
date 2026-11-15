@@ -1173,11 +1173,16 @@ export function loginCookiePlan(profile = {}) {
       failed.push({ reason: '没有域名可挂（这个环境没填启动网址，也没有目标域名）', sample: s.slice(0, 24) });
       continue;
     }
+    let pairs = 0;
     for (const pair of s.split(/;\s*/)) {
       const i = pair.indexOf('=');
       if (i <= 0) continue;
       cookies.push({ name: pair.slice(0, i).trim(), value: pair.slice(i + 1).trim(), url: fallbackUrl });
+      pairs += 1;
     }
+    // 有内容却一个 name=value 都切不出来（乱码 / 整段 JSON 被截断 / 人贴了别的东西）：
+    // 必须如实记一条失败，否则「字段里明明有东西、启动后却是游客态」会变成零日志的静默失败。
+    if (!pairs) failed.push({ reason: 'cookie 串里没有可用的 name=value 对', sample: s.slice(0, 24) });
   }
   return { cookies, failed, source: sawObject && sawRaw ? 'mixed' : sawObject ? 'object' : sawRaw ? 'raw' : 'none' };
 }
