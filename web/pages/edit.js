@@ -42,6 +42,7 @@ export default async function renderEdit({ head, page, params }) {
   state.dirty = false;
   state.lastCheck = null;
   state.touched = new Set();
+  state.snapCount = undefined;
 
   const [schema, groups, tags, proxies, apps] = await Promise.all([
     api.schema(),
@@ -212,6 +213,17 @@ export default async function renderEdit({ head, page, params }) {
         h('span', { class: 'cnt' }, String(g.total)),
         off ? h('span', { class: 'cnt off' }, `${off} 项不可用`) : null));
     }
+    /*
+     * 「备份」不是字段分组，是独立的一块（0.4.7 ②）：它改的不是指纹配置，
+     * 而是「这个环境存过几份、能不能退回去」。新建环境时还没有 id，所以不给这一页。
+     */
+    if (state.editing) {
+      tabBar.appendChild(h('button', {
+        class: `tab ${state.active === '__backup' ? 'active' : ''}`,
+        onClick: () => { state.active = '__backup'; paintTabs(tabBar, formArea); },
+      }, '备份快照',
+        state.snapCount !== undefined ? h('span', { class: 'cnt' }, String(state.snapCount)) : null));
+    }
     paintGroup(formArea);
   }
 
@@ -225,6 +237,7 @@ export default async function renderEdit({ head, page, params }) {
     state.refs = {};
     state.formArea = formArea;
     clear(formArea);
+    if (state.active === '__backup') { paintBackup(formArea); return; }
     if (!g) return;
     const grid = h('div', { class: 'form-grid' });
     const basics = g.fields.filter((f) => f.basic);
@@ -247,6 +260,145 @@ export default async function renderEdit({ head, page, params }) {
         advGrid));
     }
     if (state.lastCheck) paintFieldErrors(state.lastCheck);
+  }
+
+  /* ------------------------------ 备份快照（0.4.7 ②） ------------------------------
+   *
+   * 这一页只做三件事：拍一份、恢复一份、删一份。所有文案都从服务端 `scope` 里取
+   * （「包含什么、不包含什么」只有一份事实源，界面不另写一遍）。
+   *
+   * 恢复是**破坏性**的，所以画面上必须写清楚三句：会覆盖什么、会先自动留一份、恢复后要重新登录。
+   */
+  async function paintBackup(box) {
+    mount(box, h('div', { class: 'muted' }, '正在读取快照…'));
+    let data;
+    try {
+      data = await api.snapshotList(state.editing);
+    } catch (e) {
+      mount(box, h('div', { class: 'notice bad' }, `读取快照失败：${e.message}`));
+      return;
+    }
+    state.snapCount = data.count;
+    // 标签上的计数也跟着变（不整页重画，只改那个数字）
+    const tab = [...tabBar.querySelectorAll('.tab')].find((b) => b.textContent.startsWith('备份快照'));
+    if (tab) {
+      let cnt = tab.querySelector('.cnt');
+      if (!cnt) { cnt = h('span', { class: 'cnt' }); tab.appendChild(cnt); }
+      cnt.textContent = String(data.count);
+    }
+
+    const fmtBytes = (b) => (b === null || b === undefined ? '—' : b >= 1048576 ? `${(b / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(b / 1024))} KB`);
+    const list = data.list || [];
+
+    const rows = list.map((s) => h('tr', null,
+      h('td', { class: 'muted small' }, (s.taken_at || '').slice(0, 19).replace('T', ' ')),
+      h('td', null, s.reason_label || s.reason),
+      h('td', { class: 'num' }, fmtBytes(s.includes?.userdata_bytes || 0)),
+      h('td', { class: 'small' }, s.includes?.userdata
+        ? `记录 + 数据（${s.includes.userdata_files} 个文件）`
+        : '仅记录（拍的时候没有数据目录）'),
+      h('td', { class: 'actions' },
+        h('button', { class: 'btn sm', onClick: () => restoreOne(s) }, '恢复'),
+        ' ',
+        h('button', { class: 'btn sm ghost danger', onClick: () => deleteOne(s) }, '删除'))));
+
+    const scope = data.scope || { included: [], excluded: [] };
+    const body = h('div', { class: 'stack' },
+      h('div', { class: 'toolbar' },
+        h('div', null,
+          h('strong', null, '本地备份快照'),
+          h('span', { class: 'muted small' }, `　最多保留 ${data.keep} 份，第 ${data.keep + 1} 份会挤掉最旧的那份`)),
+        h('span', { class: 'spacer' }),
+        h('span', { class: 'muted small' }, `当前 ${data.count} 份，共 ${fmtBytes(data.usage?.bytes || 0)}`),
+        h('button', { class: 'btn sm primary', onClick: createOne }, '现在备份一份')),
+      h('div', { class: 'notice' },
+        h('div', null, h('strong', null, '快照里有什么：')),
+        h('ul', null, ...scope.included.map((x) => h('li', null, x))),
+        h('div', null, h('strong', null, '没有什么：')),
+        h('ul', null, ...scope.excluded.map((x) => h('li', null, x)))),
+      state.running
+        ? h('div', { class: 'notice warn' },
+          '环境正在运行：',
+          h('strong', null, '可以备份'),
+          '（现在这份就是运行中的样子），但',
+          h('strong', null, '不能恢复'),
+          '，恢复前先停止。')
+        : null,
+      list.length
+        ? h('table', { class: 'grid' },
+          h('thead', null, h('tr', null,
+            h('th', { style: { width: '170px' } }, '时间'),
+            h('th', { style: { width: '150px' } }, '类型'),
+            h('th', { style: { width: '90px' } }, '大小'),
+            h('th', null, '内容'),
+            h('th', { style: { width: '150px' } }, '操作'))),
+          h('tbody', null, ...rows))
+        : h('div', { class: 'empty' }, '还没有快照。点「现在备份一份」把当前状态存下来。'),
+      h('div', { class: 'muted small', style: { marginTop: '8px' } },
+        '快照存在数据目录的 snapshots 下，和库文件同一块盘。它救的是「环境被改坏 / 数据被误删」，'
+        + '不是「整块硬盘坏了」——后者要靠系统备份。'));
+    mount(box, body);
+
+    async function refresh() {
+      await paintBackup(box);
+    }
+
+    async function createOne() {
+      try {
+        const r = await api.snapshotCreate(state.editing, 'manual');
+        const ev = r.evicted || [];
+        const bad = ev.filter((x) => x.removed !== true);
+        toast(`已备份一份（${r.list.length} 份）${ev.length ? `，挤掉最旧 1 份` : ''}${bad.length ? `，但有 ${bad.length} 份没删掉（暂时超过上限）` : ''}`,
+          bad.length ? 'warn' : 'ok');
+        await refresh();
+      } catch (e) { toast(`备份失败：${e.message}`, 'bad'); }
+    }
+
+    async function restoreOne(s) {
+      if (state.running) { toast('环境正在运行，先停止再恢复', 'bad'); return; }
+      const yes = await confirmDialog({
+        title: '从快照恢复 · 确认',
+        body: h('div', { class: 'stack' },
+          h('div', null, `把 #${state.model.profile_no || ''} 恢复成 ${(s.taken_at || '').slice(0, 19).replace('T', ' ')} 那一刻的样子？`),
+          h('div', { class: 'notice bad' },
+            h('strong', null, '这会覆盖当前状态'),
+            '：cookie / 登录态、LocalStorage、书签、指纹配置、UA、代理全部变成快照里那份。'),
+          h('div', { class: 'notice' },
+            '恢复前会',
+            h('strong', null, '自动先给当前状态留一份快照'),
+            '（排在列表第一行，类型「恢复前自动留存」），所以恢复到错的快照还能再退回来。'),
+          h('div', { class: 'muted small' },
+            '恢复完要重新启动环境才生效；如果快照是很久以前的，登录态可能已经过期，需要重新登录。')),
+        okLabel: '确认恢复', danger: true,
+      });
+      if (!yes) return;
+      try {
+        const r = await api.snapshotRestore(state.editing, s.snap_id);
+        toast(r.verified
+          ? `已恢复，逐列核对通过${r.before_snapshot ? '（当前状态已自动存为一份快照）' : ''}`
+          : '已恢复，但逐列核对有不一致，请检查字段后再决定是否重试', r.verified ? 'ok' : 'warn');
+        // 表单里的值已经过时了，重新取一遍，避免「保存」把旧值写回去
+        state.model = await loadProfile(state.editing);
+        state.touched.clear();
+        state.dirty = false;
+        mount(document.getElementById('dirty-flag'), '');
+        await refresh();
+      } catch (e) { toast(`恢复失败：${e.message}`, 'bad'); }
+    }
+
+    async function deleteOne(s) {
+      const yes = await confirmDialog({
+        title: '删除这份快照',
+        body: h('div', null, `删掉 ${(s.taken_at || '').slice(0, 19).replace('T', ' ')} 那份（${s.reason_label || s.reason}）？删了就没了。`),
+        okLabel: '删除', danger: true,
+      });
+      if (!yes) return;
+      try {
+        await api.snapshotDelete(state.editing, s.snap_id);
+        toast('已删除这份快照', 'ok');
+        await refresh();
+      } catch (e) { toast(`删除失败：${e.message}`, 'bad'); }
+    }
   }
 
   function countryField() {

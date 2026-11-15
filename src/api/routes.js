@@ -33,6 +33,10 @@ import {
 import { startProfile, stopProfile, listRunning, getRunning, getInstance, userDataDirFor } from '../runtime/manager.js';
 import { purgeProfileData } from '../runtime/purge-data.js';
 import { planCacheCleanup, applyCacheCleanup } from '../runtime/cache-cleanup.js';
+import {
+  takeSnapshot, listSnapshots, readSnapshot, deleteSnapshot, restoreSnapshot,
+  snapshotUsage, SNAPSHOT_SCOPE, SNAPSHOT_REASONS, KEEP_SNAPSHOTS, reasonLabel,
+} from '../store/snapshots.js';
 import { batchStart, batchStop } from '../runtime/batch.js';
 import { profileFormSchema } from './schema.js';
 import { validateProfile } from '../../packages/profile/src/validate.js';
@@ -1665,6 +1669,125 @@ export function buildRoutes() {
         freed_bytes: r.freed_bytes,
       },
     });
+  });
+
+  /* ==================== 0.4.7 ② 本地备份快照 ====================
+   *
+   * 四条路由，全都要显式给 `profile_id`（快照是按环境存的，没有「全部环境一份快照」这种语义）：
+   *   - `GET  /snapshot/list`    → 这个环境有哪些快照 + 占了多少磁盘 + 快照范围（含/不含什么）
+   *   - `POST /snapshot/create`  → 拍一份（reason 默认 manual）
+   *   - `POST /snapshot/restore` → 从快照恢复（**破坏性**，必须 `confirm: true`）
+   *   - `POST /snapshot/delete`  → 删一份快照
+   *
+   * **恢复必须 `confirm: true`**：和 ④ 真删同一条纪律 —— 不可逆动作不许「调用方漏了参数就等于同意」。
+   * 而且恢复**自己也是不可逆的**（会覆盖当前状态），所以服务端在恢复前**自动先给当前状态留一份**
+   * （`reason: 'before_restore'`），并且这一份留不下来就**拒绝恢复**。
+   */
+  const snapshotProfile = (ctx) => {
+    const raw = (ctx.body || {}).profile_id ?? (ctx.query || {}).profile_id;
+    if (!raw) throw new ApiError(ERR.INVALID, '缺 profile_id（快照是按环境存的）', 200, { field: 'profile_id' });
+    const p = getProfile(String(raw)) || getProfileByNo(String(raw));
+    if (!p) throw new ApiError(ERR.PROFILE_NOT_FOUND, 'Profile does not exist', 200, { field: 'profile_id' });
+    return p;
+  };
+
+  add(['GET'], ['/api/v2/browser-profile/snapshot/list'], (ctx) => {
+    const p = snapshotProfile(ctx);
+    const list = listSnapshots(p.id);
+    const usage = snapshotUsage(p.id);
+    return ok({
+      profile_id: p.id,
+      profile_no: p.profile_no,
+      name: p.name,
+      list,
+      // 界面要能说「5 个满了，再拍一份会挤掉最旧的」
+      keep: KEEP_SNAPSHOTS,
+      count: list.length,
+      usage,
+      reasons: SNAPSHOT_REASONS.map((r) => ({ reason: r, label: reasonLabel(r) })),
+      // 快照里有什么、没什么 —— 文案只有服务端这一份，界面直接渲染
+      scope: SNAPSHOT_SCOPE,
+    });
+  });
+
+  add(['POST'], ['/api/v2/browser-profile/snapshot/create'], (ctx) => {
+    const p = snapshotProfile(ctx);
+    const reason = String((ctx.body || {}).reason || 'manual');
+    if (!SNAPSHOT_REASONS.includes(reason)) {
+      throw new ApiError(ERR.INVALID, `reason 只能是 ${SNAPSHOT_REASONS.join(' / ')}`, 200, { field: 'reason' });
+    }
+    const r = takeSnapshot(p, { reason });
+    if (!r.ok) {
+      // 拍不下来必须报错（静默成功会让用户以为有备份）
+      throw new ApiError(ERR.GENERIC, `创建快照失败：${r.reason}${r.error_message ? `（${r.error_message}）` : ''}`, 200, { reason: r.reason });
+    }
+    return ok({
+      snapshot: r.snapshot,
+      userdata: r.userdata,
+      // 被挤掉的如实报：`removed:false` 就是「说好只留 5 个，但这份删不掉」
+      evicted: r.evicted || [],
+      list: listSnapshots(p.id),
+      usage: snapshotUsage(p.id),
+    });
+  });
+
+  add(['POST'], ['/api/v2/browser-profile/snapshot/restore'], (ctx) => {
+    const p = snapshotProfile(ctx);
+    const body = ctx.body || {};
+    const snapId = String(body.snap_id || '');
+    if (!snapId) throw new ApiError(ERR.INVALID, '缺 snap_id（要恢复哪一份）', 200, { field: 'snap_id' });
+    if (body.confirm !== true) {
+      // 恢复会覆盖当前状态（cookie / 登录态 / 指纹配置全变），必须显式确认
+      throw new ApiError(
+        ERR.INVALID,
+        '恢复会覆盖当前状态，必须显式传 confirm: true（先调 /snapshot/list 看清要恢复哪一份）。'
+        + '服务端会在恢复前自动给当前状态留一份快照。',
+        200,
+        { field: 'confirm' },
+      );
+    }
+    // 在跑的环境不能恢复：内核占着 userdata，覆盖只会半途失败
+    if (getRunning(p.id)) {
+      throw new ApiError(ERR.GENERIC, '环境正在运行，先停止再恢复（内核占着数据目录）', 200, { reason: 'running' });
+    }
+    const r = restoreSnapshot(p, snapId);
+    if (!r.ok) {
+      const msg = {
+        running: '环境正在运行，先停止再恢复',
+        snapshot_not_found: '快照不存在（可能已被挤掉或删除）',
+        snapshot_corrupt: '快照文件损坏，无法恢复',
+        before_snapshot_failed: '留不下「恢复前」的快照，已拒绝恢复（否则恢复本身就成了新的丢数据入口）',
+        userdata_rename_failed: '当前数据目录被占用，一个字节都没动',
+        userdata_restore_failed: '拷贝快照数据失败，已尽量还原成恢复前的样子',
+        record_restore_failed: '数据目录已恢复，但环境记录写回失败（请重试或从「恢复前」那份快照再来一次）',
+      }[r.reason] || `恢复失败：${r.reason}`;
+      throw new ApiError(ERR.GENERIC, `${msg}${r.error_message ? `（${r.error_message}）` : ''}`, 200, { reason: r.reason });
+    }
+    return ok({
+      restored: true,
+      snapshot: r.snapshot,
+      // 恢复前自动留的那份：告诉用户「万一恢复错了，还能回到刚才」
+      before_snapshot: r.before_snapshot,
+      userdata: r.userdata,
+      record: r.record,
+      // 逐列核对：写进去的和快照里的逐字段相等才算真恢复
+      verified: r.verified,
+      diff: r.diff,
+      list: listSnapshots(p.id),
+      usage: snapshotUsage(p.id),
+    });
+  });
+
+  add(['POST'], ['/api/v2/browser-profile/snapshot/delete'], (ctx) => {
+    const p = snapshotProfile(ctx);
+    const snapId = String((ctx.body || {}).snap_id || '');
+    if (!snapId) throw new ApiError(ERR.INVALID, '缺 snap_id（要删哪一份）', 200, { field: 'snap_id' });
+    const r = deleteSnapshot(p.id, snapId);
+    if (!r.ok) {
+      const msg = r.reason === 'snapshot_not_found' ? '快照不存在' : `删不掉：${r.error_message || r.reason}`;
+      throw new ApiError(ERR.GENERIC, msg, 200, { reason: r.reason });
+    }
+    return ok({ deleted: snapId, list: listSnapshots(p.id), usage: snapshotUsage(p.id) });
   });
 
   /* ==================== 4.9 设置（0.4.3 ④） ====================

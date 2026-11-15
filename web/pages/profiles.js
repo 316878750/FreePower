@@ -142,7 +142,10 @@ export default async function renderProfiles({ head, page }) {
       item('检查代理', () => batchCheckProxy()),
       item('还原 Cookie（覆盖）', () => batchCookie('restore'), { title: '写完之后以文件为准：文件里没有的会被删掉。先预览再确认' }),
       item('合并 Cookie（并集）', () => batchCookie('merge'), { title: '只补文件里有、环境里没有的；同名以环境现有为准，不动登录态。合并后可撤销（只保留最近一次）' }),
-      item('撤销上次合并 Cookie', () => batchCookieUndo(), { title: '只撤销最近一次合并；撤销过一次就没有了（不做无限历史）' }));
+      item('撤销上次合并 Cookie', () => batchCookieUndo(), { title: '只撤销最近一次合并；撤销过一次就没有了（不做无限历史）' }),
+      h('div', { class: 'sep' }),
+      // 不可逆批量动作之前先拍一份快照（0.4.7 ②）：这是「批量操作搞坏了」唯一能整份退回去的路
+      item('备份快照（所选环境）', () => batchSnapshot(), { title: '每个环境各存一份（最多保留 5 份）。含 Cookie/登录态与指纹配置，不含缓存和内核' }));
     wrap.appendChild(btn);
     wrap.appendChild(panel);
     // 点别处收起（一次性监听，页面切走也无所谓）
@@ -200,6 +203,25 @@ export default async function renderProfiles({ head, page }) {
       restore_failed: '撤销时出错',
       verify_failed: '撤销后与合并前不一致',
     })[reason] || String(reason);
+  }
+
+  /** 批量备份快照：逐个拍，逐条报（一个失败不能拦掉后面的） */
+  async function batchSnapshot() {
+    const ids = picked();
+    if (!ids) return;
+    const ok = [];
+    const bad = [];
+    for (const id of ids) {
+      try {
+        const r = await api.snapshotCreate(id, 'manual');
+        ok.push({ id, evicted: (r.evicted || []).filter((x) => x.removed !== true).length });
+      } catch (e) {
+        bad.push({ id, message: e.message });
+      }
+    }
+    const evictWarn = ok.reduce((n, x) => n + x.evicted, 0);
+    reportBatch('备份快照', { ok, failed: bad.map((b) => ({ profile_id: b.id, message: b.message })) },
+      { okKey: 'ok', extra: evictWarn ? `有 ${evictWarn} 份旧快照没删掉（暂时超过上限）` : '' });
   }
 
   function toggleAll(on) {

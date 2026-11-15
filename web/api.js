@@ -255,6 +255,18 @@ export const api = {
    */
   cacheCleanup: (body) => call('/api/v2/browser-profile/cache-cleanup', { method: 'POST', body, timeoutMs: 300000 }),
 
+  /* ---- 本地备份快照（0.4.7 ②） ---- */
+  /** 这个环境有哪些快照 + 占了多少磁盘 + 快照范围（含/不含什么，界面直接渲染） */
+  snapshotList: (profileId) => call('/api/v2/browser-profile/snapshot/list', { query: { profile_id: profileId } }),
+  /** 拍一份（最多保留 5 份，第 6 份挤掉最旧的） */
+  snapshotCreate: (profileId, reason = 'manual') => call('/api/v2/browser-profile/snapshot/create', { method: 'POST', body: { profile_id: profileId, reason }, timeoutMs: 180000 }),
+  /**
+   * 从快照恢复（**破坏性**：会覆盖当前 cookie / 登录态 / 指纹配置）。
+   * 必须带 `confirm: true`；服务端会在恢复前自动给当前状态留一份快照。
+   */
+  snapshotRestore: (profileId, snapId) => call('/api/v2/browser-profile/snapshot/restore', { method: 'POST', body: { profile_id: profileId, snap_id: snapId, confirm: true }, timeoutMs: 180000 }),
+  snapshotDelete: (profileId, snapId) => call('/api/v2/browser-profile/snapshot/delete', { method: 'POST', body: { profile_id: profileId, snap_id: snapId } }),
+
   /* ---- 应用中心 / 扩展（0.4.3） ---- */
   /**
    * 扩展库。**文件全局共享一份**（`<数据根>/ext_env/<id>/`），环境只存勾选关系。
