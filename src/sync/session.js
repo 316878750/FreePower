@@ -397,6 +397,39 @@ export async function stopSync() {
   return { running: false, teardown: lastTeardown };
 }
 
+/**
+ * 重启同步（对手的 `syncRestart`）：**用当前配置 stop + start**，不重新选窗口。
+ *
+ * 为什么要这个入口：改了窗口大小、换了标签页之后，捕获脚本与 binding 还挂在旧文档上，
+ * 用户需要一个「重来一次」的按钮 —— 否则只能「停止 → 重新选主窗口/受控 → 开始」四步，
+ * 而这三样我们本来就知道（`current.master` / `current.slaves` / `current.settings`）。
+ *
+ * `settings` 不给时沿用**这次会话正在用的那份**（它本身是「设置页存的默认 + 启动时覆盖」合并出来的），
+ * 也就是 CEO 那句「参数没给时沿用已存默认」；给了就合并覆盖在上面。
+ *
+ * 失败不静默：`startSync` 抛错时，旧会话**已经停了**，调用方拿到的错要说清楚
+ * 「已停止，但没能重新开始」—— 返回里带 `restarted:false` 与 `previous`，界面照实显示。
+ */
+export async function restartSync({ settings = null } = {}) {
+  if (!current) throw new Error('没有正在运行的同步会话，先开始同步');
+  const masterId = current.master;
+  const slaveIds = [...current.slaves];
+  const keep = settings && typeof settings === 'object'
+    ? normalizeSettings({ ...current.settings, ...settings })
+    : current.settings;
+
+  await stopSync();
+  try {
+    const st = await startSync({ masterId, slaveIds, settings: keep });
+    return { restarted: true, ...st };
+  } catch (e) {
+    const err = new Error(`同步已停止，但没能重新开始：${e?.message || String(e)}`);
+    err.restarted = false;
+    err.previous = { master_id: masterId, slave_ids: slaveIds };
+    throw err;
+  }
+}
+
 /** 环境被停掉时清会话（`manager.stopProfile` 会调它，别让会话挂在死连接上） */
 export async function detachProfile(profileId) {
   if (!current) return false;

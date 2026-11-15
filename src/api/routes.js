@@ -42,7 +42,7 @@ import { readReportFile, summarize } from '../selfcheck/store.js';
 import { renderHtml } from '../selfcheck/html.js';
 import { issueTicket } from './tickets.js';
 import { apiInfoPayload, setApiVerify, resetStats } from './info.js';
-import { startSync, stopSync, syncStatus, updateSettings, refreshAll, unifySize, arrangeWindows, showWindows, forceShowWindows, openTabInAll, tabState, closeTabs, copyTabToSlaves, unifyTabs, DEFAULT_SETTINGS } from '../sync/session.js';
+import { startSync, stopSync, restartSync, syncStatus, updateSettings, refreshAll, unifySize, arrangeWindows, showWindows, forceShowWindows, openTabInAll, tabState, closeTabs, copyTabToSlaves, unifyTabs, DEFAULT_SETTINGS } from '../sync/session.js';
 import { readSyncDefaults, writeSyncDefaults, resetSyncDefaults, syncDefaultsDiff, mergeSyncSettings } from '../settings/prefs.js';
 import { networkSnapshot, probeBoundProxies } from './diagnose.js';
 import { readDisplays } from '../sync/displays.js';
@@ -1632,6 +1632,20 @@ export function buildRoutes() {
       return ok(await arrangeWindows(body));
     } catch (e) {
       throw new ApiError(ERR.INVALID, e?.message || 'sync is not running');
+    }
+  });
+
+  /**
+   * 重启同步（对手的 `syncRestart`）：用当前配置 stop + start，不用重选窗口。
+   * 入参可带 `settings`（合并覆盖在本次会话的设置上）；不带就沿用已存默认。
+   */
+  add(['POST'], ['/api/v2/sync/restart'], async (ctx) => {
+    const b = ctx.body && typeof ctx.body === 'object' ? ctx.body : {};
+    try {
+      const settings = b.settings && typeof b.settings === 'object' ? mergeSyncSettings(b.settings) : null;
+      return ok(await restartSync({ settings }));
+    } catch (e) {
+      throw new ApiError(ERR.INVALID, e?.message || 'sync restart failed');
     }
   });
 

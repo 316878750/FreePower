@@ -280,7 +280,7 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:53380/api/v1/browser/start?user_id=<pro
 | 自检报告 | 评分、通过/告警/失败、覆盖度、四个噪声维度哈希与跨重启一致性、19 项逐条「声明值 vs 实测值」（含双 Realm 与 AudioWorklet） |
 | AI Agent（0.4.0） | 选环境 → 填目标 → 生成动作清单 → 逐步看动作/参数/digest 前 8 位 → 逐条批准或拒绝 → 运行 → 每步结果（`text` 结果、截图相对路径与图片、cookie 条数）；fill / cookie set 的值显示 `••••`，截图走 120 秒票据链接（master key 不进 URL） |
 | API & MCP（0.4.2） | 本地 API 状态（地址 / key 显示·复制·重置 / **验证开关** / 请求计数）、端点清单（从路由表派生，可搜可按分组筛，标出「不支持」那批）、MCP 配置（Claude Desktop / Cursor / Codex 三段，端口与 key 自动填，可一键复制） |
-| 窗口同步（0.4.2 阶段 1，0.4.5 补齐操作台） | 选主窗口 + 受控窗口 → 开始/停止；四个同步开关（输入 / 点击 / 滚动 / 移动）与延迟、抖动，**运行中改立刻生效**；实时读数（转发条数、被开关拦下、已发出/待发）；**窗口尺寸不一致显著提示 + 一键统一尺寸**；**操作台**是独立置顶小窗，两种形态（展开 430×620 / 收起 360×56），详见[下面那节](#窗口同步操作台桌面小组件045-2026-11-15) |
+| 窗口同步（0.4.2 阶段 1，0.4.5 补齐操作台） | 选主窗口 + 受控窗口 → 开始/停止；四个同步开关（输入 / 点击 / 滚动 / 移动）与延迟、抖动，**运行中改立刻生效**；实时读数（转发条数、被开关拦下、已发出/待发）；**窗口尺寸不一致显著提示 + 一键统一尺寸**；顶部「重启同步 / 打开操作台」，页内另有**窗口排列**与**显示窗口**（0.4.5）；**操作台**是独立置顶小窗，两种形态（展开 430×620 / 收起 360×56），详见[下面那节](#窗口同步操作台桌面小组件045-2026-11-15) |
 | 应用中心（0.4.3 ①） | 扩展库：导入（粘本机目录或 `.zip` 路径，**不是上传**）、启用/停用、改名、删除、看「被几个环境用」与落盘目录；环境编辑页里勾「这个环境用哪些」。文件全局共享一份，启用状态是环境级的，见 [15 号文档](docs/15-应用中心与扩展.md) |
 | 设置（0.4.3 ④） | 窗口同步的**默认设置**（14 个开关/数值，存库、`/sync/start` 真的读它）、全局快捷键、外观（= 视图密度，与列表页同一个 localStorage 键）、本地 API 摘要；最后一节**逐条列出没做的项**（语言 / 主题 / 自动更新 / 退出登录 / 开机自启在别处）并说明原因 |
 | 网络诊断（0.4.3 ④） | **只读**：服务（版本 / pid / 运行时长 / 内存 / 数据库 + WAL 字节数 / API 计数）、本产品自己的监听端口（本地 API + 各运行中环境的 CDP）、内核（已装 / 运行中 / 出口 IP）、绑在环境上的代理（按钮探测，按 host:port:账号 去重，三态分开、超时给秒数、**不落盘**） |
@@ -515,6 +515,7 @@ B 层 `npm run test:import-large` **15 PASS / 0 FAIL**（合成 18.9 MB / 50 块
 `web/` 里「操作台 / 小组件 / widget / console」**零命中**，只有一个 `#/sync-panel` 独立小窗、
 **只能从托盘菜单打开**，页面里没有入口；没有收起/展开、没有自动收起、没有「正在同步操作」的紧凑态、
 没有位置记忆；而且因为没有 preload，网页侧**根本无法通知桌面壳**做任何事。
+同源的三个缺口（`窗口同步` 页缺「重启同步」「窗口排列」「显示窗口」）也一并补上。
 
 **没有新增第二个浮窗**：把现有 `#/sync-panel` 改造成操作台，两种形态靠**真改窗口尺寸**实现：
 
@@ -532,18 +533,16 @@ B 层 `npm run test:import-large` **15 PASS / 0 FAIL**（合成 18.9 MB / 50 块
   就回主屏居中（拔副屏 / 改缩放后窗口不会留在屏幕外）。
 - **状态词如实**：同步中「正在同步操作」；个别窗口断连只把 `tone` 变 `warn` 并另给 detail
   「有 N 个窗口连接断了」—— 我们**没有**对手 `syncOperateSyncException` 的对应状态，不硬造。
-- **新增 preload，只开一个口子**：`desktop/preload.cjs` 只暴露 `isDesktop` + `openSyncPanel()`，
+- **新增 preload，只开一个口子**：`desktop/preload.js` 只暴露 `isDesktop` + `openSyncPanel()`，
   **不透传 `ipcRenderer`**，只挂主窗口（操作台小窗不挂，它改形态走 Local API + 请求文件）；
   `sandbox` / `contextIsolation` 仍为 `true`。主进程侧还校验 `event.sender === win.webContents`。
-  （后缀用 `.cjs` 是因为 `package.json` 有 `type: module`，而 sandboxed preload 只能是 CommonJS。）
 - **纯网页如实禁用**：没有桌面壳时 `requestConsole` **不写请求文件**（写了没人读 = 说了没做），
   界面把按钮禁用并写明「桌面版才有操作台」。
 
-接口两条：`GET /api/v2/sync/console`（读状态 + 收起条模型）、`POST /api/v2/sync/console`（请求收起/展开、
-改设置、复位）；排列/显示**打的就是既有的 `/sync/arrange`、`/sync/show`**（组件抽到 `web/sync-widgets.js`，
-操作台与「窗口同步」页共用一份）。
+接口三条：`POST /api/v2/sync/restart`、`GET /api/v2/sync/console`、`POST /api/v2/sync/console`；
+排列/显示**打的就是既有的 `/sync/arrange`、`/sync/show`**（组件抽到 `web/sync-widgets.js`，两个页面共用一份）。
 
-判据：`test/sync-console.test.mjs` **59 条**（已进 `npm test`）；两处先红后绿（收起态改成不改尺寸 → 8 条红；
+判据：`test/sync-console.test.mjs` **62 条**（已进 `npm test`）；两处先红后绿（收起态改成不改尺寸 → 8 条红；
 位置校验改成「有保存值就用」→ 3 条红）。**真窗口那三条本机验不了**（agent shell 里 Electron 起不来），
 `desktop:selftest` 里报 skip，清单见已知限制第 45 条。设计与边界见 [20 号文档](docs/20-窗口同步操作台.md)。
 
@@ -860,7 +859,7 @@ $env:TMP  = "$PWD\.tmp\sys-tmp"; $env:TEMP = $env:TMP
 
 44. **0.3.2 及更早的安装包没有 FreePower 的版本资源，`FreePower.exe` 在文件属性里显示的是 Electron**：【实】用户机器上现装的 0.3.2（`%LOCALAPPDATA%\Programs\freepower\FreePower.exe`，`249,831,936` B）的 `VersionInfo` 是 `ProductName=Electron` / `FileVersion=45.2.3` / `CompanyName=GitHub, Inc.` —— 说明那些包当年也是 `signAndEditExecutable=false` 打出来的（与 0.4.0 草稿同一个坑）。**0.4.1 起才由 rcedit 写进 `ProductName=FreePower` / `FileVersion=0.4.1` / `ProductVersion=0.4.1.0`**（0.4.0 的正式包 `4010CF47…` 是第一次修好的）。记这条的用处：将来有人拿老包的版本资源跟新包对比，**别以为是我们把版本资源改坏了 —— 老包本来就没有**；也解释了为什么用户装了两年没发现这件事。
 
-45. **操作台的「收起/展开、位置记忆、拔副屏回主屏」这三条，我没在本机验出来**（0.4.5）：本机 agent shell 里 Electron 起不来（`0x80000003`），所以只有纯逻辑（`test/sync-console.test.mjs` 59 条，已进 `npm test`）与 `desktop:selftest` 的条目，**没有真窗口读数**。`--selftest` 里 `steps.console` 在本机写 `{skipped:true, reason:'no_panel'}`，不许读成通过。
+45. **操作台的「收起/展开、位置记忆、拔副屏回主屏」这三条，我没在本机验出来**（0.4.5）：本机 agent shell 里 Electron 起不来（`0x80000003`），所以只有纯逻辑（`test/sync-console.test.mjs` 62 条，已进 `npm test`）与 `desktop:selftest` 的条目，**没有真窗口读数**。`--selftest` 里 `steps.console` 在本机写 `{skipped:true, reason:'no_panel'}`，不许读成通过。
     **需要在你桌面上复验**（点一遍就知道对不对，见 §6 那节末尾的清单）：① 同步开始时自动收起成一条横条；② 拖到别处、关掉再打开还在原处；③ 拔掉副屏后重开，窗口回到主屏居中而不是留在看不见的地方。
     **尺寸与默认值是我们选的，不是对手原值**：展开 430×620、收起 360×56、「算还在屏幕上」的门槛 64×24、`自动收起默认开` —— 对手证据里只有 `openConsole` / `automaticShrink` 这两个键名与文案，**没有任何数字**。
 
@@ -1114,7 +1113,7 @@ npm run test
 npm run smoke
 ```
 
-当前实测（2026-11-15，本机）：`npm run test` = schema **10** + net-rules **56** + chain-rules **31** + recycle **44** + apps **54** + profiles-tabs **60** + batch **74** + settings-diagnose **56** + unit **85** + agent **15** + api **122** + api-mcp **46** + sync-rules **95** + sync-text **51** + sync-tabs **59** + sync-window **22** + sync-arrange **67** + sync-show **55** + markers **34** + nav-fold **60** + ui **46** + desktop **59** + kernel-download **62**（`package.json` 里那条脚本就是这二十三组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（proxy-chain，两跳代理链）+ **24/24**（workers）+ **30/30**（agent-smoke）+ **9/9**（session-restore）+ **12/12**（startup-tabs）+ **17/17**（block-page，全离线）+ **18/18**（markers-kernel）+ **39/39**（sync-kernel）+ **21/21**（sync-text-kernel）+ **39/39**（sync-tabs-kernel）+ **17/17**（sync-window-kernel）+ **28/28**（sync-arrange-kernel）+ **42/42**（sync-show-kernel）+ **15/15**（apps-kernel）+ **14/14**（purge-lock-kernel）+ **18/18**（batch-cookie-kernel）+ **13/13**（batch-show-kernel）+ **15/15**（import-large，大文件真 HTTP 端到端），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测（2026-11-15，本机）：`npm run test` = schema **10** + net-rules **56** + chain-rules **31** + recycle **44** + apps **54** + profiles-tabs **60** + batch **74** + settings-diagnose **56** + unit **85** + agent **15** + api **122** + api-mcp **46** + sync-rules **95** + sync-text **51** + sync-tabs **59** + sync-window **22** + sync-arrange **68** + sync-show **56** + sync-console **62** + markers **34** + nav-fold **60** + ui **46** + desktop **60** + kernel-download **62**（`package.json` 里那条脚本就是这二十四组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（proxy-chain，两跳代理链）+ **24/24**（workers）+ **30/30**（agent-smoke）+ **9/9**（session-restore）+ **12/12**（startup-tabs）+ **17/17**（block-page，全离线）+ **18/18**（markers-kernel）+ **39/39**（sync-kernel）+ **21/21**（sync-text-kernel）+ **39/39**（sync-tabs-kernel）+ **17/17**（sync-window-kernel）+ **28/28**（sync-arrange-kernel）+ **42/42**（sync-show-kernel）+ **15/15**（apps-kernel）+ **14/14**（purge-lock-kernel）+ **18/18**（batch-cookie-kernel）+ **13/13**（batch-show-kernel）+ **15/15**（import-large，大文件真 HTTP 端到端），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 > 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：
@@ -1656,7 +1655,7 @@ web/
   pages/agent.js       AI Agent 面板：选环境 → 目标 → 生成 → 逐条批准 → 运行 → 每步结果（含截图票据链接）
   pages/api.js         API & MCP：状态/验证开关/请求计数、端点清单（可搜可按分组筛）、三段 MCP 配置（0.4.2）
   pages/sync.js        窗口同步：选主窗口/受控窗口、四个开关与延迟、实时读数、尺寸不一致提示 + 一键统一；
-                       顶部「打开操作台」、页内「窗口排列 / 显示窗口」（0.4.5）
+                       顶部「重启同步 / 打开操作台」、页内「窗口排列 / 显示窗口」（0.4.5）
   sync-widgets.js      窗口排列 + 显示窗口两个共用区块（操作台与「窗口同步」页同一份代码，0.4.5）
   pages/sync-panel.js  操作台（对手的 Console 桌面小组件）：展开 430×620 / 收起 360×56 两种形态、
                        操作台设置、选窗口、开始/停止、统一尺寸、排列/显示、快捷键（0.4.2 起，0.4.5 改造）
@@ -2249,7 +2248,7 @@ B 层 17 条：三个 normal 窗口设成 1000×700 / 800×600 / 900×650 → �
 
 判据：
 ```
-npm run test:sync-arrange        → 67/67（A 层：参数归一 + 三段公式 + 计划自检 + 假读数判定 + 交接 + 静态扫描）
+npm run test:sync-arrange        → 68/68（A 层：参数归一 + 三段公式 + 计划自检 + 假读数判定 + 交接 + 静态扫描）
 npm run test:sync-arrange-kernel → 28/28（B 层：3 个真环境，1 主 2 受控）
 ```
 
@@ -2345,7 +2344,7 @@ Windows 11 双屏：主屏 3440×1440、扩展屏 x=-1080..0 竖屏）：
 
 判据：
 ```
-npm run test:sync-show        → 55/55（A 层：分档 + 回读判定 + 文案 + 强制置前 + 静态扫描，零 Chrome）
+npm run test:sync-show        → 56/56（A 层：分档 + 回读判定 + 文案 + 强制置前 + 静态扫描，零 Chrome）
 npm run test:sync-show-kernel → 42/42（B 层：1 主 + 2 受控真内核 + Win32 ③ 层读数）
 ```
 
@@ -2450,10 +2449,11 @@ npm run test:sync-tabs      → 59/59   （阶段 2 标签页 A 层：纯函数 
 npm run test:sync-tabs-kernel → 39/39 （阶段 2 标签页 B 层：1 主 + 2 受控真内核）
 npm run test:sync-window      → 22/22 （阶段 3 统一尺寸 A 层：状态归一 + 回读比对 + 汇总文案）
 npm run test:sync-window-kernel → 17/17（阶段 3 统一尺寸 B 层：3 个真环境，含最大化与「改不了」）
-npm run test:sync-arrange     → 67/67 （阶段 3 窗口排列 A 层：三段公式 + 假读数判定 + 显示器交接）
+npm run test:sync-arrange     → 68/68 （阶段 3 窗口排列 A 层：三段公式 + 假读数判定 + 显示器交接）
 npm run test:sync-arrange-kernel → 28/28（阶段 3 窗口排列 B 层：3 个真环境，含换行/最大化和内核已死）
-npm run test:sync-show        → 55/55 （阶段 3 显示窗口 A 层：分档 + 回读判定 + 强制置前 + 静态扫描）
+npm run test:sync-show        → 56/56 （阶段 3 显示窗口 A 层：分档 + 回读判定 + 强制置前 + 静态扫描）
 npm run test:sync-show-kernel → 42/42 （阶段 3 显示窗口 B 层：3 个真环境 + Win32 OS 前台读数）
+npm run test:sync-console     → 62/62 （0.4.5 操作台 A 层：两种形态尺寸 + 位置校验 + 收起条 + preload 边界）
 ```
 
 **标签页 A 层 59 条**覆盖：空白判定六种写法（含 `chrome://new-tab-page/` 子路径）、URL 归一（补 https、只收 http/https）、序号映射（`same_tab` 两方向、越界返回 `null` 不猜）、关其它从大到小、关空白只关空白、

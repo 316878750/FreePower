@@ -158,6 +158,8 @@ export const api = {
   /* ---- 窗口同步（0.4.2） ---- */
   syncStart: (body) => call('/api/v2/sync/start', { method: 'POST', body }),
   syncStop: () => call('/api/v2/sync/stop', { method: 'POST', body: {} }),
+  /** 重启同步（`syncRestart`）：用当前配置 stop + start；`body.settings` 不给就沿用已存默认 */
+  syncRestart: (body) => call('/api/v2/sync/restart', { method: 'POST', body: body || {} }),
   /**
    * 操作台（Console 桌面小组件）：`{managed, mode, prefs, model, sync_running}`。
    * `managed:false` = 没有桌面壳在管（纯网页跑服务），这时操作台不存在，界面要如实说。

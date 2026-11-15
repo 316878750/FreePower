@@ -388,19 +388,37 @@ const apiSrc = fs.readFileSync(path.join(ROOT, 'web', 'api.js'), 'utf8');
 const syncSrc = fs.readFileSync(path.join(ROOT, 'web', 'pages', 'sync.js'), 'utf8');
 const panelSrc = fs.readFileSync(path.join(ROOT, 'web', 'pages', 'sync-panel.js'), 'utf8');
 const widgetsSrc = fs.readFileSync(path.join(ROOT, 'web', 'sync-widgets.js'), 'utf8');
+const sessionSrc = fs.readFileSync(path.join(ROOT, 'src', 'sync', 'session.js'), 'utf8');
 
-t('两条操作台路由都在（GET 读状态 / POST 请求动作）', () => {
+t('三条新路由都在（restart / console GET / console POST）', () => {
+  assert.ok(routesSrc.includes("'/api/v2/sync/restart'"));
   assert.ok(routesSrc.includes("'/api/v2/sync/console'"));
   const gets = (routesSrc.match(/add\(\['GET'\], \['\/api\/v2\/sync\/console'\]/g) || []).length;
   const posts = (routesSrc.match(/add\(\['POST'\], \['\/api\/v2\/sync\/console'\]/g) || []).length;
   assert.equal(gets, 1, `GET /sync/console 出现 ${gets} 次`);
   assert.equal(posts, 1, `POST /sync/console 出现 ${posts} 次`);
 });
-t('无桌面壳时 POST 回 code 0 + requested:false（不是抛参数错误）', () => {
+t('restart 是 stop + start（复用 session，不另写一套）', () => {
+  const at = routesSrc.indexOf("'/api/v2/sync/restart'");
+  const seg = routesSrc.slice(at, at + 500);
+  assert.match(seg, /restartSync/);
+  // 复用既有 session 的两步，不自己拼捕获/连接
+  assert.match(sessionSrc, /await stopSync\(\)/);
+  assert.match(sessionSrc, /startSync\(\{ masterId, slaveIds/);
+});
+t('restart 失败不静默（已停止但没能重新开始要写在错误里）', () => {
+  assert.match(sessionSrc, /同步已停止，但没能重新开始/);
+  assert.match(sessionSrc, /restarted = false/);
+});
+t('无桌面壳时 POST console 回 code 0 + requested:false（不是抛参数错误）', () => {
   const at = routesSrc.indexOf("add(['POST'], ['/api/v2/sync/console']");
   const seg = routesSrc.slice(at, at + 900);
   assert.match(seg, /no_desktop_shell/);
   assert.match(seg, /requested:\s*false/);
+});
+t('界面「重启同步」调的是 /api/v2/sync/restart', () => {
+  assert.match(syncSrc, /api\.syncRestart\(/);
+  assert.match(apiSrc, /syncRestart:\s*\(body\)\s*=>\s*call\('\/api\/v2\/sync\/restart'/);
 });
 t('「窗口排列」「显示窗口」两个页面 import 同一份组件（不各写一套）', () => {
   assert.match(syncSrc, /from '\.\.\/sync-widgets\.js'/);

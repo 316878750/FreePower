@@ -11,6 +11,7 @@
  */
 import { h, mount, toast, pill, empty } from '../ui.js';
 import { api } from '../api.js';
+import { buildArrangePanel, buildShowPanel } from '../sync-widgets.js';
 
 const state = {
   running: [],
@@ -28,6 +29,7 @@ const state = {
   tabBox: null,
   timer: null,
   busy: false,
+  displays: [],   // 桌面壳写的显示器布局（窗口排列的「内置屏幕 / 扩展屏幕」用它）
 };
 
 export default async function renderSync({ head, page }) {
@@ -35,11 +37,33 @@ export default async function renderSync({ head, page }) {
   const statusBox = h('div', { class: 'panel-body' });
   const pickBox = h('div', { class: 'panel-body' });
   const warnBox = h('div', { class: 'panel-body', id: 'sync-warn' });
+  const consoleHint = h('span', { class: 'muted small' });
+
+  /** 桌面壳通过 preload 只暴露这一个方法（见 desktop/preload.cjs）；纯网页里没有这个对象 */
+  const desktop = (typeof window !== 'undefined' && window.fpDesktop) || null;
+  const hasDesktop = !!(desktop && desktop.isDesktop === true);
+
+  const restartBtn = h('button', {
+    class: 'btn sm', disabled: true,
+    title: '用当前配置重新开始（停止 → 开始），不用重选窗口',
+    onClick: () => restart(),
+  }, '重启同步');
+
+  const consoleBtn = h('button', {
+    class: 'btn sm', disabled: !hasDesktop,
+    title: hasDesktop ? '打开桌面小组件（操作台）' : '桌面版才有操作台',
+    onClick: () => openConsole(),
+  }, '打开操作台');
+
+  // 共用组件：与操作台是同一份代码、同两条路由（`sync/arrange` / `sync/show`）
+  const arrangePanel = buildArrangePanel({ nameOf, getDisplays: () => state.displays });
+  const showPanel = buildShowPanel({ nameOf });
 
   mount(head,
     h('h1', null, '窗口同步'),
     h('span', { class: 'sub' }, '主窗口的键鼠动作同步到受控窗口'),
     h('span', { class: 'spacer' }),
+    restartBtn, consoleBtn,
     h('button', { class: 'btn sm', onClick: () => reload(true) }, '刷新'));
 
   mount(page,
@@ -51,21 +75,61 @@ export default async function renderSync({ head, page }) {
       h('div', { class: 'panel-head' }, h('h2', null, '同步设置'), h('span', { class: 'sub' }, '运行中改也立刻生效，不用重开')),
       h('div', { class: 'panel-body' }, buildSettings())),
     h('div', { class: 'panel' },
+      h('div', { class: 'panel-head' }, h('h2', null, '窗口排列'), h('span', { class: 'sub' }, '只在点按钮时改窗口')),
+      h('div', { class: 'panel-body' }, arrangePanel.el)),
+    h('div', { class: 'panel' },
+      h('div', { class: 'panel-head' }, h('h2', null, '显示窗口'), h('span', { class: 'sub' }, '恢复最小化并放到前面')),
+      h('div', { class: 'panel-body' }, showPanel.el)),
+    h('div', { class: 'panel' },
       h('div', { class: 'panel-head' }, h('h2', null, '标签页管理'), h('span', { class: 'sub' }, '按序号对应主窗口的标签')),
       h('div', { class: 'panel-body' }, buildTabs())),
     h('div', { class: 'panel' },
       h('div', { class: 'panel-head' }, h('h2', null, '状态'), h('span', { class: 'sub' }, '每秒刷新')),
-      statusBox));
+      statusBox),
+    h('div', { class: 'muted small', style: { marginTop: '10px' } }, consoleHint));
+
+  if (!hasDesktop) {
+    mount(consoleHint, '纯网页模式（没有桌面壳）：没有「操作台」桌面小组件，用「打开操作台」打不开 —— 装桌面版才有。');
+  } else {
+    mount(consoleHint, '「打开操作台」会打开那个始终置顶的小窗（桌面小组件）；收起后只剩一条 360×56 的横条。');
+  }
 
   await reload(true);
   state.timer = setInterval(() => { tick().catch(() => {}); }, 1000);
   window.addEventListener('hashchange', () => clearInterval(state.timer), { once: true });
 
+  /** 操作台：桌面壳的 preload 只暴露 `openSyncPanel()` 一个方法（不暴露 ipcRenderer） */
+  async function openConsole() {
+    if (!hasDesktop) { toast('桌面版才有操作台', 'bad'); return; }
+    try {
+      const r = await desktop.openSyncPanel();
+      if (r && r.ok === false) toast(r.error || '操作台没能打开', 'bad');
+      else toast('已打开操作台');
+    } catch (e) { toast(e.message, 'bad'); }
+  }
+
+  /** 重启同步（`syncRestart`）：用当前配置 stop + start，不重选窗口 */
+  async function restart() {
+    state.busy = true;
+    paintPick();
+    try {
+      const st = await api.syncRestart();
+      state.status = st;
+      toast('同步已重启');
+    } catch (e) {
+      // 失败时旧会话已经停了 —— 服务端把这句话写在错误里，照实显示
+      toast(e.message, 'bad');
+    } finally {
+      state.busy = false;
+      await reload(true);
+    }
+  }
+
   /* ------------------------------ 数据 ------------------------------ */
 
   async function reload(full = false) {
     try {
-      if (full) await loadRunning();
+      if (full) { await loadRunning(); await loadDisplays(); }
       state.status = await api.syncStatus();
       if (state.status?.running) {
         state.masterId = state.status.master_id || state.masterId;
@@ -75,10 +139,23 @@ export default async function renderSync({ head, page }) {
     } catch (e) {
       toast(e.message, 'bad');
     }
+    syncButtons();
     paintPick();
     paintStatus();
     paintWarn();
     paintTabs().catch(() => {});
+  }
+
+  /** 「重启同步」只有同步在跑时可用（没在跑时它没东西可重启） */
+  function syncButtons() {
+    restartBtn.disabled = !state.status?.running || state.busy;
+  }
+
+  /** 显示器列表（桌面壳写的）：窗口排列要用它列「内置屏幕 / 扩展屏幕」 */
+  async function loadDisplays() {
+    const r = await api.syncDisplays().catch(() => null);
+    state.displays = Array.isArray(r?.displays) ? r.displays : [];
+    arrangePanel.refresh();
   }
 
   async function tick() {
@@ -87,6 +164,7 @@ export default async function renderSync({ head, page }) {
     } catch {
       return;
     }
+    syncButtons();
     paintStatus();
     paintWarn();
     paintTabs().catch(() => {});
