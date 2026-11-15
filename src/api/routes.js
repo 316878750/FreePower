@@ -1961,17 +1961,26 @@ function importHandler(ctx) {
     }
     const parsed = parseAdspowerTxt(content);
     if (parsed.items.length > 1000) throw new ApiError(ERR.INVALID, '单次导入最多 1000 条');
-    const r = importProfiles(parsed.items, { unit: '块' });
+    /**
+     * txt 的 index 一律是**本请求内的块号（0 基）**，不是项号：
+     * 缺 name 的块没进 items，若把项号当块号就会指错块。
+     * 分批导入时界面再叠加 `first_block` 换算成整份文件的块号。
+     */
+    const blockOf = (i) => parsed.itemBlockIndex[i] ?? i;
+    const r = importProfiles(parsed.items, { unit: '块', indexOf: blockOf });
     const list = r.list.map((p) => present(p, 'v2'));
     const failed = [...parsed.failed, ...r.failed];
     const warnings = [...parsed.warnings, ...r.warnings];
+    // 本请求一共解析出几块（界面用它核对「分块边界有没有和服务端分块口径对上」）
+    const blocks = parsed.items.length + parsed.failed.length;
     return {
       code: 0,
       msg: 'success',
       imported: r.imported,
+      blocks,
       failed,
       warnings,
-      data: { format: 'txt', list, imported: r.imported, failed, warnings },
+      data: { format: 'txt', blocks, list, imported: r.imported, failed, warnings },
     };
   }
   const items = extractImportList(body);

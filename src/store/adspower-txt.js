@@ -144,11 +144,16 @@ function parseBlocks(text) {
 
 /**
  * `.txt` 全文 → 导入项数组（能建就建：缺字段/代理切不出来只告警，整块没有 name 才进 failed）。
- * @returns {{items:object[], failed:{index:number,reason:string}[], warnings:string[]}}
+ *
+ * `itemBlockIndex`：第 i 个 item 来自第几块（0 基）。为什么要有它 —— 有的块因为缺 name
+ * 根本没进 items，之后 `importProfiles` 报的 `index` 是**项号**，直接当块号会错位；
+ * 界面还要把「本批第几块」换算成「整份文件第几块」（分批导入时）。
+ * @returns {{items:object[], itemBlockIndex:number[], failed:{index:number,reason:string}[], warnings:string[]}}
  */
 export function parseAdspowerTxt(text) {
   const { blocks, warnings } = parseBlocks(text);
   const items = [];
+  const itemBlockIndex = [];
   const failed = [];
   blocks.forEach((block, i) => {
     if (!String(block.name || '').trim()) {
@@ -159,8 +164,9 @@ export function parseAdspowerTxt(text) {
     // 块号从 1 开始（和用户看文件的行/块一致）
     for (const w of r.warnings) warnings.push(`第 ${i + 1} 块：${w}`);
     items.push(r.item);
+    itemBlockIndex.push(i);
   });
-  return { items, failed, warnings };
+  return { items, itemBlockIndex, failed, warnings };
 }
 
 /**

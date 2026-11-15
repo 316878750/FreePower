@@ -1,10 +1,11 @@
 /** 环境列表：启动/停止/自检状态/批量操作。所有动作都打 Local API，没有私有通道。 */
-import { h, mount, clear, toast, confirmDialog, promptDialog, downloadText, pickFile, pill, empty, fmtTime, drawer } from '../ui.js';
+import { h, mount, clear, toast, confirmDialog, promptDialog, downloadText, pickFile, pill, empty, fmtTime, drawer, progressToast } from '../ui.js';
 import { api } from '../api.js';
 import { tabBar } from '../tabs.js';
 import {
   DENSITIES, densityOf, applyDensity, setDensity, VIEW_STORAGE_KEY,
 } from '../density.js';
+import { splitTxtChunks, mergeBatchResults } from '../txt-split.js';
 
 const state = {
   rows: [],
@@ -870,11 +871,7 @@ export default async function renderProfiles({ head, page }) {
     // .txt（AdsPower 块格式）不是 JSON：按扩展名或首字符判断，别拿 JSON.parse 去硬解
     const isTxt = /\.txt$/i.test(file.name) || !/^\s*[[{]/.test(text);
     if (isTxt) {
-      try {
-        const r = await api.importProfilesTxt(text);
-        reportImport(r);
-        await load(false);
-      } catch (e) { toast(`导入失败：${e.message}`, 'bad'); }
+      await importTxtBatched(text);
       return;
     }
     let parsed;
@@ -885,17 +882,62 @@ export default async function renderProfiles({ head, page }) {
     if (!list) { toast('文件里没有 list 数组（支持 {list} / {data:{list}} / 裸数组）', 'bad'); return; }
     try {
       const r = await api.importProfiles(list);
-      reportImport(r);
+      reportImport(r, { unit: '条' });
       await load(false);
     } catch (e) { toast(`导入失败：${e.message}`, 'bad'); }
   }
 
-  function reportImport(r) {
-    const bits = [`导入完成：成功 ${r.imported} 条`];
-    if (r.failed?.length) bits.push(`失败 ${r.failed.length} 条`);
+  /**
+   * AdsPower `.txt` 分批导入（用户真正走的那条路）。
+   *
+   * 为什么要分批：整份文件实测 18.9 MB / 50 块，单块 cookie 行最长 55 万字符 ——
+   * 一次 POST 上去，旧版 2 MB 上限直接把连接掐断，用户只看到 `Failed to fetch`。
+   * 现在是每批 ≤8 MB 且 ≤40 块（只在块边界切），顺序发送，最后汇总。
+   *
+   * 两个容易做错的点，都在这里处理：
+   *   1. **失败项的块号要换算**：服务端返回的 `index` 是「本批内第几块」，
+   *      直接显示会错位（第 2 批的第 3 块会显示成第 3 块）。这里加 `first_block`。
+   *   2. **一批失败不中断**：记下这一批的块号，继续下一批（用户能拿到「哪些成了」）。
+   */
+  async function importTxtBatched(text) {
+    const { chunks, total_blocks: totalBlocks } = splitTxtChunks(text);
+    if (!chunks.length) {
+      toast('文件里没有可导入的块：每个块要以一行 18 个星号结束', 'bad');
+      return;
+    }
+    const prog = progressToast(`正在导入 0/${totalBlocks} 块…`);
+    let doneBlocks = 0;
+    const results = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const c = chunks[i];
+      if (chunks.length > 1) prog.update(`正在导入 ${doneBlocks}/${totalBlocks} 块…（第 ${i + 1}/${chunks.length} 批）`);
+      try {
+        results.push(await api.importProfilesTxt(c.text));
+      } catch (e) {
+        // 一批失败不中断：记下错因（块号换算交给 mergeBatchResults），继续下一批
+        results.push({ error: e.message });
+      }
+      doneBlocks += c.blocks;
+      prog.update(`正在导入 ${doneBlocks}/${totalBlocks} 块…`);
+    }
+    const sum = mergeBatchResults(chunks, results);
+    const bits = [`导入完成：成功 ${sum.imported} 块 / 共 ${totalBlocks} 块`];
+    if (sum.batches > 1) bits.push(`分 ${sum.batches} 批发送`);
+    if (sum.failed.length) bits.push(`失败 ${sum.failed.length} 块`);
+    if (sum.warnings.length) bits.push(`${sum.warnings.length} 条告警`);
+    prog.done(bits.join(' · '), sum.failed.length ? 'bad' : 'ok');
+    if (sum.failed.length || sum.warnings.length) {
+      showImportDetail({ imported: sum.imported, failed: sum.failed, warnings: sum.warnings }, { unit: '块' });
+    }
+    await load(false);
+  }
+
+  function reportImport(r, { unit = '条' } = {}) {
+    const bits = [`导入完成：成功 ${r.imported} ${unit}`];
+    if (r.failed?.length) bits.push(`失败 ${r.failed.length} ${unit}`);
     if (r.warnings?.length) bits.push(`${r.warnings.length} 条告警`);
     toast(bits.join(' · '), r.failed?.length ? 'bad' : 'ok');
-    if (r.failed?.length || r.warnings?.length) showImportDetail(r);
+    if (r.failed?.length || r.warnings?.length) showImportDetail(r, { unit });
   }
 
   /** AdsPower `.txt` 互操作导出（当前勾选的，或筛选出来的全部） */
@@ -913,14 +955,15 @@ export default async function renderProfiles({ head, page }) {
     } catch (e) { toast(`导出失败：${e.message}`, 'bad'); }
   }
 
-  function showImportDetail(r) {
+  function showImportDetail(r, { unit = '条' } = {}) {
     const lines = [];
-    for (const f of r.failed || []) lines.push(`✗ 第 ${Number(f.index) + 1} 条：${f.reason}`);
+    // index 是 0 基：.txt 里是**整份文件的块号**（分批后已加 first_block），JSON 里是项号
+    for (const f of r.failed || []) lines.push(`✗ 第 ${Number(f.index) + 1} ${unit}：${f.reason}`);
     for (const w of r.warnings || []) lines.push(`- ${w}`);
     confirmDialog({
       title: '导入结果',
       body: h('div', null,
-        h('div', null, `成功 ${r.imported} 条${r.failed?.length ? `，失败 ${r.failed.length} 条` : ''}。`),
+        h('div', null, `成功 ${r.imported} ${unit}${r.failed?.length ? `，失败 ${r.failed.length} ${unit}` : ''}。`),
         h('div', { class: 'code-block', style: { whiteSpace: 'pre-wrap' } }, lines.join('\n') || '（没有问题）')),
       okLabel: '知道了', cancelLabel: '关闭',
     });

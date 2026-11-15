@@ -1,6 +1,6 @@
 {
   "name": "freepower",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "private": true,
   "type": "module",
   "description": "FreePower — 独立实现的指纹浏览器（多环境隔离 + 代理 + 指纹一致 + 本地 API + 桌面壳）",
@@ -18,7 +18,7 @@
     "desktop": "node tools/run-desktop.mjs",
     "desktop:selftest": "node tools/run-desktop.mjs --selftest",
     "dist:win": "electron-builder --win --x64",
-    "smoke": "node --no-warnings test/smoke.mjs && node --no-warnings test/proxy-chain.test.mjs && node --no-warnings test/workers.test.mjs && node --no-warnings test/agent-smoke.test.mjs && node --no-warnings test/session-restore.test.mjs && node --no-warnings test/startup-tabs.test.mjs && node --no-warnings test/block-page.test.mjs && node --no-warnings test/markers-kernel.test.mjs && node --no-warnings test/sync-kernel.test.mjs && node --no-warnings test/sync-text-kernel.test.mjs && node --no-warnings test/sync-tabs-kernel.test.mjs && node --no-warnings test/sync-window-kernel.test.mjs && node --no-warnings test/sync-arrange-kernel.test.mjs && node --no-warnings test/sync-show-kernel.test.mjs && node --no-warnings test/apps-kernel.test.mjs && node --no-warnings test/purge-lock-kernel.test.mjs && node --no-warnings test/batch-cookie-kernel.test.mjs && node --no-warnings test/batch-show-kernel.test.mjs",
+    "smoke": "node --no-warnings test/smoke.mjs && node --no-warnings test/proxy-chain.test.mjs && node --no-warnings test/workers.test.mjs && node --no-warnings test/agent-smoke.test.mjs && node --no-warnings test/session-restore.test.mjs && node --no-warnings test/startup-tabs.test.mjs && node --no-warnings test/block-page.test.mjs && node --no-warnings test/markers-kernel.test.mjs && node --no-warnings test/sync-kernel.test.mjs && node --no-warnings test/sync-text-kernel.test.mjs && node --no-warnings test/sync-tabs-kernel.test.mjs && node --no-warnings test/sync-window-kernel.test.mjs && node --no-warnings test/sync-arrange-kernel.test.mjs && node --no-warnings test/sync-show-kernel.test.mjs && node --no-warnings test/apps-kernel.test.mjs && node --no-warnings test/purge-lock-kernel.test.mjs && node --no-warnings test/batch-cookie-kernel.test.mjs && node --no-warnings test/batch-show-kernel.test.mjs && node --no-warnings test/import-large.test.mjs",
     "test:unit": "node --no-warnings test/unit.test.mjs",
     "test:api": "node --no-warnings test/api.test.mjs",
     "test:api-mcp": "node --no-warnings test/api-mcp.test.mjs",
@@ -73,7 +73,8 @@
     "test:purge-lock-kernel": "node --no-warnings test/purge-lock-kernel.test.mjs",
     "test:apps-kernel": "node --no-warnings test/apps-kernel.test.mjs",
     "test:startup-tabs": "node --no-warnings test/startup-tabs.test.mjs",
-    "test:settings": "node --no-warnings test/settings-diagnose.test.mjs"
+    "test:settings": "node --no-warnings test/settings-diagnose.test.mjs",
+    "test:import-large": "node --no-warnings test/import-large.test.mjs"
   },
   "devDependencies": {
     "electron": "^45.2.3",

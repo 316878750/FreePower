@@ -90,7 +90,10 @@ function parseProxyString(v) {
   const port = Number(parts[1]);
   if (!host || !Number.isInteger(port) || port <= 0 || port > 65535) return null;
   return {
-    proxy_type: scheme || undefined,
+    // ⚠️ 这里**只给 scheme**，不给 `proxy_type` 键。以前给的是 `proxy_type: scheme || undefined`，
+    // 展开到别处会把调用方算好的值覆盖成 undefined（socks5 变 http 那个 bug 的根因）。
+    // 让「谁的优先级高」只在一个地方决定，别在两层各算一次。
+    scheme: scheme || '',
     proxy_host: host,
     proxy_port: port,
     proxy_user: parts.length >= 3 ? parts[2].trim() : '',
@@ -117,11 +120,17 @@ function proxyOf(item, nested) {
   }
   const fromString = parseProxyString(item.proxy);
   if (fromString) {
+    // 优先级：顶层显式 `proxy_type` > AdsPower 的 `proxytype` > 字符串里的 `socks5://` 前缀 > 无
+    // （无 → normalizeProxy 兜底 http，这是既有语义，不改）
+    //
+    // ⚠️ 展开必须放在**前面**：`conn` 里已经没有 `proxy_type` 了（见 parseProxyString 的注释），
+    // 但顺序仍然钉成「先展开、后写显式值」—— 这样以后谁往 conn 里加字段，也不会再覆盖掉算好的值。
+    const { scheme, ...conn } = fromString;
     return {
       proxy: {
-        proxy_type: item.proxy_type || item.proxytype || fromString.proxy_type,
+        ...conn,
+        proxy_type: item.proxy_type || item.proxytype || scheme || undefined,
         proxy_soft: item.proxy_soft,
-        ...fromString,
       },
     };
   }
@@ -219,25 +228,29 @@ export function normalizeImportItem(raw) {
 /**
  * 批量导入。一条失败不影响其余：失败项带 index + 可读原因。
  * @param {object[]} items
- * @param {{unit?: string}} [opts] 告警前缀的单位（JSON 用「项」、.txt 用「块」）
+ * @param {{unit?: string, indexOf?: (itemIndex:number)=>number}} [opts]
+ *   `unit` 告警前缀的单位（JSON 用「项」、.txt 用「块」）；
+ *   `indexOf` 把「第几项」换算成对用户有意义的序号（.txt 里是「第几块」——
+ *   有的块因为缺 name 没进 items，项号 ≠ 块号，不换算就会指错块）。
  * @returns {{imported:number, failed:object[], warnings:string[], list:object[]}}
  */
-export function importProfiles(items = [], { unit = '项' } = {}) {
+export function importProfiles(items = [], { unit = '项', indexOf = null } = {}) {
   const failed = [];
   const warnings = [];
   const list = [];
+  const shown = (i) => (typeof indexOf === 'function' ? indexOf(i) : i);
   for (let i = 0; i < items.length; i++) {
     const n = normalizeImportItem(items[i]);
     if (n.error) {
-      failed.push({ index: i, reason: n.error });
+      failed.push({ index: shown(i), reason: n.error });
       continue;
     }
-    for (const w of n.warnings) warnings.push(`第 ${i + 1} ${unit}：${w}`);
+    for (const w of n.warnings) warnings.push(`第 ${shown(i) + 1} ${unit}：${w}`);
     try {
       const created = createProfile(n.input);
       list.push(created);
     } catch (e) {
-      failed.push({ index: i, reason: e.message || String(e) });
+      failed.push({ index: shown(i), reason: e.message || String(e) });
     }
   }
   return { imported: list.length, failed, warnings, list };

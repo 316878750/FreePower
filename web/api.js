@@ -42,6 +42,23 @@ async function call(path, { method = 'GET', body, query, timeoutMs = 90000 } = {
       },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
+  } catch (e) {
+    /**
+     * 网络层失败**不许把英文原文抛给用户**。以前这里直接冒泡，用户看到的是一句
+     * `导入失败：Failed to fetch` —— 既不知道发生了什么，也不知道该做什么。
+     * 最常见的原因是「请求体超过服务端上限、连接被掐」，其次是服务没起来/请求超时。
+     * 原始错误只进 console（排障用），界面上只给中文和下一步动作。
+     */
+    const timedOut = e && (e.name === 'AbortError' || /abort/i.test(String(e.message || '')));
+    console.warn('[fp] 请求失败', path, e);
+    throw new FpError({
+      code: -1,
+      msg: timedOut
+        ? `请求超时（${Math.round(timeoutMs / 1000)} 秒）：本机服务可能正忙。稍后重试；导入大文件请用「导入」按钮，它会自动分批`
+        : '连不上本机服务：请求被中断或服务没响应。确认 FreePower 还在运行；'
+          + '导入大文件时不要整份一次提交 —— 控制台的「导入」会自动分批',
+      data: { network_error: String((e && e.message) || e), path },
+    }, 0);
   } finally {
     clearTimeout(timer);
   }

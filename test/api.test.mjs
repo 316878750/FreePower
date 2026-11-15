@@ -386,6 +386,130 @@ try {
   const tBadFmt = await api('POST', '/api/v2/browser-profile/export', { profile_id: [tId], format: 'yaml' });
   check('txt 导出：非法 format → 100002', tBadFmt.json.code === 100002, tBadFmt.json.msg);
 
+  /* ---- 2026-11-15 缺陷回归：`proxytype=socks5` 被存成 http（spread 顺序覆盖） ----
+   * 根因：`parseProxyString` 返回的对象里带 `proxy_type: scheme || undefined`，展开写在
+   * 后面把算好的 'socks5' 覆盖成 undefined，normalizeProxy 再兜底成 'http'。
+   * 用户 50 个环境全是 socks5，导入后全按 http 连，**且一句告警都没有**。
+   * 三种都要钉：有 proxytype / 是 https / 没有 proxytype（兜底 http）。 */
+  {
+    const mkTxt = (proxytype, name) => [
+      'acc_id=9', 'id=ads-pt', 'group=', `name=${name}`, 'remark=', 'platform=example.com',
+      'username=', 'password=', 'fakey=', 'cookie=', `proxytype=${proxytype}`, 'ipchecker=ipapi',
+      'proxy=198.51.100.44:1080:u:p', 'proxyurl=', 'proxyid=', 'ip=', 'countrycode=US',
+      'ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/142.0.0.0 Safari/537.36',
+      '*'.repeat(18), '',
+    ].join('\n');
+    const cases = [
+      ['socks5', 'socks5', 'txt 导入：proxytype=socks5 → proxy_config.proxy_type 是 socks5（不被覆盖成 http）'],
+      ['https', 'https', 'txt 导入：proxytype=https → proxy_config.proxy_type 是 https'],
+      ['', 'http', 'txt 导入：没有 proxytype → 兜底 http（既有语义不变）'],
+    ];
+    for (const [given, want, label] of cases) {
+      const imp = await api('POST', '/api/v2/browser-profile/import', {
+        format: 'txt', content: mkTxt(given, `pt-${given || 'none'}`),
+      });
+      const id = imp.json.data?.list?.[0]?.profile_id;
+      const row = id ? (await api('GET', `/api/v2/browser-profile/detail?profile_id=${id}`)).json.data : {};
+      const got = row.proxy_config?.proxy_type;
+      check(label, imp.json.code === 0 && got === want,
+        `给定 proxytype=${JSON.stringify(given)} → 落库 ${JSON.stringify(got)}（期望 ${want}），host=${row.proxy_config?.host}:${row.proxy_config?.port}`);
+    }
+    /* 反向：URL 前缀也要认（`socks5://host:port`），且前缀不该压过显式 proxytype */
+    const uImp = await api('POST', '/api/v2/browser-profile/import', {
+      format: 'txt', content: mkTxt('http', 'pt-scheme').replace('proxy=198.51.100.44:1080:u:p', 'proxy=socks5://198.51.100.44:1080:u:p'),
+    });
+    const uId = uImp.json.data?.list?.[0]?.profile_id;
+    const uRow = uId ? (await api('GET', `/api/v2/browser-profile/detail?profile_id=${uId}`)).json.data : {};
+    check('txt 导入：显式 proxytype 优先于字符串里的 socks5:// 前缀',
+      uRow.proxy_config?.proxy_type === 'http' && uRow.proxy_config?.host === '198.51.100.44',
+      `proxy_type=${uRow.proxy_config?.proxy_type} host=${uRow.proxy_config?.host}`);
+  }
+
+  /* ---- 2026-11-15：.txt 切块的纯函数（分批导入的地基） ---- */
+  {
+    const { splitTxtChunks, countTxtBlocks, DEFAULT_MAX_BYTES, DEFAULT_MAX_BLOCKS } = await import('../web/txt-split.js');
+    const SEP = '*'.repeat(18);
+    const blk = (i) => [
+      `acc_id=${i}`, `id=ads-${i}`, 'group=', `name=env-${i}`, 'remark=', 'platform=facebook.com',
+      'username=', 'password=', 'fakey=', `cookie=${JSON.stringify([{ name: 'sid', value: 'v'.repeat(200) }])}`,
+      'proxytype=socks5', 'ipchecker=ipapi', `proxy=198.51.100.${i % 250}:1080:u:p`,
+      'proxyurl=', 'proxyid=', 'ip=203.0.113.7', 'countrycode=US', 'ua=Mozilla/5.0 Chrome/142.0.0.0',
+      SEP,
+    ].join('\n') + '\n';
+    const big = Array.from({ length: 50 }, (_, i) => blk(i + 1)).join('');
+
+    check('.txt 切块：默认阈值是 8 MB / 40 块', DEFAULT_MAX_BYTES === 8 * 1024 * 1024 && DEFAULT_MAX_BLOCKS === 40,
+      `${DEFAULT_MAX_BYTES} / ${DEFAULT_MAX_BLOCKS}`);
+    const def = splitTxtChunks(big);
+    check('.txt 切块：50 块按默认阈值切成 40+10（块数上限先生效）',
+      def.chunks.length === 2 && def.chunks.map((c) => c.blocks).join(',') === '40,10'
+      && def.total_blocks === 50, `批数=${def.chunks.length} 每批块数=${def.chunks.map((c) => c.blocks)}`);
+
+    const byBytes = splitTxtChunks(big, { maxBytes: 4096, maxBlocks: 40 });
+    check('.txt 切块：字节上限生效（每批 ≤4096 B，且仍是整块）',
+      byBytes.chunks.every((c) => c.bytes <= 4096 || c.oversized) && byBytes.chunks.length > 2,
+      `批数=${byBytes.chunks.length} 每批字节=${byBytes.chunks.map((c) => c.bytes).join(',')}`);
+
+    const byBlocks = splitTxtChunks(big, { maxBytes: 8 * 1024 * 1024, maxBlocks: 7 });
+    check('.txt 切块：块数上限生效（每批 ≤7 块）',
+      byBlocks.chunks.every((c) => c.blocks <= 7) && byBlocks.total_blocks === 50,
+      `每批块数=${byBlocks.chunks.map((c) => c.blocks).join(',')}`);
+
+    for (const [label, r] of [['默认', def], ['按字节', byBytes], ['按块数', byBlocks]]) {
+      const joined = r.chunks.map((c) => c.text).join('');
+      check(`.txt 切块（${label}）：拼回去逐字节等于原文`, joined === big,
+        `拼回 ${Buffer.byteLength(joined)} B / 原文 ${Buffer.byteLength(big)} B`);
+    }
+
+    check('.txt 切块：每批都以整块结尾（没切在 cookie= 行中间）',
+      def.chunks.every((c) => c.text.endsWith(`${SEP}\n`)), def.chunks.map((c) => c.text.slice(-20).replace(/\n/g, '\\n')).join(' | '));
+    check('.txt 切块：first_block 连续累加（界面靠它把「本批第几块」换成整份文件的块号）',
+      byBlocks.chunks.map((c) => c.first_block).join(',') === byBlocks.chunks.map((_, i) => i * 7).join(','),
+      byBlocks.chunks.map((c) => c.first_block).join(','));
+    check('.txt 切块：块数与服务端解析口径一致（countTxtBlocks）', countTxtBlocks(big) === 50, String(countTxtBlocks(big)));
+
+    // 边界：单块就超过 maxBytes 时不能切碎，要单独成批并标 oversized
+    const oneHuge = splitTxtChunks(big, { maxBytes: 100, maxBlocks: 40 });
+    check('.txt 切块：单块超阈值时单独成批并标 oversized（不切碎块）',
+      oneHuge.chunks.length === 50 && oneHuge.chunks.every((c) => c.oversized && c.blocks === 1),
+      `批数=${oneHuge.chunks.length} oversized=${oneHuge.chunks.filter((c) => c.oversized).length}`);
+
+    // 边界：空文件 / 只有空白 → 不产生批（别让界面发一个空请求上去）
+    check('.txt 切块：空文件不产生批次',
+      splitTxtChunks('').chunks.length === 0 && splitTxtChunks('   \n\n').chunks.length === 0,
+      `${splitTxtChunks('').chunks.length} / ${splitTxtChunks('   \n\n').chunks.length}`);
+
+    /* ---- 汇总：失败项的块号要换算成整份文件的块号（分批最容易错位的地方） ---- */
+    const { mergeBatchResults } = await import('../web/txt-split.js');
+    const ch = splitTxtChunks(big, { maxBytes: 8 * 1024 * 1024, maxBlocks: 7 }).chunks;
+    const fake = ch.map((c, i) => ({
+      imported: c.blocks - 1,
+      // 每批都「第 2 块失败」（批内 index=1）—— 换错的话会全显示成第 2 块
+      failed: [{ index: 1, reason: 'x' }],
+      warnings: [],
+      blocks: c.blocks,
+    }));
+    const merged = mergeBatchResults(ch, fake);
+    const wantIdx = ch.map((c) => c.first_block + 1);
+    check('.txt 汇总：批内 index 换算成整份文件的块号（不是都显示第 2 块）',
+      merged.failed.map((f) => f.index).join(',') === wantIdx.join(','),
+      `得到 ${merged.failed.map((f) => f.index).join(',')} / 期望 ${wantIdx.join(',')}`);
+    check('.txt 汇总：imported 是各批之和', merged.imported === 50 - ch.length, String(merged.imported));
+
+    const withErr = mergeBatchResults(ch, fake.map((r, i) => (i === 1 ? { error: '连不上本机服务' } : r)));
+    check('.txt 汇总：整批失败不中断，其余批照常计入，失败项点名这一批的块号范围',
+      withErr.imported === merged.imported - (ch[1].blocks - 1)
+      && withErr.failed_batches === 1
+      && withErr.failed.some((f) => f.index === ch[1].first_block && /整批失败/.test(f.reason)
+        && f.reason.includes(`第 ${ch[1].first_block + 1}–${ch[1].first_block + ch[1].blocks} 块`)),
+      `imported=${withErr.imported} failed_batches=${withErr.failed_batches} 失败项=${JSON.stringify(withErr.failed.map((f) => f.index))}`);
+
+    const drift = mergeBatchResults(ch, fake.map((r, i) => (i === 0 ? { ...r, blocks: 99 } : r)));
+    check('.txt 汇总：服务端块数与预期不符时出声（不让用户拿错位的失败清单）',
+      drift.warnings.some((w) => /服务端解析出 99 块、预期/.test(w)),
+      JSON.stringify(drift.warnings).slice(0, 120));
+  }
+
   /* -------------------- 回收站：占位已换成真实现（2026-11-12），形状见 test/recycle.test.mjs -------------------- */
   const ph = await api('POST', '/api/v2/browser-profile/recycle-bin/list', { page: 1 });
   check('回收站 list：code 0 + data 键全等 limit,list,page（limit 取默认 50）+ 无 total',

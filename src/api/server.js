@@ -9,7 +9,26 @@ import { isStaticPath, renderIndex, resolveStatic, sendStatic } from './static.j
 import { buildRoutes } from './routes.js';
 import { redeemTicket } from './tickets.js';
 
-const MAX_BODY = 2 * 1024 * 1024;
+/**
+ * 请求体上限：默认 64 MB，`FREEPOWER_MAX_BODY`（字节）可覆盖。
+ *
+ * 为什么从 2 MB 提到 64 MB：用户从 AdsPower 导出的 `.txt` 实测 18,884,174 B / 50 块
+ * （单块 cookie 行最长 559,542 字符），整份塞进一个请求是 21,157,002 B —— 2 MB 上限下
+ * 连接被直接掐断，界面只看到英文 `Failed to fetch`。
+ * 64 MB 是「一份 50 块的导出文件 × 3 倍余量」，不是无上限；超过照样明确报 413。
+ */
+const MAX_BODY_DEFAULT = 64 * 1024 * 1024;
+/**
+ * 超限后**最多再读这么多字节然后放弃**。
+ * 正常超限（几十 MB）会读完再回 413；只有客户端真往本机灌 >512 MB 这种极端情况才断开。
+ */
+const MAX_DRAIN = 512 * 1024 * 1024;
+
+/** 每次请求现读 env：改了不用重启进程也能生效，判据里也好改 */
+function maxBodyBytes() {
+  const v = Number(process.env.FREEPOWER_MAX_BODY);
+  return Number.isFinite(v) && v > 0 ? Math.floor(v) : MAX_BODY_DEFAULT;
+}
 
 // 版本号**从 package.json 读**，别再写死常量：0.3.2 那个常量让控制台一直显示 v0.3.2，
 // 升了版本看起来像没升（巡检在 0.4.1 上实测到过）。
@@ -92,16 +111,55 @@ function corsOrigin(origin) {
 }
 
 /* ------------------------------- 传输 ------------------------------- */
+/**
+ * 读请求体。超限时**先把剩下的字节读完再抛 413**，不是先断开。
+ *
+ * 为什么要「读完再回」：实测四种写法（Node 24 / undici fetch，body 21 MB、上限 2 MB）
+ *
+ *   先 reject + req.destroy()      → 客户端 `fetch failed`（现状，就是用户看到的英文报错）
+ *   只 res.end(413) 不管剩余请求体   → 客户端 `fetch failed`
+ *   res.end 之后再 destroy         → 客户端 `fetch failed`
+ *   **读完剩余请求体，'end' 时回 413** → 客户端 HTTP 413 + 完整 JSON ✓
+ *
+ * 原因：客户端还在写的时候服务端就关连接，客户端把这次请求当网络错误，读不到响应。
+ * 所以只有「让客户端把话说完，再告诉它太大」这条路能真把 msg 送到界面。
+ */
 function readBody(req) {
+  const limit = maxBodyBytes();
   return new Promise((resolve, reject) => {
     let size = 0;
+    let drained = 0;
+    /** 超限时记下「已经收到的字节数」；非 null 表示已决定回 413，后续只读不存 */
+    let overflowAt = null;
     const chunks = [];
+
     req.on('data', (c) => {
       size += c.length;
-      if (size > MAX_BODY) { reject(new ApiError(ERR.INVALID, 'body too large', 413)); req.destroy(); return; }
-      chunks.push(c);
+      if (overflowAt === null) {
+        if (size > limit) {
+          overflowAt = size;
+          chunks.length = 0; // 已经没用了，早点放手
+          return;
+        }
+        chunks.push(c);
+        return;
+      }
+      drained += c.length;
+      if (drained > MAX_DRAIN) {
+        // 极端情况：客户端往本机灌超过 512 MB。不再等它说完，断开并如实报「太大」。
+        reject(new ApiError(ERR.INVALID,
+          `请求体过大：已收到 ${size} 字节，上限 ${limit} 字节；请分批导入`, 413));
+        req.destroy();
+      }
     });
+
     req.on('end', () => {
+      if (overflowAt !== null) {
+        // 数字要能指导动作：告诉用户多大、上限多少、该怎么做
+        return reject(new ApiError(ERR.INVALID,
+          `请求体过大：${size} 字节，上限 ${limit} 字节；请分批导入`
+          + `（控制台导入 .txt 会自动分批；脚本可调 FREEPOWER_MAX_BODY 调大上限）`, 413));
+      }
       if (!chunks.length) return resolve({});
       const text = Buffer.concat(chunks).toString('utf8').trim();
       if (!text) return resolve({});
@@ -270,7 +328,9 @@ export function createApiServer({ port } = {}) {
     } catch (e) {
       if (e instanceof ApiError) {
         const extra = Object.keys(e.extra || {}).length ? { data: e.extra } : {};
-        return send(res, e.httpStatus, { code: e.code, msg: e.message, ...extra }, corsHeaders);
+        // 413 明确关连接：这次请求体我们没消费完（或刚好消费完），别让客户端拿这条连接再发
+        const hdrs = e.httpStatus === 413 ? { ...corsHeaders, connection: 'close' } : corsHeaders;
+        return send(res, e.httpStatus, { code: e.code, msg: e.message, ...extra }, hdrs);
       }
       if (e && e.fieldErrors) {
         // profile schema 校验失败：100002 + 字段级明细

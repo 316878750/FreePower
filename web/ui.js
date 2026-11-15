@@ -87,6 +87,28 @@ export function toast(msg, kind = '') {
 }
 
 /**
+ * 常驻进度提示（导入这种要跑一会儿、有多批的操作）。
+ * 不是 toast：toast 会自己消失，进度条要一直挂到 `done()`。
+ * @returns {{update:(msg:string)=>void, done:(msg?:string, kind?:string)=>void}}
+ */
+export function progressToast(initial) {
+  const box = document.getElementById('toasts');
+  const el = h('div', { class: 'toast' }, initial);
+  box.appendChild(el);
+  let finished = false;
+  return {
+    update(msg) { if (!finished) el.textContent = msg; },
+    done(msg = '', kind = '') {
+      if (finished) return;
+      finished = true;
+      el.className = `toast ${kind}`.trim();
+      if (msg) el.textContent = msg;
+      setTimeout(() => { el.remove(); }, kind === 'bad' ? 6000 : 3200);
+    },
+  };
+}
+
+/**
  * 二次确认。danger 类按钮必须是用户主动点的，不能靠「反正能撤销」放行。
  * @returns {Promise<boolean>}
  */

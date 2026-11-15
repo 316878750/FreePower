@@ -185,7 +185,7 @@ fp status                服务状态 + 运行中的环境
 | POST | `/api/v1/browser/batch-stop` | 批量停 — FreePower 扩展 |
 | POST | `/api/v2/browser-profile/stop-all` | 关掉本机全部 |
 | GET | `/api/v2/browser-profile/cookies` | `{cookies:"<login_cookie 原文>"}` |
-| POST | `/api/v1|v2/browser-profile/import` | **环境导入**：JSON 三种 body（`{list}` / `{data:{list}}` / 裸数组）都认，或 `{format:"txt", content:"..."}` 认 AdsPower `.txt` 块格式；未知字段进 `warnings`；`imported` / `failed` 顶层与 `data` 各一份（`code` 仍 0） |
+| POST | `/api/v1|v2/browser-profile/import` | **环境导入**：JSON 三种 body（`{list}` / `{data:{list}}` / 裸数组）都认，或 `{format:"txt", content:"..."}` 认 AdsPower `.txt` 块格式；未知字段进 `warnings`；`imported` / `failed` 顶层与 `data` 各一份（`code` 仍 0）。**请求体默认上限 64 MB**（`FREEPOWER_MAX_BODY` 覆盖，超限回 **413** + 中文 msg，不是掐连接）；`.txt` 的 `failed[].index` 是**本请求内的块号（0 基）**、响应带 `blocks`（本请求解析出的块数）—— 控制台会自动分批并用 `first_block` 换算成整份文件的块号（0.4.4） |
 | GET/POST | `/api/v1|v2/browser-profile/export` | **环境导出**：默认 `{list}`，同时带我方字段与 AdsPower 兼容键（`proxy_*`，代理密码原样）；`format:"txt"` → `data:{format,count,filename,content}`（AdsPower 块格式，**不含 list**）；`{profile_id:[...]}` 或 GET 多个 `profile_id` |
 | POST | `/api/v1|v2/browser-profile/copy` | **复制环境**：指纹配置原样，`fp_seed` 与四个噪声种子**全部重生**，返回 `seeds_regenerated:true`；`copy_cookies` 默认关 |
 | GET | `/api/v1|v2/browser-profile/cookie/export` | **cookie 导出**（`format=json|netscape`）；**要求环境在跑**，没跑报 `800002`，不会为了导出偷偷起内核 |
@@ -484,6 +484,30 @@ Esc 能收起。
 判据 `test/settings-diagnose.test.mjs` **56 PASS / 0 FAIL**（A 层，不起内核，已进 `npm test`），
 七段：设置合并与越界、真生效、存坏了、快照内容与只读、代理探测三态与不落盘、静态约束、纯函数契约。
 完整设计见 [18 号文档](docs/18-侧栏账号菜单-设置-外观-网络诊断.md)。
+
+### 大文件导入与代理类型（0.4.4，2026-11-15）
+
+用户从 AdsPower 导出的 `profiles_*.txt` 在 0.4.3 里导入报「Failed to fetch」。两个**真缺陷**（第二个静默写错数据）：
+
+1. **2 MB 请求体上限 + 先断连接后回响应**：`src/api/server.js` 收到第 2 MB 就 `reject` + `req.destroy()`，
+   响应还没发出去，客户端只拿到 `Failed to fetch`。整份文件实测 21,157,002 B，切 3 块就 200 —— 导入逻辑没坏，
+   是整份塞不进一个请求。**修法**：默认上限提到 **64 MB**（`FREEPOWER_MAX_BODY` 覆盖，每次请求现读），
+   超限时**把剩余请求体读完再回 413**（实测另外三种写法客户端全拿不到响应），413 带中文 msg + 真实字节数 +
+   「请分批导入」，并加 `connection: close`。
+2. **`proxytype=socks5` 被存成 `http`**：`proxyOf` 里 `...fromString` 展开写在后面，把算好的 `'socks5'`
+   覆盖成 `undefined`，`normalizeProxy` 兜底成 `http`。50 个环境全按 http 连、**零告警**。
+   **修法**：`parseProxyString` 不再产出 `proxy_type`（改给 `scheme`），`proxyOf` 先展开、后写显式值。
+   优先级：顶层 `proxy_type` > `proxytype` > 字符串 `socks5://` 前缀 > 无（→ `http`）。
+
+**界面分批**（用户真正走的路，`web/txt-split.js` 纯函数）：双阈值 **≤8 MB 且 ≤40 块**，**只在块边界切**
+（绝不切在 `cookie=` 行中间；那一行实测可 50 万字符），各批拼回去**逐字节等于原文**；顺序发送 + 常驻进度
+（「正在导入 12/50 块…」）；一批失败不中断；**失败项的块号换算成整份文件的块号**（服务端 `index` 是批内序号，
+界面加 `first_block`）；服务端响应新增 `blocks`，与预期不符时进 `warnings`；网络层错误给中文，不再把
+`Failed to fetch` 原样抛给用户。
+
+判据：A 层 `npm run test:api` 新增 **20 条**（代理类型三态 + 前缀优先级、切块纯函数、块号换算）；
+B 层 `npm run test:import-large` **15 PASS / 0 FAIL**（合成 18.9 MB / 50 块真 HTTP 端到端，已进 `npm run smoke`）。
+设计、红绿读数、边界见 [19 号文档](docs/19-大文件导入与代理类型.md)。
 
 ## 六、桌面壳与安装包（P6）
 
@@ -982,6 +1006,20 @@ Object.getOwnPropertyNames(window).some(n => /^__fp/.test(n))   // true → 这�
     （CDP 客户端、内核管理器）拖进来，`session.js` 又要用 prefs —— 一个循环。
     以后加设置项，**改 `settings.js`，别改回 `session.js`**。
 
+53. **64 MB 与 8 MB / 40 块都是我们选的数字（0.4.4）**：服务端请求体默认上限 **64 MB**（一份 50 块的
+    AdsPower 导出文件实测约 21 MB，这是「× 3 倍余量」），`FREEPOWER_MAX_BODY`（字节）可改，**每次请求现读**；
+    控制台分批阈值 **8 MB 且 40 块**是给 64 MB 留余量、同时防「很多小块」把请求数打爆。三个数字都是我们定的，
+    不是对手原值、也不是协议上限。超过 64 MB 的单个请求会回 **413 + 中文 msg**（不再是掐连接）；
+    单次请求仍最多 1000 条（未改）。超限时服务端必须**把剩余请求体读完再回 413**（实测另外三种写法客户端只拿到
+    `fetch failed`），代价是那条连接要陪着收完这几 MB；只有 >512 MB 才主动断开。界面分批是**顺序发**，
+    导入**不幂等**：中途关页面 = 剩余批不发、已成功的批已落库，重试会重复建环境。整份文件先读进内存再切块
+    （不做流式解析），几百 MB 的文件会吃浏览器内存。
+54. **0.4.3 导入过的 `socks5` 环境在库里是 `http`，0.4.4 不自动修旧数据（0.4.4）**：缺陷在 0.4.3 里是
+    **静默写错**（`proxy_type` 被覆盖，`host` / `port` / 账号密码都对，只有类型错、一句告警都没有）。
+    升级到 0.4.4 后，**0.4.3 期间成功导入过的 `socks5` / `https` 环境需要重新导入或手工改代理类型**。
+    用户这次整份导入失败（连接被掐、一条都没进库），所以没有受影响数据 —— 但对别的用户的旧库是真事。
+    0.4.4 不动数据库结构（无新列、无新表），0.4.3 与 0.4.4 可以互相打开同一个库。
+
 
 
 - **0.4.0 及以前**：命中黑名单 / 白名单外的**顶层文档**走 `Fetch.failRequest`，浏览器显示的是 `net::ERR_BLOCKED_BY_CLIENT`（「无法访问此网站」），`page.goto(...)` 直接抛错。
@@ -1012,7 +1050,7 @@ npm run test
 npm run smoke
 ```
 
-当前实测（2026-11-14，本机）：`npm run test` = schema **10** + net-rules **56** + chain-rules **31** + recycle **44** + apps **54** + profiles-tabs **60** + batch **74** + settings-diagnose **56** + unit **85** + agent **15** + api **102** + api-mcp **46** + sync-rules **95** + sync-text **51** + sync-tabs **59** + sync-window **22** + sync-arrange **67** + sync-show **55** + markers **34** + nav-fold **60** + ui **46** + desktop **59** + kernel-download **62**（`package.json` 里那条脚本就是这二十三组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（proxy-chain，两跳代理链）+ **24/24**（workers）+ **30/30**（agent-smoke）+ **9/9**（session-restore）+ **12/12**（startup-tabs）+ **17/17**（block-page，全离线）+ **18/18**（markers-kernel）+ **39/39**（sync-kernel）+ **21/21**（sync-text-kernel）+ **39/39**（sync-tabs-kernel）+ **17/17**（sync-window-kernel）+ **28/28**（sync-arrange-kernel）+ **42/42**（sync-show-kernel）+ **15/15**（apps-kernel）+ **14/14**（purge-lock-kernel）+ **18/18**（batch-cookie-kernel）+ **13/13**（batch-show-kernel），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
+当前实测（2026-11-15，本机）：`npm run test` = schema **10** + net-rules **56** + chain-rules **31** + recycle **44** + apps **54** + profiles-tabs **60** + batch **74** + settings-diagnose **56** + unit **85** + agent **15** + api **122** + api-mcp **46** + sync-rules **95** + sync-text **51** + sync-tabs **59** + sync-window **22** + sync-arrange **67** + sync-show **55** + markers **34** + nav-fold **60** + ui **46** + desktop **59** + kernel-download **62**（`package.json` 里那条脚本就是这二十三组，缺一组都不算跑完）；`npm run smoke` = **152/152**（`test/smoke.mjs`）+ **37/37**（proxy-chain，两跳代理链）+ **24/24**（workers）+ **30/30**（agent-smoke）+ **9/9**（session-restore）+ **12/12**（startup-tabs）+ **17/17**（block-page，全离线）+ **18/18**（markers-kernel）+ **39/39**（sync-kernel）+ **21/21**（sync-text-kernel）+ **39/39**（sync-tabs-kernel）+ **17/17**（sync-window-kernel）+ **28/28**（sync-arrange-kernel）+ **42/42**（sync-show-kernel）+ **15/15**（apps-kernel）+ **14/14**（purge-lock-kernel）+ **18/18**（batch-cookie-kernel）+ **13/13**（batch-show-kernel）+ **15/15**（import-large，大文件真 HTTP 端到端），真 Chrome `157.0.8103.78`。另有 `npm run test:nav-race` **13/13**、`npm run test:native-tostring` **11/11**。**unit 里那条「字段表产物是最新的」**（判据⑨）：直接 import `tools/gen-schema.mjs` 的 `buildArtifacts()` 重新算一遍，和仓库里的 `fields.generated.json` / `schema.sql` **逐字节**比对（连 CRLF / BOM / 末尾换行都算差异），不一致就红并打印「跑 `node tools/gen-schema.mjs` 再提交」和第一处差异的字节位置 —— 防「改了 `overrides.mjs` 忘了重跑生成器」。**代理链两套判据都已入口**：纯逻辑那套在 `npm test` 的十组里，起 5 次内核的那套在 `npm run smoke` 里 —— 别再单独跑就算完，脱门就会像 `api.test.mjs:363` 那样静默过期。桌面壳的人工验收记录见 [P6 文档](docs/07-P6-桌面壳.md)。
 > 若本机同时开着**已安装的** FreePower 应用，`smoke` 最后那条「无残留 chrome 进程」会因为那批进程（`--user-data-dir` 指向 `%APPDATA%\FreePower\data\profiles\...`）而红 —— 那是用户自己的内核，不属于测试残留，按规矩不要杀；关掉应用再跑即是 152/152。
 
 **外部检测对照**（不属于 `npm run test`，需要外网，约 2 分钟）：
@@ -1049,6 +1087,15 @@ npm run test:cdp-page       # 3 项：CDP 直建带 URL 的页面，注入必须
 ```powershell
 npm run test:fileio   # 19 项：导出→删→导入逐字段+四个哈希一致；同一环境重启对照；复制体四个哈希全不同；
                       #       cookie json/netscape 两种格式、跨环境搬运、环境没在跑报 800002（不偷偷起内核）
+```
+
+**大文件导入真 HTTP 端到端（0.4.4，不需要 Chrome，约 40 秒；已进 `npm run smoke`）**：
+
+```powershell
+npm run test:import-large   # 15 项：合成 18.9 MB / 50 块（最大 cookie 行约 50 万字符）走控制台分批路
+                            #       → 50 条全导入、failed 为空；落库核对 proxy_type 只有 socks5；
+                            #       上限临时调回 2 MB → 客户端拿到 HTTP 413 + 中文 msg（不是 fetch failed）；
+                            #       FREEPOWER_MAX_BODY 调大后同一份文件又能过。**不用用户的真实文件**
 ```
 
 **注入函数源码一致性（已知限制 35 的回归监视，需要真实 Chrome，约 20 秒）**：
@@ -1536,6 +1583,7 @@ web/
   style.css            全部样式（无预处理器、无主题）
   ui.js                极简视图层：h() / mount() / toast / confirm / drawer
   api.js               Local API 客户端（界面只走这一条路）
+  txt-split.js         `.txt` 分批导入的纯函数：切块（8 MB / 40 块、只在块边界）、块数统计、失败块号换算（0.4.4）
   app.js               hash 路由 + 侧栏 + 运行态角标
   pages/profiles.js    环境列表：启停、批量、自检摘要、删除
   pages/edit.js        环境编辑：11 组分栏、实时校验（文案来自后端）
@@ -1551,7 +1599,7 @@ bin/
   fp.mjs               CLI `fp list|start|stop|status`（key/端口从命令行或 data/local_api）（0.4.2）
 test/smoke.mjs         端到端冒烟（152 项，需真实 Chrome）
 test/unit.test.mjs     零 Chrome 单元测试（84 项）
-test/api.test.mjs      本地 API 契约测试（100 项，不需要 Chrome）
+test/api.test.mjs      本地 API 契约测试（122 项，不需要 Chrome）
 test/net-rules.test.mjs  网络规则匹配逻辑单测（38 项，不需要 Chrome）
 test/recycle.test.mjs  回收站数据层 + 两条路由（44 项，含重启读库）
 test/chain-rules.test.mjs  多级代理链纯逻辑（31 项：hop 解析、塌单跳、PAC、协议限制）
@@ -1570,6 +1618,7 @@ test/proxy-health.test.mjs  代理健康检查真机验证（15 项：四态 / �
 test/media-devices.test.mjs 媒体设备真机验证（P9-C，12 项：真实枚举 + 只改 label + toJSON + 按 kind 授权）
 test/speech.test.mjs   语音投影真机验证（P9-A，8 项）
 test/cdp-target.test.mjs  CDP 直建带 URL 页面的注入兜底（3 项）
+test/import-large.test.mjs  大文件导入真 HTTP 端到端（15 项，不需要 Chrome：合成 18.9 MB / 50 块走分批路、落库核 proxy_type、413 中文 msg、上限可配）（0.4.4）
 test/helpers/profile-probe.mjs  真机探针脚手架（起环境 + 两个 origin，不含断言）
 test/fake-proxy.mjs    假代理 / 假出口端点（冒烟不依赖公网）
 tools/make-icons.py    自绘图标生成（Pillow，不引用第三方素材）
