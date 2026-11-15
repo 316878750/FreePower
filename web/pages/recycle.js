@@ -156,9 +156,11 @@ export default async function renderRecycle({ head, page }) {
         } catch (e) { toast(`删除失败：${e.message}`, 'bad'); return; }
         const s = res.summary || {};
         const failed = res.failed || [];
+        const absentN = s.already_absent || 0;
         mount(resultBox,
           h('div', { class: failed.length ? 'notice warn' : 'notice ok' },
             `已删除 ${s.deleted} 个环境的数据目录，释放 ${fmtSize(s.freed_bytes)}。`
+            + (absentN ? `另有 ${absentN} 个本来就没有数据目录（没东西可删，不算删除）。` : '')
             + (failed.length ? `${failed.length} 个没删掉。` : '')),
           failed.length ? h('div', { class: 'code-block', style: { whiteSpace: 'pre-wrap' } },
             failed.map((f) => `· ${f.name || f.profile_id}：${f.intact ? '一个字节都没动（被占用，关掉占用后可以再试）' : '数据已不在原位置'}${f.error_code ? `（${f.error_code}）` : ''}`).join('\n')) : null,

@@ -185,12 +185,13 @@ try {
     check('不删库记录：环境记录还在（下次启动重建干净目录）',
       !!prof.getProfile(a.id) && !!prof.getProfile(b.id), a.id.slice(0, 8));
 
-    // 目录本来就不在 → absent（不虚报释放空间）
+    // 目录本来就不在 → 进 already_absent（**不许算进 deleted 的条数**：界面会写成「已删除 N 个」）
     const gone = { profile_id: 'iiiiiiii-1', profile_no: 23, name: 'I 没目录', size_bytes: 999, days_unused: 40 };
     const r2 = applyCacheCleanup([gone]);
-    check('目录本来就不在 → deleted 里标 absent:true、removed:false，**freed_bytes 不加**',
-      r2.deleted.length === 1 && r2.deleted[0].absent === true && r2.deleted[0].removed === false && r2.freed_bytes === 0,
-      JSON.stringify({ d: r2.deleted[0], freed: r2.freed_bytes }));
+    check('目录本来就不在 → 进 `already_absent`（不在 deleted 里）、freed_bytes 不加',
+      r2.deleted.length === 0 && (r2.already_absent || []).length === 1
+      && r2.already_absent[0].profile_id === 'iiiiiiii-1' && r2.freed_bytes === 0,
+      JSON.stringify({ deleted: r2.deleted.length, absent: (r2.already_absent || []).length, freed: r2.freed_bytes }));
 
     // 删不掉 → 必须报 intact（真占用在 purge-lock-kernel 里用真锁验）
     const j = { id: 'jjjjjjjj-1', profile_no: 24, name: 'J 占用', last_launch_at: daysAgo(50).toISOString(), status: 'idle' };
@@ -259,7 +260,26 @@ try {
       badDays.json?.code === 100002 && badDays.json?.data?.field === 'days',
       JSON.stringify({ code: badDays.json?.code, field: badDays.json?.data?.field }));
 
-    // ③ 真删：只确认 old → 只删 old
+    // ③ **最要命的一条**：真删不带任何确认清单 → 必须拒，且一个字节都不许动。
+    //    这不是「顺手加个校验」：API 是一等公民，脚本里一个 {days:30} 就能删掉几十个环境的登录态，
+    //    而且会静默回 code=0 —— 恰好是这一版要防的事故。
+    const noList = await api('POST', '/api/v2/browser-profile/cache-cleanup', { days: 30 });
+    check('真删**不带 `confirm_ids` → 拒**（HTTP 200 + 非 0 code + field=confirm_ids，msg 说清「先 preview」）',
+      noList.status === 200 && noList.json?.code !== 0 && noList.json?.code !== undefined
+      && noList.json?.data?.field === 'confirm_ids'
+      && /preview/.test(noList.json?.msg || ''),
+      JSON.stringify({ status: noList.status, code: noList.json?.code, field: noList.json?.data?.field, msg: (noList.json?.msg || '').slice(0, 60) }));
+    check('被拒的那次**一个字节都没动**（old / old2 / fresh 的目录都还在）',
+      fs.existsSync(dataDirOf(oldP)) && fs.existsSync(dataDirOf(old2P)) && fs.existsSync(dataDirOf(freshP)),
+      JSON.stringify([dataDirOf(oldP), dataDirOf(old2P), dataDirOf(freshP)].map((d) => fs.existsSync(d))));
+    // `profile_ids` 是老字段名，一并认（脚本里两种写法都有人用）；但空串/空数组同样算「没带清单」
+    const emptyList = await api('POST', '/api/v2/browser-profile/cache-cleanup', { days: 30, confirm_ids: [] });
+    check('`confirm_ids: []`（空数组）→ 同样拒，不许当成「全选」',
+      emptyList.json?.code !== 0 && emptyList.json?.data?.field === 'confirm_ids'
+      && fs.existsSync(dataDirOf(old2P)),
+      JSON.stringify({ code: emptyList.json?.code, field: emptyList.json?.data?.field }));
+
+    // ④ 真删：只确认 old → 只删 old
     const run = await api('POST', '/api/v2/browser-profile/cache-cleanup', { days: 30, confirm_ids: [oldP.profile_id] });
     const runDeleted = (run.json?.data?.deleted || []).map((x) => x.profile_id);
     check('真删只删确认过的那个（old）', run.json?.code === 0 && runDeleted.length === 1 && runDeleted[0] === oldP.profile_id,
@@ -271,8 +291,10 @@ try {
       JSON.stringify({ exists: fs.existsSync(dataDirOf(old2P)) }));
     check('**没确认的 fresh 一个字节都没动**（哪怕它也不够天数）',
       fs.existsSync(dataDirOf(freshP)));
-    check('真删响应带 freed_bytes 与 summary（界面要报「释放了多少」）',
-      typeof run.json?.data?.freed_bytes === 'number' && typeof run.json?.data?.summary?.deleted === 'number',
+    check('真删响应带 freed_bytes 与 summary，且 `deleted` 与 `already_absent` **分开计**（条数不许虚报）',
+      typeof run.json?.data?.freed_bytes === 'number' && typeof run.json?.data?.summary?.deleted === 'number'
+      && typeof run.json?.data?.summary?.already_absent === 'number'
+      && run.json?.data?.summary?.deleted === 1 && run.json?.data?.summary?.already_absent === 0,
       JSON.stringify({ freed: run.json?.data?.freed_bytes, s: run.json?.data?.summary }));
     check('真删之后环境记录还在（数据没了、环境还在）',
       !!prof.getProfile(oldP.profile_id), oldP.profile_id.slice(0, 8));
@@ -314,6 +336,10 @@ try {
     const runBlock = routesSrc.slice(runAt, runAt + 3000);
     check('静态：真删路由里用「确认 ∩ 计划」过滤（`targetIds.has`），不是按新计划全删',
       /applyCacheCleanup\(/.test(runBlock) && /targetIds\.has\(/.test(runBlock));
+    check('静态：真删路由**缺清单时抛 100002 + field=confirm_ids**，不是 `: plan.will_delete` 兜底',
+      /field: 'confirm_ids'/.test(runBlock) && !/toDelete = targetIds[\s\S]{0,80}:\s*plan\.will_delete/.test(runBlock));
+    check('静态：`applyCacheCleanup` 把「本来就没有目录」单独放 `already_absent`（不算「已删除」条数）',
+      /already_absent: alreadyAbsent/.test(fs.readFileSync(new URL('../src/runtime/cache-cleanup.js', import.meta.url), 'utf8')));
     check('静态：真删路由把「确认后变了」的如实报回来（kept_after_confirm）',
       /kept_after_confirm/.test(runBlock));
 

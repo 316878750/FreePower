@@ -1532,8 +1532,10 @@ export function buildRoutes() {
    *
    * **两阶段，不许合并成一步**：
    *   - `POST /api/v2/browser-profile/cache-cleanup/preview`（默认）→ 只读，回「将删哪些、各多大、
-   *     哪些不删以及为什么」；
-   *   - `POST /api/v2/browser-profile/cache-cleanup` + `preview:false` → 真删，**只删清单里那些**。
+   *     哪些不删以及为什么」；**不给 `profile_ids` 是合法的**（本意就是按天数筛全部环境）；
+   *   - `POST /api/v2/browser-profile/cache-cleanup` + `confirm_ids` → 真删，**只删清单里那些**；
+   *     **不给清单一律拒**（`100002` + `field: 'confirm_ids'`）—— 「没给」只等于「调用方漏了」，
+   *     不等于「同意全删」。这两条路由的语义不对称是刻意的。
    *
    * 为什么必须两阶段：这是**不可逆**的（删掉 cache + cookie + localStorage + 书签 + 登录态）。
    * 用户看到的必须是「将删哪些」，不是「已删除 N 个」。
@@ -1601,40 +1603,63 @@ export function buildRoutes() {
     if (!Number.isFinite(days) || days < 0) {
       throw new ApiError(ERR.INVALID, 'days 必须是 ≥0 的数字（删「N 天未开环境」的缓存）', 200, { field: 'days' });
     }
+
+    /*
+     * **真删必须带上用户确认过的那份清单**（`confirm_ids`，老写法 `profile_ids` 也认）。
+     *
+     * 为什么不是「没带就等于全选」：API 是这个产品的一等公民（脚本、MCP 会批量跑），
+     * 一个 `{days:30}` 的 POST 就能删掉几十个环境的登录态 —— 那正是这一版要防的事故，
+     * 而且它会**静默回 code=0**，脚本根本不会以为出错。
+     * 「没给清单」在这条路由上**只有一种解释：调用方漏了**，不是「我同意全删」。
+     * 想删光，就先把 `preview` 返回的 `profile_id` 列表原样带回来 —— 那才是「我看过清单并同意」。
+     *
+     * 注意与 `preview` 的区别：**preview 不给清单是合法的**（它的本意就是「按天数筛一遍」），
+     * 真删不给就是错的。这两条路由的语义不对称，是刻意的。
+     */
+    const confirmedRaw = body.confirm_ids ?? body.profile_ids;
+    const confirmList = Array.isArray(confirmedRaw)
+      ? confirmedRaw
+      : (typeof confirmedRaw === 'string' ? confirmedRaw.split(',') : []);
+    const cleanConfirm = confirmList.map((s) => String(s).trim()).filter(Boolean);
+    if (!cleanConfirm.length) {
+      throw new ApiError(
+        ERR.INVALID,
+        '真删必须带 confirm_ids（先调 /api/v2/browser-profile/cache-cleanup/preview，把它返回的 profile_id 列表带回来）。'
+        + '不带清单不会被当成「全删」—— 这是不可逆操作。',
+        200,
+        { field: 'confirm_ids' },
+      );
+    }
+
     const profiles = cacheCleanupTargets(ctx);
     const plan = planCacheCleanup(profiles, { days });
 
     /*
-     * 真要删时，**必须带上用户确认过的那份清单**（`profile_ids` 或 `confirm_ids`）。
+     * 实际删的集合 = **用户确认的集合 ∩ 现在的计划** —— 两边都同意才删。
      * 为什么：计划是「算」出来的，而用户点确认到服务端执行之间，环境状态可能变了
      * （比如某个环境刚被启动）。这时候「按新计划删」就会删到用户没看见的东西。
-     * 所以：实际删的集合 = 用户确认的集合 ∩ 现在的计划 —— 两边都同意才删。
      */
-    const confirmedRaw = body.confirm_ids ?? body.profile_ids;
-    let targetIds = null;
-    if (confirmedRaw !== undefined && confirmedRaw !== null && confirmedRaw !== '') {
-      targetIds = new Set(idList(Array.isArray(confirmedRaw) ? confirmedRaw : String(confirmedRaw).split(',').map((s) => s.trim()).filter(Boolean), 'v2').map(String));
-    }
-    const toDelete = targetIds
-      ? plan.will_delete.filter((x) => targetIds.has(String(x.profile_id)))
-      : plan.will_delete;
+    const targetIds = new Set(idList(cleanConfirm, 'v2').map(String));
+    const toDelete = plan.will_delete.filter((x) => targetIds.has(String(x.profile_id)));
     // 用户确认了但现在已经不该删的（刚启动 / 刚有记录）：如实报，不删
-    const nowKept = targetIds
-      ? plan.keep.filter((x) => targetIds.has(String(x.profile_id)))
-      : [];
+    const nowKept = plan.keep.filter((x) => targetIds.has(String(x.profile_id)));
 
     const r = applyCacheCleanup(toDelete);
     return ok({
       preview: false,
       days,
       deleted: r.deleted,
+      // 目录本来就不在的那几个单独一栏：不许算进「已删除 N 个」（条数虚报）
+      already_absent: r.already_absent,
       failed: r.failed,
       kept_after_confirm: nowKept,
       freed_bytes: r.freed_bytes,
       unknown_count: plan.unknown_count,
       summary: {
         scanned: profiles.length,
+        confirmed: targetIds.size,
         deleted: r.deleted.length,
+        already_absent: r.already_absent.length,
         failed: r.failed.length,
         kept_after_confirm: nowKept.length,
         freed_bytes: r.freed_bytes,

@@ -119,8 +119,8 @@ export function planCacheCleanup(profiles = [], { days, now = new Date(), fsx = 
  * 执行清理。**调用方必须先把 `planCacheCleanup` 的结果给用户看过并确认。**
  *
  * 每一条都走 `purgeProfileData`（先改名再删墓碑）：
- *   - `ok:true, removed:true` → 真删掉了
- *   - `ok:true, absent:true`  → 目录本来就没有（不算失败，也不算删掉）
+ *   - `ok:true, removed:true` → 真删掉了（进 `deleted`，算释放空间）
+ *   - `ok:true, absent:true`  → 目录本来就没有（进 `already_absent`，**不算「删掉了」、也不算失败**）
  *   - `ok:false, intact:true` → **一个字节都没动**（被占用），如实报，下次再试
  *   - `ok:false, data_detached:true` → 极罕见：改名后删不掉且改不回来，数据已不在原路径
  *
@@ -129,10 +129,11 @@ export function planCacheCleanup(profiles = [], { days, now = new Date(), fsx = 
  *
  * @param {object[]} willDelete `planCacheCleanup().will_delete`
  * @param {{fsx?:object}} [opts]
- * @returns {{deleted:object[], failed:object[], freed_bytes:number}}
+ * @returns {{deleted:object[], already_absent:object[], failed:object[], freed_bytes:number}}
  */
 export function applyCacheCleanup(willDelete = [], { fsx = fs } = {}) {
   const deleted = [];
+  const alreadyAbsent = [];
   const failed = [];
   let freedBytes = 0;
 
@@ -144,8 +145,10 @@ export function applyCacheCleanup(willDelete = [], { fsx = fs } = {}) {
       continue;
     }
     if (r.ok && r.absent) {
-      // 目录已经不在了：不报「删掉了」（会虚报释放的空间），也不报失败
-      deleted.push({ ...item, removed: false, absent: true });
+      // 目录已经不在了（预览之后被别的路径清掉 / 手动删了）：
+      // **单独一栏**，不算进「已删除 N 个」—— 界面上写「已删除 3 个」而其中 2 个本来就没东西，
+      // 就是条数虚报，和虚报释放空间是同一类错。
+      alreadyAbsent.push({ ...item, absent: true });
       continue;
     }
     failed.push({
@@ -160,5 +163,5 @@ export function applyCacheCleanup(willDelete = [], { fsx = fs } = {}) {
     });
   }
 
-  return { deleted, failed, freed_bytes: freedBytes };
+  return { deleted, already_absent: alreadyAbsent, failed, freed_bytes: freedBytes };
 }

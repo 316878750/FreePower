@@ -248,7 +248,9 @@ export const api = {
    */
   cacheCleanupPreview: (body) => call('/api/v2/browser-profile/cache-cleanup/preview', { method: 'POST', body, timeoutMs: 120000 }),
   /**
-   * 真删。只删 `confirm_ids` 里、且**现在的计划里还在**的那些（确认之后状态变了的会跳过并报回来）。
+   * 真删。**必须带 `confirm_ids`**（不带会被拒，不是「全删」）—— 先 `cacheCleanupPreview`，
+   * 把它返回的 `will_delete[].profile_id` 里用户勾过的那些带回来。
+   * 只删「确认的 ∩ 现在的计划」里那些（确认之后状态变了的会跳过并报回来）。
    * 删的是整个 user-data 目录，环境记录不删 —— 下次启动是全新浏览器。
    */
   cacheCleanup: (body) => call('/api/v2/browser-profile/cache-cleanup', { method: 'POST', body, timeoutMs: 300000 }),
