@@ -256,4 +256,18 @@ test('不变式 C：本轮接上的四个字段（clear_cache_after_closing / hi
   // 且只在 window_position === 'topLeft' 时才算数（联动禁用那一条的代码侧）
   assert.match(text('src/kernel/chrome.js'), /===\s*'topLeft'/,
     'win_x/win_y 必须按 window_position 联动（只有 topLeft 才用这两个数）');
+
+  // 接上之后**用户不看就会踩坑**的那几个，必须有页面上可见的提示（`f.note` → edit.js 的 hint）。
+  // 为什么钉这条：`clear_cache_after_closing` 会删掉整个环境数据目录，界面上一句提示都没有的话，
+  // 用户就是「用着用着发现登录态全没了」—— 那正是这一版要消灭的体验。
+  const byName = new Map(form.fields.map((f) => [f.name, f]));
+  const mustHint = {
+    clear_cache_after_closing: /删除|数据目录/,
+    hidden_notification: /通知|权限/,
+  };
+  for (const [n, re] of Object.entries(mustHint)) {
+    const f = byName.get(n);
+    assert.ok(f, `${n} 不在表单里了`);
+    assert.ok(f.note && re.test(f.note), `${n} 已接线但界面没有可见提示（f.note 为空或不含关键信息）—— 用户不看就会踩坑`);
+  }
 });

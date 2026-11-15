@@ -713,4 +713,14 @@ export const NOTES = {
   device_scale: '0 < x < 2.1',
   timezone: 'IANA 名，空格转下划线',
   speech_voices: '音色列表，移动端/内核能力相关',
+
+  // 0.4.6 接线的字段：这里写的是**界面上显示给用户的那行提示**（`f.note` → edit.js 的 hintOf）。
+  // 为什么必须写：这几个字段现在是真生效的，用户不看提示就不知道代价 —— 尤其是
+  // `clear_cache_after_closing` 会**删掉整个环境数据目录**，那不是「清缓存」三个字能概括的。
+  // 规矩：只有「用户不看就会踩坑」的才写，别把 hint 变成说明书。
+  clear_cache_after_closing: '关环境 2 秒后删除整个环境数据目录（cache / cookie / localStorage / 书签），下次启动是全新浏览器；只有 Cookie 字段里存着的登录态会被写回',
+  hidden_notification: '通知权限请求一律被拒（页面拿到 false / null），网页无法再弹通知授权框',
+  win_x: '只有「窗口位置」是 topLeft 时才用这两个数；其它取值下会被禁用（对手是同一种行为，只是静默忽略）',
+  win_y: '只有「窗口位置」是 topLeft 时才用这两个数；其它取值下会被禁用',
+  disable_image: 'Blink 层直接不请求图片，服务器侧一条图片请求都收不到',
 };
