@@ -221,6 +221,42 @@ try {
   check('轮转之后再恢复一次，环境仍能真启动',
     !!third.real_version && Number(third.pid) > 0, `pid=${third.pid}`);
   await manager.stopProfile(p.profile_id);
+  await sleep(600);
+
+  /* ---------------- 8. 池子满 5 份时恢复最旧那份（目标不许被自己的「恢复前」快照挤掉） ---------------- */
+  console.log('\n— 8. 池子满 5 份时恢复最旧那份 → 登录态必须真回来 —');
+  {
+    const pool = snap.listSnapshots(p.profile_id);
+    check('（前提）快照池子满 5 份', pool.length === 5, String(pool.length));
+    const oldestSnap = pool[pool.length - 1];
+
+    // 造「登录态没了」：整份 userdata 删掉（不删的话恢复了也看不出差别，会自己跟自己对上）
+    fs.rmSync(liveDir, { recursive: true, force: true });
+    check('（前提）当前 userdata 已删除', !fs.existsSync(liveDir));
+
+    const rOld = snap.restoreSnapshot(profiles.getProfile(p.profile_id), oldestSnap.snap_id);
+    check('恢复最旧那份：成功', rOld.ok === true, JSON.stringify({ ok: rOld.ok, reason: rOld.reason }));
+    check('**目标快照没被自己的「恢复前」快照挤掉**（目录还在盘上，还能重试）',
+      fs.existsSync(snap.snapshotDirFor(p.profile_id, oldestSnap.snap_id)));
+    check('**数据层真的换上了**：verified / verified_data 为 true 且 `replaced:true`',
+      rOld.verified === true && rOld.verified_data === true && rOld.userdata.replaced === true,
+      JSON.stringify({ verified: rOld.verified, verified_data: rOld.verified_data, userdata: rOld.userdata }));
+    check('被挤掉的是**另一份**更旧的快照，且如实报出来（`evicted`）',
+      (rOld.evicted || []).length === 1 && rOld.evicted[0].snap_id !== oldestSnap.snap_id
+      && rOld.evicted[0].removed === true,
+      JSON.stringify(rOld.evicted));
+
+    // 只有起一次内核才知道「登录态真回来了」—— 文件对不代表能读出来
+    const fourth = await startAndOpen(p.profile_id);
+    check('恢复最旧那份之后环境仍能真启动',
+      !!fourth.started.real_version && Number(fourth.started.pid) > 0, `pid=${fourth.started.pid}`);
+    const cookiesBack = await readCookies(fourth.inst.client).catch(() => []);
+    check('**探针 cookie 真回来了**（半恢复报成功就是这个模式：记录回了、登录态没回）',
+      cookiesBack.some((c) => c.name === PROBE_NAME && c.value === PROBE_VALUE),
+      JSON.stringify(cookiesBack.map((c) => c.name)));
+    await manager.stopProfile(p.profile_id);
+    await sleep(600);
+  }
 } catch (e) {
   check('B 层跑完没有抛异常', false, `${e && e.message}`);
   console.error(e);

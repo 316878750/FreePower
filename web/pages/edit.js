@@ -294,9 +294,16 @@ export default async function renderEdit({ head, page, params }) {
       h('td', { class: 'muted small' }, (s.taken_at || '').slice(0, 19).replace('T', ' ')),
       h('td', null, s.reason_label || s.reason),
       h('td', { class: 'num' }, fmtBytes(s.includes?.userdata_bytes || 0)),
-      h('td', { class: 'small' }, s.includes?.userdata
-        ? `记录 + 数据（${s.includes.userdata_files} 个文件）`
-        : '仅记录（拍的时候没有数据目录）'),
+      h('td', { class: 'small' },
+        s.includes?.userdata
+          ? `记录 + 数据（${s.includes.userdata_files} 个文件）`
+          : '仅记录（拍的时候没有数据目录）',
+        // 在环境跑着的时候拍的：拷的是活着的 userdata（Cookies 是 WAL 模式的 SQLite），
+        // 可能不一致。**必须在这一行上看得见**，不许让人以为它跟别的一样可靠。
+        s.taken_while_running
+          ? h('div', { class: 'muted small', style: { color: 'var(--warn, #b26a00)' } },
+            '运行时拍摄 · 数据可能不完整（建议停止环境后重拍）')
+          : null),
       h('td', { class: 'actions' },
         h('button', { class: 'btn sm', onClick: () => restoreOne(s) }, '恢复'),
         ' ',
@@ -348,8 +355,10 @@ export default async function renderEdit({ head, page, params }) {
         const r = await api.snapshotCreate(state.editing, 'manual');
         const ev = r.evicted || [];
         const bad = ev.filter((x) => x.removed !== true);
-        toast(`已备份一份（${r.list.length} 份）${ev.length ? `，挤掉最旧 1 份` : ''}${bad.length ? `，但有 ${bad.length} 份没删掉（暂时超过上限）` : ''}`,
-          bad.length ? 'warn' : 'ok');
+        // 运行中拍的：拷的是活着的 userdata，可能不一致 —— 这句必须出现在备份成功的那一刻
+        const runText = r.taken_while_running ? '；环境正在运行，这份数据可能不完整，建议停止后重拍一份' : '';
+        toast(`已备份一份（${r.list.length} 份）${ev.length ? `，挤掉最旧 1 份` : ''}${bad.length ? `，但有 ${bad.length} 份没删掉（暂时超过上限）` : ''}${runText}`,
+          (bad.length || r.taken_while_running) ? 'warn' : 'ok');
         await refresh();
       } catch (e) { toast(`备份失败：${e.message}`, 'bad'); }
     }
@@ -367,6 +376,11 @@ export default async function renderEdit({ head, page, params }) {
             '恢复前会',
             h('strong', null, '自动先给当前状态留一份快照'),
             '（排在列表第一行，类型「恢复前自动留存」），所以恢复到错的快照还能再退回来。'),
+          s.taken_while_running
+            ? h('div', { class: 'notice warn' },
+              h('strong', null, '这份是环境运行的时候拍的'),
+              '：当时的数据目录是活的，Cookies 库可能拷到一半不一致，恢复出来登录态可能少几条。')
+            : null,
           h('div', { class: 'muted small' },
             '恢复完要重新启动环境才生效；如果快照是很久以前的，登录态可能已经过期，需要重新登录。')),
         okLabel: '确认恢复', danger: true,
@@ -374,9 +388,32 @@ export default async function renderEdit({ head, page, params }) {
       if (!yes) return;
       try {
         const r = await api.snapshotRestore(state.editing, s.snap_id);
-        toast(r.verified
-          ? `已恢复，逐列核对通过${r.before_snapshot ? '（当前状态已自动存为一份快照）' : ''}`
-          : '已恢复，但逐列核对有不一致，请检查字段后再决定是否重试', r.verified ? 'ok' : 'warn');
+        /*
+         * 文案必须如实：`verified` 现在是「记录 + 数据」都通过才为 true。
+         * 以前这里只问 `verified`，而 `verified` 只核对记录列 —— 数据没换上也照样报绿。
+         */
+        const ev = r.evicted || [];
+        const evictedText = ev.length
+          ? `；快照池子满了，顺带挤掉了 ${ev.length} 份更旧的快照`
+            + (ev.some((x) => x.removed !== true) ? '（其中有的没删掉，暂时超过上限）' : '')
+          : '';
+        const onlyRecord = r.userdata && r.userdata.mode === 'not_in_snapshot'
+          ? '；这份快照只有记录、没有数据目录（登录态不会变）' : '';
+        const runningText = r.taken_while_running
+          ? '；注意这份是环境运行时拍的，数据可能不完整' : '';
+        let msg;
+        let tone;
+        if (r.verified) {
+          msg = `已恢复，记录与数据都核对通过（数据目录 ${r.userdata?.files || 0} 个文件）${onlyRecord}${evictedText}${runningText}`;
+          tone = (ev.length || r.taken_while_running) ? 'warn' : 'ok';
+        } else if (r.verified_record && !r.verified_data) {
+          msg = `记录已恢复，但数据目录没换上（登录态可能没回来），请检查后重试${evictedText}`;
+          tone = 'bad';
+        } else {
+          msg = `已恢复，但逐列核对有不一致（${Object.keys(r.diff || {}).join(' / ') || '见接口返回'}），请检查后再决定是否重试${evictedText}`;
+          tone = 'warn';
+        }
+        toast(msg, tone);
         // 表单里的值已经过时了，重新取一遍，避免「保存」把旧值写回去
         state.model = await loadProfile(state.editing);
         state.touched.clear();

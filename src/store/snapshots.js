@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 本地备份快照（0.4.7 ②）—— **丢数据的最后一道防线**。
  *
  * ## 它解决什么
@@ -33,6 +33,22 @@
  *    否则恢复本身就成了新的丢数据入口 —— 恢复到错的快照，连「刚才是什么样」都没了。
  * 3. **恢复要先换目录、再写库**，换目录走「改名 → 拷贝 → 删墓碑」：
  *    拷贝失败就把原名改回来，一个字节都没变（与 `purge-data.js` 同一条纪律）。
+ * 4. **正在恢复的那份快照不许被自己的「恢复前」快照挤掉**。恢复第 1 步会拍一份
+ *    `before_restore`，而拍照会触发轮转（超 5 份真删目录）。池子满 5 份时恢复**最旧那份**，
+ *    新拍的第 6 份本来会把最旧那份删掉 —— 删的正是正在恢复的那份，于是 userdata 找不到、
+ *    静默跳过换目录，接口却回 `restored:true` + `verified:true`（**半恢复报成功**）。
+ *    所以 `takeSnapshot` 带 `protect: [目标 snap_id]`，轮转跳过它、改删更旧的一份。
+ * 5. **快照声称有 userdata 就必须真有**。`meta.includes.userdata === true` 而盘上那份
+ *    `userdata/` 不存在或为空 → **硬失败**（`snapshot_userdata_missing`），且在动任何东西之前
+ *    就失败。静默跳过换目录 = 「环境在、登录态没了」还报成功，是这一版最坏的失败形态。
+ * 6. **`verified` 要同时覆盖记录和数据**：只核对 `profiles` 的业务列，等于「数据层一点没覆盖」，
+ *    半恢复照样绿（0.4.7 ② 修之前的真实缺陷）。数据没恢复成功时 `verified` 不许是 true。
+ *
+ * ## 在运行时拍摄（如实标记，不禁止）
+ *
+ * 允许在环境跑着的时候拍快照（用户「边跑边备份」是合理需求），但那时拷的是**活着的 userdata**：
+ * `Cookies` 是 WAL 模式的 SQLite，拷到一半可能是不一致的副本。所以 `meta.taken_while_running`
+ * 如实记下来，列表上带可见标记、恢复时再提示一次 —— **不许让人以为这份跟别的一样可靠**。
  *
  * ## 恢复哪些列、不恢复哪些列（刻意的）
  *
@@ -157,7 +173,10 @@ function profileColumns() {
  * 拍一份快照。
  *
  * @param {object} profile 环境记录（要 `id` / `profile_no`）
- * @param {{reason?:string, now?:Date, fsx?:object, keep?:number}} [opts]
+ * @param {{reason?:string, now?:Date, fsx?:object, keep?:number,
+ *          protect?:string[], running?:boolean}} [opts]
+ *   - `protect`：这次轮转**不许删**的 snap_id（恢复时用来保护正在恢复的那份）
+ *   - `running`：拍的时候环境是否在跑；不给就看 `profile.status`（如实记进 meta，见文件头）
  * @returns {{
  *   ok: boolean, reason?: string,
  *   snapshot?: object,          // meta
@@ -167,10 +186,14 @@ function profileColumns() {
  *   - `ok:true` 一定能在盘上找到这份快照
  *   - 拍不下来就 `ok:false` + `reason`（调用方必须如实报，不许静默成功）
  */
-export function takeSnapshot(profile, { reason = 'manual', now = new Date(), fsx = fs, keep = KEEP_SNAPSHOTS } = {}) {
+export function takeSnapshot(profile, {
+  reason = 'manual', now = new Date(), fsx = fs, keep = KEEP_SNAPSHOTS, protect = [], running,
+} = {}) {
   const profileId = String(profile.id || profile.profile_id || '');
   if (!profileId) return { ok: false, reason: 'no_profile_id' };
   const why = SNAPSHOT_REASONS.includes(reason) ? reason : 'manual';
+  // 在跑的时候拍：拷的是活着的 userdata，可能不一致。如实记下来，不假装它跟别的一样可靠。
+  const wasRunning = running === undefined ? String(profile.status || '') === 'running' : running === true;
 
   const snapId = newSnapId(why, now);
   const dir = snapshotDirFor(profileId, snapId);
@@ -225,6 +248,9 @@ export function takeSnapshot(profile, { reason = 'manual', now = new Date(), fsx
     taken_at: now.toISOString(),
     reason: why,
     reason_label: reasonLabel(why),
+    // 拍摄时环境在跑：拷的是活着的 userdata，Cookies 是 WAL 模式的 SQLite，可能不一致。
+    // 界面与恢复时都要提示，不许让人以为这份跟别的一样可靠。
+    taken_while_running: wasRunning,
     includes: {
       record: true,
       record_columns: Object.keys(record).length,
@@ -244,21 +270,30 @@ export function takeSnapshot(profile, { reason = 'manual', now = new Date(), fsx
   }
 
   // 4) 轮转：只留最近 keep 个，多出来的**真删目录**
-  const evicted = rotate(profileId, { keep, fsx });
+  //    被 `protect` 点名的（恢复时正在恢复的那份）跳过，改删更旧的一份 ——
+  //    否则「恢复最旧那份」会先被自己的「恢复前」快照挤掉，导致半恢复还报成功。
+  const evicted = rotate(profileId, { keep, fsx, protect });
   return { ok: true, snapshot: meta, evicted, userdata };
 }
 
 /**
  * 挤掉最旧的，直到只剩 `keep` 个。
  *
+ * `protect`：这次**不许删**的 snap_id 列表。被保护的跳过（它仍占一个名额），所以会往下再删一份
+ * 更旧的 —— 总份数照样回到 `keep`，只是死的不是被保护那份。全都受保护时宁可超上限也不删。
+ *
  * 为什么「挤不掉也要保留新快照」：删不掉通常是文件被占用（杀毒、资源管理器缩略图），
  * 那一刻拒绝备份等于把用户刚做的操作变成「没有兜底」。宁可暂时多占一份，也要把备份留下，
  * 并把 `removed:false` 如实报给界面 —— 界面会说「有 N 份没删掉，暂时超过 5 份」。
  */
-export function rotate(profileId, { keep = KEEP_SNAPSHOTS, fsx = fs } = {}) {
+export function rotate(profileId, { keep = KEEP_SNAPSHOTS, fsx = fs, protect = [] } = {}) {
+  const protectedSet = new Set((protect || []).map((x) => String(x)));
   const all = listSnapshots(profileId, { fsx }); // 新的在前
   const evicted = [];
-  for (const s of all.slice(keep)) {
+  let remaining = all.length;
+  for (let i = all.length - 1; i >= 0 && remaining > keep; i -= 1) {
+    const s = all[i];
+    if (protectedSet.has(String(s.snap_id))) continue; // 跳过但**不**减 remaining：要再多删一份更旧的
     const dir = snapshotDirFor(profileId, s.snap_id);
     let removed = false;
     let error = null;
@@ -269,6 +304,7 @@ export function rotate(profileId, { keep = KEEP_SNAPSHOTS, fsx = fs } = {}) {
     } catch (e) {
       error = e.message;
     }
+    if (removed) remaining -= 1;
     evicted.push({ snap_id: s.snap_id, taken_at: s.taken_at, removed, error });
   }
   return evicted;
@@ -356,10 +392,13 @@ export function snapshotUsage(profileId, { fsx = fs } = {}) {
  * @returns {{
  *   ok: boolean, reason?: string,
  *   before_snapshot?: object,     // 恢复前自动留的那份
- *   userdata?: {replaced:boolean, files:number, bytes:number},
+ *   evicted?: object[],           // 这次「恢复前」拍照挤掉的快照
+ *   userdata?: {replaced:boolean, mode:'replaced'|'not_in_snapshot', files:number, bytes:number},
  *   record?: {written:number, kept_current:string[]},
- *   verified?: boolean, diff?: object,
+ *   verified?: boolean,           // 记录**和**数据都核对通过才是 true
+ *   verified_record?: boolean, verified_data?: boolean, diff?: object,
  * }}
+ *   - `snapshot_userdata_missing`：meta 说包含数据但盘上没有 → 硬失败，**在动任何东西之前**
  */
 export function restoreSnapshot(profile, snapId, { fsx = fs, now = new Date(), skipBefore = false } = {}) {
   const profileId = String(profile.id || profile.profile_id || '');
@@ -375,22 +414,64 @@ export function restoreSnapshot(profile, snapId, { fsx = fs, now = new Date(), s
     return { ok: false, reason: e.reason || 'snapshot_not_found', error_message: e.message };
   }
 
+  /*
+   * 0) **先验数据层，再动任何东西**。
+   *
+   * `meta.includes.userdata === true` 但盘上那份 `userdata/` 不见了或空了 → 硬失败。
+   * 以前这里是 `if (fsx.existsSync(snapUserdata))` 一句静默跳过：记录照常写回、接口回
+   * `restored:true` + `verified:true`，用户拿到「环境在、登录态没了」。
+   * 在跑的环境被自己的「恢复前」快照挤掉时就是这个形态（见文件头第 4 条）。
+   *
+   * 放在拍 `before_restore` **之前**：这一步失败时一个字节都没动（连快照池子都没变），
+   * 所以「记录没变」是天然成立的，不靠回滚。
+   */
+  const claimsUserdata = snap.meta && snap.meta.includes && snap.meta.includes.userdata === true;
+  const snapUserdata = path.join(snapshotDirFor(profileId, snapId), 'userdata');
+  if (claimsUserdata) {
+    let snapFiles = 0;
+    try { snapFiles = dirBytes(snapUserdata, { fsx }).files; } catch { snapFiles = 0; }
+    if (!fsx.existsSync(snapUserdata) || snapFiles === 0) {
+      return {
+        ok: false,
+        reason: 'snapshot_userdata_missing',
+        error_message: `这份快照的 meta 说包含数据目录，但盘上的 userdata/ ${fsx.existsSync(snapUserdata) ? '是空的' : '不存在'}`
+          + '（可能被挤掉、被手工删掉，或拷贝时中断）。恢复会得到一个「环境在、登录态没了」的结果，所以拒绝。',
+      };
+    }
+  }
+
   // 1) 恢复前先给**当前状态**留一份：恢复错了还能回到「恢复之前」
+  //    `protect` 必须带上正在恢复的那份 —— 池子满时这一步会触发轮转，不加保护就会把
+  //    正在恢复的快照自己删掉（先拍后拷，删了就没 userdata 可拷了）。
   let before = null;
+  let evicted = [];
   if (!skipBefore) {
-    const r = takeSnapshot(profile, { reason: 'before_restore', now, fsx });
+    const r = takeSnapshot(profile, { reason: 'before_restore', now, fsx, protect: [snapId] });
     if (!r.ok) {
       // 留不下「恢复前」的快照就**不许恢复** —— 否则恢复本身成了新的丢数据入口
       return { ok: false, reason: 'before_snapshot_failed', error_message: r.reason || '' };
     }
     before = r.snapshot;
+    // 这次拍照挤掉了谁，要如实往上报：「你刚恢复了最旧那份，代价是另一份被挤掉了」
+    evicted = r.evicted || [];
   }
 
   // 2) 换 userdata：改名 → 拷 → 删墓碑（拷贝失败就改回来，一个字节都没变）
+  //    `userdata.mode` 把「真的换了」和「快照里本来就没数据」分开说 —— 两者都 `replaced:false`
+  //    会让人分不清是没恢复还是没得恢复。
   const liveDir = userDataDirFor(profile);
-  const snapUserdata = path.join(snapshotDirFor(profileId, snapId), 'userdata');
-  let userdata = { replaced: false, files: 0, bytes: 0 };
-  if (fsx.existsSync(snapUserdata)) {
+  let userdata = { replaced: false, mode: 'not_in_snapshot', files: 0, bytes: 0 };
+  if (claimsUserdata) {
+    // 第二道：第 0 步验过之后到这一步之间，目标快照仍可能消失（别的进程清理、手工删）。
+    // 那时必须报「快照数据不见了」，不是含糊的「拷贝失败」—— 这两种失败对用户的意义完全不同。
+    if (!fsx.existsSync(snapUserdata)) {
+      return {
+        ok: false,
+        reason: 'snapshot_userdata_missing',
+        error_message: '快照里的 userdata/ 在恢复过程中消失了（可能被轮转挤掉或被手工删除）。记录没有写回。',
+        before_snapshot: before,
+      };
+    }
     const tomb = `${liveDir}.fp-restore-${crypto.randomBytes(3).toString('hex')}`;
     let renamed = false;
     if (fsx.existsSync(liveDir)) {
@@ -405,7 +486,7 @@ export function restoreSnapshot(profile, snapId, { fsx = fs, now = new Date(), s
       fsx.mkdirSync(path.dirname(liveDir), { recursive: true });
       fsx.cpSync(snapUserdata, liveDir, { recursive: true });
       const size = dirBytes(liveDir, { fsx });
-      userdata = { replaced: true, files: size.files, bytes: size.bytes };
+      userdata = { replaced: true, mode: 'replaced', files: size.files, bytes: size.bytes };
     } catch (e) {
       // 拷坏了：把原目录改回来（尽力），报「什么都没变」
       try { fsx.rmSync(liveDir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -432,25 +513,40 @@ export function restoreSnapshot(profile, snapId, { fsx = fs, now = new Date(), s
   //    否则「某个列悄悄没写」这种事会自己跟自己对上（0.4.7 ① 的教训：空集合对空集合也是绿的）。
   const after = getDb().prepare('SELECT * FROM profiles WHERE id = ?').get(profileId) || {};
   const diff = {};
-  let verified = true;
+  let verifiedRecord = true;
   const checkCols = Object.keys(snap.record).filter((c) => !KEEP_CURRENT_COLS.has(c) && recordResult.written_cols.includes(c) === true);
   const expectedCols = Object.keys(snap.record).filter((c) => !KEEP_CURRENT_COLS.has(c) && profileColumns().includes(c));
   for (const col of expectedCols) {
     const want = snap.record[col];
     const got = after[col];
     if (JSON.stringify(want ?? null) !== JSON.stringify(got ?? null)) {
-      verified = false;
+      verifiedRecord = false;
       diff[col] = { want: String(want ?? '').slice(0, 40), got: String(got ?? '').slice(0, 40), written: checkCols.includes(col) };
     }
   }
+
+  /*
+   * 数据层也要进 `verified`。
+   *
+   * 以前 `verified` 只核对 `profiles` 的业务列，**完全不看 userdata** —— 于是「记录回到快照、
+   * 登录态还是恢复前的样子」也会是 `verified:true` + `diff:{}`。那正是 B 红1 抓到的形态。
+   * 规则：快照说包含数据，就必须真换上了；说没包含，才允许 `replaced:false`。
+   * （正常路径上第 0 步已经硬失败，这里是第二道，防以后有人把第 0 步的检查挪走。）
+   */
+  const verifiedData = claimsUserdata ? userdata.replaced === true : true;
+  if (!verifiedData) diff.__userdata = { want: 'replaced', got: userdata.mode || 'not_replaced' };
 
   return {
     ok: true,
     snapshot: snap.meta,
     before_snapshot: before,
+    // 这次恢复前拍照挤掉的快照：用户得知道「刚恢复了最旧那份，代价是另一份被挤掉了」
+    evicted,
     userdata,
     record: recordResult,
-    verified,
+    verified: verifiedRecord && verifiedData,
+    verified_record: verifiedRecord,
+    verified_data: verifiedData,
     diff,
   };
 }

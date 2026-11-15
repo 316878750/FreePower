@@ -254,11 +254,104 @@ try {
       const r3 = snap.restoreSnapshot(prof.getProfile(p3.profile_id), s3.snapshot.snap_id);
       check('恢复这种快照不报错，且 `userdata.replaced:false`（没有数据可换，不是「删了当前数据」）',
         r3.ok === true && r3.userdata.replaced === false, JSON.stringify(r3.userdata));
+      check('「快照里本来就没数据」与「想恢复但没恢复上」分开说（`mode: not_in_snapshot`）',
+        r3.userdata.mode === 'not_in_snapshot' && r3.verified_data === true,
+        JSON.stringify({ mode: r3.userdata.mode, verified_data: r3.verified_data }));
+    }
+
+    /* ==================== 8. 池子满 5 份时恢复最旧那份（目标不许被自己的 before_restore 挤掉） ==================== */
+    console.log('\n— 8. 池子满 5 份时恢复最旧那份（目标快照必须活下来） —');
+    {
+      const p5 = prof.createProfile({ name: `snap-pool-${Date.now()}`, group_id: '0' });
+      const dir5 = dirOf(p5);
+      const snapIds = [];
+      for (let i = 1; i <= 5; i += 1) {
+        fs.mkdirSync(dir5, { recursive: true });
+        fs.writeFileSync(path.join(dir5, 'MARKER.txt'), `state-S${i}`);
+        prof.updateProfile(p5.profile_id, { name: `env-S${i}` });
+        const rr = snap.takeSnapshot(prof.getProfile(p5.profile_id), { reason: 'manual' });
+        snapIds.push(rr.snapshot.snap_id);
+        // 保证 snap_id 的字典序就是时间序（同一毫秒内拍两份，排序只能靠随机尾巴）
+        await new Promise((res) => setTimeout(res, 5));
+      }
+      check('（前提）池子正好 5 份', snap.listSnapshots(p5.profile_id).length === 5,
+        String(snap.listSnapshots(p5.profile_id).length));
+
+      // 把「当前状态」改掉，否则恢复了也看不出差别（会自己跟自己对上）
+      fs.writeFileSync(path.join(dir5, 'MARKER.txt'), 'state-CURRENT');
+      prof.updateProfile(p5.profile_id, { name: 'env-CURRENT' });
+
+      const oldest = snapIds[0];
+      const rr = snap.restoreSnapshot(prof.getProfile(p5.profile_id), oldest);
+      check('恢复最旧那份：成功（ok:true）', rr.ok === true, JSON.stringify({ ok: rr.ok, reason: rr.reason }));
+      check('**目标快照没被自己的「恢复前」快照挤掉**（目录还在盘上）',
+        fs.existsSync(snap.snapshotDirFor(p5.profile_id, oldest)));
+      check('**userdata 真恢复了**：标记文件内容回到 state-S1（不是静默跳过换目录）',
+        fs.existsSync(path.join(dir5, 'MARKER.txt'))
+        && fs.readFileSync(path.join(dir5, 'MARKER.txt'), 'utf8') === 'state-S1',
+        fs.existsSync(path.join(dir5, 'MARKER.txt')) ? fs.readFileSync(path.join(dir5, 'MARKER.txt'), 'utf8') : '(文件不存在)');
+      check('记录也回到那一版（name=env-S1）', prof.getProfile(p5.profile_id).name === 'env-S1',
+        prof.getProfile(p5.profile_id).name);
+      check('**`verified` 覆盖数据层**：verified / verified_data 都是 true 且 `replaced:true`',
+        rr.verified === true && rr.verified_data === true && rr.userdata.replaced === true,
+        JSON.stringify({ verified: rr.verified, verified_data: rr.verified_data, userdata: rr.userdata }));
+      check('被挤掉的是**另一份更旧的**（第二旧那份），不是正在恢复的目标',
+        (rr.evicted || []).length === 1 && rr.evicted[0].snap_id === snapIds[1] && rr.evicted[0].removed === true,
+        JSON.stringify(rr.evicted));
+      check('总数仍受 5 份上限约束（保护目标不等于放开上限）',
+        snap.listSnapshots(p5.profile_id).length === 5, String(snap.listSnapshots(p5.profile_id).length));
+    }
+
+    /* ==================== 9. 快照声称有数据、盘上没有 → 硬失败 ==================== */
+    console.log('\n— 9. 快照声称有 userdata 但盘上没有（不许静默跳过） —');
+    {
+      const p6 = prof.createProfile({ name: `snap-missing-${Date.now()}`, group_id: '0' });
+      const dir6 = dirOf(p6);
+      makeUserdata(p6);
+      const s6 = snap.takeSnapshot(prof.getProfile(p6.profile_id), { reason: 'manual' });
+      check('（前提）meta 里写着包含 userdata', s6.snapshot.includes.userdata === true);
+
+      // 手工删掉快照里的 userdata（模拟被挤掉/被手工删掉/拷贝中断），meta 不动
+      fs.rmSync(path.join(snap.snapshotDirFor(p6.profile_id, s6.snapshot.snap_id), 'userdata'),
+        { recursive: true, force: true });
+      prof.updateProfile(p6.profile_id, { name: '恢复前的名字' });
+      const poolBefore = snap.listSnapshots(p6.profile_id).length;
+
+      const r6 = snap.restoreSnapshot(prof.getProfile(p6.profile_id), s6.snapshot.snap_id);
+      check('**恢复必须失败**（reason=snapshot_userdata_missing），不是半恢复报成功',
+        r6.ok === false && r6.reason === 'snapshot_userdata_missing',
+        JSON.stringify({ ok: r6.ok, reason: r6.reason }));
+      check('失败时**没有** `verified:true`（不许回一个绿的核对结果）', r6.verified !== true);
+      check('**记录一个字节没变**（name 还是恢复前的）', prof.getProfile(p6.profile_id).name === '恢复前的名字',
+        prof.getProfile(p6.profile_id).name);
+      check('**当前数据目录一个字节没动**（Cookies 还在，没被「先删再拷失败」）',
+        fs.existsSync(path.join(dir6, 'Default', 'Cookies')));
+      check('**失败发生在动任何东西之前**：没有多拍一份「恢复前」快照（池子没变）',
+        snap.listSnapshots(p6.profile_id).length === poolBefore,
+        JSON.stringify({ before: poolBefore, after: snap.listSnapshots(p6.profile_id).length }));
+    }
+
+    /* ==================== 10. 在运行时拍摄要如实标记 ==================== */
+    console.log('\n— 10. 环境运行中拍的快照（如实标记，不装成一样可靠） —');
+    {
+      const p7 = prof.createProfile({ name: `snap-running-${Date.now()}`, group_id: '0' });
+      makeUserdata(p7);
+      const idle = snap.takeSnapshot(prof.getProfile(p7.profile_id), { reason: 'manual' });
+      check('正常（停止状态）拍的 → `taken_while_running:false`',
+        idle.snapshot.taken_while_running === false, String(idle.snapshot.taken_while_running));
+
+      prof.markStatus(p7.profile_id, 'running');
+      const running = snap.takeSnapshot(prof.getProfile(p7.profile_id), { reason: 'manual' });
+      check('环境在跑时拍的 → `taken_while_running:true`（拷的是活着的 userdata，可能不一致）',
+        running.snapshot.taken_while_running === true, String(running.snapshot.taken_while_running));
+      check('列表里这一份带着标记（界面据此打「运行时拍摄 · 数据可能不完整」）',
+        snap.listSnapshots(p7.profile_id).find((x) => x.snap_id === running.snapshot.snap_id)?.taken_while_running === true);
+      prof.markStatus(p7.profile_id, 'idle');
     }
   }
 
-  /* ==================== 8. 路由：恢复必须 confirm、在跑不许恢复 ==================== */
-  console.log('\n— 8. 路由（confirm / 在跑 / 不存在） —');
+  /* ==================== 11. 路由：恢复必须 confirm、在跑不许恢复 ==================== */
+  console.log('\n— 11. 路由（confirm / 在跑 / 不存在） —');
   const { server, apiKey } = createApiServer();
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -336,8 +429,8 @@ try {
     server.close();
   }
 
-  /* ==================== 9. 静态：纪律不许被改回去 ==================== */
-  console.log('\n— 9. 静态断言 —');
+  /* ==================== 12. 静态：纪律不许被改回去 ==================== */
+  console.log('\n— 12. 静态断言 —');
   {
     const src = fs.readFileSync(new URL('../src/store/snapshots.js', import.meta.url), 'utf8');
     check('静态：`KEEP_SNAPSHOTS = 5`（上限是常量，不读环境变量）',
@@ -353,6 +446,15 @@ try {
     check('静态：`SNAPSHOT_SCOPE` 里同时写了「包含」和「不包含」（文案只有一份）',
       /SNAPSHOT_SCOPE = Object\.freeze/.test(src) && /excluded: \[/.test(src));
     check('静态：快照范围里明说**内核本体不备份**', /内核本体/.test(src));
+    check('静态：**轮转支持保护名单**（`rotate` 收 `protect`，恢复时用它保住正在恢复的那份）',
+      /export function rotate\(profileId, \{ keep = KEEP_SNAPSHOTS, fsx = fs, protect = \[\] \}/.test(src)
+      && /protect: \[snapId\]/.test(src));
+    check('静态：快照声称有 userdata 而盘上没有 → `snapshot_userdata_missing` 硬失败（不是 `if (existsSync)` 静默跳过）',
+      /snapshot_userdata_missing/.test(src) && /const claimsUserdata = /.test(src));
+    check('静态：`verified` 同时要求记录与数据（`verifiedRecord && verifiedData`）',
+      /verified: verifiedRecord && verifiedData/.test(src) && /verified_data: verifiedData/.test(src));
+    check('静态：meta 里记 `taken_while_running`（运行中拍摄要如实标记）',
+      /taken_while_running: wasRunning/.test(src));
 
     const routesSrc = fs.readFileSync(new URL('../src/api/routes.js', import.meta.url), 'utf8');
     const restoreAt = routesSrc.indexOf("'/api/v2/browser-profile/snapshot/restore'");
@@ -364,6 +466,19 @@ try {
     const createBlock = routesSrc.slice(createAt, createAt + 1200);
     check('静态：拍快照失败要抛错（不许静默成功让用户以为有备份）',
       /if \(!r\.ok\)/.test(createBlock) && /创建快照失败/.test(createBlock));
+    check('静态：create 路由把「是否在跑」传给拍照（`running: !!getRunning`）',
+      /running: !!getRunning\(p\.id\)/.test(createBlock));
+    check('静态：restore 响应带上被挤掉的快照（`evicted`）与两条核对结果',
+      /evicted: r\.evicted \|\| \[\]/.test(restoreBlock) && /verified_data: r\.verified_data/.test(restoreBlock));
+
+    // 界面也要能被判据钉住：「数据没恢复上」时不许回一句绿的「已恢复，逐列核对通过」
+    const editSrc = fs.readFileSync(new URL('../web/pages/edit.js', import.meta.url), 'utf8');
+    check('静态：界面 toast 按 `verified_data` 分开说（旧的「已恢复，逐列核对通过」必须消失）',
+      /verified_data/.test(editSrc) && !/已恢复，逐列核对通过/.test(editSrc));
+    check('静态：界面报出被挤掉的快照（`r.evicted`）',
+      /r\.evicted/.test(editSrc) && /挤掉/.test(editSrc));
+    check('静态：列表上给「运行中拍摄」一行**可见文字**（不是 title / hover）',
+      /运行时拍摄/.test(editSrc));
   }
 } catch (e) {
   check('A 层跑完没有抛异常', false, `${e && e.message}`);

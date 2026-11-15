@@ -211,17 +211,24 @@ export default async function renderProfiles({ head, page }) {
     if (!ids) return;
     const ok = [];
     const bad = [];
+    const running = [];
     for (const id of ids) {
       try {
         const r = await api.snapshotCreate(id, 'manual');
         ok.push({ id, evicted: (r.evicted || []).filter((x) => x.removed !== true).length });
+        // 在跑的环境拍出来可能不一致 —— 批量里也要如实说，不能只在单个环境那页提示
+        if (r.taken_while_running) running.push(id);
       } catch (e) {
         bad.push({ id, message: e.message });
       }
     }
     const evictWarn = ok.reduce((n, x) => n + x.evicted, 0);
+    const extra = [
+      evictWarn ? `有 ${evictWarn} 份旧快照没删掉（暂时超过上限）` : '',
+      running.length ? `其中 ${running.length} 个环境正在运行，那份数据可能不完整，建议停止后重拍` : '',
+    ].filter(Boolean).join('；');
     reportBatch('备份快照', { ok, failed: bad.map((b) => ({ profile_id: b.id, message: b.message })) },
-      { okKey: 'ok', extra: evictWarn ? `有 ${evictWarn} 份旧快照没删掉（暂时超过上限）` : '' });
+      { okKey: 'ok', extra });
   }
 
   function toggleAll(on) {

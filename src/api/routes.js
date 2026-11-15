@@ -1716,7 +1716,9 @@ export function buildRoutes() {
     if (!SNAPSHOT_REASONS.includes(reason)) {
       throw new ApiError(ERR.INVALID, `reason 只能是 ${SNAPSHOT_REASONS.join(' / ')}`, 200, { field: 'reason' });
     }
-    const r = takeSnapshot(p, { reason });
+    // 在跑的时候**允许**拍（用户边跑边备份是合理需求），但拷的是活着的 userdata，
+    // Cookies 是 WAL 模式的 SQLite，可能不一致 —— meta 里如实记 `taken_while_running`
+    const r = takeSnapshot(p, { reason, running: !!getRunning(p.id) });
     if (!r.ok) {
       // 拍不下来必须报错（静默成功会让用户以为有备份）
       throw new ApiError(ERR.GENERIC, `创建快照失败：${r.reason}${r.error_message ? `（${r.error_message}）` : ''}`, 200, { reason: r.reason });
@@ -1724,6 +1726,8 @@ export function buildRoutes() {
     return ok({
       snapshot: r.snapshot,
       userdata: r.userdata,
+      // 这份是在环境跑着的时候拍的：界面要打标记，别让人以为它跟别的一样可靠
+      taken_while_running: r.snapshot.taken_while_running === true,
       // 被挤掉的如实报：`removed:false` 就是「说好只留 5 个，但这份删不掉」
       evicted: r.evicted || [],
       list: listSnapshots(p.id),
@@ -1756,6 +1760,7 @@ export function buildRoutes() {
         running: '环境正在运行，先停止再恢复',
         snapshot_not_found: '快照不存在（可能已被挤掉或删除）',
         snapshot_corrupt: '快照文件损坏，无法恢复',
+        snapshot_userdata_missing: '这份快照说包含数据目录，但盘上的 userdata 不见了或为空（一个字节都没动）',
         before_snapshot_failed: '留不下「恢复前」的快照，已拒绝恢复（否则恢复本身就成了新的丢数据入口）',
         userdata_rename_failed: '当前数据目录被占用，一个字节都没动',
         userdata_restore_failed: '拷贝快照数据失败，已尽量还原成恢复前的样子',
@@ -1768,11 +1773,18 @@ export function buildRoutes() {
       snapshot: r.snapshot,
       // 恢复前自动留的那份：告诉用户「万一恢复错了，还能回到刚才」
       before_snapshot: r.before_snapshot,
+      // 留那份会触发轮转（池子满 5 份时）：挤掉了谁必须如实报，
+      // 否则用户不知道「恢复最旧那份的代价是另一份没了」
+      evicted: r.evicted || [],
       userdata: r.userdata,
       record: r.record,
-      // 逐列核对：写进去的和快照里的逐字段相等才算真恢复
+      // 逐列核对：记录**和**数据都核对通过才是 true（以前只看记录，半恢复也报 true）
       verified: r.verified,
+      verified_record: r.verified_record,
+      verified_data: r.verified_data,
       diff: r.diff,
+      // 这份快照是在环境跑着的时候拍的：数据可能不完整，界面要提示
+      taken_while_running: r.snapshot && r.snapshot.taken_while_running === true,
       list: listSnapshots(p.id),
       usage: snapshotUsage(p.id),
     });
