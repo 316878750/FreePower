@@ -232,7 +232,11 @@ export function normalizeImportItem(raw) {
  *   `unit` 告警前缀的单位（JSON 用「项」、.txt 用「块」）；
  *   `indexOf` 把「第几项」换算成对用户有意义的序号（.txt 里是「第几块」——
  *   有的块因为缺 name 没进 items，项号 ≠ 块号，不换算就会指错块）。
- * @returns {{imported:number, failed:object[], warnings:string[], list:object[]}}
+ * @returns {{imported:number, failed:object[], warnings:string[], list:object[],
+ *            ua_aligned:number, ua_notice:object|null}}
+ *   `ua_aligned` / `ua_notice`（0.4.7.1 要求 3）：导入的 UA 大版本与本机内核不是同一版时，
+ *   **建的时候就说**，别等用户点开才发现（「导入报成功、点开才炸」是最糟的顺序）。
+ *   逐条也带 `ua_notice`（由 `createProfile` 挂上），汇总只在有命中时出现。
  */
 export function importProfiles(items = [], { unit = '项', indexOf = null } = {}) {
   const failed = [];
@@ -253,7 +257,31 @@ export function importProfiles(items = [], { unit = '项', indexOf = null } = {}
       failed.push({ index: shown(i), reason: e.message || String(e) });
     }
   }
-  return { imported: list.length, failed, warnings, list };
+  return { imported: list.length, failed, warnings, list, ...uaSummaryOf(list) };
+}
+
+/**
+ * 导入结果里的 UA 汇总。
+ *
+ * 只在真的有人「UA 版本 ≠ 本机内核」时给一句人话；全部一致时返回 `ua_aligned: 0, ua_notice: null`，
+ * 不让界面上凭空多出一行。
+ */
+function uaSummaryOf(list = []) {
+  const hit = list.filter((p) => p && p.ua_notice);
+  if (!hit.length) return { ua_aligned: 0, ua_notice: null };
+  const majors = [...new Set(hit.map((p) => p.ua_notice.ua_major))].sort();
+  const kernelMajor = hit[0].ua_notice.kernel_major;
+  const which = majors.map((m) => `Chrome/${m}`).join('、');
+  return {
+    ua_aligned: hit.length,
+    ua_notice: {
+      count: hit.length,
+      ua_majors: majors,
+      kernel_major: kernelMajor,
+      // 界面直接显示这一句（不含 Markdown 记号，0.4.6 起界面文案不许出现 `**`）
+      message: `${hit.length} 个环境的 UA 是 ${which}，本机只装了 ${kernelMajor} 内核；首次打开会按内核对齐 UA`,
+    },
+  };
 }
 
 /** 复制时用到的字段：全部指纹/行为字段，去掉身份、运行态与 cookie（cookie 由 copy_cookies 决定） */

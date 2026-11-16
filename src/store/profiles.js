@@ -17,6 +17,7 @@ import { BY_NAME } from '../../packages/profile/src/fields.js';
 import { getDb } from './db.js';
 import { generateFingerprint, regenerateFingerprint, FALLBACK_KERNEL, geoFor } from '../fingerprint/generate.js';
 import { fingerprintView, declaredSnapshot } from '../fingerprint/view.js';
+import { withClientHints, reconcileForWrite, uaKernelNotice } from '../fingerprint/hints.js';
 import { newSeed } from '../fingerprint/rng.js';
 import { findChrome } from '../kernel/chrome.js';
 import { getProxy, proxyConfigOf } from './proxies.js';
@@ -66,23 +67,33 @@ function flattenFingerprint(input = {}) {
   return out;
 }
 
-/** 内部记录 → 对外形状（保留嵌套视图，方便老调用方与注入层） */
+/**
+ * 内部记录 → 对外形状（保留嵌套视图，方便老调用方与注入层）。
+ *
+ * **读路径必须先过一遍 `withClientHints`**（0.4.7.1）：0.4.4 建的环境 `client_hints` 是按
+ * 当时的本机内核填的，而 `ua` 是导入时带进来的老版本，两者一读出来就自相矛盾 ——
+ * 0.4.6 把这条升级成硬冲突之后，那些环境**一启动就被拦**（用户 50/50 全挂）。
+ * 这里只**派生一个自洽的视图**，不写库（`ua-hints` 判据第 2 组钉的就是「读不写库」）。
+ */
 export function toApi(profile) {
   if (!profile) return null;
-  const view = fingerprintView(profile);
+  const withHints = withClientHints(profile, {
+    kernelVersion: profile.kernel_version || kernelVersionForNewProfile(),
+  });
+  const view = fingerprintView(withHints);
   let launchArgs = [];
   if (Array.isArray(profile.launch_args)) launchArgs = profile.launch_args;
   else if (typeof profile.launch_args === 'string' && profile.launch_args.trim()) {
     try { launchArgs = JSON.parse(profile.launch_args); } catch { launchArgs = profile.launch_args.split(/\r?\n/).filter(Boolean); }
   }
   return {
-    ...profile,
+    ...withHints,
     launch_args: launchArgs,
     profile_id: profile.id,
     group_name: groupName(profile.group_id),
     proxy_config: profile.user_proxy_config ? normalizeProxy(profile.user_proxy_config) : { ...DEFAULT_PROXY },
     fingerprint_config: {
-      ...declaredSnapshot(profile, view),
+      ...declaredSnapshot(withHints, view),
       // 兼容 v0 嵌套字段（smoke 与老脚本读这些）
       seed: String(profile.fp_seed),
       kernel: { full_version: profile.kernel_version || kernelVersionForNewProfile(), major: String(profile.kernel_version || '').split('.')[0] || undefined },
@@ -173,6 +184,15 @@ export function createProfile(input = {}) {
     if (preset) flat.user_proxy_config = proxyConfigOf(preset);
   }
 
+  /*
+   * 0.4.7.1：落库前把 UA 与 client_hints 对齐成一对。
+   * `generateFingerprint` 给的是「按本机内核」的 hints，而用户/导入带的 `ua` 可能是老版本 ——
+   * 两份拼在一起就是「UA 报 133、UA-CH 报 157」，记录一建出来就自相矛盾（P0 的成因）。
+   * 现在：有 UA 就按 UA 的大版本派生 hints；UA 解析不出才用内核那份。
+   */
+  const writeHints = reconcileForWrite({ ua: flat.ua, client_hints: flat.client_hints, kernel_version: kernel });
+  if (writeHints.client_hints) flat.client_hints = writeHints.client_hints;
+
   const res = dbCreate(getDb(), flat);
   if (!res.ok) {
     const err = new Error(res.errors.map((e) => `${e.field}: ${e.message}`).join('; '));
@@ -180,7 +200,11 @@ export function createProfile(input = {}) {
     err.warnings = res.warnings;
     throw err;
   }
-  return toApi(res.profile);
+  const created = toApi(res.profile);
+  // 要求 3：不要等用户点开才发现「这个环境的 UA 不是本机内核这一版」
+  const notice = uaKernelNotice(created);
+  if (notice) created.ua_notice = notice;
+  return created;
 }
 
 function seedHash(seed) {
@@ -331,13 +355,26 @@ export function updateProfile(profileId, patch = {}) {
     flat.random_fingerprint = '0';
   }
 
+  // 0.4.7.1：UA 与 client_hints 必须一起自洽再落库（只改 UA 时 hints 跟着走，
+  // 否则「改了 UA、UA-CH 还是内核那版」= 存进一个矛盾对，打开时才报错）
+  const writeHints = reconcileForWrite({
+    ua: flat.ua !== undefined ? flat.ua : cur.ua,
+    client_hints: flat.client_hints !== undefined ? flat.client_hints : cur.client_hints,
+    kernel_version: flat.kernel_version || cur.kernel_version,
+  });
+  if (writeHints.changed && writeHints.client_hints) flat.client_hints = writeHints.client_hints;
+
   const res = dbUpdate(getDb(), profileId, flat);
   if (!res.ok) {
     const err = new Error(res.errors.map((e) => `${e.field}: ${e.message}`).join('; '));
     err.fieldErrors = res.errors;
     throw err;
   }
-  return toApi(res.profile);
+  const updated = toApi(res.profile);
+  // 保存后同样要能看见「这个环境的 UA 不是本机内核这一版」（与新建/导入同一句话）
+  const notice = uaKernelNotice(updated);
+  if (notice) updated.ua_notice = notice;
+  return updated;
 }
 
 /**

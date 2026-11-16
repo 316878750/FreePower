@@ -2669,7 +2669,10 @@ function importHandler(ctx) {
       blocks,
       failed,
       warnings,
-      data: { format: 'txt', blocks, list, imported: r.imported, failed, warnings },
+      // 0.4.7.1 要求 3：导入时就告诉界面「有多少个环境的 UA 跟本机内核不是一版」
+      ua_aligned: r.ua_aligned,
+      ua_notice: r.ua_notice,
+      data: { format: 'txt', blocks, list, imported: r.imported, failed, warnings, ua_aligned: r.ua_aligned, ua_notice: r.ua_notice },
     };
   }
   const items = extractImportList(body);
@@ -2683,7 +2686,12 @@ function importHandler(ctx) {
     imported: r.imported,
     failed: r.failed,
     warnings: r.warnings,
-    data: { list, imported: r.imported, failed: r.failed, warnings: r.warnings },
+    ua_aligned: r.ua_aligned,
+    ua_notice: r.ua_notice,
+    data: {
+      list, imported: r.imported, failed: r.failed, warnings: r.warnings,
+      ua_aligned: r.ua_aligned, ua_notice: r.ua_notice,
+    },
   };
 }
 

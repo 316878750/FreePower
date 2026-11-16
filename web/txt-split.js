@@ -156,6 +156,9 @@ export function splitTxtChunks(text, opts = {}) {
 export function mergeBatchResults(chunks, results) {
   let imported = 0;
   let failedBatches = 0;
+  let uaAligned = 0;
+  const uaMajors = new Set();
+  let kernelMajor = null;
   const failed = [];
   const warnings = [];
   chunks.forEach((c, i) => {
@@ -173,6 +176,12 @@ export function mergeBatchResults(chunks, results) {
       failed.push({ ...f, index: c.first_block + Number(f.index ?? 0) });
     }
     for (const w of r.warnings || []) warnings.push(w);
+    // 0.4.7.1：UA 大版本 ≠ 本机内核的条数要跨批次累加，否则分批导入会把这件事拆散报（或干脆不报）
+    uaAligned += Number(r.ua_aligned) || 0;
+    if (r.ua_notice) {
+      for (const m of r.ua_notice.ua_majors || []) uaMajors.add(String(m));
+      kernelMajor = kernelMajor || r.ua_notice.kernel_major || null;
+    }
     // 服务端解析出的块数应等于这批的块数；不等说明两边分块口径有分歧，后面的块号可能偏移。
     // 宁可说出来，也不让用户拿一份错位的失败清单。
     const serverBlocks = Number(r.blocks);
@@ -181,5 +190,22 @@ export function mergeBatchResults(chunks, results) {
         + '失败清单里的块号可能偏移（已导入的环境不受影响）');
     }
   });
-  return { imported, failed, warnings, batches: chunks.length, failed_batches: failedBatches };
+  const majors = [...uaMajors].sort();
+  return {
+    imported,
+    failed,
+    warnings,
+    batches: chunks.length,
+    failed_batches: failedBatches,
+    ua_aligned: uaAligned,
+    ua_notice: uaAligned
+      ? {
+        count: uaAligned,
+        ua_majors: majors,
+        kernel_major: kernelMajor,
+        message: `${uaAligned} 个环境的 UA 是 ${majors.map((m) => `Chrome/${m}`).join('、')}，`
+          + `本机只装了 ${kernelMajor} 内核；首次打开会按内核对齐 UA`,
+      }
+      : null,
+  };
 }

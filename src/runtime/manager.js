@@ -12,6 +12,7 @@ import { compileNetRules, decideRequest } from '../kernel/net-rules.js';
 import { blockPageResponse } from '../kernel/block-page.js';
 import { writeCookies } from '../kernel/cookies.js';
 import { alignProfileToKernel } from '../kernel/version.js';
+import { preAlignForLaunch } from '../fingerprint/hints.js';
 import { fingerprintView, geoPolicy } from '../fingerprint/view.js';
 import { ensureNoiseSeeds } from '../fingerprint/seeds.js';
 import { checkProfile, markStatus, markLaunched, applyProfileFields, persistEgress, getProfile } from '../store/profiles.js';
@@ -124,8 +125,45 @@ export async function startProfile(profile, { force = false, systemProxy = null 
   }
 
   const p = (async () => {
-    // 1) 启动前校验：硬冲突 + 值域错误阻断，软冲突只告警
-    const check = checkProfile(profile, { force });
+    /**
+     * 1) 启动前校验：硬冲突 + 值域错误阻断，软冲突只告警。
+     *
+     * **1.1) 只剩「UA 版本 vs UA-CH 版本」这一类硬冲突时，先按本机内核预对齐**（0.4.7.1 要求 2）。
+     *
+     * 0.4.6 把「UA 报 Chrome/133、`client_hints.ua_full_version`=157」升级成硬冲突是对的，
+     * 但它和历史数据撞在一起就成了死胡同：老记录的 UA 是导入时带的 133，UA-CH 是建环境
+     * 那一刻按本机内核填的 157 —— 一读出来就自相矛盾，而启动后那次 `alignProfileToKernel`
+     * 压根轮不到执行（校验在它前面就 throw 了）。用户 50 个环境全被这一条拦住（P0）。
+     *
+     * 这里只在**别的硬冲突一条都没有**时做一次（`preAlignForLaunch` 自己判），
+     * 对齐后必须重查 `ok === true` 才采用；`webgl` 空开关、UA 平台 ↔ `navigator.platform`
+     * 矛盾这些继续阻断，一个口子都不开。
+     *
+     * 对齐结果**不落库**：这是「这一轮拿来启动」的临时视图，落库只走启动后那次
+     * （以 Browser.getVersion 的真值为准，目录名/注册表给的版本只是猜）。
+     */
+    let launchProfile = profile;
+    let check = checkProfile(launchProfile, { force });
+    let uaRealign = null;
+    if (!check.ok && !force) {
+      const chromeForPreAlign = findChrome();
+      const guessed = chromeForPreAlign && chromeForPreAlign.version;
+      if (guessed) {
+        const pre = preAlignForLaunch(launchProfile, {
+          kernelVersion: guessed,
+          check: (x) => checkProfile(x, { force }),
+        });
+        if (pre.applied) {
+          launchProfile = pre.profile;
+          check = checkProfile(launchProfile, { force });
+          uaRealign = {
+            from: (profile.client_hints && profile.client_hints.ua_full_version) || null,
+            to: guessed,
+            reasons: pre.reasons,
+          };
+        }
+      }
+    }
     if (!check.ok) {
       const err = new Error(check.errors.map((e) => `${e.field}: ${e.message}`).join('; '));
       err.code = 800005;
@@ -134,9 +172,16 @@ export async function startProfile(profile, { force = false, systemProxy = null 
       throw err;
     }
     const warnings = [...check.soft];
+    if (uaRealign) {
+      warnings.unshift(soft('ua_realign_precheck',
+        `UA 与 UA-CH 的版本号不一致，已在启动前按本机内核 ${uaRealign.to} 对齐：${uaRealign.reasons.join('; ')}`));
+      log(id, 'UA 预对齐', uaRealign.reasons.join('; '));
+    }
     if (check.forced) {
       warnings.unshift(soft('$', `已强制启动：${check.hard.length} 条硬冲突被 force=1 越过（${check.hard.map((e) => e.field).join(',')}）`));
     }
+    // 本轮就用对齐后的视图启动（不改库；库由启动后那次真值对齐负责）
+    profile = launchProfile;
 
     // 1.5) PAC 明确拒绝：不能为了「支持」而留一个 DIRECT 回退的后门
     const pac = pacInUse(profile);

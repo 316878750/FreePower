@@ -1021,8 +1021,12 @@ export default async function renderProfiles({ head, page }) {
     if (sum.failed.length) bits.push(`失败 ${sum.failed.length} 块`);
     if (sum.warnings.length) bits.push(`${sum.warnings.length} 条告警`);
     prog.done(bits.join(' · '), sum.failed.length ? 'bad' : 'ok');
-    if (sum.failed.length || sum.warnings.length) {
-      showImportDetail({ imported: sum.imported, failed: sum.failed, warnings: sum.warnings }, { unit: '块' });
+    // 0.4.7.1：UA 与本机内核不是一版这件事，必须在导入汇总里就说，不能等用户点开才发现
+    if (sum.ua_notice) toast(sum.ua_notice.message, 'warn');
+    if (sum.failed.length || sum.warnings.length || sum.ua_notice) {
+      showImportDetail({
+        imported: sum.imported, failed: sum.failed, warnings: sum.warnings, ua_notice: sum.ua_notice,
+      }, { unit: '块' });
     }
     await load(false);
   }
@@ -1032,7 +1036,9 @@ export default async function renderProfiles({ head, page }) {
     if (r.failed?.length) bits.push(`失败 ${r.failed.length} ${unit}`);
     if (r.warnings?.length) bits.push(`${r.warnings.length} 条告警`);
     toast(bits.join(' · '), r.failed?.length ? 'bad' : 'ok');
-    if (r.failed?.length || r.warnings?.length) showImportDetail(r, { unit });
+    // 同上：先说明「这些环境的 UA 会被按内核对齐」，别让用户点了启动才看到失败
+    if (r.ua_notice) toast(r.ua_notice.message, 'warn');
+    if (r.failed?.length || r.warnings?.length || r.ua_notice) showImportDetail(r, { unit });
   }
 
   /** AdsPower `.txt` 互操作导出（当前勾选的，或筛选出来的全部） */
@@ -1055,6 +1061,8 @@ export default async function renderProfiles({ head, page }) {
     // index 是 0 基：.txt 里是**整份文件的块号**（分批后已加 first_block），JSON 里是项号
     for (const f of r.failed || []) lines.push(`✗ 第 ${Number(f.index) + 1} ${unit}：${f.reason}`);
     for (const w of r.warnings || []) lines.push(`- ${w}`);
+    // 导入时的 UA 跟版提醒也进这份清单（用户会截图/复制这段去核对，只弹 toast 会丢）
+    if (r.ua_notice) lines.push(`! ${r.ua_notice.message}`);
     confirmDialog({
       title: '导入结果',
       body: h('div', null,
