@@ -115,8 +115,19 @@ export const PROXY_PROBE_TIMEOUT_MS = Number(process.env.FREEPOWER_PROXY_TIMEOUT
 /** 浏览器内出口探测超时（页面加载 + 读完 JSON） */
 export const EGRESS_TIMEOUT_MS = Number(process.env.FREEPOWER_EGRESS_TIMEOUT || 8000);
 
-/** UA 跟版：内核升级后自动把 UA/UA-CH/内核版本号对齐真实内核（1=开，0=只告警） */
-export const UA_AUTOALIGN = process.env.FREEPOWER_UA_AUTOALIGN !== '0';
+/**
+ * UA 跟版的**出厂默认**：0.4.7.2 起**默认关**（1=开，0=关）。
+ *
+ * 为什么翻过来（2026-11-16 用户拍板）：AdsPower 的 `ua` 与 `client_hints` 是两个各自可配的字段
+ * （逆向 02-指纹字段表.md:168-169，`client_hints` → `staticConfig.UserAgentMetadata`），
+ * 它**不会**按内核版本改写用户的 UA。用户的 SunBrowser 也是 Chrome 157，可他 50 个环境的 UA
+ * 就是 133 —— 在对手那边能正常跑。我们跟版就等于把他存好的指纹改掉了。
+ *
+ * 所以：跟版变成一个**显式开关**（设置页「UA 跟随内核版本升级」，默认关，存库 `meta.ua_autoalign`）。
+ * 这里的常量只是「没存过设置时用哪个」；环境级开关排在 0.4.9。
+ * 环境变量 `FREEPOWER_UA_AUTOALIGN=1` 仍可把出厂默认改成开（测试与排障用）。
+ */
+export const UA_AUTOALIGN = process.env.FREEPOWER_UA_AUTOALIGN === '1';
 
 /**
  * 自检：环境启动后自动跑一次（0=关闭，用 API 手动触发）。

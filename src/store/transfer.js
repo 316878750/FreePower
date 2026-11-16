@@ -279,7 +279,8 @@ function uaSummaryOf(list = []) {
       ua_majors: majors,
       kernel_major: kernelMajor,
       // 界面直接显示这一句（不含 Markdown 记号，0.4.6 起界面文案不许出现 `**`）
-      message: `${hit.length} 个环境的 UA 是 ${which}，本机只装了 ${kernelMajor} 内核；首次打开会按内核对齐 UA`,
+      message: `${hit.length} 个环境的 UA 是 ${which}，本机内核是 ${kernelMajor}；`
+        + '按环境自己的 UA 打开，UA 不会被改（要跟内核版本走，请到设置里打开「UA 跟随内核版本升级」）',
     },
   };
 }

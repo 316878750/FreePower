@@ -3,7 +3,9 @@
  *
  * 只放「真的有行为在用它」的项 —— 设置页上摆一个不生效的开关，
  * 比不摆更糟：用户改了、以为生效了、回头发现什么都没变。
- * 所以这里目前只有一组：**窗口同步的默认设置**（`meta.sync_defaults`）。
+ * 目前四组：**窗口同步的默认设置**（`meta.sync_defaults`）、**关闭环境时自动备份**
+ * （`meta.snapshot_on_close`，0.4.7 ③）、**UA 跟随内核版本升级**（`meta.ua_autoalign`，
+ * 0.4.7.2，**默认关**），以及自动备份的结果记录（`meta.snapshot_on_close_state`）。
  *
  * 为什么存在库里而不是 localStorage：
  *   1. 它要在**服务端**生效（`/api/v2/sync/start` 没显式给 settings 时用它），
@@ -15,6 +17,7 @@
  */
 import { getMeta, setMeta } from '../store/db.js';
 import { DEFAULT_SETTINGS, normalizeSettings } from '../sync/settings.js';
+import { UA_AUTOALIGN } from '../config.js';
 
 /** meta 表的键。改名等于丢用户设置，别乱动。 */
 export const SYNC_DEFAULTS_KEY = 'sync_defaults';
@@ -89,6 +92,78 @@ export function syncDefaultsDiff() {
     if (settings[k] !== DEFAULT_SETTINGS[k]) out.push(k);
   }
   return out;
+}
+
+/* ==================== UA 跟随内核版本升级（0.4.7.2） ====================
+ *
+ * **默认必须是关**，理由不是「实现简单」，而是**改用户的指纹**：
+ *
+ *   0.4.4 ~ 0.4.7.1 的跟版会在启动后把 `ua` / `client_hints` / `kernel_version` 全拉成
+ *   本机内核版本并落库。用户 50 个环境的 UA 是导入时带的 Chrome/133，本机内核是 157 ——
+ *   一开一次环境，133 就被永久改写成 157，而且**不可逆**（原值没有第二份）。
+ *
+ *   对手（AdsPower / SunBrowser）不做这件事：`ua` 与 `client_hints` 是两个各自可配的字段
+ *   （逆向 02-指纹字段表.md:168-169），内核换了它也不动用户存好的 UA。
+ *   所以「跟版」必须是用户显式要的，不能是默认行为。
+ *
+ * 存库（meta 表）而不是 localStorage：它要在**服务端**生效（`manager.startProfile` 读它），
+ * 和 `sync_defaults` / `snapshot_on_close` 同一个理由。
+ *
+ * 键名不许改（改名等于把用户的选择丢掉）。
+ */
+export const UA_AUTOALIGN_KEY = 'ua_autoalign';
+
+/**
+ * 读「UA 跟随内核版本升级」开关。
+ * @returns {{enabled:boolean, saved:boolean, broken:boolean}}
+ *   - `saved:false` = 没存过（**按出厂默认，0.4.7.2 起是关**）或存坏了
+ *   - `broken:true` = 存坏了，界面要如实说「已按关处理」
+ */
+export function readUaAutoAlign() {
+  let raw = null;
+  try {
+    raw = getMeta(UA_AUTOALIGN_KEY);
+  } catch {
+    return { enabled: UA_AUTOALIGN, saved: false, broken: false };
+  }
+  if (raw === null || raw === undefined || String(raw).trim() === '') {
+    return { enabled: UA_AUTOALIGN, saved: false, broken: false };
+  }
+  const text = String(raw).trim();
+  // 只认明确的开/关；其余（脏数据）**一律当关** —— 这是会改写用户 UA 的开关，
+  // 读不懂就必须偏向「不动用户数据」。
+  if (text === 'true' || text === '1') return { enabled: true, saved: true, broken: false };
+  if (text === 'false' || text === '0') return { enabled: false, saved: true, broken: false };
+  return { enabled: false, saved: false, broken: true };
+}
+
+/**
+ * 写开关。只接受布尔（或 'true'/'false' 字符串），别的一律拒 —— 不猜用户意图。
+ * @returns {{enabled:boolean, saved:true, changed:boolean}}
+ */
+export function writeUaAutoAlign(value) {
+  const prev = readUaAutoAlign();
+  let next;
+  if (value === true || value === 'true' || value === 1 || value === '1') next = true;
+  else if (value === false || value === 'false' || value === 0 || value === '0') next = false;
+  else {
+    const e = new Error('enabled must be a boolean');
+    e.code = 'INVALID_ENABLED';
+    throw e;
+  }
+  setMeta(UA_AUTOALIGN_KEY, next ? 'true' : 'false');
+  return { enabled: next, saved: true, changed: prev.enabled !== next };
+}
+
+/**
+ * 这次启动实际要不要跟版（`manager.startProfile` 只读这一个函数）。
+ *
+ * **关着的时候，任何路径都不许改写 `ua` / `client_hints` / `kernel_version`** ——
+ * 包括启动前那次「只剩版本冲突才对齐」的预对齐（它会改这一轮呈现的指纹，虽然不落库）。
+ * 判据 `test/ua-hints-kernel.test.mjs` 组 1 与 `test/ua-autoalign.test.mjs` 的静态扫描钉这一条。
+ */
+export function uaAutoAlignEnabled() {
+  return readUaAutoAlign().enabled === true;
 }
 
 /* ==================== 关闭环境时自动备份（0.4.7 ③） ====================

@@ -25,6 +25,36 @@ function injectionConfig(fp) {
     seed: String(fp.seed ?? 'freepower'),
     platform: fp.platform || null,
     ua: fp.ua || null,
+    /**
+     * UA-CH（0.4.7.2）：`Emulation.setUserAgentOverride` 的 `userAgentMetadata` 里
+     * `brands` / `fullVersionList` / `platformVersion` / `architecture` / `bitness` / `model` /
+     * `wow64` 内核都认，**只有已废弃的 `uaFullVersion` 永远返回真实内核版本**
+     * （2026-11-16 真内核实测：传 133 读回 157.0.8103.78，同一会话里手动再覆写一次也一样）。
+     * 所以这一项只能在注入层补 —— 做法与 hidden_notification 同源（evaluateOnNewDocument
+     * + native code 外观 + 重复注入前置判断），不需要自编译内核。
+     *
+     * 顺带把**整套** UA-CH 一起钉住（"值不对才补"）：哪条路径的 CDP 覆写万一没落地，
+     * 页面读到的仍然是 profile 这一套，不会出现「brands 是宿主 157、uaFullVersion 是 133」
+     * 这种更显眼的半套状态。值本来就对时这里一个字段都不装。
+     */
+    uaData: (() => {
+      const md = fp.ua_metadata;
+      if (!md || typeof md !== 'object') return null;
+      const list = Array.isArray(md.fullVersionList) ? md.fullVersionList : null;
+      const full = (list || []).map((b) => (b && typeof b.version === 'string' ? b.version : null)).find(Boolean) || null;
+      return {
+        brands: Array.isArray(md.brands) ? md.brands : null,
+        fullVersionList: list,
+        uaFullVersion: full,
+        platform: md.platform || null,
+        platformVersion: md.platformVersion || null,
+        architecture: md.architecture || null,
+        bitness: md.bitness || null,
+        model: typeof md.model === 'string' ? md.model : null,
+        mobile: md.mobile === true,
+        wow64: md.wow64 === true,
+      };
+    })(),
     timezone: fp.timezone || null,
     language: Array.isArray(fp.language) ? fp.language.slice() : null,
     hardwareConcurrency: fp.hardware_concurrency ?? null,
@@ -277,6 +307,94 @@ const CORE = `
         return r;
       }, 'readPixels', 7));
     }
+  };
+
+  /* ---------- UA-CH：CDP 认的那几项之外，uaFullVersion 只能在这里补（0.4.7.2） ----------
+   *
+   * 为什么必须有这一层（2026-11-16 真内核 157.0.8103.78 实测）：
+   *   - Emulation.setUserAgentOverride 的 brands / fullVersionList / platformVersion /
+   *     architecture / bitness / model / wow64 **都认**（传 133.0.6943.127 页面读到的就是它）；
+   *   - **uaFullVersion 永远不认**：不管 CDP 传什么，getHighEntropyValues(['uaFullVersion'])
+   *     都返回真实内核版本，同一会话里手动再发一次覆写 + reload 也一样。
+   *   所以「UA 报 133、内核 157」这种组合在这一项上必然露馅，只有注入层能补。
+   *
+   * 两条纪律（和 hidden_notification 一样）：
+   *   ① **前置判断**：只接原生实现（toString 里含 native code）—— 防重复注入、也不跟页面
+   *      自己的 polyfill 打架；
+   *   ② **值不对才补**：CDP 已经落地时这里一个字段都不改，getHighEntropyValues 只是原样
+   *      转交（返回值对象都不换）。少一层改写就少一层痕迹。
+   *
+   * 返回的 brands / fullVersionList 按原生形状做**冻结数组 + 冻结对象**：
+   * 裸内核的 navigator.userAgentData.brands 是 frozen 的，能冻结而没冻结本身就是一条破绽。
+   * 注意：这段在 CORE 里（模板串），注释里不许出现反引号与美元花括号。 */
+  const freezeBrands = (list) => Object.freeze((list || []).map((b) => Object.freeze({
+    brand: String(b && b.brand),
+    version: String(b && b.version),
+  })));
+
+  const patchUaData = (host) => {
+    if (!CFG.uaData) return;
+    const UAD = typeof NavigatorUAData !== 'undefined' ? NavigatorUAData : null;
+    let proto = UAD && UAD.prototype;
+    /* worker realm 里 NavigatorUAData 这个名字不一定在全局上（实测主帧有、worker 视情况），
+     * 所以退一步：从实例的原型拿 —— 拿到的一定是同一个接口原型。 */
+    if (!proto) {
+      try {
+        const inst = host && host.navigator && host.navigator.userAgentData;
+        if (inst) proto = Object.getPrototypeOf(inst);
+      } catch (e) { proto = null; }
+    }
+    if (!proto || typeof proto.getHighEntropyValues !== 'function') return;
+    const orig = proto.getHighEntropyValues;
+    let src = '';
+    try { src = orig.toString(); } catch (e) { src = ''; }
+    if (src.indexOf('native code') === -1) return;   // 已经装过 / 页面自己的实现：不碰
+
+    const md = CFG.uaData;
+    const want = {};
+    if (md.brands) want.brands = freezeBrands(md.brands);
+    if (md.fullVersionList) want.fullVersionList = freezeBrands(md.fullVersionList);
+    if (md.uaFullVersion) want.uaFullVersion = md.uaFullVersion;
+    if (md.platformVersion) want.platformVersion = md.platformVersion;
+    if (md.architecture) want.architecture = md.architecture;
+    if (md.bitness) want.bitness = md.bitness;
+    if (md.model !== null) want.model = md.model;
+    if (typeof md.wow64 === 'boolean') want.wow64 = md.wow64;
+    if (typeof md.mobile === 'boolean') want.mobile = md.mobile;
+    if (!Object.keys(want).length) return;
+
+    const same = (a, b) => {
+      try { return JSON.stringify(a) === JSON.stringify(b); } catch (e) { return false; }
+    };
+
+    defMethod(proto, 'getHighEntropyValues', native(function getHighEntropyValues() {
+      const p = orig.apply(this, arguments);
+      if (!p || typeof p.then !== 'function') return p;
+      return p.then(function (r) {
+        if (!r || typeof r !== 'object') return r;
+        try {
+          for (const k of Object.keys(want)) {
+            if (!(k in r)) continue;              // 调用方没要这一项：一个字段都不塞
+            if (same(r[k], want[k])) continue;    // 值已经对：不碰
+            r[k] = want[k];
+          }
+        } catch (e) {}
+        return r;
+      });
+    }, 'getHighEntropyValues', 1));
+    mark('ua_ch');
+
+    /* 低熵三项（brands / mobile / platform）同理：CDP 落地时值本来就对，这里不装；
+     * 万一没落地，靠它们跟上面的高熵结果保持一致（brands 报 157、uaFullVersion 报 133
+     * 比整套都错更显眼）。 */
+    try {
+      const cur = host && host.navigator && host.navigator.userAgentData;
+      if (cur) {
+        if (want.brands && !same(cur.brands, want.brands)) defGetter(proto, 'brands', want.brands);
+        if (typeof want.mobile === 'boolean' && cur.mobile !== want.mobile) defGetter(proto, 'mobile', want.mobile);
+        if (md.platform && cur.platform !== md.platform) defGetter(proto, 'platform', md.platform);
+      }
+    } catch (e) {}
   };
 
   /* ---------- 诊断用的种子快照 ---------- */
@@ -822,6 +940,9 @@ const PAGE_BODY = `
     });
   } catch (e) {}
 
+  /* ---------- UA-CH：uaFullVersion 只能在这一层补（见 CORE 里的 patchUaData） ---------- */
+  try { patchUaData(window); } catch (e) {}
+
   /* ---------- 诊断 ----------
    * 全部不可枚举：Object.keys(window) / for...in 都看不见。
    * 名字按 fp_seed 派生（每环境不同、同环境稳定），页面拿不到固定签名。
@@ -901,6 +1022,9 @@ const WORKER_BODY = `
   try { patchGL(typeof WebGL2RenderingContext !== 'undefined' && WebGL2RenderingContext.prototype); } catch (e) {}
   if (CFG.webgl) mark('webgl');
   if (CFG.webgl_image) mark('webgl_image');
+
+  /* ---------- UA-CH：专用 worker 里的 uaFullVersion 同样是宿主真值，一起补 ---------- */
+  try { patchUaData(self); } catch (e) {}
 
   /* ---------- 诊断 ---------- */
   try {

@@ -2,8 +2,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   PROFILES_DIR, LOG_DIR, START_TIMEOUT_MS,
-  EGRESS_PROBE_URL, PROXY_PROBE_TIMEOUT_MS, EGRESS_TIMEOUT_MS, UA_AUTOALIGN, SELFCHECK_ON_START, FP_DEBUG,
+  EGRESS_PROBE_URL, PROXY_PROBE_TIMEOUT_MS, EGRESS_TIMEOUT_MS, SELFCHECK_ON_START, FP_DEBUG,
 } from '../config.js';
+import { uaAutoAlignEnabled } from '../settings/prefs.js';
 import { findChrome, buildArgs, launchChrome, waitForDevToolsPort, killProcessTree, rememberVersion } from '../kernel/chrome.js';
 import { CdpClient, fetchJson } from '../kernel/cdp.js';
 import { buildInjectionSource, buildWorkerInjectionSource } from '../kernel/inject.js';
@@ -141,11 +142,18 @@ export async function startProfile(profile, { force = false, systemProxy = null 
      *
      * 对齐结果**不落库**：这是「这一轮拿来启动」的临时视图，落库只走启动后那次
      * （以 Browser.getVersion 的真值为准，目录名/注册表给的版本只是猜）。
+     *
+     * **0.4.7.2 起整段挂在开关之下**（`uaAutoAlign`，设置页「UA 跟随内核版本升级」，默认关）：
+     * 关着的时候连「这一轮呈现的 UA」都不许改 —— 用户存的是 133，就必须按 133 打开。
+     * 开关关着又碰上真矛盾对（库里的 hints 与 UA 版本打架）时，照旧抛 800005 阻断，
+     * **不静默改指纹**；正常路径不会走到这里（读路径 `withClientHints` 已经让记录自洽）。
      */
+    /** 这次启动要不要跟版（默认关；关 = 任何路径都不改写 ua / client_hints / kernel_version） */
+    const uaAutoAlign = uaAutoAlignEnabled();
     let launchProfile = profile;
     let check = checkProfile(launchProfile, { force });
     let uaRealign = null;
-    if (!check.ok && !force) {
+    if (!check.ok && !force && uaAutoAlign) {
       const chromeForPreAlign = findChrome();
       const guessed = chromeForPreAlign && chromeForPreAlign.version;
       if (guessed) {
@@ -348,8 +356,9 @@ export async function startProfile(profile, { force = false, systemProxy = null 
       const realVersion = String(bv.product || '').replace(/^.*\//, '');
       rememberVersion(chrome.path, realVersion);
 
-      // 4) UA / 内核版本跟版：以真实内核版本为准，系统 Chrome 自动升级后不用人手改
-      if (UA_AUTOALIGN && realVersion) {
+      // 4) UA / 内核版本跟版：**只在开关打开时**才以真实内核版本为准（0.4.7.2 起默认关）。
+      //    关着的时候这里一行都不写库 —— 用户存的是 Chrome/133，本机内核是 157，那就按 133 开。
+      if (uaAutoAlign && realVersion) {
         const aligned = alignProfileToKernel(profile, realVersion);
         if (aligned.changed) {
           effective = aligned.profile;
@@ -360,10 +369,16 @@ export async function startProfile(profile, { force = false, systemProxy = null 
         }
       }
 
-      // 内核版本漂移检查：UA 声明的版本必须等于真实内核版本（跟版之后这里应当已经一致）
+      // 内核版本漂移检查：**只在开了跟版时才算异常**（开了却没对上 = 真出了问题，要告警）。
+      // 关着时「UA 声明 133、本机内核 157」正是用户要的状态（对手也是这样），
+      // 只在环境日志里留一行给排障看，不往启动响应里塞告警 —— 否则 50 个环境每次启动都弹一条。
       const declared = effective.client_hints?.ua_full_version;
       if (declared && realVersion && declared !== realVersion) {
-        warnings.push(soft('client_hints.ua_full_version', `UA 声明 ${declared}，真实内核 ${realVersion}（未开自动跟版？）`));
+        if (uaAutoAlign) {
+          warnings.push(soft('client_hints.ua_full_version', `UA 声明 ${declared}，真实内核 ${realVersion}（跟版开着却没对上）`));
+        } else {
+          log(id, 'UA 与内核版本不同', `UA 声明 ${declared}，本机内核 ${realVersion}；未开「UA 跟随内核版本升级」，按环境自己的 UA 打开`);
+        }
       }
 
       // P2 · 位置权限（浏览器级，设一次）：allow=授权 / ask=保持 prompt（不碰）/ block=显式拒绝。
@@ -648,6 +663,13 @@ async function injectAndOpen(instance, profile, view) {
     /** Chrome 自己的 UI target（type='browser_ui'）：不属于页面，跳过并单独计数 */
     browser_ui: 0,
     iframes: 0,
+    /**
+     * 子帧（跨站子帧 = OOPIF，是独立 target）的 UA / UA-CH 覆写结果。
+     * 0.4.7.2 起对它发一次 **CDP 原生** `Emulation.setUserAgentOverride`（不注入 JS），
+     * 成功/失败分开记账 —— 「发了」不等于「生效」，排障时要能看出是哪一种。
+     */
+    iframes_ua: 0,
+    iframes_ua_failed: 0,
     /** AudioWorklet 也是独立 target（type='worklet'），但按设计不注入，单独记账 */
     worklets: 0,
     other: 0,
@@ -687,10 +709,31 @@ async function injectAndOpen(instance, profile, view) {
     workerStats.total += 1;
     workerStats.by_type[type] = (workerStats.by_type[type] || 0) + 1;
 
-    // iframe 是 DOM 上下文，不是 worker：塞 worker 脚本只会补半套、还多一层痕迹。
-    // 本轮不覆盖（P2 起就是放行），只计数，写进已知限制。
+    /* iframe：**注入层的 JS 一套不覆盖子帧**（塞 worker 脚本只会补半套、还多一层痕迹），
+     * 但 UA / UA-CH 是 CDP 原生覆写，没有新的痕迹面，所以这一层要补上。
+     *
+     * 为什么必须补（2026-11-16 实测，内核 157.0.8103.78）：**跨站子帧是独立 target（OOPIF）**，
+     * 不设 Emulation 时它里面读到的是宿主真值 —— 父帧是我们配的 133 / platformVersion 10.0.0，
+     * 子帧却是 `Chrome/157` / `platformVersion 19.0.0` / 真 `uaFullVersion`。
+     * 检测页把一致性检查放进跨站 iframe（这是常态做法）就能一眼看出破绽。
+     * 同站子帧不是独立 target（跟随父帧会话），本来就已经覆盖。
+     *
+     * 时序：`waitForDebuggerOnStart` 把子帧停在首行之前，覆写先落地再放行，
+     * 所以子帧的首个文档就是我们配置的那一套。设不上不拖死（catch 记账后照常放行）。 */
     if (type === 'iframe') {
       workerStats.iframes += 1;
+      if (view && view.ua) {
+        const sess = sessionId;
+        client.send('Emulation.setUserAgentOverride', {
+          userAgent: view.ua,
+          acceptLanguage: (view.language || []).join(','),
+          platform: view.platform || 'Win32',
+          userAgentMetadata: view.ua_metadata || undefined,
+        }, sess).then(() => { workerStats.iframes_ua += 1; }, (e) => {
+          workerStats.iframes_ua_failed += 1;
+          log(profileId, 'WARN 子帧 UA 覆写失败', targetId, e.message);
+        });
+      }
       resumeNow(sessionId, waitingForDebugger);
       return;
     }

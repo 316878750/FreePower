@@ -267,8 +267,9 @@ try {
     check('导入只带 UA 133 → 建出来的记录自洽、checkProfile.ok === true',
       r.imported === 1 && prof.checkProfile(r.list[0]).ok === true, `imported=${r.imported}`);
     check('导入结果带 `ua_aligned` 计数（1 个）', r.ua_aligned === 1, String(r.ua_aligned));
-    check('导入结果带一句人话（含「首次打开会按内核对齐 UA」）',
-      /首次打开会按内核对齐 UA/.test(r.ua_notice?.message || ''), r.ua_notice?.message);
+    check('导入结果带一句人话（0.4.7.2 起说「UA 不会被改」，不再承诺自动对齐）',
+      /UA 不会被改/.test(r.ua_notice?.message || '') && !/首次打开会按内核对齐/.test(r.ua_notice?.message || ''),
+      r.ua_notice?.message);
     check('逐条也带 `ua_notice`（哪个环境的 UA 是哪版）',
       r.list[0].ua_notice?.ua_major === '133' && r.list[0].ua_notice?.kernel_major === kernelMajor,
       JSON.stringify(r.list[0].ua_notice));
@@ -299,7 +300,7 @@ try {
     check('静态：导入两条路（JSON / txt）都把 `ua_aligned` 透传给界面',
       (routesSrc.match(/ua_aligned: r\.ua_aligned/g) || []).length >= 2);
     check('静态：导入汇总的人话在 store 与分批合并两处都拼得出来',
-      /首次打开会按内核对齐 UA/.test(xferSrc) && /首次打开会按内核对齐 UA/.test(splitSrc));
+      /UA 不会被改/.test(xferSrc) && /UA 不会被改/.test(splitSrc));
     check('静态：界面真的把这句显示出来（toast + 导入结果清单）',
       /r\.ua_notice\.message/.test(webSrc) && /sum\.ua_notice\.message/.test(webSrc)
       && /if \(r\.ua_notice\) lines\.push/.test(webSrc));

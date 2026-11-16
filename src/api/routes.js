@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 本地 API 路由表。
  *
  * 分三类（对齐拆解手 07 号清单）：
@@ -51,7 +51,8 @@ import { issueTicket } from './tickets.js';
 import { apiInfoPayload, setApiVerify, resetStats } from './info.js';
 import { startSync, stopSync, restartSync, syncStatus, updateSettings, refreshAll, unifySize, arrangeWindows, showWindows, forceShowWindows, openTabInAll, tabState, closeTabs, copyTabToSlaves, unifyTabs, DEFAULT_SETTINGS } from '../sync/session.js';
 import { readSyncDefaults, writeSyncDefaults, resetSyncDefaults, syncDefaultsDiff, mergeSyncSettings,
-  readSnapshotOnClose, writeSnapshotOnClose, readSnapshotOnCloseState } from '../settings/prefs.js';
+  readSnapshotOnClose, writeSnapshotOnClose, readSnapshotOnCloseState,
+  readUaAutoAlign, writeUaAutoAlign } from '../settings/prefs.js';
 import { networkSnapshot, probeBoundProxies } from './diagnose.js';
 import { readDisplays } from '../sync/displays.js';
 import { readHotkeyStatus, requestHotkey } from '../sync/hotkey.js';
@@ -1918,6 +1919,7 @@ export function buildRoutes() {
   add(['GET'], ['/api/v2/settings'], () => {
     const r = readSyncDefaults();
     const onClose = readSnapshotOnClose();
+    const uaAlign = readUaAutoAlign();
     return ok({
       sync_defaults: r.settings,
       sync_defaults_saved: r.saved,
@@ -1930,6 +1932,10 @@ export function buildRoutes() {
       snapshot_on_close_broken: onClose.broken,
       // 上一次自动备份的结果：界面要能显示「上次自动备份失败」
       snapshot_on_close_state: readSnapshotOnCloseState(),
+      // 0.4.7.2：UA 跟随内核版本升级（**默认关**，没存过就是 false）
+      ua_autoalign: uaAlign.enabled,
+      ua_autoalign_saved: uaAlign.saved,
+      ua_autoalign_broken: uaAlign.broken,
     });
   });
 
@@ -1948,6 +1954,33 @@ export function buildRoutes() {
     let r;
     try {
       r = writeSnapshotOnClose(b.enabled);
+    } catch (e) {
+      if (e.code === 'INVALID_ENABLED') {
+        throw new ApiError(ERR.INVALID, 'enabled must be a boolean', 200, { field: 'enabled' });
+      }
+      throw e;
+    }
+    return ok({ enabled: r.enabled, saved: true, changed: r.changed });
+  });
+
+  /**
+   * UA 跟随内核版本升级开关（0.4.7.2）。
+   *
+   * 语义只有一条：`enabled:true` 之后，**下一次启动**环境时才会像 0.4.7.1 那样
+   * 把 `ua` / `client_hints` / `kernel_version` 对齐到真实内核并落库；`false`（默认）时
+   * **任何路径都不改写这三个字段** —— 包括启动前那次预对齐（它改的是这一轮呈现的指纹）。
+   *
+   * 只接受布尔 —— 别的一律 `100002` + `field:'enabled'`，不猜用户意图：
+   * 这个开关打开后会**永久改写**用户存好的 UA（原值没有第二份），必须是他明确要的。
+   */
+  add(['POST'], ['/api/v2/settings/ua-autoalign'], (ctx) => {
+    const b = ctx.body || {};
+    if (b.enabled === undefined) {
+      throw new ApiError(ERR.INVALID, 'enabled is required（true / false）', 200, { field: 'enabled' });
+    }
+    let r;
+    try {
+      r = writeUaAutoAlign(b.enabled);
     } catch (e) {
       if (e.code === 'INVALID_ENABLED') {
         throw new ApiError(ERR.INVALID, 'enabled must be a boolean', 200, { field: 'enabled' });

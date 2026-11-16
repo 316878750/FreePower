@@ -192,6 +192,10 @@ export function reconcileForWrite({ ua, client_hints, kernel_version } = {}) {
 /**
  * 启动前「只剩版本号冲突」时的一次性对齐（0.4.7.1 要求 2：不许留死胡同）。
  *
+ * **0.4.7.2 起调用方必须先看开关**（`uaAutoAlignEnabled()`，设置页「UA 跟随内核版本升级」，
+ * 默认关）：关着的时候这一轮呈现的 UA 也不许改 —— 用户存 133 就按 133 打开。
+ * 这个函数本身不动库，但它会改「这一轮启动的视图」，所以同样属于「改写」。
+ *
  * 判据只有一条：**去掉版本号那几条之后，别的硬冲突一条都没有**。
  * 满足才按本机内核做 `alignProfileToKernel` 同一套对齐，否则原样返回、照旧阻断
  * （webgl 空开关、UA 平台 ↔ `navigator.platform` 矛盾这些必须继续拦）。
@@ -233,6 +237,10 @@ export function preAlignForLaunch(profile, { kernelVersion = null, check = null 
 /**
  * 导入结果里那一条「这个环境的 UA 不是本机内核这一版」（要求 3：别让用户点开才发现）。
  *
+ * 0.4.7.2 起这句话**不再承诺「首次打开会按内核对齐」** —— 跟版默认关，
+ * 按环境自己的 UA 打开才是正常行为（对手也是这样）。只有用户显式打开
+ * 「UA 跟随内核版本升级」之后，才会真的对齐。
+ *
  * @returns {{ua_major:string, kernel_major:string, message:string}|null}
  */
 export function uaKernelNotice(profile) {
@@ -242,6 +250,6 @@ export function uaKernelNotice(profile) {
   return {
     ua_major: uaMajor,
     kernel_major: kernelMajor,
-    message: `UA 是 Chrome/${uaMajor}，本机只装了 ${kernelMajor} 内核；首次打开会按内核对齐 UA`,
+    message: `UA 是 Chrome/${uaMajor}，本机内核是 ${kernelMajor}；按环境自己的 UA 打开，UA 不会被改（要跟内核版本走，请到设置里打开「UA 跟随内核版本升级」）`,
   };
 }

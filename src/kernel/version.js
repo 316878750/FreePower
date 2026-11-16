@@ -6,7 +6,12 @@
  *
  * 策略：启动时用 Browser.getVersion 拿到的**真实内核版本**做一次对齐，
  * 把 UA 的版本段、UA-CH 的 ua_full_version / brands、以及 kernel_version 列全部拉到真实值，
- * 并落库（下次启动就不用再对齐）。不想自动改就设 FREEPOWER_UA_AUTOALIGN=0。
+ * 并落库（下次启动就不用再对齐）。
+ *
+ * **0.4.7.2 起这是可选行为，默认关**：设置页「UA 跟随内核版本升级」打开才走这里
+ * （存库 `meta.ua_autoalign`，`manager.startProfile` 只读 `uaAutoAlignEnabled()`）。
+ * 关着的时候这三个字段**一个字节都不许改** —— 对手（AdsPower）也是各存各的，
+ * 不会按内核版本改写用户的 UA。环境变量 `FREEPOWER_UA_AUTOALIGN=1` 可把出厂默认改成开。
  */
 
 const majorOf = (v) => String(v || '').split('.')[0];

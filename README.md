@@ -688,6 +688,24 @@ $env:TMP  = "$PWD\.tmp\sys-tmp"; $env:TEMP = $env:TMP
 双击会「看着装完了、其实没装」（文件照拷、注册项和快捷方式静默丢失）。拷到桌面等普通目录再装，
 拷过去标签就没了（0.4.1 起一直这么做）。
 
+**0.4.7.2 起这三坑收进 `npm run dist:win`**（`tools/dist-win.mjs`）：缓存/TMP 自动指到 `.tmp/`、
+`--config.electronDist` 自动加、镜像自动指 npmmirror（可用 `ELECTRON_BUILDER_BINARIES_MIRROR` 覆盖）。
+所以现在只需要 `& npm.cmd run dist:win`（排障时可加 `-- --dir` 只出 `win-unpacked`）。
+
+**四段版本号怎么打包（0.4.7.2 起）**：electron-builder 用 `semver.valid(version, true)` 校验
+`package.json` 的 `version`，而 semver 只有三段 —— `0.4.7.2` 这种热修号会被直接拒：
+`⨯ Invalid version: "0.4.7.2"`。包装器的做法（`tools/dist-win.mjs` 头注释有完整理由）：
+
+1. 打包**期间**把 `package.json` 的 `version` 临时写成 semver 合法的 `0.4.7-2`（只改这一行）；
+2. `--config.extraMetadata.version=0.4.7.2` 把真实版本号塞回去 —— electron-builder 是**先校验、
+   后合并** `extraMetadata`，所以 asar 里的 `package.json` 与控制台显示的版本仍是 `0.4.7.2`；
+3. `--config.buildVersion=0.4.7.2` + `--config.buildNumber=2` 让 VersionInfo 的
+   FileVersion / ProductVersion 也是 `0.4.7.2`（`buildNumber` 就是第 4 段）；
+4. 打完**按字节还原** `package.json` 并核 sha256，还原失败直接非 0 退出（不留脏工作区）。
+
+产物核验时注意：**setup 与解包后的 `FreePower.exe` 的 VersionInfo 要分别读**（历史上有过一个带
+尾随 `.0`、一个不带的情况，读回什么写什么，不要归一化）。
+
 ## 七、已知限制（必须如实告知用户，不藏着）
 
 1. **Canvas / Audio / WebGL 标识 / 字体是 JS 注入，不是内核级。**
@@ -1632,7 +1650,8 @@ tab 模型（三个 hash + `tabOf` 认末尾斜杠 + 编辑页不算 tab）、�
 - **PAC 明确拒绝**：建环境 `100002`；老数据启动 `800003` + 零内核进程
 - **出口地理一致性**：声明时区/语言与出口不一致时会出现在 `warnings` 里
 - **launch_args 白名单**：从真实 `CommandLine` 验证白名单参数生效、保护参数不在 argv 里
-- **UA 跟版**：旧版本 UA 启动时对齐到真实内核版本并落库
+- **UA 跟版（0.4.7.2 起默认关，设置页可开）**：开了才把旧版本 UA / UA-CH / `kernel_version` 对齐到真实内核版本并落库；关着时这三个字段一个字节都不改（对手 AdsPower 也不改，`ua` 与 `client_hints` 是两个各自可配的字段）
+- **UA-CH 逐项忠实**：`brands` / `fullVersionList` / `platformVersion` / `architecture` / `bitness` / `model` / `wow64` 走 CDP 原生覆写，已废弃的 `uaFullVersion` 只能由注入层补（CDP 永远返回真实内核版本）；跨站子帧（OOPIF，独立 target）也补上 UA / UA-CH 覆写
 - **控制台**：首页带 api_key、`/ui/app.js` 可加载、schema 11 组 131 字段、表单校验接口放行 UTC 与空 cookie
 
 ## 九、目录

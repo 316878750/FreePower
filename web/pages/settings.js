@@ -203,6 +203,45 @@ export default async function settingsPage({ head, page }) {
         : null);
   }
 
+  /* ======================= 3c. 指纹：UA 跟随内核版本升级（0.4.7.2） ======================= */
+  const uaBox = h('div', { class: 'stack' });
+  body.appendChild(panel('指纹：UA 跟随内核版本升级', uaBox,
+    h('div', { class: 'muted small' },
+      '默认是关，和 AdsPower 一样：环境里存的是什么 UA，就用什么 UA 打开，'
+      + '哪怕本机内核版本比它新。开着的话，每次启动环境都会把该环境的 UA、UA-CH 版本号'
+      + '和内核版本改成这台机器的真实内核版本（默认策略），下一次启动也按改后的值走。')));
+
+  function paintUaAutoAlign(st) {
+    const on = st?.enabled === true;
+    mount(uaBox,
+      h('label', { class: 'checks', style: { display: 'inline-flex' } },
+        h('input', {
+          type: 'checkbox',
+          checked: on,
+          onChange: async (e) => {
+            const want = e.target.checked;
+            try {
+              const r = await api.setUaAutoAlign(want);
+              toast(r.enabled
+                ? '已开启：下次启动环境会把 UA / UA-CH 对齐本机内核版本'
+                : '已关闭：UA 与 UA-CH 保持环境自己的值，一个字节都不改', 'ok');
+              await loadSettings(false);
+            } catch (err) { toast(`改不了：${err.message}`, 'bad'); paintUaAutoAlign(st); }
+          },
+        }),
+        h('span', null, 'UA 跟随内核版本升级'),
+        h('span', { class: 'muted small' }, on ? '　当前：开' : '　当前：关（默认）')),
+      h('div', { class: 'muted small' },
+        on
+          ? '开着的时候用户存好的 UA 会被改成本机内核版本，而且改完就写进库里（原值没有第二份，'
+            + '改之前请自己导出一份备份）。开关关掉不会把已经改过的值改回去。'
+          : '关着的时候 UA / UA-CH / 内核版本号一个字节都不改：环境报 Chrome/133 本机内核是 157，'
+            + '打开后页面上仍然是 133。要让 UA 跟着内核升级走，才需要打开它。'),
+      st?.broken
+        ? h('div', { class: 'notice warn' }, '这个开关在库里存坏了，已按「关」处理（重新勾选一次就会覆盖坏数据）。')
+        : null);
+  }
+
   /* ======================= 4. 本地 API（只读摘要） ======================= */
   const apiBox = h('div', { class: 'stack' });
   body.appendChild(panel('本地 API', apiBox,
@@ -270,6 +309,11 @@ export default async function settingsPage({ head, page }) {
         saved: r.snapshot_on_close_saved,
         broken: r.snapshot_on_close_broken === true,
         state: r.snapshot_on_close_state || null,
+      });
+      paintUaAutoAlign({
+        enabled: r.ua_autoalign === true,
+        saved: r.ua_autoalign_saved,
+        broken: r.ua_autoalign_broken === true,
       });
       if (r.sync_defaults_broken) {
         toast('库里的同步默认设置存坏了，已回内置默认（保存一次就会覆盖掉坏数据）', 'warn');

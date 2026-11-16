@@ -180,7 +180,16 @@ check('安装完自动启动', /runAfterFinish:\s*true/.test(yml));
 const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
 check('package.json main 指向壳', pkg.main === 'desktop/main.js');
 check('electron 只在 devDependencies（不进运行时依赖）', !!pkg.devDependencies.electron && !pkg.dependencies);
-check('有 dist:win 脚本', String(pkg.scripts['dist:win']).includes('electron-builder'));
+check('有 dist:win 脚本（0.4.7.2 起走 tools/dist-win.mjs：四段版本号映射 + 本机三个坑都收在里面）',
+  String(pkg.scripts['dist:win']).includes('tools/dist-win.mjs'));
+{
+  // 脚本可以换壳，但**打包工具还是 electron-builder**、内核包还是用本地那份（不许退化成下载）
+  const distSrc = fs.readFileSync(path.join(ROOT, 'tools', 'dist-win.mjs'), 'utf8');
+  check('dist-win 包装器真的调 electron-builder，且用本地 electronDist',
+    /electron-builder/.test(distSrc) && /config\.electronDist=node_modules\/electron\/dist/.test(distSrc));
+  check('dist-win 包装器把四段版本号映射成 semver 合法值，并保证 package.json 按字节还原',
+    /extraMetadata\.version/.test(distSrc) && /没还原成功/.test(distSrc));
+}
 
 const ico = path.join(ROOT, 'desktop', 'build', 'icon.ico');
 const tray = path.join(ROOT, 'desktop', 'assets', 'tray.png');

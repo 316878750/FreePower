@@ -120,7 +120,7 @@ export function buildReport(profile, raw, { kernelVersion = null, previous = nul
       status: unverified ? (ctx.secure === false ? 'warn' : 'fail') : undefined,
       declared: md ? { platform: wantPlatform, fullVersionList: md.fullVersionList } : null,
       actual: raw.uaData ? { platform: gotPlatform, brands, fullVersionList: high ? high.fullVersionList : null } : null,
-      note: raw.uaData ? (match ? null : 'UA-CH 与声明不一致（常见原因：内核升级后没跟版）')
+      note: raw.uaData ? (match ? null : 'UA-CH 与声明不一致（注入层没生效，或内核不支持这一项覆盖）')
         : (insecureNote || '页面没有 navigator.userAgentData（非 Chromium）'),
     }));
   }
