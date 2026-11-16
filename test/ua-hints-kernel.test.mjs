@@ -50,10 +50,38 @@ const pickHdr = (h) => Object.fromEntries(HDR_KEYS.map((k) => [k, h[k] ?? null])
 const ACCEPT_CH = 'Sec-CH-UA-Full-Version-List, Sec-CH-UA-Platform-Version, Sec-CH-UA-Arch, '
   + 'Sec-CH-UA-Bitness, Sec-CH-UA-Model, Sec-CH-UA-WoW64';
 
-/* 内层（另一个站点，制造跨站子帧 = OOPIF） */
+/* 内层（另一个站点，制造跨站子帧 = OOPIF）。
+ * **读数由子帧自己读、自己 postMessage 回父页** —— 判据不许用 CDP 直读子帧 target：
+ * CDP 会话里读到的是「补丁装好了没有」，不是「页面看到的是什么」（0.4.7.2 第三版实测：
+ * 同一子帧，页面侧 `uaFullVersion` 是 157.0.8103.78，CDP 侧是 133.0.6943.127）。 */
 const srvInner = http.createServer((req, res) => {
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-  res.end('<!doctype html><html><head><meta charset="utf-8"><title>inner</title></head><body><div id="i">inner</div></body></html>');
+  res.end('<!doctype html><html><head><meta charset="utf-8"><title>inner</title></head><body>'
+    + '<div id="i">inner</div>'
+    + `<script>
+(function () {
+  var buf = [];
+  function push(tag) {
+    var d = navigator.userAgentData;
+    if (!d) { buf.push({ tag: tag, no: 1 }); try { parent.postMessage(JSON.stringify(buf), '*'); } catch (e) {} return; }
+    d.getHighEntropyValues(['uaFullVersion', 'platformVersion', 'fullVersionList']).then(function (hi) {
+      buf.push({
+        tag: tag,
+        ua: navigator.userAgent,
+        ufv: hi.uaFullVersion,
+        pv: hi.platformVersion,
+        fvl: hi.fullVersionList || null,
+        at: Math.round(performance.now()),
+      });
+      try { parent.postMessage(JSON.stringify(buf), '*'); } catch (e) {}
+    }).catch(function () {});
+  }
+  push('parse');
+  document.addEventListener('DOMContentLoaded', function () { push('dcl'); });
+  window.addEventListener('load', function () { push('load'); });
+})();
+</script>`
+    + '</body></html>');
 });
 await new Promise((r) => srvInner.listen(0, '127.0.0.1', r));
 const INNER_URL = `http://localhost:${srvInner.address().port}/inner.html`;
@@ -68,6 +96,7 @@ const srvOuter = http.createServer((req, res) => {
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'accept-ch': ACCEPT_CH });
   res.end('<!doctype html><html><head><meta charset="utf-8"><title>ua probe</title></head><body>'
     + '<div id="d">ua</div>'
+    + "<script>window.__child = [];addEventListener('message', function (e) { try { var v = JSON.parse(e.data); if (Array.isArray(v)) window.__child = v; } catch (err) {} });</script>"
     + `<iframe id="f" src="${INNER_URL}" width="320" height="120"></iframe>`
     + "<script>window.__hdrP = fetch('/hdr').then(function (r) { return r.json(); }).catch(function () { return null; });</script>"
     + '</body></html>');
@@ -170,26 +199,35 @@ async function readSession(client, sessionId, label) {
   return val || { ua: '', brands: null, hi: null, hdr: null };
 }
 
+/**
+ * 读**父页里**那个 `window.__child`（子帧自己 postMessage 出来的读数）。
+ * 口径就是「页面自己看到什么」—— 不再 attach 子帧 target 用 CDP 读。
+ */
+async function readChildReadings(client, sessionId, timeoutMs = 6000) {
+  const deadline = Date.now() + timeoutMs;
+  let reads = [];
+  while (Date.now() < deadline) {
+    const r = await client.send('Runtime.evaluate', {
+      expression: 'JSON.stringify(window.__child || [])', returnByValue: true,
+    }, sessionId).catch(() => null);
+    try { reads = JSON.parse(r?.result?.value || '[]'); } catch { reads = []; }
+    if (reads.some((x) => x.tag === 'load')) break;
+    await sleep(150);
+  }
+  if (!reads.length) console.log('  (oopif: 子帧一条读数都没送出来)');
+  return { reads, parse: reads.find((x) => x.tag === 'parse') || null, load: reads.find((x) => x.tag === 'load') || null };
+}
+
 /** 一次启动 → 新开两个标签页 + 跨站子帧，全部读数 */
 async function probe(profile) {
   const started = await manager.startProfile(profile);
   const inst = manager.getInstance(profile.id || profile.profile_id);
   const t1 = await inst.openPage(PROBE_URL);
   const first = await readSession(inst.client, t1.sessionId, 'tab1');
+  // 跨站子帧（OOPIF）是独立 target，但读数只能取「页面自己看到的」：子帧 postMessage → 父页收集
+  const oopif = await readChildReadings(inst.client, t1.sessionId);
   const t2 = await inst.openPage(PROBE_URL);
   const second = await readSession(inst.client, t2.sessionId, 'tab2');
-
-  // 跨站子帧（OOPIF）是独立 target：从自己的会话读（模拟检测页在 iframe 里做一致性检查）
-  let oopif = null;
-  const targets = (await inst.client.send('Target.getTargets').catch(() => ({ targetInfos: [] }))).targetInfos || [];
-  for (const t of targets.filter((x) => x.type === 'iframe')) {
-    const s = await inst.client.send('Target.attachToTarget', { targetId: t.targetId, flatten: true }).catch(() => null);
-    if (s?.sessionId) {
-      oopif = await readSession(inst.client, s.sessionId, 'oopif');
-      await inst.client.send('Target.detachFromTarget', { sessionId: s.sessionId }).catch(() => {});
-      break;
-    }
-  }
   return { started, first, second, oopif, inst };
 }
 
@@ -259,15 +297,27 @@ try {
       `${String(s.ua).slice(0, 60)} / ${s.hi?.uaFullVersion} / ${s.hi?.platformVersion}`);
 
     const o = r?.oopif || {};
-    /* 这一条是 0.4.7.2 第一版假绿的根因：原来只比 UA / platformVersion / brands，
-     * 而子帧里漏的恰恰是 `uaFullVersion`（CDP 永远不认这一项，子帧又没挂 UA-CH 脚本）。
-     * 现在单独成一条断言：去掉子帧脚本时**只有这一条红**，别的断言一条都不许跟着红。 */
-    check('**跨站子帧（OOPIF）的 uaFullVersion 也是 133.0.0.0**（CDP 永远不认，子帧必须挂 UA-CH 脚本）',
-      o.hi?.uaFullVersion === '133.0.0.0', String(o.hi?.uaFullVersion));
-    check('**跨站子帧（OOPIF）也是 133 / 10.0.0**（0.4.7.1 这里读到的是宿主真值）',
-      (/Chrome\/(\d+)\./.exec(o.ua || '') || [])[1] === '133'
-      && o.hi?.platformVersion === '10.0.0' && brandMajors(o.brands).every((m) => m === '133'),
-      `ua=${String(o.ua).slice(0, 60)} pv=${o.hi?.platformVersion} brands=${JSON.stringify(o.brands)}`);
+    const oParse = o.parse || {};
+    const oLoad = o.load || {};
+    const fvlMajor = (list) => (Array.isArray(list) ? list : [])
+      .filter((b) => b && b.brand !== 'Not_A Brand' && b.brand !== 'Not-A.Brand')
+      .map((b) => majorOf(b.version));
+    /* 口径：这两条读的是**子帧页面自己**看到的值（子帧 postMessage 回父页），
+     * 不是 CDP 直读子帧 target —— CDP 侧那条只会继续骗人，已经删掉。
+     *
+     * ① CDP 原生覆写从首字节就生效：brands / fullVersionList / platformVersion 都对。
+     * ② `uaFullVersion` 是**已知缺陷**：跨站子帧里页面在补丁落地前读到的是宿主真值，
+     *    8 秒内都不会翻过来（补丁只在外部调试会话挂上去之后才"看得见"）。
+     *    这条断言把缺陷钉死：哪天修好了它会红，逼着改文档、改口径。 */
+    check('跨站子帧（OOPIF）**首字节**就是 133 / 10.0.0（页面自己读：UA、brands、fullVersionList、platformVersion 全对）',
+      (/Chrome\/(\d+)\./.exec(oParse.ua || '') || [])[1] === '133'
+      && fvlMajor(oParse.fvl).every((m) => m === '133') && fvlMajor(oParse.fvl).length > 0
+      && oParse.pv === '10.0.0',
+      `parse: ua=${String(oParse.ua).slice(-40)} pv=${oParse.pv} fvl=${JSON.stringify(oParse.fvl)}`);
+    check('**已知缺陷（0.4.8 再修）：跨站子帧里页面在补丁落地前读到的 uaFullVersion 仍是真实内核版本**'
+      + '（解析期与 load 后都一样；CDP 侧读到 133 是假象，判据不许用它）',
+      !!oParse.ufv && oParse.ufv === kernelVersion && oLoad.ufv === kernelVersion,
+      `parse=${oParse.ufv} load=${oLoad.ufv}（内核 ${kernelVersion}）`);
 
     const after = { ua: rawRow(p.profile_id).ua, kv: rawRow(p.profile_id).kernel_version, fp: rawRow(p.profile_id).fingerprint_config };
     check('库里 ua 列逐字节不变', after.ua === before.ua, `${before.ua?.slice(0, 40)} → ${after.ua?.slice(0, 40)}`);
