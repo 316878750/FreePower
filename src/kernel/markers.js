@@ -23,10 +23,11 @@ import crypto from 'node:crypto';
 /**
  * 标记的种类。每加一种就要同步改注入脚本里的写入点与读取点。
  *   applied / seeds / realm / installed / mediaMode / fontsDeclared —— 自检与宿主判注入用
+ *   uaCh —— 跨站子帧（OOPIF）那份「只做 UA-CH」的最小脚本装过的标记（0.4.7.2）
  *   config / orig —— 只在 FP_DEBUG 时出现（排查用，平时页面里没有）
  */
 export const MARKER_KEYS = Object.freeze([
-  'applied', 'seeds', 'realm', 'installed', 'mediaMode', 'fontsDeclared', 'config', 'orig',
+  'applied', 'seeds', 'realm', 'installed', 'mediaMode', 'fontsDeclared', 'uaCh', 'config', 'orig',
 ]);
 
 /** 标记名允许的形状：下划线开头 + 8 位小写 hex。判据也用它钉住「不许退化回固定名」。 */

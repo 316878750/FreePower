@@ -86,7 +86,7 @@ try {
     const after = JSON.stringify(rawRow(p.profile_id));
 
     check('hints 缺失 → 按 UA 的 Chrome/133 派生（**不是本机内核 ' + kernelMajor + '**）',
-      got.client_hints?.ua_full_version === '133.0.0.0',
+      got.client_hints?.ua_full_version === '133.0.6943.127',
       `ua_full_version=${got.client_hints?.ua_full_version} 内核=${kernelVersion}`);
     check('大版本自洽：UA 133 ↔ ua_full_version 133', prof.checkProfile(got).ok === true,
       JSON.stringify(prof.checkProfile(got).hard));
@@ -96,6 +96,38 @@ try {
       before === after ? '' : '行被改写过');
     check('两次读出来一模一样（不是每次都重新派生出一个新值）',
       JSON.stringify(again.client_hints) === JSON.stringify(got.client_hints));
+  }
+
+  /* ==================== 1b. 版本号做实：UA 写全了就按 UA 的四段 ==================== */
+  console.log('\n— 1b. 派生出来的完整版本号取自 UA（0.4.7.2） —');
+  {
+    check('UA 里能解析出四段 → 用那四段（不再打码成 133.0.0.0）',
+      hints.chromeVersionOf(UA133) === '133.0.6943.127', String(hints.chromeVersionOf(UA133)));
+    check('UA 只有 Chrome/133（没写全）→ 解析不出完整版本，回落 <major>.0.0.0',
+      hints.chromeVersionOf('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+        + '(KHTML, like Gecko) Chrome/133 Safari/537.36') === null
+      && hints.hintsFromUa('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+        + '(KHTML, like Gecko) Chrome/133 Safari/537.36')?.ua_full_version === '133.0.0.0',
+      String(hints.hintsFromUa('Mozilla/5.0 Chrome/133 Safari/537.36')?.ua_full_version));
+    check('只有两段（Chrome/133.0）也算没写全 → 回落 133.0.0.0',
+      hints.chromeVersionOf('Mozilla/5.0 Chrome/133.0 Safari/537.36') === null
+      && hints.hintsFromUa('Mozilla/5.0 Chrome/133.0 Safari/537.36')?.ua_full_version === '133.0.0.0');
+    check('UA 里写全的四段 → 派生 hints 也是那四段（派生 + 对齐同一条规则）',
+      hints.hintsFromUa(UA133)?.ua_full_version === '133.0.6943.127',
+      String(hints.hintsFromUa(UA133)?.ua_full_version));
+    check('解析不出 Chrome 版本（非 Chrome UA）→ 不猜，返回 null',
+      hints.chromeVersionOf('Mozilla/5.0 (Windows NT 10.0) Gecko/20100101 Firefox/128.0') === null);
+
+    // 端到端：读路径派生 + 写路径对齐都走这条规则，且读路径仍然零写入
+    const p = prof.createProfile({ name: uniq('ua-derive'), group_id: '0', ua: UA133 });
+    stripHints(p.profile_id);
+    const before = JSON.stringify(rawRow(p.profile_id));
+    const got = prof.getProfile(p.profile_id);
+    check('读路径：无 hints + UA 四段 → 派生 133.0.6943.127',
+      got.client_hints?.ua_full_version === '133.0.6943.127', String(got.client_hints?.ua_full_version));
+    check('读路径仍然零写入（派生值只在视图里，不落库）', before === JSON.stringify(rawRow(p.profile_id)));
+    check('派生之后 checkProfile.ok === true（四段自洽，不是靠放宽校验换来的）',
+      prof.checkProfile(got).ok === true, JSON.stringify(prof.checkProfile(got).hard));
   }
 
   /* ==================== 2. 用户库里那种矛盾对：UA 133 + hints 157 ==================== */
@@ -132,13 +164,14 @@ try {
     const got = prof.getProfile(p.profile_id);
     const after = JSON.stringify(rawRow(p.profile_id));
 
-    check('读出来：hints 版本段对齐到 UA 的 133', got.client_hints?.ua_full_version === '133.0.0.0',
+    check('读出来：hints 版本段对齐到 UA 的 133（0.4.7.2 起取 UA 里写全的四段）',
+      got.client_hints?.ua_full_version === '133.0.6943.127',
       String(got.client_hints?.ua_full_version));
     check('**platform 一个字节都不动**（那是另一条硬冲突，不许在这里被顺手放宽）',
       got.client_hints?.platform === 'Windows', String(got.client_hints?.platform));
     check('brands / fullVersionList 的版本段同步对齐（Not_A Brand 保持原样）',
       got.client_hints?.brands?.find((b) => b.brand === 'Google Chrome')?.version === '133'
-      && got.client_hints?.fullVersionList?.find((b) => b.brand === 'Google Chrome')?.version === '133.0.0.0'
+      && got.client_hints?.fullVersionList?.find((b) => b.brand === 'Google Chrome')?.version === '133.0.6943.127'
       && got.client_hints?.brands?.find((b) => b.brand === 'Not_A Brand')?.version === '24');
     check('checkProfile.ok === true（这就是 P0 那个 50/50 全红的入口）',
       prof.checkProfile(got).ok === true, JSON.stringify(prof.checkProfile(got).hard));

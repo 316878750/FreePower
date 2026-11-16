@@ -102,8 +102,16 @@ function injectionConfig(fp) {
  * ⚠️ 这里的 canvas / webgl_image / audio / client_rects 噪声实现是**唯一一份**：
  *    主帧（page 层）和 worker（worker 层）都调用它。**此处改动会同时影响主帧与 worker**，
  *    改完必须跑 `test/unit.test.mjs` 里的「主帧与 worker 噪声同源同值」断言与冒烟双 Realm 对比。
+ *
+ * 0.4.7.2 起拆成三段（字节顺序不变，`CORE` 仍是三段拼起来的那一份）：
+ *   - `CORE_PRELUDE`：诊断数组 + 原生伪装工具（`native` / `defGetter` / `defMethod` + toString 接管）
+ *   - `CORE_NOISE`  ：四维噪声与 OffscreenCanvas / WebGL
+ *   - `CORE_UA_CH`  ：`patchUaData`（UA-CH 补丁）
+ * 拆开**只为一件事**：跨站子帧（OOPIF）是独立 realm，父帧的整套注入进不去，
+ * 而它必须补 `uaFullVersion`（CDP 永远不认这一项）。子帧只装 prelude + UA-CH，
+ * 噪点/字体/WebGL 在 OOPIF 里仍然一个都不碰 —— 见 `buildUaChOnlySource`。
  */
-const CORE = `
+const CORE_PRELUDE = `
   const applied = [];
   const mark = (name) => { if (!applied.includes(name)) applied.push(name); };
 
@@ -220,7 +228,10 @@ const CORE = `
 
   // 先接管 toString，再让各层开始登记 —— 顺序不能反（反了先装的函数会有一小段裸窗口）
   installToStringTrap();
+`;
 
+/* 噪点实现：与 UA-CH 无关，子帧那份 UA-CH-only 脚本不装这一段。 */
+const CORE_NOISE = `
   /* ---------- 2D 像素噪声（page 的 HTMLCanvasElement 与 worker 的 OffscreenCanvas 共用） ---------- */
   function noiseImageData(img, seedStr, strength) {
     const d = img.data;
@@ -308,7 +319,11 @@ const CORE = `
       }, 'readPixels', 7));
     }
   };
+`;
 
+/* UA-CH 补丁（patchUaData）：主帧 / worker / 跨站子帧（OOPIF）三处共用**这一份**实现。
+ * 子帧只装 prelude + 这一段，见 buildUaChOnlySource。 */
+const CORE_UA_CH = `
   /* ---------- UA-CH：CDP 认的那几项之外，uaFullVersion 只能在这里补（0.4.7.2） ----------
    *
    * 为什么必须有这一层（2026-11-16 真内核 157.0.8103.78 实测）：
@@ -396,7 +411,10 @@ const CORE = `
       }
     } catch (e) {}
   };
+`;
 
+/* 诊断种子（只有整套注入要；子帧那份 UA-CH-only 脚本不装）。 */
+const CORE_TAIL = `
   /* ---------- 诊断用的种子快照 ---------- */
   const seedsSnapshot = () => ({
     canvas: CFG.canvas && CFG.canvas.seed || null,
@@ -405,6 +423,9 @@ const CORE = `
     client_rects: CFG.client_rects && CFG.client_rects.seed || null,
   });
 `;
+
+/* page / worker 两侧共用的完整核心：顺序 = prelude → 噪点 → UA-CH → 诊断种子。 */
+const CORE = CORE_PRELUDE + CORE_NOISE + CORE_UA_CH + CORE_TAIL;
 
 /* ============================ page 层 ============================ */
 const PAGE_BODY = `
@@ -1071,6 +1092,51 @@ export function buildWorkerInjectionSource(fp, { debug = false, markers = null }
   const DEBUG = ${debug ? 'true' : 'false'};
 ${CORE}${WORKER_BODY}
   try { Object.defineProperty(self, MK.installed, { value: true, enumerable: false, configurable: false }); } catch (e) {}
+})();`;
+}
+
+/**
+ * 跨站子帧（OOPIF）用的**最小**注入源：只做 UA-CH（0.4.7.2 补的那一刀）。
+ *
+ * ## 为什么非要有它
+ *
+ * 跨站子帧是**独立 target / 独立 realm**，父帧的 `Page.addScriptToEvaluateOnNewDocument`
+ * 进不去（这正是 0.4.7.2 第一版漏掉的那一项）。而 `uaFullVersion` 是 CDP
+ * `Emulation.setUserAgentOverride` **永远改不动**的一项（真内核 157.0.8103.78 实测：
+ * 传 133 读回 157.0.8103.78）。所以子帧里只发 CDP 覆写时，`navigator.userAgent` /
+ * `brands` / `platformVersion` 都是 133，**只有 `uaFullVersion` 还是宿主真值** ——
+ * 检测页把一致性检查放进跨站 iframe 就能一眼看穿。
+ *
+ * ## 只装什么
+ *
+ * `CORE_PRELUDE`（诊断数组 + `native`/`defGetter`/`defMethod` + toString 接管）+ `CORE_UA_CH`
+ * （`patchUaData`）。**不装**噪点、字体、WebGL、媒体设备、Screen —— 那些维度在 OOPIF 里
+ * 仍然是宿主真值，这是**已知限制**（README / docs 都写着），不要读成「子帧已经全套伪装」。
+ *
+ * 为什么连 toString 接管也要装：`patchUaData` 用 `native()` 登记包装函数，没有那一层，
+ * 子帧里 `getHighEntropyValues.toString()` 会吐出我们的真源码 —— 比不补更显眼。
+ *
+ * ## 纪律（与整套注入一致）
+ *
+ * - 只接原生实现（`toString` 含 `native code`），防重复注入、不跟页面自己的 polyfill 打架；
+ * - **值不对才补**：CDP 已经给对的字段一个都不改；
+ * - 调用方必须**先注册脚本再 `Runtime.runIfWaitingForDebugger`**：子帧这时停在首行之前，
+ *   注册晚了首个文档就是裸的。
+ *
+ * @returns {string|null} 没有 UA-CH 配置（`ua_metadata` 缺失）时返回 `null`：不装任何东西。
+ */
+export function buildUaChOnlySource(fp, { markers = null } = {}) {
+  const cfg = injectionConfig(fp);
+  if (!cfg.uaData) return null;
+  const mk = markers || markerNames(fp && fp.seed);
+  return `(() => {
+  'use strict';
+  ${markerConstSource(mk)}
+  if (window[MK.uaCh]) return;
+  const CFG = ${JSON.stringify({ uaData: cfg.uaData })};
+${CORE_PRELUDE}${CORE_UA_CH}
+  try { patchUaData(window); } catch (e) {}
+  try { Object.defineProperty(window, MK.uaCh, { value: true, enumerable: false, configurable: false }); } catch (e) {}
 })();`;
 }
 

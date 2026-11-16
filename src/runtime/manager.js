@@ -7,7 +7,7 @@ import {
 import { uaAutoAlignEnabled } from '../settings/prefs.js';
 import { findChrome, buildArgs, launchChrome, waitForDevToolsPort, killProcessTree, rememberVersion } from '../kernel/chrome.js';
 import { CdpClient, fetchJson } from '../kernel/cdp.js';
-import { buildInjectionSource, buildWorkerInjectionSource } from '../kernel/inject.js';
+import { buildInjectionSource, buildWorkerInjectionSource, buildUaChOnlySource } from '../kernel/inject.js';
 import { markerNames, installedExpression, workerRealmExpression } from '../kernel/markers.js';
 import { compileNetRules, decideRequest } from '../kernel/net-rules.js';
 import { blockPageResponse } from '../kernel/block-page.js';
@@ -41,6 +41,11 @@ const soft = (field, message) => ({ field, message, severity: 'soft' });
  * 超时会把该项写进 failed 清单，**不静默丢**。
  */
 const WORKER_INJECT_TIMEOUT_MS = 3000;
+/**
+ * 子帧（OOPIF）装配的等待上限：CDP 覆写 + UA-CH 最小脚本注册，两件事都落地才放行子帧。
+ * 正常毫秒级；超时只是「别把子帧永远停着」的兜底 —— 停住的子帧 = 页面白屏。
+ */
+const IFRAME_ARM_TIMEOUT_MS = 1500;
 /** 被 auto-attach 接住、需要注入 JS 的 target 类型 */
 const WORKER_TARGET_TYPES = new Set(['worker', 'shared_worker', 'service_worker']);
 
@@ -664,12 +669,16 @@ async function injectAndOpen(instance, profile, view) {
     browser_ui: 0,
     iframes: 0,
     /**
-     * 子帧（跨站子帧 = OOPIF，是独立 target）的 UA / UA-CH 覆写结果。
-     * 0.4.7.2 起对它发一次 **CDP 原生** `Emulation.setUserAgentOverride`（不注入 JS），
-     * 成功/失败分开记账 —— 「发了」不等于「生效」，排障时要能看出是哪一种。
+     * 子帧（跨站子帧 = OOPIF，是独立 target）的 UA / UA-CH 装配结果。
+     * 0.4.7.2 起两条通道都发：**CDP 原生** `Emulation.setUserAgentOverride`
+     * （brands / fullVersionList / platformVersion / …）＋ **只做 UA-CH 的最小脚本**
+     * （`uaFullVersion`，CDP 永远不认这一项）。四条各自记账 ——
+     * 「发了」不等于「生效」，排障时要能看出是哪一条没落地。
      */
     iframes_ua: 0,
     iframes_ua_failed: 0,
+    iframes_ua_ch: 0,
+    iframes_ua_ch_failed: 0,
     /** AudioWorklet 也是独立 target（type='worklet'），但按设计不注入，单独记账 */
     worklets: 0,
     other: 0,
@@ -709,8 +718,8 @@ async function injectAndOpen(instance, profile, view) {
     workerStats.total += 1;
     workerStats.by_type[type] = (workerStats.by_type[type] || 0) + 1;
 
-    /* iframe：**注入层的 JS 一套不覆盖子帧**（塞 worker 脚本只会补半套、还多一层痕迹），
-     * 但 UA / UA-CH 是 CDP 原生覆写，没有新的痕迹面，所以这一层要补上。
+    /* iframe：**注入层的整套 JS 不覆盖子帧**（塞 worker 脚本只会补半套、还多一层痕迹），
+     * 但 UA / UA-CH 必须补 —— 两条不同的通道，缺一条就漏一项。
      *
      * 为什么必须补（2026-11-16 实测，内核 157.0.8103.78）：**跨站子帧是独立 target（OOPIF）**，
      * 不设 Emulation 时它里面读到的是宿主真值 —— 父帧是我们配的 133 / platformVersion 10.0.0，
@@ -718,23 +727,52 @@ async function injectAndOpen(instance, profile, view) {
      * 检测页把一致性检查放进跨站 iframe（这是常态做法）就能一眼看出破绽。
      * 同站子帧不是独立 target（跟随父帧会话），本来就已经覆盖。
      *
-     * 时序：`waitForDebuggerOnStart` 把子帧停在首行之前，覆写先落地再放行，
-     * 所以子帧的首个文档就是我们配置的那一套。设不上不拖死（catch 记账后照常放行）。 */
+     * **两条通道都要，缺一不可**（0.4.7.2 第二版，CEO 复验打回的那条）：
+     *   ① `Emulation.setUserAgentOverride`：`brands` / `fullVersionList` / `platformVersion` /
+     *      `architecture` / `bitness` / `model` / `wow64` 内核都认，原生覆写、零 JS 痕迹；
+     *   ② `Page.addScriptToEvaluateOnNewDocument` + **只做 UA-CH 的最小脚本**
+     *      （`buildUaChOnlySource`）：`uaFullVersion` 是 CDP **永远改不动**的那一项，
+     *      只发 ① 的话子帧里它必然还是宿主真值 —— 第一版就是这么漏的。
+     *      脚本只装 `patchUaData`（+ 它依赖的原生伪装工具），canvas/字体/WebGL 在 OOPIF 里
+     *      仍然一个都不碰（那是已知限制，别读成「子帧已全套伪装」）。
+     *
+     * 时序：`waitForDebuggerOnStart` 把子帧停在首行之前，**两件事都落地再放行**，
+     * 所以子帧的首个文档就是我们配置的那一套。设不上不拖死：每条各自记账、超时也照常放行
+     * （子帧永远停着 = 页面白屏，比漏一项指纹严重得多）。 */
     if (type === 'iframe') {
       workerStats.iframes += 1;
+      const jobs = [];
       if (view && view.ua) {
-        const sess = sessionId;
-        client.send('Emulation.setUserAgentOverride', {
+        jobs.push(client.send('Emulation.setUserAgentOverride', {
           userAgent: view.ua,
           acceptLanguage: (view.language || []).join(','),
           platform: view.platform || 'Win32',
           userAgentMetadata: view.ua_metadata || undefined,
-        }, sess).then(() => { workerStats.iframes_ua += 1; }, (e) => {
+        }, sessionId).then(() => { workerStats.iframes_ua += 1; }, (e) => {
           workerStats.iframes_ua_failed += 1;
           log(profileId, 'WARN 子帧 UA 覆写失败', targetId, e.message);
-        });
+        }));
       }
-      resumeNow(sessionId, waitingForDebugger);
+      const uaChSource = view ? buildUaChOnlySource(view, { markers }) : null;
+      if (uaChSource) {
+        /* `runImmediately: true` 是这一刀的关键（0.4.7.2 第二版实测）：
+         * 子帧被 `waitForDebuggerOnStart` 停住时，**它的首个文档已经建好了** ——
+         * 只注册「对下一个文档生效」的脚本，当前文档里 `uaFullVersion` 仍是宿主真值
+         * （探针读数：注册成功、CDP 覆写也生效、brands/platformVersion 都对，唯独这一项 157）。
+         * `runImmediately` 让脚本在当前文档里立刻跑一遍，同时又注册给后续文档。
+         * 此刻目标停在首行之前，页面的脚本还没跑，所以补上去仍然赶在它自己读之前。 */
+        jobs.push(client.send('Page.addScriptToEvaluateOnNewDocument', { source: uaChSource, runImmediately: true }, sessionId)
+          .then(() => { workerStats.iframes_ua_ch += 1; }, (e) => {
+            workerStats.iframes_ua_ch_failed += 1;
+            log(profileId, 'WARN 子帧 UA-CH 脚本注册失败', targetId, e.message);
+          }));
+      }
+      if (!jobs.length) {
+        resumeNow(sessionId, waitingForDebugger);
+        return;
+      }
+      withTimeout(Promise.all(jobs), IFRAME_ARM_TIMEOUT_MS, '子帧装配超时')
+        .then(() => resumeNow(sessionId, waitingForDebugger));
       return;
     }
     // AudioWorklet 有独立 target（type='worklet'），但里面没有可注入的指纹表面

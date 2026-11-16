@@ -11,11 +11,12 @@
  * ## 三条规则（按顺序，前一条命中就不走后面）
  *
  *   1. **有完整 `ua_full_version`**：只在「它和 UA 里的 Chrome 大版本矛盾」时，
- *      把**版本段**对齐到 UA 的大版本（`<major>.0.0.0`），`brands` / `fullVersionList`
+ *      把**版本段**对齐到 UA（0.4.7.2 起：UA 写全了 `133.0.6943.127` 就用这个完整版本，
+ *      只有 `Chrome/133` 这种没写全的才回落 `<major>.0.0.0`），`brands` / `fullVersionList`
  *      若存在也一起对齐。**`platform` 一个字节都不动** —— 那是另一条硬冲突
  *      （UA 平台 vs `navigator.platform`），不许在这里被顺手放宽。
  *   2. **没有 hints（或没有完整版本）**：UA 能解析出 `Chrome/<major>` → **用那个 major 派生**，
- *      不许用本机内核版本（用内核就等于凭空造一个矛盾出来）。
+ *      完整版本同样优先取 UA 里写全的那一个，不许用本机内核版本（用内核就等于凭空造一个矛盾出来）。
  *   3. **UA 缺失 / 解析不出 Chrome 版本**：才回落到本机内核版本（此时 UA-CH 与内核一致，
  *      而 UA 本来也没声明任何版本，怎么都对得上）。
  *
@@ -28,13 +29,37 @@
 
 import { alignProfileToKernel } from '../kernel/version.js';
 
-const CHROME_RE = /Chrome\/(\d+)\./;
+const CHROME_RE = /Chrome\/(\d+)/;
+const CHROME_FULL_RE = /Chrome\/(\d+(?:\.\d+)*)/;
 
 /** UA 里的 Chrome 大版本（`Chrome/133.0.6943.127` → `'133'`）；解析不出返回 `null` */
 export function chromeMajorOf(ua) {
   const s = typeof ua === 'string' ? ua : '';
   const m = CHROME_RE.exec(s);
   return m ? m[1] : null;
+}
+
+/**
+ * UA 里能解析出的 Chrome **完整**版本（`Chrome/133.0.6943.127` → `'133.0.6943.127'`）。
+ *
+ * 为什么要有这条（0.4.7.2）：派生出来的 hints 以前一律打码成 `<major>.0.0.0`，
+ * 而 UA 里明明写着 `133.0.6943.127` —— 页面只要把 UA 的四段和
+ * `getHighEntropyValues(['uaFullVersion'])` 的四段放在一起看，就能看出后三段是编的。
+ * 现在 UA 里写了三段以上就用它本人；只有 `Chrome/133` / `Chrome/133.0` 这种
+ * **没写全**的才回落 `<major>.0.0.0`（那种 UA 本来就没声称补丁号，打码不会自相矛盾）。
+ *
+ * @returns {string|null} 三段以上的版本串；不足三段 / 解析不出返回 `null`
+ */
+export function chromeVersionOf(ua) {
+  const s = typeof ua === 'string' ? ua : '';
+  const m = CHROME_FULL_RE.exec(s);
+  if (!m) return null;
+  return m[1].split('.').length >= 3 ? m[1] : null;
+}
+
+/** 派生 hints 时用的完整版本号：UA 里写全了就用它，否则 `<major>.0.0.0` */
+function derivedFullVersion(ua, major) {
+  return chromeVersionOf(ua) || `${major}.0.0.0`;
 }
 
 /** 内核完整版本号的大版本（`157.0.8103.78` → `'157'`） */
@@ -79,7 +104,7 @@ function hintsFor(major, full, ua) {
 export function hintsFromUa(ua) {
   const major = chromeMajorOf(ua);
   if (!major) return null;
-  return hintsFor(major, `${major}.0.0.0`, ua);
+  return hintsFor(major, derivedFullVersion(ua, major), ua);
 }
 
 /** 按内核完整版本派生一套 hints（规则 3） */
@@ -132,7 +157,8 @@ export function withClientHints(profile, { kernelVersion = null } = {}) {
   if (curFull) {
     if (!uaMajor) return profile; // UA 不可解析：没有依据，保持原样
     if (String(curFull).split('.')[0] === uaMajor) return profile;
-    const next = alignBrandVersions({ ...cur, ua_full_version: `${uaMajor}.0.0.0` }, uaMajor, `${uaMajor}.0.0.0`);
+    const full = derivedFullVersion(ua, uaMajor);
+    const next = alignBrandVersions({ ...cur, ua_full_version: full }, uaMajor, full);
     return { ...profile, client_hints: next };
   }
 
@@ -180,7 +206,7 @@ export function reconcileForWrite({ ua, client_hints, kernel_version } = {}) {
   if (String(curFull).split('.')[0] === uaMajor) {
     return { client_hints: cur, changed: false, from: curFull, to: curFull };
   }
-  const full = `${uaMajor}.0.0.0`;
+  const full = derivedFullVersion(ua, uaMajor);
   return {
     client_hints: alignBrandVersions({ ...cur, ua_full_version: full }, uaMajor, full),
     changed: true,

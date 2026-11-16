@@ -84,6 +84,8 @@ const { LOG_DIR } = await import('../src/config.js');
 const { getProfile: dbGet } = await import('../packages/profile/src/repo.js');
 
 const UA133 = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.6943.127 Safari/537.36';
+/** 只有大版本、没有补丁号的那种 UA（导入文件里偶尔就是这么写的） */
+const UA133_BARE = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133 Safari/537.36';
 
 const rawRow = (id) => getDb().prepare('SELECT * FROM profiles WHERE id = ?').get(id);
 const rawFp = (id) => JSON.parse(rawRow(id).fingerprint_config || '{}');
@@ -92,6 +94,12 @@ const setFp = (id, fp) => getDb()
   .run(JSON.stringify(fp), id);
 const logOf = (id) => {
   try { return fs.readFileSync(path.join(LOG_DIR, `${id}.log`), 'utf8'); } catch { return ''; }
+};
+/** 把 hints 从库里摘掉 = 0.4.4 那种「client_hints 列是 NULL」的老形态（0.4.7.2 版本号判据要用） */
+const stripHints = (id) => {
+  const fp = rawFp(id);
+  delete fp.client_hints;
+  setFp(id, fp);
 };
 const majorOf = (v) => String(v || '').split('.')[0];
 
@@ -251,6 +259,11 @@ try {
       `${String(s.ua).slice(0, 60)} / ${s.hi?.uaFullVersion} / ${s.hi?.platformVersion}`);
 
     const o = r?.oopif || {};
+    /* 这一条是 0.4.7.2 第一版假绿的根因：原来只比 UA / platformVersion / brands，
+     * 而子帧里漏的恰恰是 `uaFullVersion`（CDP 永远不认这一项，子帧又没挂 UA-CH 脚本）。
+     * 现在单独成一条断言：去掉子帧脚本时**只有这一条红**，别的断言一条都不许跟着红。 */
+    check('**跨站子帧（OOPIF）的 uaFullVersion 也是 133.0.0.0**（CDP 永远不认，子帧必须挂 UA-CH 脚本）',
+      o.hi?.uaFullVersion === '133.0.0.0', String(o.hi?.uaFullVersion));
     check('**跨站子帧（OOPIF）也是 133 / 10.0.0**（0.4.7.1 这里读到的是宿主真值）',
       (/Chrome\/(\d+)\./.exec(o.ua || '') || [])[1] === '133'
       && o.hi?.platformVersion === '10.0.0' && brandMajors(o.brands).every((m) => m === '133'),
@@ -271,6 +284,49 @@ try {
       (logOf(p.profile_id).split('\n').find((l) => /UA 与内核版本不同/.test(l)) || '').slice(0, 120));
 
     await manager.stopProfile(p.profile_id).catch(() => {});
+    await sleep(600);
+  }
+
+  /* ================= 1b. 版本号做实：UA 写全了就按 UA 的四段 ================= */
+  console.log('\n— 1b. 读路径派生的完整版本号取自 UA（不再一律打码成 <major>.0.0.0） —');
+  {
+    // ① UA 写全了 133.0.6943.127 → 页面 uaFullVersion / fullVersionList 都是它
+    const p = profiles.createProfile({ name: `ua-k-full-${Date.now()}`, group_id: '0', ua: UA133 });
+    startedIds.push(p.profile_id);
+    stripHints(p.profile_id);
+    const view = profiles.getProfile(p.profile_id);
+    check('（前提）UA 133.0.6943.127 + 无 hints → 读路径派生 133.0.6943.127（不是打码的 133.0.0.0）',
+      view.client_hints?.ua_full_version === '133.0.6943.127', String(view.client_hints?.ua_full_version));
+    let r = null;
+    let err = null;
+    try { r = await probe(view); } catch (e) { err = e; }
+    check('真启动成功（UA 四段 + 派生 hints）', !!r && Number(r.started.pid) > 0,
+      err ? `${err.code || ''} ${err.message}` : `pid=${r?.started.pid}`);
+    const f = r?.first || {};
+    check('**页面 uaFullVersion = 133.0.6943.127**（UA 里那四段，不是 133.0.0.0）',
+      f.hi?.uaFullVersion === '133.0.6943.127', String(f.hi?.uaFullVersion));
+    check('**页面 fullVersionList 的 Google Chrome = 133.0.6943.127**（UA 与 UA-CH 四段一致，不再露后三段）',
+      (f.hi?.fullVersionList || []).filter((b) => b.brand === 'Google Chrome').every((b) => b.version === '133.0.6943.127')
+      && (f.hi?.fullVersionList || []).some((b) => b.brand === 'Google Chrome'),
+      JSON.stringify(f.hi?.fullVersionList));
+    await manager.stopProfile(p.profile_id).catch(() => {});
+    await sleep(600);
+
+    // ② UA 只有 Chrome/133（没写全）→ 仍回落 133.0.0.0
+    const p2 = profiles.createProfile({ name: `ua-k-bare-${Date.now()}`, group_id: '0', ua: UA133_BARE });
+    startedIds.push(p2.profile_id);
+    stripHints(p2.profile_id);
+    const view2 = profiles.getProfile(p2.profile_id);
+    check('（前提）UA 只有 Chrome/133 → 读路径仍回落 133.0.0.0',
+      view2.client_hints?.ua_full_version === '133.0.0.0', String(view2.client_hints?.ua_full_version));
+    let r2 = null;
+    let err2 = null;
+    try { r2 = await probe(view2); } catch (e) { err2 = e; }
+    check('真启动成功（UA 只有大版本也能起）', !!r2 && Number(r2.started.pid) > 0,
+      err2 ? `${err2.code || ''} ${err2.message}` : `pid=${r2?.started.pid}`);
+    check('页面 uaFullVersion 仍是 133.0.0.0（UA 没声称补丁号，打码不自相矛盾）',
+      r2?.first?.hi?.uaFullVersion === '133.0.0.0', String(r2?.first?.hi?.uaFullVersion));
+    await manager.stopProfile(p2.profile_id).catch(() => {});
     await sleep(600);
   }
 

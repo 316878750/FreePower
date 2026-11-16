@@ -43,8 +43,8 @@ const namesA = markerNames(seedA);
 const namesA2 = markerNames(seedA);
 const namesB = markerNames(seedB);
 
-check('派生 8 个名字（applied/seeds/realm/installed/mediaMode/fontsDeclared/config/orig）',
-  Object.keys(namesA).length === 8, Object.keys(namesA).join(','));
+check('派生 9 个名字（applied/seeds/realm/installed/mediaMode/fontsDeclared/uaCh/config/orig）',
+  Object.keys(namesA).length === 9, Object.keys(namesA).join(','));
 check('MARKER_KEYS 与派生结果一一对应',
   MARKER_KEYS.every((k) => typeof namesA[k] === 'string') && Object.keys(namesA).length === MARKER_KEYS.length);
 
@@ -56,8 +56,8 @@ check('不同 seed 派生不同（环境之间不可关联）',
 // 形状：_xxxxxxxx，不含 fp、不带 __ 前缀
 check('全部符合 _<8位小写hex>', MARKER_KEYS.every((k) => MARKER_NAME_RE.test(namesA[k])),
   Object.values(namesA).join(','));
-check('8 个名字互不相同（不能有两个标记撞名）',
-  new Set(Object.values(namesA)).size === 8);
+check('9 个名字互不相同（不能有两个标记撞名）',
+  new Set(Object.values(namesA)).size === 9);
 check('名字里不含 "fp"（大小写都算）',
   MARKER_KEYS.every((k) => !/fp/i.test(namesA[k])), Object.values(namesA).join(','));
 check('名字没有 __ 前缀（看起来像普通临时变量）',

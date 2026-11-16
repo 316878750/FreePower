@@ -43,7 +43,8 @@ try {
   const { getMeta, setMeta, closeDb } = await import('../src/store/db.js');
   const hints = await import('../src/fingerprint/hints.js');
   const { fingerprintView } = await import('../src/fingerprint/view.js');
-  const { buildInjectionSource, buildWorkerInjectionSource } = await import('../src/kernel/inject.js');
+  const { buildInjectionSource, buildWorkerInjectionSource, buildUaChOnlySource } = await import('../src/kernel/inject.js');
+  const { markerNames } = await import('../src/kernel/markers.js');
 
   /* ==================== 1. 默认关 ==================== */
   console.log('\n— 1. 默认关（没存过设置 / 出厂常量） —');
@@ -174,6 +175,26 @@ try {
     const noHints = buildInjectionSource(fingerprintView({ id: 'p2', ua: view.ua, fp_seed: 's2' }));
     check('没有 client_hints 的视图 → 不生成 uaData（不凭空造 UA-CH）',
       /"uaData":null/.test(noHints));
+
+    /* ---- 子帧那份「只做 UA-CH」的最小脚本（0.4.7.2 第二版，CEO 打回的那条） ---- */
+    const uaChOnly = buildUaChOnlySource(view);
+    check('子帧脚本存在，且带上 uaFullVersion / platformVersion',
+      !!uaChOnly && /"uaFullVersion":"133\.0\.0\.0"/.test(uaChOnly) && /"platformVersion":"10\.0\.0"/.test(uaChOnly));
+    check('子帧脚本真的调了 patchUaData(window)', /patchUaData\(window\)/.test(uaChOnly));
+    check('子帧脚本**不装**整套注入（没有 canvas / WebGL / 媒体设备 / 字体 / Screen 那段）',
+      !/noiseImageData|patchGL|enumerateDevices|speechSynthesis|availWidth|Screen\.prototype|HTMLCanvasElement/.test(uaChOnly)
+      && !/MK\.fontsDeclared/.test(uaChOnly));
+    check('子帧脚本也带 toString 伪装（否则 getHighEntropyValues.toString() 吐出真源码）',
+      /installToStringTrap\(\)/.test(uaChOnly));
+    check('子帧脚本带自己的防重复标记（uaCh，按种子派生、不是固定名）',
+      uaChOnly.includes(markerNames(view.seed).uaCh) && !/__fp/.test(uaChOnly));
+    check('没有 client_hints 时子帧脚本为 null（不装任何东西）',
+      buildUaChOnlySource(fingerprintView({ id: 'p3', ua: view.ua, fp_seed: 's3' })) === null);
+    const mgrSrc6 = readSrc('../src/runtime/manager.js');
+    check('静态：iframe 分支既发 CDP 覆写、也注册 UA-CH 脚本，且两件都落地才放行',
+      /Emulation\.setUserAgentOverride/.test(mgrSrc6) && /buildUaChOnlySource\(view/.test(mgrSrc6)
+      && /runImmediately: true/.test(mgrSrc6)
+      && /Promise\.all\(jobs\)[\s\S]{0,120}resumeNow/.test(mgrSrc6));
   }
 
   /* ==================== 7. 接线：路由 + 界面 ==================== */
