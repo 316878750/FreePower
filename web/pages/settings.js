@@ -242,6 +242,43 @@ export default async function settingsPage({ head, page }) {
         : null);
   }
 
+  /* ======================= 3d. 启动：总是打开起始页（0.4.7.3） ======================= */
+  const startBox = h('div', { class: 'stack' });
+  body.appendChild(panel('启动：起始页', startBox,
+    h('div', { class: 'muted small' },
+      '环境的第一张标签是 FreePower 的起始页（显示环境名、代理、期望出口 IP、实测出口 IP、'
+      + '内核版本与 UA）。没有配启动网址的环境，第一张就是它；配了启动网址的环境按原样打开。'
+      + '这个开关打开后，配了启动网址的环境也会多开一张起始页（和 AdsPower 一致），默认是关。')));
+
+  function paintStartPage(st) {
+    const on = st?.enabled === true;
+    mount(startBox,
+      h('label', { class: 'checks', style: { display: 'inline-flex' } },
+        h('input', {
+          type: 'checkbox',
+          checked: on,
+          onChange: async (e) => {
+            const want = e.target.checked;
+            try {
+              const r = await api.setAlwaysStartPage(want);
+              toast(r.enabled
+                ? '已开启：每次启动环境都会先开一张起始页，配的启动网址照常开'
+                : '已关闭：只有没配启动网址的环境才开起始页（默认）', 'ok');
+              await loadSettings(false);
+            } catch (err) { toast(`改不了：${err.message}`, 'bad'); paintStartPage(st); }
+          },
+        }),
+        h('span', null, '总是打开起始页（与 AdsPower 一致）'),
+        h('span', { class: 'muted small' }, on ? '　当前：开' : '　当前：关（默认）')),
+      h('div', { class: 'muted small' },
+        on
+          ? '开着：启动环境时第一张一定是起始页，配好的启动网址会在它后面照常打开。'
+          : '关着：只有 open_urls 为空的环境才开起始页；有启动网址的环境行为与以前一模一样。'),
+      st?.broken
+        ? h('div', { class: 'notice warn' }, '这个开关在库里存坏了，已按「关」处理（重新勾选一次就会覆盖坏数据）。')
+        : null);
+  }
+
   /* ======================= 4. 本地 API（只读摘要） ======================= */
   const apiBox = h('div', { class: 'stack' });
   body.appendChild(panel('本地 API', apiBox,
@@ -314,6 +351,11 @@ export default async function settingsPage({ head, page }) {
         enabled: r.ua_autoalign === true,
         saved: r.ua_autoalign_saved,
         broken: r.ua_autoalign_broken === true,
+      });
+      paintStartPage({
+        enabled: r.always_start_page === true,
+        saved: r.always_start_page_saved,
+        broken: r.always_start_page_broken === true,
       });
       if (r.sync_defaults_broken) {
         toast('库里的同步默认设置存坏了，已回内置默认（保存一次就会覆盖掉坏数据）', 'warn');

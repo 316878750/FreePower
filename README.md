@@ -1,4 +1,4 @@
-# FreePower
+﻿# FreePower
 
 独立实现的指纹浏览器（AdsPower 同类产品）：**多环境隔离 + 代理绑定 + 指纹一致 + 本地 API**。
 
@@ -184,6 +184,10 @@ fp status                服务状态 + 运行中的环境
 | POST | `/api/v1/browser/batch-start` | 批量起（并发上限、失败清单、可中断）— FreePower 扩展 |
 | POST | `/api/v1/browser/batch-stop` | 批量停 — FreePower 扩展 |
 | POST | `/api/v2/browser-profile/stop-all` | 关掉本机全部 |
+| GET | `/start` | **起始页本身**（纯 HTML，`?id=<环境>&sig=<签名>`；**不要 api_key**，签名 24h 有效）— 0.4.7.3 |
+| GET | `/start/data` | 起始页的「重新检测」（同一对 id/sig，`force=1` 跳过 15s 缓存）— 0.4.7.3 |
+| POST | `/api/v2/browser-profile/start-page` | 给某个环境取一条带签名的起始页 URL（要 api_key）— 0.4.7.3 |
+| POST | `/api/v2/settings/always-start-page` | 开关「总是打开起始页」（`{enabled:bool}`，非布尔 → `100002`）— 0.4.7.3 |
 | GET | `/api/v2/browser-profile/cookies` | `{cookies:"<login_cookie 原文>"}` |
 | POST | `/api/v1|v2/browser-profile/import` | **环境导入**：JSON 三种 body（`{list}` / `{data:{list}}` / 裸数组）都认，或 `{format:"txt", content:"..."}` 认 AdsPower `.txt` 块格式；未知字段进 `warnings`；`imported` / `failed` 顶层与 `data` 各一份（`code` 仍 0）。**请求体默认上限 64 MB**（`FREEPOWER_MAX_BODY` 覆盖，超限回 **413** + 中文 msg，不是掐连接）；`.txt` 的 `failed[].index` 是**本请求内的块号（0 基）**、响应带 `blocks`（本请求解析出的块数）—— 控制台会自动分批并用 `first_block` 换算成整份文件的块号（0.4.4） |
 | GET/POST | `/api/v1|v2/browser-profile/export` | **环境导出**：默认 `{list}`，同时带我方字段与 AdsPower 兼容键（`proxy_*`，代理密码原样）；`format:"txt"` → `data:{format,count,filename,content}`（AdsPower 块格式，**不含 list**）；`{profile_id:[...]}` 或 GET 多个 `profile_id` |
@@ -718,8 +722,12 @@ $env:TMP  = "$PWD\.tmp\sys-tmp"; $env:TEMP = $env:TMP
    根治要**自编译 Chromium**（把宿主字体集换成目标平台字体集）；JS 层做「字体投影」只能改 `measureText` / `document.fonts` 的返回值，改不了真实字形与宽度度量，**会造出新的不一致，风险大于收益**。
    **标 `none` 不等于字体指纹裸奔**：canvas 文本噪声已覆盖字形渲染这一类；裸的是「宿主装了哪些字体」这个**枚举面**（本机实测枚举到 `Microsoft YaHei` / `Microsoft YaHei UI` / `SimSun` / `SimHei` / `KaiTi` / `FangSong`）。
 3. **内核配置类 42 条 + `--extended-parameters` 10 条不实现**，列入「不兼容项」。
-4. **SOCKS5 的账号密码只有预检支持**（Chrome 的 `--proxy-server` 不接受 SOCKS5 凭据，内核限制）；HTTP/HTTPS 代理认证走 CDP `Fetch`，只对带账号密码的代理挂载，会给请求加一跳。
-   AdsPower 形状的 `proxy_host` / `proxy_port` / `proxy_user` / `proxy_password` **全链路都认**（`checkProxy` 预检、`--proxy-server`、CDP `Fetch.authRequired`）；`buildArgs` 在「已绑定代理但 host/port 拼不出来」时**直接抛错**，绝不退回直连（fail-open 已修）。
+4. **SOCKS5 的账号密码走本地中继（0.4.7.3 起，不再是「只有预检支持」）**：Chrome 的 `--proxy-server` 不接受 SOCKS5 凭据（内核只会发 `no-auth`，服务端要 `0x02` 就握手失败 → 页面全 `ERR_BLOCKED_BY_CLIENT`），
+   所以**带 username 或 password 的代理**一律先在本机起一个只 bind `127.0.0.1` 的 SOCKS5 中继（`src/proxy/relay.js`），认证在 FreePower 这一侧对上游完成 —— 内核只看到 `socks5://127.0.0.1:<port>`，命令行里没有上游 host/port、也没有账密。
+   http/https 带凭据的代理**也走这条路**（不再走 CDP `Fetch.authRequired`，少一层页面可见的挑战）；不带凭据的 socks5 仍是直连写法（Chrome 自己能跑，多一层没必要）。
+   中继起不来 → `800003` fail-closed，**绝不降级直连**。设计与红/绿读数见 [docs/26](docs/26-带凭据代理本地中继.md)。
+   AdsPower 形状的 `proxy_host` / `proxy_port` / `proxy_user` / `proxy_password` **全链路都认**；`buildArgs` 在「已绑定代理但 host/port 拼不出来」时**直接抛错**，绝不退回直连（fail-open 已修）。
+   边界：中继只靠「只 bind 127.0.0.1」护着，本机其它进程能白用这个出口（与第 17 条同一条信任边界）。
 5. **WebRTC 只做参数级**（`disable_non_proxied_udp`），不做 JS 层伪造 `RTCPeerConnection`。
 6. **Worker 注入的覆盖范围：页面直接创建的三类 worker + 任意深度的嵌套 worker；OOPIF 子帧与启动前已在跑的 SW 不在内。**
    覆盖到的：专用 worker / SharedWorker / ServiceWorker 都能在**脚本首行之前**注入（`Target.setAutoAttach` + `waitForDebuggerOnStart`，实测三类 worker 的 `atTop` 均为 `worker`），module worker 实测同样覆盖，主帧与 worker 的 canvas 哈希同值。
@@ -763,7 +771,7 @@ $env:TMP  = "$PWD\.tmp\sys-tmp"; $env:TEMP = $env:TMP
     - **别把自检的 `pass 10 / warn 9 / fail 0` 读成「过了检测站」**：自检只证明我们注入的东西自己一致，五处 canvas 哈希相同也只证明噪声同源。唯一的对外证据是上面那张对照表。
 27. **运行中不做「热改注入参数」，只做重启**：`POST /api/v1/browser/restart`（v2 同名）语义是 stop → 落库 → start，一个请求内完成；apply 或 start 任一步失败都保持 **stopped**，绝不会留下一个「还在跑旧代理/旧指纹」的内核。**为什么不热改**：CDP override 确实能热改时区/地理/语言，但注入脚本（`addScriptToEvaluateOnNewDocument`）已经在页面里跑过一轮，热改只会让主帧与 worker 出现两套值 —— 那正是我们自己的双 Realm 漏洞，宁可让用户短暂离线。
 28. **代理检测的边界**：批量检查限并发 **3**、单条上限 **10s**（超时记 fail，不拖住整批），上限是常量 `src/proxy/health.js`（`HEALTH_CONCURRENCY` / `HEALTH_TIMEOUT_MS`），没有做成可调参数；`https` 代理的 TLS-in-TLS 预检不支持（见第 8 条）。**失败结果只存在当前页面会话里**（库里只有 `rememberProxyCheck` 落下的「上次成功出口」），刷新控制台后失败原因就没了 —— 这是故意的：检测是只读操作，不为它加表。列表里超过 24 小时的结果按「结果过期」显示，不当成现状。
-29. **代理凭据与指纹参数不进命令行（这一点我们和对手相反）**：逆向 08/09 号报告实测 AdsPower 把噪声种子、时区、出口 IP、地理坐标、配置文件路径、`UserId` 以 `--protected-*` **明文**挂在每个子进程命令行上，本机任何进程读一次 `Win32_Process.CommandLine` 就能拿全。我们的 `--proxy-server` 只带 `http://host:port`，HTTP/HTTPS 认证走 CDP `Fetch.authRequired`（第 4 条），指纹参数走 CDP + 注入。**这不是读码结论**：`npm run test:cmdline` 用 `Win32_Process.CommandLine` 读该环境全部 chrome 进程实测（见第八节）。
+29. **代理凭据与指纹参数不进命令行（这一点我们和对手相反）**：逆向 08/09 号报告实测 AdsPower 把噪声种子、时区、出口 IP、地理坐标、配置文件路径、`UserId` 以 `--protected-*` **明文**挂在每个子进程命令行上，本机任何进程读一次 `Win32_Process.CommandLine` 就能拿全。我们的 `--proxy-server` 只带 `http://host:port`（带凭据的代理更极端：只带 `socks5://127.0.0.1:<中继端口>`，见第 4 条），认证在中继里对上游完成，指纹参数走 CDP + 注入。**这不是读码结论**：`npm run test:cmdline` 用 `Win32_Process.CommandLine` 读该环境全部 chrome 进程实测（见第八节）。
 30. **媒体设备改成「真实枚举 + 只改名字」（P9-C），不再伪造设备列表。** 逆向我们的人用自己的探针实测过旧做法三条破绽：跨 origin `deviceId` 恒定、未授权就返回非空 label、报得出摄像头但 `getUserMedia({video:true})` 抛 `NotFoundError`。
     现在的做法：`enumerateDevices()` 先调内核真值，**未授权原样返回**（label 天然空串）；授权后只按 kind 的第 i 个设备改名，`deviceId` / `groupId` / `kind` 原样保留 —— 跨 origin 加盐由内核负责。命名池不够用时用 Windows 自己的 `2- ` 前缀去重，**不让两个 deviceId 挂同一个 label**。`media_devices_num` 只作「授权后的命名池」，**不再决定列表长度**。
     依据：**「造一整套假设备」不如「给真实设备改名」隐蔽**（AdsPower 走的也是这条路）。实测未授权 `{audioinput:1, videoinput:0, audiooutput:1}`、id/label 全空；授权后枚举与 `getUserMedia` 一致，`track.label` 等于枚举里对应设备的名字；跨 origin `deviceId` 不同。复跑：`npm run test:media-devices`。
@@ -1143,6 +1151,14 @@ Object.getOwnPropertyNames(window).some(n => /^__fp/.test(n))   // true → 这�
     读数**没有重跑**，引的是既有读数 —— 这一条别当已验证。
     仍然没验的：`cookie` 启动写入路上的 `httpOnly` / `secure` / 分区 cookie；以及所有**界面观感**
     （本机 agent shell 里 Electron 起不来，没有截图）。
+60. **起始页（0.4.7.3）的边界，一条都别当成「已覆盖」**：
+    - **什么时候出现**：`open_urls` 为空 → 第一张就是起始页；有值 → 维持原行为；设置里「总是打开起始页」默认**关**（打开后 = 起始页 + 原网址，两张）。用户库 102 个环境里 101 个 `open_urls` 是 `[]`，所以默认就会看到它。
+    - **怎么在代理全挂时还能打开**：`--proxy-bypass-list=<-loopback>;start.freepower.test` + `--host-resolver-rules=MAP start.freepower.test 127.0.0.1`。**不能**把 `127.0.0.1`/`localhost` 直接放进 bypass —— `test/smoke.mjs` 钉着「连 127.0.0.1 也走代理（没有 loopback bypass）」，那是代理不泄漏的底线。代价：该假域名在这个内核进程里被钉死解析到回环（只影响我们的子进程，不改系统 hosts、不改别的浏览器）。
+    - **页面零外连**：CSP `default-src 'none'`，内联脚本只 `fetch('/start/data')`；出口探测全在**服务进程**做（与代理预检同一份 `checkProxy`），结果注入 HTML。所以代理不通时页面照样打得开、并写明「代理未连通：<原因>」。
+    - **签名 24 小时**：`?id=&sig=` 的签名过期后，「重新检测」会 403；重开起始页（或重启环境）即可。签名只防跨站读，不是权限。
+    - **探测有 15 秒缓存**（`force=1` 绕过）；代理不通时如实写原因，**不猜出口 IP**（不会把宿主 IP 当环境 IP 显示）。
+    - **不显示任何凭据**：只有协议 + `host:port` + 「带用户名密码」。
+    - **页面上的时间是环境自己的时钟**（按环境时区），不是宿主时间 —— 与页面内 `Date` 一致，别读成「时间错了」。
 
 
 
@@ -2504,6 +2520,8 @@ Target.createTarget({ url: 'about:blank' })
 
 ```
 npm run test:sync            → 95/95   （A 层：纯函数 + 路由清单，不需要 Chrome）
+npm run test:start-page      → 57/57   （0.4.7.3 A 层：签名 / 页面内容 / 静态零外连 / 出口探测 / 开关 / 与窗口同步的相互作用，不需要 Chrome）
+npm run test:start-page-kernel → 36/36 （0.4.7.3 B 层：真内核；代理全挂时起始页照样打开、代理通时出口 IP 与 profile.ip 一致）
 npm run test:sync-kernel     → 39/39   （B 层：真内核 + 两个环境 + CDP 派发模拟输入）
 npm run test:sync-text       → 51/51   （阶段 2 文本输入 A 层：语义 + 界面静态扫描）
 npm run test:sync-text-kernel → 21/21  （阶段 2 文本输入 B 层：1 主 + 2 受控真内核）

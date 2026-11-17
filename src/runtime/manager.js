@@ -4,7 +4,7 @@ import {
   PROFILES_DIR, LOG_DIR, START_TIMEOUT_MS,
   EGRESS_PROBE_URL, PROXY_PROBE_TIMEOUT_MS, EGRESS_TIMEOUT_MS, SELFCHECK_ON_START, FP_DEBUG,
 } from '../config.js';
-import { uaAutoAlignEnabled } from '../settings/prefs.js';
+import { uaAutoAlignEnabled, readAlwaysStartPage } from '../settings/prefs.js';
 import { findChrome, buildArgs, launchChrome, waitForDevToolsPort, killProcessTree, rememberVersion } from '../kernel/chrome.js';
 import { CdpClient, fetchJson } from '../kernel/cdp.js';
 import { buildInjectionSource, buildWorkerInjectionSource, buildUaChOnlySource } from '../kernel/inject.js';
@@ -21,11 +21,13 @@ import { extensionsForProfile, rememberUniqueId } from '../store/extensions.js';
 import { loadUnpackedExtensions } from '../kernel/extensions.js';
 import { checkProxy, hasProxy, normalizeProxyConfig } from '../proxy/probe.js';
 import { resolveChain, startChain } from '../proxy/chain.js';
+import { startRelay } from '../proxy/relay.js';
 import { pacInUse, pacMessage } from '../proxy/pac.js';
 import { probeEgressInBrowser } from '../proxy/egress.js';
 import { runSelfCheck } from '../selfcheck/index.js';
 import { summarize } from '../selfcheck/store.js';
 import { checkEgress } from '../../packages/profile/src/validate.js';
+import { startPageUrl } from '../start/page.js';
 import { ensureRestoreOnStartup, RESTORE_ON_STARTUP } from './prefs.js';
 
 /** profile_id -> instance */
@@ -227,12 +229,27 @@ export async function startProfile(profile, { force = false, systemProxy = null 
     let effectiveProxy = proxy;
     /** 多级链的本地监听；失败/停止时必须 close，否则反复起停会漏端口 */
     let chainServer = null;
+    /**
+     * 带凭据代理的本地中继（0.4.7.3 P0）。
+     * **Chrome 内核不支持 SOCKS5 认证**：`--proxy-server=socks5://host:port` 只会发 `no-auth(0x00)`，
+     * 服务端要求 `0x02` 时握手直接失败 → 所有请求 ERR_BLOCKED_BY_CLIENT、页面全打不开；
+     * 而 Node 侧的代理预检是**带凭据**的，能通 —— 于是「预检绿、浏览器死」。
+     * 带 username/password 的代理一律换成 `127.0.0.1:<port>` 的本地中继（src/proxy/relay.js）。
+     * 生命周期同 chainServer：停止 / 内核自己退出 / 启动失败 / 链式路径，四条都要 close。
+     */
+    let relayServer = null;
     let proxyCheck = null;
 
     // 2.1) 多级代理链：hop0 = 本机 **Windows 系统代理**，hop1 = 环境自己的代理（对手也是这样两跳拼出来的）
     //      - 本机没配系统代理 → **塌成单跳、正常启动**（不算失败，误报 800003 才是错）
     //      - 确实是两跳 → 浏览器只看到本地回环监听，链在浏览器外由我们逐跳转发
     const chain = resolveChain(profile, { systemProxy });
+    /**
+     * 内核眼里的代理形态：'off' | 'none' | 'single' | 'chain' | 'relay'。
+     * 'chain' 与 'relay' 都是「内核连的是本地无认证监听」→ 必须关掉 Fetch 的代理认证路径
+     * （见 applyToSession 的 proxyAuth 与 installRequestGating 的 needAuth）。
+     */
+    let chainMode = chain.mode;
     if (chain.active && !chain.ok) {
       // PAC / 组不成链 → 拒绝启动，**绝不静默降级成单跳或直连**
       const err = new Error(chain.reason === 'pac_unsupported'
@@ -285,6 +302,36 @@ export async function startProfile(profile, { force = false, systemProxy = null 
       }
     } else {
       warnings.push(soft('proxy', '未绑定代理：出口即本机 IP，跑真实账号请务必绑代理'));
+    }
+
+    /* 2.2) 带凭据的代理 → 本地 SOCKS5 中继（0.4.7.3 P0，见 src/proxy/relay.js 顶部）
+     *
+     * 只对**带 username 或 password** 的代理生效，而且是**在预检之后**：
+     * 预检必须继续打真实上游（带凭据），否则「预检绿」就变成「探自己」——
+     * 那正是这一版要修的假绿灯，绝不能换个地方再造一个。
+     *
+     * 不带凭据的 socks5 **保持直连写法**（Chrome 自己能跑，多一层中继纯属浪费），
+     * 这条由 `username || password` 这个条件本身保证，别为了「统一」把它也塞进来。
+     *
+     * 中继起不来 → 800003 拒绝启动，**绝不降级直连**（降级 = 用户以为在用代理、其实在用本机 IP）。
+     * 凭据只出现在发往上游的握手报文里：日志只打 `127.0.0.1:<port> → 上游 host:port`。 */
+    if (proxyBound && chain.mode !== 'chain' && (effectiveProxy.username || effectiveProxy.password)) {
+      const upstream = normalizeProxyConfig(effectiveProxy);
+      try {
+        relayServer = await startRelay(upstream);
+      } catch (e) {
+        log(id, '代理中继失败，拒绝启动', e.message);
+        const err = new Error(`代理带认证，但本地中继起不来，已阻止启动（fail-closed）：${e.message}`);
+        err.code = 800003;
+        err.reason = 'proxy_relay_failed';
+        throw err;
+      }
+      log(id, '代理中继', `127.0.0.1:${relayServer.port} → 上游 ${upstream.type} ${upstream.host}:${upstream.port}`);
+      warnings.push(soft('proxy_auth_relay',
+        `代理带用户名密码：Chrome 内核不支持 SOCKS5 认证（只会发 no-auth），已由本地中继转发 —— `
+        + `内核只看到 127.0.0.1:${relayServer.port}，认证在 FreePower 这一侧对上游完成`));
+      effectiveProxy = { type: 'socks5', host: '127.0.0.1', port: relayServer.port, username: '', password: '' };
+      chainMode = 'relay';
     }
 
     // 3) 起内核：用户 launch_args 走白名单合并进真实 argv
@@ -346,6 +393,8 @@ export async function startProfile(profile, { force = false, systemProxy = null 
       pid = child.pid;
     } catch (e) {
       if (chainServer) { await chainServer.close().catch(() => {}); chainServer = null; }
+      // 中继同理：拼参数/起进程这一步抛错也要立刻还端口
+      if (relayServer) { await relayServer.close().catch(() => {}); relayServer = null; }
       throw e;
     }
     let client = null;
@@ -411,8 +460,10 @@ export async function startProfile(profile, { force = false, systemProxy = null 
         proxy: proxyCheck,
         // 多级链的本地监听：`stop` 与「内核自己退出」两条路径都要 close（见 stopProfile / exit 回调）
         chain: chainServer,
-        // 'off' | 'none' | 'single' | 'chain'：只有 'chain' 才关掉 Fetch 的代理认证路径（见 applyToSession）
-        chain_mode: chain.mode,
+        // 带凭据代理的本地中继（0.4.7.3）：生命周期与 chain 完全相同，四条路径都要 close
+        relay: relayServer,
+        // 'off' | 'none' | 'single' | 'chain' | 'relay'：'chain' 与 'relay' 都要关掉 Fetch 的代理认证路径
+        chain_mode: chainMode,
         egress: null,
         ua_aligned: uaAligned,
         launch_args: { applied: built.applied, rejected: built.rejected },
@@ -437,6 +488,7 @@ export async function startProfile(profile, { force = false, systemProxy = null 
           scheduleCachePurgeOnClose(cur);
         }
         if (chainServer) { chainServer.close().catch(() => {}); chainServer = null; }
+        if (relayServer) { relayServer.close().catch(() => {}); relayServer = null; }
         try { if (client) client.close(); } catch { /* ignore */ }
       });
 
@@ -536,6 +588,8 @@ export async function startProfile(profile, { force = false, systemProxy = null 
       killProcessTree(pid);
       // 链监听一定要关：失败路径漏端口，几轮反复起停之后才会炸，最难查
       if (chainServer) { await chainServer.close().catch(() => {}); chainServer = null; }
+      // 带凭据代理的本地中继同理（0.4.7.3）：漏一个端口就是下次启动「端口被占」
+      if (relayServer) { await relayServer.close().catch(() => {}); relayServer = null; }
       if (!err.code) err.code = 800003;
       throw err;
     }
@@ -551,6 +605,10 @@ async function injectAndOpen(instance, profile, view) {
   /* 诊断标记名按 fp_seed 派生：每环境不同、同环境稳定。
    * 全仓库不再有固定的 `__fp*` 名 —— 固定名等于给对手一行判定代码（P0）。 */
   const markers = markerNames(view?.seed);
+  /* 别的模块（窗口同步的前置检查）也要判「这张页注入过没有」。
+   * 标记名是按 `view.seed` 派生的，重算一遍就可能与这里不一致（种子来源有多层回落），
+   * 所以**只算一次、挂到实例上**，谁要用谁来读 —— 判据与生产读的是同一份名字。 */
+  instance.markers = markers;
 
   /** targetId -> { prep, sessionId } */
   const pageReady = new Map();
@@ -902,7 +960,7 @@ async function injectAndOpen(instance, profile, view) {
     const blank = !targetInfo.url || targetInfo.url === 'about:blank' || targetInfo.url.startsWith('chrome://newtab');
     const prep = (async () => {
       try {
-        await applyToSession(client, sessionId, profile, view, { proxyAuth: instance.chain_mode !== 'chain' });
+        await applyToSession(client, sessionId, profile, view, { proxyAuth: !['chain', 'relay'].includes(instance.chain_mode) });
       } catch (e) {
         log(profileId, 'session 装配失败', targetInfo.targetId, e.message);
       } finally {
@@ -981,7 +1039,20 @@ async function injectAndOpen(instance, profile, view) {
     const urls = (Array.isArray(profile.open_urls) ? profile.open_urls : [])
       .map((u) => String(u || '').trim())
       .filter(Boolean);
-    const firstUrl = urls[0] || 'about:blank';
+    /* 起始页（0.4.7.3，见 src/start/page.js 顶部）：
+     *   - `open_urls` 为空 → 开起始页。**这条不需要开关**：空白页对用户没有任何价值，
+     *     用户库里 101/102 个环境就是 `[]`，老行为等于「打开是空白」；
+     *   - 有值 → 只有「总是打开起始页」开着才多开第一张（默认关，行为与 0.4.7.2 逐字节一致）。
+     * 起始页地址带签名，**不进日志**（签名等于这一页的访问凭证）。 */
+    const alwaysStart = readAlwaysStartPage().enabled;
+    const wantStartPage = urls.length === 0 || alwaysStart;
+    const startUrl = wantStartPage ? startPageUrl(profileId) : null;
+    if (startUrl) {
+      log(profileId, '起始页',
+        urls.length === 0 ? 'open_urls 为空，第一张打开起始页' : '「总是打开起始页」已开，第一张打开起始页');
+    }
+    const tabs = startUrl ? [startUrl, ...urls] : urls.slice();
+    const firstUrl = tabs[0] || 'about:blank';
 
     let reused = false;
     if (keeper) {
@@ -1006,7 +1077,7 @@ async function injectAndOpen(instance, profile, view) {
     }
 
     // 第一个网址由复用页承担；其余照常新开（新建的走 about:blank → 装配 → navigate）
-    const rest = reused ? urls.slice(1) : (urls.length ? urls : ['about:blank']);
+    const rest = reused ? tabs.slice(1) : (tabs.length ? tabs : ['about:blank']);
     for (const url of rest) {
       const { targetId } = await client.send('Target.createTarget', { url: 'about:blank' });
       const entry = pageReady.get(targetId) || await waitFor(() => pageReady.get(targetId), 5000);
@@ -1352,17 +1423,18 @@ async function seedLoginCookies(client, profile, profileId) {
  */
 async function installRequestGating(client, sessionId, profile, proxy, { proxyAuth = true } = {}) {
   const rules = compileNetRules(profile);
-  // 链式环境：Chrome 连的是**无认证的本地中继**，认证由链逐跳完成；这时候再开 `handleAuthRequests`
+  // 链式 / 带凭据中继环境：Chrome 连的都是**无认证的本地监听**（chain.js / relay.js），
+  // 认证由我们在浏览器外逐跳完成；这时候再开 `handleAuthRequests`
   // 只会让 authRequired 去应答一个根本不存在的挑战（而且环境代理的账密不该出现在这一层）。
   // 单跳仍走原来的 Fetch.authRequired 路径 —— 那条是老坑，别一刀切关掉。
   //
   // 「双重保险」的两道防线，各防一种改动（巡检 S2，2026-11-12）：
-  //   第一道 —— 调用方 `applyToSession` 调用点（本文件 :685）在链式环境显式传
-  //              `proxyAuth: instance.chain_mode !== 'chain'`，认证路径根本不进来；
+  //   第一道 —— 调用方 `applyToSession` 调用点在本文件内显式传
+  //              `proxyAuth: !['chain','relay'].includes(instance.chain_mode)`，认证路径根本不进来；
   //   第二道 —— 下一行的 `!!(proxy.username && proxy.host)` 短路，兜「将来有人加了新调用点
-  //              却忘了传 `proxyAuth:false`」：链式环境的 `effectiveProxy.username` 恒为空串
-  //              （本文件 :181 组装本地中继时写死）。
-  // 两道**不是**冗余：拆掉任何一道，另一道的默认前提都会破（链上会冒出一个不存在的认证挑战）。
+  //              却忘了传 `proxyAuth:false`」：链式/中继环境的 `effectiveProxy.username` 恒为空串
+  //              （本文件组装本地监听时写死）。
+  // 两道**不是**冗余：拆掉任何一道，另一道的默认前提都会破（本地监听上会冒出一个不存在的认证挑战）。
   const needAuth = proxyAuth && !!(proxy.username && proxy.host);
   if (!rules.active && !needAuth) return;
 
@@ -1557,6 +1629,8 @@ export async function stopProfile(profileId) {
   try { inst.client.close(); } catch { /* ignore */ }
   // 链监听跟实例同生命周期：不关它，反复起停会一直漏端口
   if (inst.chain) { await inst.chain.close().catch(() => {}); inst.chain = null; }
+  // 带凭据代理的本地中继（0.4.7.3）同理：**先 destroy 所有 socket 再 close 监听**（relay.close 内部就这么做）
+  if (inst.relay) { await inst.relay.close().catch(() => {}); inst.relay = null; }
   running.delete(profileId);
   markStatus(profileId, 'idle');
   // 关闭时自动备份（0.4.7 ③，**默认关**）：必须在清缓存之前，否则备份到的是被删空的目录。
@@ -1578,3 +1652,10 @@ export async function stopAll() {
   for (const id of ids) await stopProfile(id);
   return ids;
 }
+
+/**
+ * 实例日志的写入口（`sync/session.js` 要用：同步的开始/结束必须落在**主窗口那个环境**的
+ * 实例日志里，用户说「没反应」时能直接翻日志定责）。
+ * 不另外实现一份格式化 —— 两份日志格式一分开，排查时就得两处对时间戳。
+ */
+export { log as logProfile };

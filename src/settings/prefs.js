@@ -166,6 +166,58 @@ export function uaAutoAlignEnabled() {
   return readUaAutoAlign().enabled === true;
 }
 
+/* ==================== 总是打开起始页（0.4.7.3） ====================
+ *
+ * 起始页本身是「`open_urls` 为空时的兜底」—— 那条不需要开关，因为空白页没有任何用户价值。
+ * 这个开关管的是**有启动网址时**要不要也在第一张多开一张起始页（对手默认就这么做）。
+ *
+ * **默认关**：用户库里 100 个环境配了启动网址，多开一张标签是可见的行为改变，
+ * 不能替用户决定。关着时「`open_urls` 有值 → 行为与 0.4.7.2 逐字节一致」。
+ *
+ * 存库（meta 表）而不是 localStorage：它要在**服务端**生效（`manager.startProfile` 读它）。
+ * 键名不许改（改名等于把用户的选择丢掉）。
+ */
+export const ALWAYS_START_PAGE_KEY = 'always_start_page';
+
+/**
+ * 读「总是打开起始页」。
+ * @returns {{enabled:boolean, saved:boolean, broken:boolean}} 没存过 = 关（默认）
+ */
+export function readAlwaysStartPage() {
+  let raw = null;
+  try {
+    raw = getMeta(ALWAYS_START_PAGE_KEY);
+  } catch {
+    return { enabled: false, saved: false, broken: false };
+  }
+  if (raw === null || raw === undefined || String(raw).trim() === '') {
+    return { enabled: false, saved: false, broken: false };
+  }
+  const text = String(raw).trim();
+  // 只认明确的开/关；脏数据一律当关 —— 读不懂就不改用户的启动行为
+  if (text === 'true' || text === '1') return { enabled: true, saved: true, broken: false };
+  if (text === 'false' || text === '0') return { enabled: false, saved: true, broken: false };
+  return { enabled: false, saved: false, broken: true };
+}
+
+/**
+ * 写开关。只接受布尔（或 'true'/'false' 字符串），别的一律拒。
+ * @returns {{enabled:boolean, saved:true, changed:boolean}}
+ */
+export function writeAlwaysStartPage(value) {
+  const prev = readAlwaysStartPage();
+  let next;
+  if (value === true || value === 'true' || value === 1 || value === '1') next = true;
+  else if (value === false || value === 'false' || value === 0 || value === '0') next = false;
+  else {
+    const e = new Error('enabled must be a boolean');
+    e.code = 'INVALID_ENABLED';
+    throw e;
+  }
+  setMeta(ALWAYS_START_PAGE_KEY, next ? 'true' : 'false');
+  return { enabled: next, saved: true, changed: prev.enabled !== next };
+}
+
 /* ==================== 关闭环境时自动备份（0.4.7 ③） ====================
  *
  * **默认必须是关**。理由不是「实现简单」，是这个开关会让磁盘持续增长：

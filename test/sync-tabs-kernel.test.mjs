@@ -140,10 +140,17 @@ try {
       hits.get('/opened') === 3, `/opened 被请求 ${hits.get('/opened')} 次（三个窗口各一次才正常）`);
     await insts[1].client.send('Target.detachFromTarget', { sessionId: att.sessionId }).catch(() => {});
     await sync.closeTabs('blank').catch(() => {});
-    // 关掉刚才多开的：把三个窗口都退回只有一张页
+    // 关掉刚才多开的：把三个窗口都退回只有 /base 那一张
+    // 0.4.7.3：每个环境第一张是**起始页**（open_urls 为空时），它不是业务页，
+    // 这里一并关掉 —— 否则后面「主窗口现在有 3 个标签」会多出一张（判据要的是业务页张数）。
     for (let i = 0; i < 3; i++) {
+      const inst = manager.getInstance(started[i]);
       const tabs = await tabsOf(started[i]);
-      if (tabs.length > 1) await tabsMod.closeTabAt(manager.getInstance(started[i]).client, tabs[tabs.length - 1].targetId);
+      const keep = tabs.find((t) => String(t.url).includes('/base'));
+      for (const t of tabs) {
+        if (keep && t.targetId === keep.targetId) continue;
+        await tabsMod.closeTabAt(inst.client, t.targetId);
+      }
     }
     await sleep(400);
   }

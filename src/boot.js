@@ -11,6 +11,7 @@ import { createApiServer } from './api/server.js';
 import { loadWorkflows } from './agent/workflow.js';
 import { stopAll, listRunning } from './runtime/manager.js';
 import { findChrome } from './kernel/chrome.js';
+import { setStartPagePort } from './start/page.js';
 
 /** 端口被占时往后顺延；20 个够用，再全被占就是本机有别的东西在乱扫 */
 export const PORT_TRIES = 20;
@@ -52,6 +53,10 @@ export async function startApiServer({ port = API_PORT, tries = PORT_TRIES, writ
     server.close();
     throw new Error(`端口 ${port}~${port + tries - 1} 全被占`);
   }
+
+  // 起始页的地址必须指到**真正在听**的端口（53380 被占会顺延到 53381…），
+  // 否则环境里那张页一开就是 ERR_CONNECTION_REFUSED（比空白页更糟）。
+  setStartPagePort(actualPort);
 
   // 发现文件：脚本读它拿地址 + key（对齐对手写 local_api 文件的做法）
   if (writeDiscovery) {

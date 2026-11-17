@@ -115,7 +115,18 @@ test('代理字段：AdsPower 形状（proxy_host/proxy_port/proxy_user/proxy_pa
   // buildArgs：形状不同也必须拼出 --proxy-server（否则预检过、内核直连 = fail-open）
   const built = buildArgs({ webgl_config: {} }, { userDataDir: 'C:\\fp\\udd', proxy: adspower, proxyBound: true, userArgs: [] });
   assert.ok(built.args.includes('--proxy-server=http://203.0.113.5:8000'), built.args.join(' '));
-  assert.ok(built.args.includes('--proxy-bypass-list=<-loopback>'));
+  /* 0.4.7.3：起始页要能在代理全挂时打开，所以 bypass 名单里多了一个**独立假域名**。
+   * 三条一起钉住，缺一条就是回归：
+   *   ① `<-loopback>` 还在（127.0.0.1 仍然走代理，fail-closed 没丢）；
+   *   ② 起始页域名在名单里（否则代理一挂起始页就是错误页）；
+   *   ③ 名单里**没有** 127.0.0.1/localhost（不许为了让起始页能开就把 loopback 的口子打开）。 */
+  const bypass = built.args.find((a) => a.startsWith('--proxy-bypass-list=')) || '';
+  assert.ok(bypass.includes('<-loopback>'), `必须保留 <-loopback>：${bypass}`);
+  assert.ok(bypass.includes('start.freepower.test'), `起始页域名必须放行：${bypass}`);
+  assert.ok(!/(^|;)127\.0\.0\.1(;|$)/.test(bypass.replace('--proxy-bypass-list=', '')), `不许放行 loopback：${bypass}`);
+  assert.ok(!/(^|;)localhost(;|$)/.test(bypass), `不许放行 localhost：${bypass}`);
+  // 假域名必须钉到回环（`.test` 是保留域，公网解析不到；不钉就是 ERR_NAME_NOT_RESOLVED）
+  assert.ok(built.args.includes('--host-resolver-rules=MAP start.freepower.test 127.0.0.1'), built.args.join(' '));
 
   // proxyBound 但配置不可用：宁可抛错也不许起一个直连内核
   assert.throws(() => buildArgs({ webgl_config: {} }, { userDataDir: 'C:\\fp\\udd', proxy: { proxy_type: 'http' }, proxyBound: true }), /不完整|直连/);
@@ -308,7 +319,7 @@ const BASE = [
   '--disable-blink-features=AutomationControlled',
   '--disable-features=Translate,OptimizationHints',
   '--proxy-server=http://127.0.0.1:8080',
-  '--proxy-bypass-list=<-loopback>',
+  '--proxy-bypass-list=<-loopback>;start.freepower.test',
 ];
 
 test('launch_args：保护名单里的参数一条都不进 argv，并回报原因', () => {
@@ -352,7 +363,7 @@ test('launch_args：绑定代理时禁止自定义 bypass（否则等于给直�
   const r = mergeLaunchArgs(BASE, ['--proxy-bypass-list=*'], { proxyBound: true });
   assert.equal(r.applied.length, 0);
   assert.match(r.rejected[0].reason, /fail-closed/);
-  assert.ok(r.args.includes('--proxy-bypass-list=<-loopback>'));
+  assert.ok((r.args.find((x) => x.startsWith('--proxy-bypass-list=')) || '').includes('<-loopback>'));
 });
 
 test('launch_args：命令行装扩展已失效 → 明确拒绝并指向应用中心（不再假装成功）', () => {

@@ -322,7 +322,9 @@ export function createApiServer({ port } = {}) {
         params: routeParams,
       };
       const out = await route.handler(ctx);
-      if (out && typeof out.__html === 'string') sendHtml(res, out.__html, corsHeaders);
+      // `__htmlHeaders`：起始页要带 CSP（页面自己一个外连都不许发），
+      // 头只能在服务端发 —— 页面里的 <meta> 是第二道，不是第一道。
+      if (out && typeof out.__html === 'string') sendHtml(res, out.__html, { ...corsHeaders, ...(out.__htmlHeaders || {}) });
       else if (out && out.__bytes) sendBytes(res, out.__bytes, out.contentType, corsHeaders);
       else send(res, 200, out, corsHeaders);
     } catch (e) {

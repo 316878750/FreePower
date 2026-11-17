@@ -16,6 +16,7 @@ import { newBindingName } from './binding.js';
 import { buildSyncPlan, enabledBySwitch } from './replay.js';
 import { makeTextResolver, textOf } from './text-input.js';
 import { SyncScheduler, makeRng } from './scheduler.js';
+import { isStartPageUrl } from '../start/host.js';
 import {
   normalizeState, needsRestoreBeforeResize, summarizeResize, verifyBounds,
 } from './window.js';
@@ -66,12 +67,21 @@ async function connectInstance(profileId) {
   return { inst, client };
 }
 
-/** 选一张页面 target：优先真实 URL（跳过 about:blank / chrome://newtab），没有就取第一张 page */
+/**
+ * 选一张页面 target：优先真实 URL（跳过 about:blank / chrome://newtab），没有就取第一张 page。
+ *
+ * 0.4.7.3：**还要跳过我们自己的起始页**（`http://start.freepower.test:.../start?...`）。
+ * 它现在是每个环境的第一张标签，不跳过的话「同步起来点哪都没反应」——受控窗口的同步目标
+ * 被选成了起始页，用户的点击全落在起始页上（smoke 里 7 条红就是这个）。
+ */
 async function pickPageTarget(client) {
   const { targetInfos } = await client.send('Target.getTargets');
   const pages = (targetInfos || []).filter((t) => t.type === 'page');
   if (!pages.length) return null;
-  const real = pages.find((t) => t.url && !t.url.startsWith('about:blank') && !t.url.startsWith('chrome://newtab'));
+  const real = pages.find((t) => t.url
+    && !t.url.startsWith('about:blank')
+    && !t.url.startsWith('chrome://newtab')
+    && !isStartPageUrl(t.url));
   return real || pages[0];
 }
 

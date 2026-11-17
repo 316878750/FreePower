@@ -4,6 +4,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { CHROME_BIN, DATA_DIR, KERNELS_DIR, START_TIMEOUT_MS } from '../config.js';
 import { fingerprintView } from '../fingerprint/view.js';
 import { normalizeProxyConfig } from '../proxy/probe.js';
+import { START_BYPASS_ENTRY, START_RESOLVER_RULE } from '../start/host.js';
 import { mergeLaunchArgs } from './launch-args.js';
 
 const CANDIDATE_DIRS = [
@@ -333,8 +334,17 @@ export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, use
   if (proxyBound) {
     // fail-closed 的浏览器侧：只认这一个代理，且把「本机/内网直连」的隐含 bypass 也去掉。
     // `<-loopback>` 是 Chromium 的「减掉 loopback 隐含绕过」写法；不加它就还能直连 localhost。
-    args.push('--proxy-bypass-list=<-loopback>');
+    //
+    // 0.4.7.3 起多放行一个 `start.freepower.test`（起始页专用假域名，见 src/start/host.js）：
+    // 起始页必须在**代理全挂**时也能打开，但它不能用 127.0.0.1 —— 那等于给整个 loopback 开口子。
+    // 实测（`.tmp/probe-bypass.mjs`，内核 157.0.8103.78，代理指向死端口）：
+    //   只 `<-loopback>`            → ERR_PROXY_CONNECTION_FAILED（起始页打不开）
+    //   `<-loopback>;127.0.0.1`     → 能开，但 loopback 的 fail-closed 没了（判据会红）
+    //   `<-loopback>;start.freepower.test` → 能开，且 127.0.0.1 仍走代理（本条采用）
+    args.push(`--proxy-bypass-list=<-loopback>;${START_BYPASS_ENTRY}`);
   }
+  // 假域名钉到回环（不管有没有代理都加：解析规则本身不改任何别的域名）
+  args.push(`--host-resolver-rules=${START_RESOLVER_RULE}`);
 
   // 代理字段统一走 normalizeProxyConfig：AdsPower 形状是 proxy_host / proxy_port / proxy_user /
   // proxy_password，这里直读 proxy.host 会让 --proxy-server 拼不出来 —— 预检通过、内核却直连（fail-open）。

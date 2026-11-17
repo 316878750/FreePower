@@ -107,7 +107,8 @@ try {
   {
     const mgrSrc = readSrc('../src/runtime/manager.js');
     check('manager 不再直接读 config 里的 UA_AUTOALIGN，改读 uaAutoAlignEnabled()',
-      /import \{ uaAutoAlignEnabled \} from '\.\.\/settings\/prefs\.js'/.test(mgrSrc)
+      // 只要是从 prefs 里拿这个开关就行（import 里可以并列别的开关，0.4.7.3 加了 readAlwaysStartPage）
+      /import \{[^}]*\buaAutoAlignEnabled\b[^}]*\} from '\.\.\/settings\/prefs\.js'/.test(mgrSrc)
       && !/UA_AUTOALIGN/.test(mgrSrc));
     check('启动后那次落库对齐在 `if (uaAutoAlign && realVersion)` 之下',
       /if \(uaAutoAlign && realVersion\)/.test(mgrSrc));

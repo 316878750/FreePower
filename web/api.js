@@ -276,6 +276,8 @@ export const api = {
   setSnapshotOnClose: (enabled) => call('/api/v2/settings/snapshot-on-close', { method: 'POST', body: { enabled } }),
   /** UA 跟随内核版本升级（0.4.7.2，**默认关**）。只接受布尔 */
   setUaAutoAlign: (enabled) => call('/api/v2/settings/ua-autoalign', { method: 'POST', body: { enabled } }),
+  /** 总是打开起始页（0.4.7.3，**默认关**）。只接受布尔 */
+  setAlwaysStartPage: (enabled) => call('/api/v2/settings/always-start-page', { method: 'POST', body: { enabled } }),
 
   /* ---- 应用中心 / 扩展（0.4.3） ---- */
   /**

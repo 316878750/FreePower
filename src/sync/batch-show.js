@@ -16,15 +16,19 @@
  */
 import { getInstance } from '../runtime/manager.js';
 import { planForce, planShow, summarizeForce, summarizeShow, verifyForced, verifyShown } from './show.js';
+import { isStartPageUrl } from '../start/host.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** 选一张页面 target：优先真实 URL（跳过 about:blank / chrome://newtab） */
+/** 选一张页面 target：优先真实 URL（跳过 about:blank / chrome://newtab / 我们自己的起始页） */
 async function pageTargetOf(client) {
   const { targetInfos = [] } = await client.send('Target.getTargets');
   const pages = targetInfos.filter((t) => t.type === 'page');
   if (!pages.length) return null;
-  return pages.find((t) => t.url && !t.url.startsWith('about:blank') && !t.url.startsWith('chrome://newtab')) || pages[0];
+  return pages.find((t) => t.url
+    && !t.url.startsWith('about:blank')
+    && !t.url.startsWith('chrome://newtab')
+    && !isStartPageUrl(t.url)) || pages[0];
 }
 
 /** 窗口位置 + 尺寸 + 状态（回读比对读它） */

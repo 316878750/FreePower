@@ -52,7 +52,9 @@ import { apiInfoPayload, setApiVerify, resetStats } from './info.js';
 import { startSync, stopSync, restartSync, syncStatus, updateSettings, refreshAll, unifySize, arrangeWindows, showWindows, forceShowWindows, openTabInAll, tabState, closeTabs, copyTabToSlaves, unifyTabs, DEFAULT_SETTINGS } from '../sync/session.js';
 import { readSyncDefaults, writeSyncDefaults, resetSyncDefaults, syncDefaultsDiff, mergeSyncSettings,
   readSnapshotOnClose, writeSnapshotOnClose, readSnapshotOnCloseState,
-  readUaAutoAlign, writeUaAutoAlign } from '../settings/prefs.js';
+  readUaAutoAlign, writeUaAutoAlign,
+  readAlwaysStartPage, writeAlwaysStartPage } from '../settings/prefs.js';
+import { resolveStartRequest, renderStartHtml, startPageData, START_PAGE_CSP, startPageUrl } from '../start/page.js';
 import { networkSnapshot, probeBoundProxies } from './diagnose.js';
 import { readDisplays } from '../sync/displays.js';
 import { readHotkeyStatus, requestHotkey } from '../sync/hotkey.js';
@@ -160,6 +162,43 @@ export function buildRoutes() {
   const notImplemented = (path) => () => { throw unsupported(path); };
 
   add(['GET'], ['/status'], () => ({ code: 0, msg: 'success' }), { auth: false });
+
+  /* ==================== 0. 起始页（0.4.7.3） ====================
+   *
+   * 为什么**不走 api_key**：这一页是内核里直接打开的，key 拼进地址栏就会留在浏览器历史、
+   * 内核日志、用户的截图里。用绑定 profile_id 的签名（`src/start/sign.js`，24 小时过期）代替，
+   * 泄露影响面只有一个环境的起始页读数。
+   *
+   * 为什么**不设限流**：它每次启动只被请求一次（外加用户点「重新检测」），
+   * 而探测本身有 15 秒缓存 + 并发去重（`src/start/probe.js`），打不爆。
+   */
+  add(['GET'], ['/start'], (ctx) => {
+    const r = resolveStartRequest(ctx.query.id, ctx.query.sig);
+    if (!r.ok) {
+      const msg = r.reason === 'expired' ? '起始页签名已过期，请重新启动这个环境'
+        : r.reason === 'profile_not_found' ? '环境不存在（可能已被删除）'
+          : '起始页签名无效';
+      throw new ApiError(ERR.NOT_FOUND, msg, r.status);
+    }
+    return {
+      __html: renderStartHtml(r.profile),
+      __htmlHeaders: { 'content-security-policy': START_PAGE_CSP, 'cache-control': 'no-store' },
+    };
+  }, { auth: false });
+
+  /** 起始页的读数刷新（同源 + 签名）：页面只认这一条，**不直连任何外网** */
+  add(['GET'], ['/start/data'], async (ctx) => {
+    const r = resolveStartRequest(ctx.query.id, ctx.query.sig);
+    if (!r.ok) throw new ApiError(ERR.NOT_FOUND, '起始页签名无效或已过期', r.status);
+    const force = ['1', 'true', 'yes'].includes(String(ctx.query.force ?? '').toLowerCase());
+    return ok(await startPageData(r.profile, { force }));
+  }, { auth: false });
+
+  /** 控制台「在浏览器里打开起始页」用：给一个带签名的地址（相对路径，前端自己拼 host） */
+  add(['POST'], ['/api/v2/browser-profile/start-page'], (ctx) => {
+    const p = resolveProfile(ctx, 'v2');
+    return ok({ url: startPageUrl(p.id), profile_id: p.id });
+  });
 
   /* ============================ 1. A 类 8 条 ============================ */
 
@@ -1920,6 +1959,7 @@ export function buildRoutes() {
     const r = readSyncDefaults();
     const onClose = readSnapshotOnClose();
     const uaAlign = readUaAutoAlign();
+    const alwaysStart = readAlwaysStartPage();
     return ok({
       sync_defaults: r.settings,
       sync_defaults_saved: r.saved,
@@ -1936,7 +1976,35 @@ export function buildRoutes() {
       ua_autoalign: uaAlign.enabled,
       ua_autoalign_saved: uaAlign.saved,
       ua_autoalign_broken: uaAlign.broken,
+      // 0.4.7.3：总是打开起始页（**默认关**；关着时只有 open_urls 为空才开）
+      always_start_page: alwaysStart.enabled,
+      always_start_page_saved: alwaysStart.saved,
+      always_start_page_broken: alwaysStart.broken,
     });
+  });
+
+  /**
+   * 「总是打开起始页」开关（0.4.7.3）。
+   *
+   * 关（默认）：`open_urls` 为空才开起始页 —— 有启动网址的环境行为**一个字节都不变**。
+   * 开：每次启动在第一张多开一张起始页，`open_urls` 的网址照常全开（与对手一致）。
+   * 只接受布尔；别的 `100002` + `field:'enabled'`。
+   */
+  add(['POST'], ['/api/v2/settings/always-start-page'], (ctx) => {
+    const b = ctx.body || {};
+    if (b.enabled === undefined) {
+      throw new ApiError(ERR.INVALID, 'enabled is required（true / false）', 200, { field: 'enabled' });
+    }
+    let r;
+    try {
+      r = writeAlwaysStartPage(b.enabled);
+    } catch (e) {
+      if (e.code === 'INVALID_ENABLED') {
+        throw new ApiError(ERR.INVALID, 'enabled must be a boolean', 200, { field: 'enabled' });
+      }
+      throw e;
+    }
+    return ok({ enabled: r.enabled, saved: true, changed: r.changed });
   });
 
   /**

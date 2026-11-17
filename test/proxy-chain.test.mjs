@@ -447,9 +447,11 @@ async function main() {
   }
 
   /* ==========================================================================
-   * E) 单跳认证回归：链关着时仍走 Fetch.authRequired（别把老路径一刀切关掉）
+   * E) 单跳认证回归：0.4.7.3 起带凭据的单跳**改走本地中继**（内核不支持 SOCKS5 认证）
+   *    —— 这里钉两件事：① 页面照样能开；② 代理侧照样收到本环境的账密（认证真的发生了）。
+   *    注意口径变了：不再是 `Fetch.authRequired` 那条路，而是中继对上游完成认证。
    * ======================================================================== */
-  console.log('\n=== E) 单跳 + 代理认证 → 仍走 Fetch.authRequired ===');
+  console.log('\n=== E) 单跳 + 代理认证 → 走本地中继（0.4.7.3 起） ===');
   {
     const hop0 = await startRecorder({ label: 'E-hop0' });
     const hop = await startRecorder({ label: 'E-hop', auth: ['single-user', 'single-pass'] });
@@ -466,10 +468,12 @@ async function main() {
       const want = `Basic ${Buffer.from('single-user:single-pass').toString('base64')}`;
       const authSeen = hop.records.filter((r) => r.auth === want);
       check('E. 链关着时环境正常起来（系统代理不参与）', Boolean(started.real_version), fmt(started.real_version));
-      check('E. 页面加载成功（407 被 Fetch.authRequired 应答掉了）',
+      check('E. 页面加载成功（认证由本地中继对上游完成）',
         String(page.snap?.body || '').includes('PAGE-OK'), fmt(page.snap?.body));
       check('E. 代理侧确实收到了本环境的账密（正例：认证真的发生了）', authSeen.length >= 1, `命中 ${authSeen.length}`);
       check('E. 链关着时 hop0 一次都没被用（对照）', hop0.records.length === 0, `hop0 记录 ${hop0.records.length}`);
+      check('E. 带凭据的单跳走的是中继（chain_mode=relay，内核只看到 127.0.0.1）',
+        inst?.chain_mode === 'relay' && Boolean(inst?.relay?.port), fmt({ mode: inst?.chain_mode, relay: inst?.relay?.port }));
     } finally {
       await manager.stopProfile(id).catch(() => {});
       await hop0.close().catch(() => {});

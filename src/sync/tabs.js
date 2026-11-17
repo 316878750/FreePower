@@ -16,6 +16,7 @@
  *   **这条不做成开关**：首帧指纹不是可选项，两个分支迟早腐化成一个（拦截页不加开关同一个理由）。
  */
 import { setTimeout as delay } from 'node:timers/promises';
+import { isStartPageUrl } from '../start/host.js';
 
 /* 自己带一个 sleep：不从 session.js 借 —— session 会 import 本模块，
  * 互相 import 在 ESM 里虽然能跑，但初始化顺序会变得难解释，不值得。 */
@@ -108,6 +109,11 @@ export function planUnify(masterUrls, slaveUrls) {
   const s = (Array.isArray(slaveUrls) ? slaveUrls : []).map(String);
   const navigate = [];
   for (let i = 0; i < Math.min(m.length, s.length); i++) {
+    /* 0.4.7.3：**任一边**是起始页就跳过这个序号。
+     * 起始页 URL 里带的是**各自环境**的 id 与签名（端口也可能不同），照字面比一定不相等；
+     * 硬导航过去只会让受控窗口显示一张 403 的起始页（签名不属于它），
+     * 反过来把用户那张起始页导航成业务页也是错的。两种不对称都要挡住。 */
+    if (isStartPageUrl(m[i]) || isStartPageUrl(s[i])) continue;
     if (m[i] !== s[i]) navigate.push({ index: i, url: m[i] });
   }
   const open = m.slice(s.length);
