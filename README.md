@@ -1668,6 +1668,7 @@ tab 模型（三个 hash + `tabOf` 认末尾斜杠 + 编辑页不算 tab）、�
 - **launch_args 白名单**：从真实 `CommandLine` 验证白名单参数生效、保护参数不在 argv 里
 - **UA 跟版（0.4.7.2 起默认关，设置页可开）**：开了才把旧版本 UA / UA-CH / `kernel_version` 对齐到真实内核版本并落库；关着时这三个字段一个字节都不改（对手 AdsPower 也不改，`ua` 与 `client_hints` 是两个各自可配的字段）
 - **UA-CH 逐项忠实**：`brands` / `fullVersionList` / `platformVersion` / `architecture` / `bitness` / `model` / `wow64` 走 CDP 原生覆写，已废弃的 `uaFullVersion` 只能由注入层补（CDP 永远返回真实内核版本）；跨站子帧（OOPIF，独立 target）也补上 UA / UA-CH 覆写
+- **判据的「本机内核」取真值**：`test/ua-hints-kernel.test.mjs` 的基准是真启动一次内核后读 `Browser.getVersion`，**不取** `Application\` 下最大版本目录名 —— Windows 上 Chrome 自动更新是「新版本目录先落盘、Chrome 完全退出后才把 `new_chrome.exe` 换成 `chrome.exe`」，落盘到生效之间启动器跑的仍是旧版（2026-11-17 实测：目录 `.78`/`.79` 并存，`chrome.exe` 是 .78、注册表 pv 已是 .79）。产品侧「新建环境的 `kernel_version` 取目录名」这件事**如实按已知缺陷钉了一条断言**（见升级说明已知限制 #10，0.4.8 修）
 - **控制台**：首页带 api_key、`/ui/app.js` 可加载、schema 11 组 131 字段、表单校验接口放行 UTC 与空 cookie
 
 ## 九、目录
@@ -2522,7 +2523,7 @@ Target.createTarget({ url: 'about:blank' })
 npm run test:sync            → 95/95   （A 层：纯函数 + 路由清单，不需要 Chrome）
 npm run test:start-page      → 57/57   （0.4.7.3 A 层：签名 / 页面内容 / 静态零外连 / 出口探测 / 开关 / 与窗口同步的相互作用，不需要 Chrome）
 npm run test:start-page-kernel → 36/36 （0.4.7.3 B 层：真内核；代理全挂时起始页照样打开、代理通时出口 IP 与 profile.ip 一致）
-npm run test:sync-kernel     → 49/49   （B 层：真内核 + 两个环境 + CDP 派发模拟输入；含「主窗口是错误页 → 明确报错、不起会话」）
+npm run test:sync-kernel     → 50/50   （B 层：真内核 + 两个环境 + CDP 派发模拟输入；含「主窗口是错误页 → 明确报错、不起会话」，前置要求主窗口只留一张页面 —— 多标签时 pickPageTarget 取哪张不确定，见 0.4.8）
 npm run test:sync-detached-kernel → 36/36（0.4.7.4 排列/显示/统一尺寸解绑：2 个真环境，无会话也能排列 + 先排列再同步不误报）
 npm run test:sync-text       → 51/51   （阶段 2 文本输入 A 层：语义 + 界面静态扫描）
 npm run test:sync-text-kernel → 21/21  （阶段 2 文本输入 B 层：1 主 + 2 受控真内核）

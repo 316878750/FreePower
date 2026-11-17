@@ -475,6 +475,23 @@ try {
    * 但页面上永远没人按键 → 一条事件都抓不到，用户看到的就是「同步没反应」。
    * 这条判据钉两件事：① 必须明确报错（不是静默成功）；② **不许留下会话**。 */
   console.log('\n— 主窗口停在错误页 → 明确报错、不起会话 —');
+  /* 前置：主窗口只留一张「真实页面」。
+   * 为什么必须显式做：`pickPageTarget` 取的是 `Target.getTargets` 里**第一张**非空白 / 非起始页，
+   * 多标签时「哪张算主窗口」由列表顺序决定，而 Chrome 不保证这个顺序 —— 判据若把这条不确定性
+   * 带进来，同一份实现会时红时绿（2026-11-17 实测：instA 有 3 张 page target 时，
+   * 那 5 条断言随机红；把多出来的关掉后稳定）。
+   * 产品侧「多标签应该按**可见**标签选主窗口」是另一件事，记在 0.4.8，不在本判据里替它做主。 */
+  const pagesNow = (await instA.client.send('Target.getTargets')).targetInfos.filter((t) => t.type === 'page');
+  for (const t of pagesNow) {
+    if (t.targetId === pageA.targetId) continue;
+    await instA.client.send('Target.closeTarget', { targetId: t.targetId }).catch(() => {});
+  }
+  await sleep(600);
+  const pagesAfter = (await instA.client.send('Target.getTargets')).targetInfos.filter((t) => t.type === 'page');
+  check('前置：主窗口只留一张页面（多标签时 pickPageTarget 取哪张不确定，见 0.4.8）',
+    pagesAfter.length === 1 && pagesAfter[0].targetId === pageA.targetId,
+    JSON.stringify(pagesAfter.map((t) => String(t.url).slice(0, 60))));
+
   await instA.client.send('Page.navigate', { url: 'http://127.0.0.1:1/nope' }, pageA.sessionId).catch(() => {});
   let errUrl = '';
   for (let i = 0; i < 40; i++) {

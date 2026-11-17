@@ -111,6 +111,66 @@ const { getDb, closeDb } = await import('../src/store/db.js');
 const { ensureNoiseSeeds } = await import('../src/fingerprint/seeds.js');
 const { LOG_DIR } = await import('../src/config.js');
 const { getProfile: dbGet } = await import('../packages/profile/src/repo.js');
+const chromeMod = await import('../src/kernel/chrome.js');
+
+/**
+ * 「本机内核」必须是**真值**：真启动一次内核，读 `Browser.getVersion`。
+ *
+ * 不能取 `Application\` 下最大版本目录名 —— Windows 上 Chrome 自动更新是「先把新版本目录落盘、
+ * 等 Chrome 完全退出才把 `new_chrome.exe` 换成 `chrome.exe`」，落盘到生效之间启动器跑的仍是旧版。
+ * 2026-11-17 实测：目录里有 `.78`（11-12）和 `.79`（当天 17:38 落盘），`chrome.exe` 的
+ * FileVersion 还是 .78，注册表 pv 已是 .79 —— 按目录名取最大值就会把判据基准钉到 .79，
+ * 而产品真值是 .78，于是「uaFullVersion = 真实内核版本」那几条假红。
+ */
+async function probeRealKernelVersion() {
+  const k = chromeMod.findChrome();
+  if (!k || !k.path) throw new Error('找不到本机内核，判据没法钉基准');
+  const ud = path.join(os.tmpdir(), `freepower-uahints-probe-${Date.now()}`);
+  const child = chromeMod.launchChrome(k.path, [
+    `--user-data-dir=${ud}`,
+    '--remote-debugging-port=0',
+    '--headless=new',
+    '--no-first-run',
+    '--no-default-browser-check',
+    'about:blank',
+  ]);
+  try {
+    const { port } = await chromeMod.waitForDevToolsPort(ud, { timeoutMs: 25000, child });
+    const browser = await new Promise((resolve, reject) => {
+      http.get({ host: '127.0.0.1', port, path: '/json/version', timeout: 8000 }, (res) => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => { body += c; });
+        res.on('end', () => { try { resolve(JSON.parse(body).Browser); } catch (e) { reject(e); } });
+      }).on('error', reject);
+    });
+    const m = /Chrome\/(\d+\.\d+\.\d+\.\d+)/.exec(String(browser || ''));
+    if (!m) throw new Error(`Browser.getVersion 里没有四段版本号：${browser}`);
+    return { version: m[1], browser, exe: k.path, guessed: k.version || null, source: k.source || null };
+  } finally {
+    try { chromeMod.killProcessTree(child.pid); } catch { /* 已经退了 */ }
+    await sleep(300);
+    try { fs.rmSync(ud, { recursive: true, force: true }); } catch { /* 句柄还在，留给系统 */ }
+  }
+}
+
+/** 产品 `kernelVersionForNewProfile()` 的取法：内核 exe 同级目录里版本号目录的最大值 */
+function maxVersionDirOf(exePath) {
+  const cmp = (a, b) => {
+    const x = a.split('.').map(Number);
+    const y = b.split('.').map(Number);
+    for (let i = 0; i < 4; i += 1) if (x[i] !== y[i]) return y[i] - x[i];
+    return 0;
+  };
+  try {
+    const list = fs.readdirSync(path.dirname(exePath))
+      .filter((x) => /^\d+\.\d+\.\d+\.\d+$/.test(x))
+      .sort(cmp);
+    return list[0] || null;
+  } catch {
+    return null;
+  }
+}
 
 const UA133 = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.6943.127 Safari/537.36';
 /** 只有大版本、没有补丁号的那种 UA（导入文件里偶尔就是这么写的） */
@@ -238,9 +298,27 @@ const brandMajors = (list) => (Array.isArray(list) ? list : [])
 const startedIds = [];
 
 try {
-  const kernelVersion = profiles.kernelVersionForNewProfile();
+  // 基准 = 真启动一次内核读 Browser.getVersion（不是目录名；见 probeRealKernelVersion 注释）
+  const real = await probeRealKernelVersion();
+  const kernelVersion = real.version;
   const kernelMajor = majorOf(kernelVersion);
-  console.log(`本机内核 = ${kernelVersion}`);
+  console.log(`本机内核 = ${kernelVersion}（真启动 Browser.getVersion；目录名猜的是 ${real.guessed}）`);
+  check('（前提）判据基准取自真启动内核（Browser.getVersion），不是 Application\\ 下最大版本目录名',
+    !!kernelVersion && /^\d+\.\d+\.\d+\.\d+$/.test(kernelVersion),
+    `${kernelVersion}（${real.browser}）`);
+
+  /* 已知缺陷单独钉一条（CEO 要求：接受缺陷不等于删断言）：
+   * 产品新建环境的 `kernel_version` 取的是目录名，Chrome 更新落盘未生效时会比实际内核新一个补丁号。
+   * 断言的是**当前真实行为**（取目录名）；哪天产品改成真值，这条会红，逼着改文档与口径。 */
+  const maxDir = maxVersionDirOf(real.exe);
+  const guess = profiles.kernelVersionForNewProfile();
+  check('已知缺陷 · 计划 0.4.8 修：新建环境的 kernel_version 取 Application\\ 下最大版本目录名，'
+    + 'Chrome 更新落盘未生效时会比实际内核新一个补丁号（本机此刻 '
+    + (guess === kernelVersion ? '一致' : '不一致') + '）',
+    maxDir ? guess === maxDir : guess === kernelVersion,
+    `目录名=${guess} 实际内核=${kernelVersion}`
+    + (maxDir ? ` 目录最大=${maxDir}` : '（找不到版本目录，退回比对真值）'));
+
   check('（前提）默认是关（这一版的全部断言都建立在默认关上）',
     readUaAutoAlign().enabled === false, JSON.stringify(readUaAutoAlign()));
 
