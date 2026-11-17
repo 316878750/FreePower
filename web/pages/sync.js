@@ -56,8 +56,10 @@ export default async function renderSync({ head, page }) {
   }, '打开操作台');
 
   // 共用组件：与操作台是同一份代码、同两条路由（`sync/arrange` / `sync/show`）
-  const arrangePanel = buildArrangePanel({ nameOf, getDisplays: () => state.displays });
-  const showPanel = buildShowPanel({ nameOf });
+  // 「已选环境」= 主窗口 + 勾选的受控窗口（0.4.7.4：排列/显示不要求同步已经起来）
+  const selectedIds = () => [state.masterId, ...state.slaveIds].filter(Boolean);
+  const arrangePanel = buildArrangePanel({ nameOf, getDisplays: () => state.displays, getSelectionIds: selectedIds });
+  const showPanel = buildShowPanel({ nameOf, getSelectionIds: selectedIds });
 
   mount(head,
     h('h1', null, '窗口同步'),

@@ -433,7 +433,9 @@ t('show.js 零原生依赖：不碰 electron / koffi / child_process / Win32', (
 
 t('面板有「显示窗口」按钮，且调 /api/v2/sync/show', () => {
   assert.match(widgetSrc, /显示窗口/);
-  assert.match(widgetSrc, /api\.syncShow\(\)/);
+  /* 0.4.7.3 起带作用范围：可以是 `api.syncShow()`（会话）也可以是 `api.syncShow(ids)`（已选环境），
+   * 判据只钉「打的是这条路由」，不钉参数形状 —— 否则解绑就被判成回归。 */
+  assert.match(widgetSrc, /api\.syncShow\(/);
   assert.match(apiSrc, /syncShow:[\s\S]{0,120}\/api\/v2\/sync\/show/);
 });
 

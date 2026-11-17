@@ -460,6 +460,49 @@ try {
   const stopped2 = await sync.stopSync();
   check('第二次 stop 也 removed=true', stopped2.teardown?.removed === true, JSON.stringify(stopped2.teardown));
 
+  /* ------------------------------ 实例日志：开始 / 结束各一行（0.4.7.4） ------------------------------ */
+  console.log('\n— 实例日志：同步开始 / 结束各一行 —');
+  const logPath = path.join(dataDir, 'logs', `${started[0]}.log`);
+  const logText = (() => { try { return fs.readFileSync(logPath, 'utf8'); } catch { return ''; } })();
+  check('主窗口实例日志里有「同步开始」一行', logText.includes('同步开始'), logPath);
+  check('「同步开始」带主窗口 url 与「捕获脚本=已装」',
+    /同步开始.*主窗口=\S+.*捕获脚本=已装/.test(logText), '');
+  check('「同步结束」带转发数 / 开关拦下数 / teardown 读数',
+    /同步结束.*转发=\d+.*开关拦下=\d+.*teardown=binding 已摘/.test(logText), '');
+
+  /* ------------------------------ 主窗口停在错误页 → 明确报错、不起会话（0.4.7.4） ------------------------------
+   * 用户实测的现场：3 个环境全停在 Chrome 错误页（代理挂了），老实现照样起会话，
+   * 但页面上永远没人按键 → 一条事件都抓不到，用户看到的就是「同步没反应」。
+   * 这条判据钉两件事：① 必须明确报错（不是静默成功）；② **不许留下会话**。 */
+  console.log('\n— 主窗口停在错误页 → 明确报错、不起会话 —');
+  await instA.client.send('Page.navigate', { url: 'http://127.0.0.1:1/nope' }, pageA.sessionId).catch(() => {});
+  let errUrl = '';
+  for (let i = 0; i < 40; i++) {
+    errUrl = String(await evalIn(instA, pageA.sessionId, 'location.href') || '');
+    if (errUrl.startsWith('chrome-error:')) break;
+    await sleep(150);
+  }
+  check('前置：主窗口确实落到了 chrome-error:// 上（不是拿假 URL 骗自己）',
+    errUrl.startsWith('chrome-error:'), errUrl);
+  let syncErr = null;
+  try {
+    await sync.startSync({ masterId: started[0], slaveIds: [started[1]], settings: {} });
+  } catch (e) { syncErr = e; }
+  check('主窗口是错误页 → startSync 明确报错（不静默起会话）', Boolean(syncErr), syncErr?.message || '没有抛错');
+  check('报错文案说人话（提到错误页 / 没有可同步的页面）',
+    /错误页|没有可同步的页面/.test(String(syncErr?.message || '')), String(syncErr?.message || ''));
+  check('报错带 reason=master_not_syncable', syncErr?.reason === 'master_not_syncable', String(syncErr?.reason));
+  check('没有留下会话（running=false）', sync.syncStatus().running === false, String(sync.syncStatus().running));
+  const errShape = await evalIn(instA, pageA.sessionId,
+    'JSON.stringify(Object.getOwnPropertyNames(window).filter((n) => /^_s[0-9a-f]{8}$/.test(n)))');
+  check('错误页上也没有留下 binding（拒绝发生在装 binding 之前）', errShape === '[]', String(errShape));
+  check('日志里记了「WARN 同步未开始」一行（下次能直接看日志定责）',
+    fs.readFileSync(logPath, 'utf8').includes('同步未开始'), logPath);
+
+  // 恢复：导航回真实页，下面「环境被杀」那条判据还要用 instA
+  await instA.client.send('Page.navigate', { url: URL_MAIN }, pageA.sessionId).catch(() => {});
+  await sleep(1500);
+
   /* ------------------------------ 异常结束：连接断开要如实记 ------------------------------ */
   console.log('\n— 异常结束（内核被外部杀掉）—');
   await sync.startSync({ masterId: started[0], slaveIds: [started[1]], settings: {} });

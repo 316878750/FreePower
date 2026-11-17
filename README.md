@@ -2504,9 +2504,9 @@ Target.createTarget({ url: 'about:blank' })
 | GET | `/api/v2/sync/status` | 没在跑也给稳定形状（`running:false` + 默认设置） |
 | POST | `/api/v2/sync/settings` | 运行中改开关/延迟，不重开会话 |
 | POST | `/api/v2/sync/refresh` | 重读各窗口视口与外框尺寸 |
-| POST | `/api/v2/sync/unify-size` | 一键统一尺寸（只在用户点按钮时执行） |
-| POST | `/api/v2/sync/arrange` | 窗口排列：`{width,height,row,top,left,hs,vs,range,screenId,screenList}` 或 `{auto:true}`（一键排列）；摆完逐个回读，不一致如实报 |
-| POST | `/api/v2/sync/show` | 显示窗口：`{profile_ids?}`（省 = 所有同步窗口）；逐窗口回读，`raise` 分 `restored`（真到 OS 前台）/ `page_only`（只做页面级激活）/ `none`（全屏不动），`os_foreground` 只在全部 restored 时 true |
+| POST | `/api/v2/sync/unify-size` | 一键统一尺寸（只在用户点按钮时执行）；**0.4.7.4 起接受 `{ids}`**：同步没开始时也能用，参考尺寸取 ids 的第一个 |
+| POST | `/api/v2/sync/arrange` | 窗口排列：`{width,height,row,top,left,hs,vs,range,screenId,screenList}` 或 `{auto:true}`（一键排列）；摆完逐个回读，不一致如实报。**0.4.7.4 起接受 `{ids}`（运行中的环境列表）—— 排列不需要同步已经起来**（AdsPower 的流程是「勾选环境 → 排列 → 启动同步」）；不给 ids 才用同步会话，响应里的 `source` 说明走的是哪条，`attached` 恒为 0 |
+| POST | `/api/v2/sync/show` | 显示窗口：`{profile_ids?}` / `{ids?}`（省 = 所有同步窗口；**0.4.7.4 起没有同步会话也能用，给 ids**）；逐窗口回读，`raise` 分 `restored`（真到 OS 前台）/ `page_only`（只做页面级激活）/ `none`（全屏不动），`os_foreground` 只在全部 restored 时 true |
 | POST | `/api/v2/sync/show/force` | 强制抬到前台（**用户显式点按钮才调**）：对那批窗口做 `minimize → 恢复原状态`，会闪一下；`confirmed: 'window_restored'` = 只能确认窗口已恢复正常，不确认在最前面 |
 | GET | `/api/v2/sync/displays` | 显示器列表（桌面壳写、服务进程读；`managed:false` = 没有桌面壳，不是失败） |
 | POST | `/api/v2/sync/tab` | 打开网址：`{urls}`（数组或多行文本），每行一个、最多 10 个，超了报「一键最多打开10个网址」；走上面那条 about:blank 姿势 |
@@ -2522,7 +2522,8 @@ Target.createTarget({ url: 'about:blank' })
 npm run test:sync            → 95/95   （A 层：纯函数 + 路由清单，不需要 Chrome）
 npm run test:start-page      → 57/57   （0.4.7.3 A 层：签名 / 页面内容 / 静态零外连 / 出口探测 / 开关 / 与窗口同步的相互作用，不需要 Chrome）
 npm run test:start-page-kernel → 36/36 （0.4.7.3 B 层：真内核；代理全挂时起始页照样打开、代理通时出口 IP 与 profile.ip 一致）
-npm run test:sync-kernel     → 39/39   （B 层：真内核 + 两个环境 + CDP 派发模拟输入）
+npm run test:sync-kernel     → 49/49   （B 层：真内核 + 两个环境 + CDP 派发模拟输入；含「主窗口是错误页 → 明确报错、不起会话」）
+npm run test:sync-detached-kernel → 36/36（0.4.7.4 排列/显示/统一尺寸解绑：2 个真环境，无会话也能排列 + 先排列再同步不误报）
 npm run test:sync-text       → 51/51   （阶段 2 文本输入 A 层：语义 + 界面静态扫描）
 npm run test:sync-text-kernel → 21/21  （阶段 2 文本输入 B 层：1 主 + 2 受控真内核）
 npm run test:sync-tabs      → 59/59   （阶段 2 标签页 A 层：纯函数 + 设置 + 界面/开标签姿势静态扫描）

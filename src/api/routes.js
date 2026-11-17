@@ -2344,24 +2344,29 @@ export function buildRoutes() {
   /**
    * 一键统一尺寸：受控窗口拉到主窗口的宽高。
    * **只在用户点按钮时执行** —— 不自动改人家的窗口（那是可见的副作用）。
+   * 0.4.7.4 起接受 `ids`（运行中的环境列表）：没同步会话也能用，参考尺寸取 ids 的第一个。
    */
-  add(['POST'], ['/api/v2/sync/unify-size'], async () => {
+  add(['POST'], ['/api/v2/sync/unify-size'], async (ctx) => {
+    const body = ctx.body && typeof ctx.body === 'object' ? ctx.body : {};
     try {
-      return ok(await unifySize());
+      return ok(await unifySize(body.ids ?? body.profile_ids ?? ctx.query?.ids));
     } catch (e) {
       throw new ApiError(ERR.INVALID, e?.message || 'sync is not running');
     }
   });
 
   /**
-   * 窗口排列（`tileWin`）：把参与同步的窗口按网格摆好。
+   * 窗口排列（`tileWin`）：把窗口按网格摆好。
    * 参数对齐对手：row/hs/vs/left/top/width/height/range/screenId/screenList；`auto:true` = 一键排列。
    * 摆完**回读**每个窗口的位置尺寸，不一致如实报（不静默当成功）。
+   *
+   * 0.4.7.4：接受 `ids`（运行中的环境列表）—— **排列不需要同步已经起来**，
+   * 这就是对手的「勾选环境 → 窗口排列 → 启动同步」流程；不给 ids 时才用同步会话（老行为）。
    */
   add(['POST'], ['/api/v2/sync/arrange'], async (ctx) => {
     const body = ctx.body && typeof ctx.body === 'object' ? ctx.body : {};
     try {
-      return ok(await arrangeWindows(body));
+      return ok(await arrangeWindows(body, body.ids ?? body.profile_ids ?? ctx.query?.ids));
     } catch (e) {
       throw new ApiError(ERR.INVALID, e?.message || 'sync is not running');
     }
@@ -2437,7 +2442,7 @@ export function buildRoutes() {
    */
   add(['POST'], ['/api/v2/sync/show'], async (ctx) => {
     const body = ctx.body && typeof ctx.body === 'object' ? ctx.body : {};
-    const ids = body.profile_ids ?? body.profile_id ?? ctx.query?.profile_id;
+    const ids = body.profile_ids ?? body.profile_id ?? body.ids ?? ctx.query?.profile_id ?? ctx.query?.ids;
     try {
       return ok(await showWindows(ids));
     } catch (e) {
@@ -2455,7 +2460,7 @@ export function buildRoutes() {
    */
   add(['POST'], ['/api/v2/sync/show/force'], async (ctx) => {
     const body = ctx.body && typeof ctx.body === 'object' ? ctx.body : {};
-    const ids = body.profile_ids ?? body.profile_id ?? ctx.query?.profile_id;
+    const ids = body.profile_ids ?? body.profile_id ?? body.ids ?? ctx.query?.profile_id ?? ctx.query?.ids;
     try {
       return ok(await forceShowWindows(ids));
     } catch (e) {

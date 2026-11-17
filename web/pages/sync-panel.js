@@ -53,8 +53,10 @@ export default async function renderSyncPanel({ head, page }) {
   const nameOf = (id) => state.profiles.get(id)?.name || id;
 
   // 共用组件：操作台与「窗口同步」页用的是同一份代码、同两条路由
-  const arrangePanel = buildArrangePanel({ nameOf, getDisplays: () => state.displays });
-  const showPanel = buildShowPanel({ nameOf });
+  // 「已选环境」= 主窗口 + 勾选的受控窗口（同步没开始时也能拿来排列/显示）
+  const selectedIds = () => [state.masterId, ...state.slaves].filter(Boolean);
+  const arrangePanel = buildArrangePanel({ nameOf, getDisplays: () => state.displays, getSelectionIds: selectedIds });
+  const showPanel = buildShowPanel({ nameOf, getSelectionIds: selectedIds });
 
   await reload(true);
   await loadDisplays();

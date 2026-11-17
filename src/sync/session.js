@@ -10,7 +10,8 @@
  */
 import crypto from 'node:crypto';
 import { CdpClient } from '../kernel/cdp.js';
-import { getInstance, getRunning } from '../runtime/manager.js';
+import { getInstance, getRunning, logProfile } from '../runtime/manager.js';
+import { installedExpression, markerNames } from '../kernel/markers.js';
 import { buildCaptureScript } from './agent-script.js';
 import { newBindingName } from './binding.js';
 import { buildSyncPlan, enabledBySwitch } from './replay.js';
@@ -85,6 +86,38 @@ async function pickPageTarget(client) {
   return real || pages[0];
 }
 
+/**
+ * 主窗口这张页面**能不能同步**（0.4.7.4）。返回 `null` = 能，返回字符串 = 不能的原因（人话）。
+ *
+ * 为什么要有这道前置检查（用户实测的坑，2026-11-17）：
+ *   他 3 个环境全停在 **Chrome 错误页**（代理挂了），主窗口上根本没有可捕获的页面。
+ *   老实现照样把会话起起来：binding 装上了、`Page.frameNavigated` 也挂了，
+ *   但页面上永远不会有人按键 → 一条事件都抓不到，用户看到的就是「同步没反应」，
+ *   而日志里干干净净，谁都看不出是「没有页面」还是「引擎坏了」。
+ *   所以宁可**在起会话之前**明确拒绝，也不许起一个抓不到事件的死会话。
+ *
+ * 口径（哪张能、哪张不能）：
+ *   - `chrome-error://`（打不开的站、代理失败）→ 不能，页面不是站点文档；
+ *   - `devtools://` / `chrome://` / `chrome-extension://` / `view-source:` → 不能，
+ *     这些页面拿不到键盘焦点，也没有可捕获的 DOM；
+ *   - `about:blank` → **看注入**：注入脚本跑过（有派生标记）说明这是我们接管的空白页，
+ *     能同步（新建标签的常态）；没跑过就是一张死的空白页，不能。
+ */
+function unusableMasterPage(url, { injected = false } = {}) {
+  const u = String(url || '');
+  if (!u) return '主窗口这张标签没有地址';
+  if (/^chrome-error:/i.test(u)) return `主窗口停在 Chrome 错误页（${u.slice(0, 90)}）`;
+  if (/^devtools:/i.test(u)) return '主窗口是开发者工具页';
+  if (/^(chrome|chrome-extension|edge|view-source|chrome-search|chrome-untrusted):/i.test(u)) {
+    return `主窗口是浏览器内部页面（${u.slice(0, 60)}）`;
+  }
+  if (/^about:/i.test(u)) {
+    if (u === 'about:blank' && injected) return null;
+    return '主窗口还停在空白页，而且注入脚本没装上（不是我们接管的那张）';
+  }
+  return null;
+}
+
 async function attach(client, targetId) {
   const { sessionId } = await client.send('Target.attachToTarget', { targetId, flatten: true });
   return sessionId;
@@ -130,6 +163,131 @@ async function windowRectOf(client, targetId) {
   }
 }
 
+/* ------------------------------ 「要动哪些窗口」：与同步会话解绑（0.4.7.4） ------------------------------ */
+
+/**
+ * 为什么会有这一段（用户实测的可用性问题，2026-11-17）：
+ * AdsPower 的正常流程是「勾选环境 → 窗口排列 → 启动同步」——**排列不需要同步已经起来**，
+ * 它作用在勾选的那些窗口上。我们把 `arrange` / `show` / `show/force` / `unify-size`
+ * 四个动作全绑在同步会话上（`if (!current) throw`），用户按习惯先排列就直接吃到 100002，
+ * 而界面上「窗口排列」区块就在那里、点了就报错。
+ *
+ * 解绑的边界（都是硬约束，不是风格）：
+ *   · **不新起内核、不 startProfile、不重连**：只用 `getInstance(id)` 已经连着的
+ *     浏览器级 CDP 客户端；窗口位置尺寸（`Browser.getWindowForTarget` / `setWindowBounds`）
+ *     本来就是浏览器级命令，连 session 都不用开；
+ *   · 有会话且没给 ids → 行为与解绑前**完全一致**（用会话里的 targets，不重复 attach）；
+ *   · 给了 ids → 会话里已有的直接复用（不重复 attach），其余按运行实例解析；
+ *   · 既没会话也没 ids → 100002 + 人话，明确说「先勾选正在运行的环境」。
+ */
+
+/** 把 `ids` 归一成字符串数组：接受数组 / 单个 id / 逗号串；去空、去重、保序。 */
+function normalizeIdList(raw) {
+  const flat = Array.isArray(raw) ? raw : (raw === undefined || raw === null ? [] : [raw]);
+  const out = [];
+  for (const x of flat) {
+    if (x === undefined || x === null) continue;
+    for (const part of String(x).split(',')) {
+      const id = part.trim();
+      if (id && !out.includes(id)) out.push(id);
+    }
+  }
+  return out;
+}
+
+/** 这个环境在会话里是什么角色；不在会话里就是普通窗口（解绑路径才有这个值） */
+function roleOf(profileId) {
+  if (!current) return 'window';
+  if (profileId === current.master) return 'master';
+  if (current.slaves.includes(profileId)) return 'slave';
+  return 'window';
+}
+
+/**
+ * 解析「这次要动哪些窗口」。
+ * @param {string[]|string|null} rawIds
+ * @param {{what?:string}} opt `what` 只进错误文案（排列 / 显示 / 统一尺寸）
+ * @returns {Promise<{handles:Array, skipped:Array, source:'session'|'ids'}>}
+ */
+async function resolveWindows(rawIds, { what = '排列' } = {}) {
+  const want = normalizeIdList(rawIds);
+  const handles = [];
+  const skipped = [];
+
+  // ① 没给 ids：沿用同步会话（解绑前的行为，一个字节都不变）
+  if (!want.length) {
+    if (!current) {
+      const err = new Error(`没有可${what}的窗口：先勾选正在运行的环境（同步没开始时也能排列），或者先开始同步`);
+      err.reason = 'no_windows';
+      throw err;
+    }
+    for (const id of [current.master, ...current.slaves]) {
+      const t = current.targets.get(id);
+      if (!t) continue;
+      handles.push({
+        id, client: t.client, targetId: t.targetId, sessionId: t.sessionId,
+        role: id === current.master ? 'master' : 'slave', source: 'session', attachedByUs: false,
+      });
+    }
+    if (!handles.length) {
+      const err = new Error(`没有可${what}的窗口：同步会话里没有可用的窗口连接`);
+      err.reason = 'no_windows';
+      throw err;
+    }
+    return { handles, skipped, source: 'session' };
+  }
+
+  // ② 给了 ids：会话里已有的直接复用（不重复 attach），其余用运行实例的浏览器级连接
+  for (const id of want) {
+    const inSession = current?.targets.get(id);
+    if (inSession) {
+      handles.push({
+        id, client: inSession.client, targetId: inSession.targetId, sessionId: inSession.sessionId,
+        role: roleOf(id), source: 'session', attachedByUs: false,
+      });
+      continue;
+    }
+    const inst = getInstance(id);
+    if (!inst || !inst.client) { skipped.push({ profile_id: id, reason: '没有在运行' }); continue; }
+    let page = null;
+    try { page = await pickPageTarget(inst.client); } catch (e) { skipped.push({ profile_id: id, reason: `读不到页面：${e?.message || e}` }); continue; }
+    if (!page) { skipped.push({ profile_id: id, reason: '没有页面 target' }); continue; }
+    handles.push({
+      id, client: inst.client, targetId: page.targetId, sessionId: null,
+      role: roleOf(id), source: 'instance', attachedByUs: false,
+    });
+  }
+  if (!handles.length) {
+    const why = skipped.map((x) => `${x.profile_id}（${x.reason}）`).join('、');
+    const err = new Error(`没有可${what}的窗口：勾选的环境都没在运行（${why || '没给 id'}）。先勾选正在运行的环境`);
+    err.reason = 'no_windows';
+    throw err;
+  }
+  return { handles, skipped, source: 'ids' };
+}
+
+/**
+ * 拿一张页面的 CDP 会话（只在真需要 Page 域命令时才 attach）。
+ * 窗口位置/尺寸走浏览器级命令，不需要它 —— 这也是「排列不解绑也要能用」的关键：
+ * 排列一次 attach 都不产生，所以不会和同步会话抢会话、也不会留半条连接。
+ */
+async function pageSessionOf(h) {
+  if (h.sessionId) return h.sessionId;
+  h.sessionId = await attach(h.client, h.targetId);
+  h.attachedByUs = true;
+  return h.sessionId;
+}
+
+/** 收尾：我们自己 attach 的会话要摘掉，别留给下一次（复用实例的连接是共用的） */
+async function releaseHandles(handles) {
+  for (const h of handles) {
+    if (!h.attachedByUs || !h.sessionId) continue;
+    try { await h.client.send('Target.detachFromTarget', { sessionId: h.sessionId }); } catch { /* 连接已断就算了 */ }
+    h.attachedByUs = false;
+    h.sessionId = null;
+  }
+}
+
 /* ------------------------------ 启动 / 停止 ------------------------------ */
 
 /**
@@ -171,6 +329,8 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
     rng_seed: seed,
     started_at: new Date().toISOString(),
     events: 0,
+    /** 真的排进过至少一个受控窗口的事件数（与被开关拦下的 `dropped` 分开记） */
+    forwarded: 0,
     dropped: 0,
     text_sent: 0,
     text_swallowed: 0,
@@ -190,6 +350,30 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
     const mSession = await attach(m.client, mTarget.targetId);
     targets.set(master, { client: m.client, sessionId: mSession, targetId: mTarget.targetId, viewport: null, window: await windowSizeOf(m.client, mTarget.targetId) });
 
+    /* 前置检查：主窗口现在有没有「可同步的页面」（见 unusableMasterPage 的注释）。
+     * 必须在装 binding / 捕获脚本**之前**判 —— 先装再报错，等于在死页面上留了一层痕迹。
+     *
+     * 地址取**页面自己报的 `location.href`**，不拿 `Target.getTargets` 里的 url：
+     * 错误页那里报的是「当初想去的地址」（`http://127.0.0.1:1/nope`），
+     * 页面实际停在 `chrome-error://chromewebdata/` —— 按 targetInfo.url 判会漏掉整类错误页
+     * （0.4.7.4 判据第一次跑就是这么假绿的）。 */
+    const masterMarkers = m.inst.markers || markerNames(undefined);
+    const masterProbe = await m.client.send('Runtime.evaluate', {
+      expression: 'JSON.stringify({href: location.href, injected: ' + installedExpression(masterMarkers) + '})',
+      returnByValue: true,
+    }, mSession).then((r) => {
+      try { return JSON.parse(r?.result?.value || 'null'); } catch { return null; }
+    }).catch(() => null);
+    const masterHref = String(masterProbe?.href || mTarget.url || '');
+    const notSyncable = unusableMasterPage(masterHref, { injected: masterProbe?.injected === true });
+    if (notSyncable) {
+      logProfile(master, 'WARN 同步未开始', `主窗口不可同步：${notSyncable}（href=${masterHref.slice(0, 120)}）`);
+      const err = new Error(`主窗口现在没有可同步的页面（${notSyncable}），先把页面打开再开始同步`);
+      err.reason = 'master_not_syncable';
+      err.master_url = masterHref;
+      throw err;
+    }
+
     await m.client.send('Page.enable', {}, mSession).catch(() => {});
     await m.client.send('Runtime.enable', {}, mSession).catch(() => {});
     await m.client.send('Runtime.addBinding', { name: bindingName }, mSession);
@@ -198,6 +382,12 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
     await m.client.send('Page.addScriptToEvaluateOnNewDocument', { source: buildCaptureScript({ bindingName }) }, mSession);
     // 当前文档：直接跑一遍（新文档脚本只对「下一个文档」生效）
     await m.client.send('Runtime.evaluate', { expression: buildCaptureScript({ bindingName }) }, mSession).catch(() => {});
+    /* 会话开始就落一行实例日志（0.4.7.4）：用户说「没反应」时，
+     * 第一件事是分清「主窗口是不是根本没页面」和「有页面但事件没转发」。
+     * 这一行把主/受控 id、主窗口 url、捕获脚本装没装一次说清。 */
+    logProfile(master, '同步开始',
+      `会话=${session.id.slice(0, 8)} 主=${master} 受控=${slaves.join(',') || '-'} `
+      + `主窗口=${String(mTarget.url || '').slice(0, 120)} 捕获脚本=已装 binding=${bindingName}`);
 
     m.client.on('Page.frameNavigated', (params, sid) => {
       if (sid !== mSession) return;
@@ -236,6 +426,8 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
         // 文本/键盘事件不需要视口；鼠标类没有视口就丢（宁可漏一次移动，也不要在 (0,0) 乱点）
         const isText = ev?.t === 'key' || ev?.t === 'text' || ev?.t === 'paste';
         let textEmitted = false;
+        /** 这一条事件有没有真的排进**至少一个**受控窗口（stop 那行日志要这个读数） */
+        let delivered = false;
         for (const id of session.slaves) {
           const t = targets.get(id);
           if (!t || degraded.has(id)) continue;
@@ -256,7 +448,9 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
               await t.client.send(call.method, call.params, t.sessionId);
             }
           });
+          delivered = true;
         }
+        if (delivered) session.forwarded += 1;
         /* 读数：带文字的事件里，**真的发出去了**多少条、被**内容策略**吞掉多少条。
          * 与被开关拦下的 dropped 分开记 —— 「相同文本关掉」和「按键被丢掉」是两回事，
          * 合成一个数字会让用户（和判据）分不清是开关没生效还是文本策略生效。
@@ -289,6 +483,10 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
       error: session.abnormal,
       reason: 'connection_lost',
     };
+    // 异常结束同样留一行：这时 removeBinding 发不出去，读数必须是「没摘干净」而不是空白
+    logProfile(session.master, '同步异常结束',
+      `会话=${session.id.slice(0, 8)} 事件=${session.events} 转发=${session.forwarded} `
+      + `开关拦下=${session.dropped} teardown=binding 未摘（${session.abnormal}）`);
     // 别的连接也要断掉：会话已经废了，留着只是占资源
     for (const [, t] of targets) { try { t.client.close(); } catch { /* ignore */ } }
     targets.clear();
@@ -333,6 +531,12 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
       teardown.error = '主窗口连接已不在（无法摘 binding）';
     }
     lastTeardown = teardown;
+    /* 结束也落一行实例日志：转发多少条、被开关拦下多少、teardown 有没有真摘掉 binding。
+     * 三样缺一样，用户报「没反应 / 有反应但不对」时就分不清是捕获、开关还是收尾的问题。 */
+    logProfile(master, '同步结束',
+      `会话=${session.id.slice(0, 8)} 事件=${session.events} 转发=${session.forwarded} `
+      + `开关拦下=${session.dropped} 文本发出=${session.text_sent} 文本被吞=${session.text_swallowed} `
+      + `teardown=${teardown.removed ? 'binding 已摘' : `binding 未摘（${teardown.error || '未知原因'}）`}`);
 
     for (const [, t] of targets) {
       try { t.client.close(); } catch { /* ignore */ }
@@ -374,6 +578,7 @@ function statusOf(session) {
     binding_name: session.binding_name,
     started_at: session.started_at,
     events: session.events,
+    forwarded: session.forwarded,
     dropped: session.dropped,
     text_sent: session.text_sent,
     text_swallowed: session.text_swallowed,
@@ -474,11 +679,11 @@ export function updateSettings(raw) {
  * 主窗口自己如果是最大化/全屏，也先恢复成 normal：不这么做的话「参考尺寸」是屏幕大小，
  * 受控窗口会变成三个屏幕那么宽的普通窗口，视口照样对不上（而且用户看不出为什么）。
  */
-export async function unifySize() {
-  if (!current) throw new Error('没有正在运行的同步会话');
-  const s = current;
-  const mt = s.targets.get(s.master);
-  if (!mt) throw new Error('主窗口连接已不在');
+export async function unifySize(rawIds = null) {
+  const { handles, skipped, source } = await resolveWindows(rawIds, { what: '统一尺寸' });
+  // 会话路径的参考尺寸必须是**主窗口**（解绑前的语义）；主窗口连接不在时如实报错，不拿受控窗口顶替
+  if (source === 'session' && handles[0].role !== 'master') throw new Error('主窗口连接已不在');
+  const mt = handles[0];
 
   /** 读一张页所属窗口的当前状态 */
   const readWin = async (t) => {
@@ -510,10 +715,9 @@ export async function unifySize() {
   }
 
   const resized = [];
-  for (const id of s.slaves) {
-    const t = s.targets.get(id);
-    if (!t) continue;
-    const entry = { profile_id: id, role: 'slave', target_id: t.targetId, ok: false, expected: ref };
+  for (const t of handles.slice(1)) {
+    const id = t.id;
+    const entry = { profile_id: id, role: t.role, target_id: t.targetId, ok: false, expected: ref };
     try {
       let win = await readWin(t);
       entry.state_before = normalizeState(win.state);
@@ -540,12 +744,16 @@ export async function unifySize() {
   await refreshAll();
   const summary = summarizeResize(resized);
   return {
+    /** 参考窗口（会话路径就是主窗口；解绑路径是 ids 里的第一个） */
+    reference_id: mt.id,
+    source,
+    skipped,
     reference: ref,
     master_restored: masterRestored,
     master_state_before: normalizeState(masterBefore.state),
     resized,
     summary,
-    status: current.status(),
+    status: current ? current.status() : syncStatus(),
   };
 }
 
@@ -562,11 +770,14 @@ export async function unifySize() {
  *      实测读数见 README「阶段 3 第 1 件」）；
  *   ③ 摆完**回读**每个窗口的 left/top/width/height 比对，不一致如实报「有 N 个窗口没能排到位」。
  */
-export async function arrangeWindows(rawParams = {}) {
-  if (!current) throw new Error('没有正在运行的同步会话');
-  const s = current;
-  const ids = [s.master, ...s.slaves].filter((id) => s.targets.get(id));
-  if (!ids.length) throw new Error('没有可排列的窗口');
+export async function arrangeWindows(rawParams = {}, rawIds = null) {
+  /* 窗口排列**不需要同步会话**（0.4.7.4 解绑，见 resolveWindows 顶部）：
+   * 给了 ids 就排这些运行中的环境；没给且会话在跑就排会话里的窗口（老行为）。 */
+  const { handles, skipped, source } = await resolveWindows(
+    rawIds ?? rawParams?.ids ?? rawParams?.profile_ids,
+    { what: '排列' },
+  );
+  const ids = handles.map((h) => h.id);
 
   const screens = screensForArrange();
   const params = { ...rawParams };
@@ -595,11 +806,10 @@ export async function arrangeWindows(rawParams = {}) {
   const audit = auditPlan(plan.windows, screens.find((x) => String(x.id) === String(plan.screen_id))?.workArea || null);
 
   const placed = [];
-  for (let i = 0; i < ids.length; i++) {
-    const id = ids[i];
-    const t = s.targets.get(id);
+  for (let i = 0; i < handles.length; i++) {
+    const t = handles[i];
     const want = plan.windows[i];
-    const entry = { profile_id: id, role: id === s.master ? 'master' : 'slave', index: i, ok: false };
+    const entry = { profile_id: t.id, role: t.role, index: i, ok: false };
     try {
       const win = await windowSizeOf(t.client, t.targetId);
       if (!win?.windowId) throw new Error('读不到窗口 id');
@@ -624,6 +834,10 @@ export async function arrangeWindows(rawParams = {}) {
 
   await refreshAll();
   return {
+    source,
+    skipped,
+    /** 这一轮为了排列而新开的 CDP 会话数：窗口排列只走浏览器级命令，**恒为 0** */
+    attached: 0,
     screen_id: plan.screen_id,
     plan: plan.windows,
     audit,
@@ -632,7 +846,7 @@ export async function arrangeWindows(rawParams = {}) {
     displays_managed: screens.length > 0,
     placed,
     summary: summarizeArrange(placed),
-    status: current.status(),
+    status: current ? current.status() : syncStatus(),
   };
 }
 
@@ -652,21 +866,15 @@ export async function arrangeWindows(rawParams = {}) {
  * 动过窗口，所以位置尺寸也要回到原样，别把多屏窗口搬回主屏。
  */
 export async function forceShowWindows(rawIds) {
-  if (!current) throw new Error('没有正在运行的同步会话');
-  const s = current;
-  const all = [s.master, ...s.slaves];
-  const want = rawIds === undefined || rawIds === null
-    ? all
-    : (Array.isArray(rawIds) ? rawIds : [rawIds]).map(String);
-  const ids = want.filter((id) => s.targets.get(id));
-  if (!ids.length) throw new Error('没有可显示的窗口');
+  // 强制置前同样解绑（0.4.7.4）：只有浏览器级命令 + 状态回读，不需要同步会话
+  const { handles, skipped, source } = await resolveWindows(rawIds, { what: '显示' });
 
   const results = [];
-  for (const id of ids) {
-    const t = s.targets.get(id);
+  for (const t of handles) {
+    const id = t.id;
     const entry = {
       profile_id: id,
-      role: id === s.master ? 'master' : 'slave',
+      role: t.role,
       ok: false,
       action: 'force',
       raise: 'none',
@@ -710,11 +918,13 @@ export async function forceShowWindows(rawIds) {
 
   await refreshAll();
   return {
+    source,
+    skipped,
     forced: results,
     summary: summarizeForce(results),
     /** 能确认的只有「窗口恢复正常」，不是「在最前面」（产品里不调 Win32） */
     os_foreground_confirmed: false,
-    status: current.status(),
+    status: current ? current.status() : syncStatus(),
   };
 }
 
@@ -757,67 +967,72 @@ async function nudgeToFront(client, windowId, stateBefore) {
  * 是可见副作用，不在这一版里默认做（要不要引 Win32 依赖把它做成瞬间的，等定）。
  */
 export async function showWindows(rawIds) {
-  if (!current) throw new Error('没有正在运行的同步会话');
-  const s = current;
-  const all = [s.master, ...s.slaves];
-  const want = rawIds === undefined || rawIds === null
-    ? all
-    : (Array.isArray(rawIds) ? rawIds : [rawIds]).map(String);
-  const ids = want.filter((id) => s.targets.get(id));
-  if (!ids.length) throw new Error('没有可显示的窗口');
+  // 显示窗口解绑（0.4.7.4）：给了 ids 就动这些运行中的环境，不需要同步会话
+  const { handles, skipped, source } = await resolveWindows(rawIds, { what: '显示' });
 
   const results = [];
-  for (const id of ids) {
-    const t = s.targets.get(id);
-    const entry = {
-      profile_id: id,
-      role: id === s.master ? 'master' : 'slave',
-      ok: false,
-      raise: 'none',
-      state_before: null,
-      state_after: null,
-      rect_before: null,
-      rect_after: null,
-    };
-    try {
-      const win = await windowSizeOf(t.client, t.targetId);
-      if (!win?.windowId) throw new Error('读不到窗口 id');
-      const before = await windowRectOf(t.client, t.targetId);
-      entry.state_before = normalizeState(win.state);
-      entry.rect_before = before;
-      const [plan] = planShow([{ profile_id: id, state: win.state }]);
-      entry.action = plan.action;
+  let attached = 0;
+  try {
+    for (const t of handles) {
+      const id = t.id;
+      const entry = {
+        profile_id: id,
+        role: t.role,
+        ok: false,
+        raise: 'none',
+        state_before: null,
+        state_after: null,
+        rect_before: null,
+        rect_after: null,
+      };
+      try {
+        const win = await windowSizeOf(t.client, t.targetId);
+        if (!win?.windowId) throw new Error('读不到窗口 id');
+        const before = await windowRectOf(t.client, t.targetId);
+        entry.state_before = normalizeState(win.state);
+        entry.rect_before = before;
+        const [plan] = planShow([{ profile_id: id, state: win.state }]);
+        entry.action = plan.action;
 
-      if (plan.action === 'restore') {
-        entry.raise = 'restored';
-        await t.client.send('Browser.setWindowBounds', { windowId: win.windowId, bounds: { windowState: 'normal' } });
-        await settle(160);
-      } else if (plan.action === 'page_only') {
-        entry.raise = 'page_only';
-        await t.client.send('Page.bringToFront', {}, t.sessionId);
-        await settle(160);
-      }
+        if (plan.action === 'restore') {
+          entry.raise = 'restored';
+          await t.client.send('Browser.setWindowBounds', { windowId: win.windowId, bounds: { windowState: 'normal' } });
+          await settle(160);
+        } else if (plan.action === 'page_only') {
+          entry.raise = 'page_only';
+          /* 页面级激活要 Page 域 → 这时才 attach（解绑路径按需开、用完摘） */
+          if (!t.sessionId) attached += 1;
+          await t.client.send('Page.bringToFront', {}, await pageSessionOf(t));
+          await settle(160);
+        }
 
-      /* 回读：恢复成功只认状态 + 位置尺寸没被搬走（见 show.js 顶部） */
-      const after = await windowRectOf(t.client, t.targetId);
-      entry.rect_after = after;
-      entry.state_after = normalizeState(after?.state);
-      const v = verifyShown({ state_before: entry.state_before, rect_before: before }, after);
-      // page_only 那批同时记下「页面拿到焦点没有」—— 但**它不参与 ok**，只作读数
-      if (plan.action === 'page_only') {
-        entry.page_focused = await pageHasFocus(t.client, t.sessionId);
+        /* 回读：恢复成功只认状态 + 位置尺寸没被搬走（见 show.js 顶部） */
+        const after = await windowRectOf(t.client, t.targetId);
+        entry.rect_after = after;
+        entry.state_after = normalizeState(after?.state);
+        const v = verifyShown({ state_before: entry.state_before, rect_before: before }, after);
+        // page_only 那批同时记下「页面拿到焦点没有」—— 但**它不参与 ok**，只作读数
+        if (plan.action === 'page_only') {
+          entry.page_focused = await pageHasFocus(t.client, await pageSessionOf(t));
+        }
+        entry.ok = v.ok;
+        entry.problems = v.problems;
+        if (!v.ok) entry.reason = v.problems.map((m) => `${m.field} 期望 ${m.expected} 实际 ${m.actual}`).join('；');
+      } catch (e) {
+        entry.reason = e?.message || String(e);
       }
-      entry.ok = v.ok;
-      entry.problems = v.problems;
-      if (!v.ok) entry.reason = v.problems.map((m) => `${m.field} 期望 ${m.expected} 实际 ${m.actual}`).join('；');
-    } catch (e) {
-      entry.reason = e?.message || String(e);
+      results.push(entry);
     }
-    results.push(entry);
+  } finally {
+    await releaseHandles(handles);
   }
 
   await refreshAll();
   return {
+    source,
+    skipped,
+    /** 这一轮为了「页面级激活」新开的 CDP 会话数（解绑路径才会有；用完已摘） */
+    attached,
     shown: results,
     summary: summarizeShow(results),
     /**
@@ -825,7 +1040,7 @@ export async function showWindows(rawIds) {
      * 面板据此显示一行提示，不让用户以为「点了就跑到最前面了」。
      */
     os_foreground: results.length > 0 && results.every((r) => r.raise === 'restored'),
-    status: current.status(),
+    status: current ? current.status() : syncStatus(),
   };
 }
 

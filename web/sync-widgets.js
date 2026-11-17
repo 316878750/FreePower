@@ -24,12 +24,19 @@ import { api } from './api.js';
  *   窗口数量 `windowNum` + `syncOperate5`「个/行」→ row
  *   显示器 `sync84` → screenId（-1 = 全部屏幕）
  *
- * @param {{nameOf:(id:string)=>string, getDisplays:()=>object[], compact?:boolean}} opt
+ * **作用范围**（0.4.7.4 解绑）：对手的流程是「勾选环境 → 窗口排列 → 启动同步」，
+ * 排列**不需要同步已经起来**。所以这里多一个范围选择：
+ *   · 已选环境（默认）：把页面上勾选的那些运行中环境 id 发给服务端（`ids`）；
+ *   · 当前同步会话：不传 ids，用会话里的窗口（解绑前的老行为）。
+ * 两页（操作台 / 窗口同步页）都用这一份组件，**不各写一套**。
+ *
+ * @param {{nameOf:(id:string)=>string, getDisplays:()=>object[], getSelectionIds?:()=>string[], compact?:boolean}} opt
  * @returns {{el:HTMLElement, refresh:(displays?:object[])=>void}}
  */
-export function buildArrangePanel({ nameOf, getDisplays, compact = false }) {
+export function buildArrangePanel({ nameOf, getDisplays, getSelectionIds = null, compact = false }) {
   const state = {
     mode: 'auto', // 'auto'（一键排列）| 'custom'（自定义排列）
+    scope: 'selection', // 'selection'（已选环境）| 'session'（当前同步会话）
     left: 0, top: 0, width: 1000, height: 700, hs: 0, vs: 0, row: 2,
     screenId: null, // null = 主屏；-1 = 全部屏幕
   };
@@ -50,6 +57,12 @@ export function buildArrangePanel({ nameOf, getDisplays, compact = false }) {
     },
       h('option', { value: 'auto', selected: a.mode === 'auto' }, '一键排列'),
       h('option', { value: 'custom', selected: a.mode === 'custom' }, '自定义排列'));
+
+    const scopeSel = h('select', {
+      onChange: (e) => { a.scope = e.target.value; paint(); },
+    },
+      h('option', { value: 'selection', selected: a.scope === 'selection' }, '已选环境'),
+      h('option', { value: 'session', selected: a.scope === 'session' }, '当前同步会话'));
 
     const displays = getDisplays() || [];
     const screenOpts = [];
@@ -74,6 +87,11 @@ export function buildArrangePanel({ nameOf, getDisplays, compact = false }) {
 
     mount(el,
       h('div', { class: 'row' },
+        h('span', { class: 'muted small' }, '作用范围'), scopeSel,
+        h('span', { class: 'muted small' }, a.scope === 'selection'
+          ? `已选 ${selectionIds().length} 个环境（同步没开始时也能排列）`
+          : '用当前同步会话里的窗口')),
+      h('div', { class: 'row', style: { marginTop: '6px' } },
         h('span', { class: 'muted small' }, '排列方式'), modeSel,
         h('span', { class: 'spacer' }),
         h('button', { class: 'btn primary sm', onClick: () => run() }, '窗口排列')),
@@ -93,8 +111,18 @@ export function buildArrangePanel({ nameOf, getDisplays, compact = false }) {
       resBox);
   }
 
+  /** 「已选环境」是页面上勾选的那些运行中环境（两页各自提供，组件不自己猜） */
+  function selectionIds() {
+    if (!getSelectionIds) return [];
+    try {
+      const list = getSelectionIds();
+      return Array.isArray(list) ? list.filter(Boolean).map(String) : [];
+    } catch { return []; }
+  }
+
   async function run() {
     const a = state;
+    const ids = a.scope === 'selection' ? selectionIds() : null;
     const body = a.mode === 'auto'
       ? { auto: true, screenId: a.screenId === null ? undefined : a.screenId }
       : {
@@ -102,19 +130,26 @@ export function buildArrangePanel({ nameOf, getDisplays, compact = false }) {
         left: a.left, top: a.top, range: 0,
         screenId: a.screenId === null ? undefined : a.screenId,
       };
+    if (ids) body.ids = ids;
     try {
       const r = await api.syncArrange(body);
       const bad = (r?.placed || []).filter((x) => !x.ok);
       const warn = (r?.warnings || []).slice();
+      const skipped = r?.skipped || [];
       toast(bad.length ? `有 ${bad.length} 个窗口没能排到位` : `已排列 ${r?.placed?.length ?? 0} 个窗口`, bad.length ? 'bad' : '');
       mount(resBox,
         bad.length
           ? h('div', { class: 'notice bad', style: { marginTop: '6px' } },
             h('strong', null, `有 ${bad.length} 个窗口没能排到位：`),
             ...bad.map((x) => h('div', { class: 'muted small' },
-              `${nameOf(x.profile_id)}（${x.role === 'master' ? '主控' : '受控'}）：${x.reason || '位置不符'}`)))
+              `${nameOf(x.profile_id)}（${roleLabel(x.role)}）：${x.reason || '位置不符'}`)))
           : h('div', { class: 'muted small', style: { marginTop: '6px' } },
             `已排列 ${r?.placed?.length ?? 0} 个窗口${r?.auto ? `（每行 ${r.auto.cols} 个，${r.auto.width}×${r.auto.height}）` : ''}`),
+        skipped.length
+          ? h('div', { class: 'notice warn', style: { marginTop: '6px' } },
+            ...skipped.map((x) => h('div', { class: 'muted small' },
+              `${nameOf(x.profile_id)} 跳过了：${x.reason}`)))
+          : null,
         warn.length
           ? h('div', { class: 'notice warn', style: { marginTop: '6px' } }, ...warn.map((w) => h('div', { class: 'muted small' }, w)))
           : null);
@@ -129,6 +164,16 @@ export function buildArrangePanel({ nameOf, getDisplays, compact = false }) {
 }
 
 /**
+ * 角色文案：同步会话里有主/受控；解绑后按 id 动的那些窗口没有角色，就叫「窗口」。
+ * 只有一处定义，两个区块共用（不各写一套）。
+ */
+function roleLabel(role) {
+  if (role === 'master') return '主控';
+  if (role === 'slave') return '受控';
+  return '窗口';
+}
+
+/**
  * 显示窗口区块（`viewWin`）。
  *
  * **能力边界必须写在界面上**：最小化的窗口恢复后实测会真的到 OS 前台；
@@ -136,16 +181,41 @@ export function buildArrangePanel({ nameOf, getDisplays, compact = false }) {
  * 所以按钮下面那行小字是「恢复最小化并把窗口放到前面」，结果显示 `page_only` 时
  * 明确写「有 N 个窗口只做了页面级激活（可能仍被其它窗口盖住）」，不假装都到前面了。
  *
- * @param {{nameOf:(id:string)=>string}} opt
+ * 作用范围与排列区块同源（0.4.7.4）：已选环境 / 当前同步会话。
+ *
+ * @param {{nameOf:(id:string)=>string, getSelectionIds?:()=>string[]}} opt
  * @returns {{el:HTMLElement}}
  */
-export function buildShowPanel({ nameOf }) {
+export function buildShowPanel({ nameOf, getSelectionIds = null }) {
   const el = h('div');
   const resBox = h('div');
+  const state = { scope: 'selection' };
+
+  function selectionIds() {
+    if (!getSelectionIds) return [];
+    try {
+      const list = getSelectionIds();
+      return Array.isArray(list) ? list.filter(Boolean).map(String) : [];
+    } catch { return []; }
+  }
+
+  function scopeRow(onChange) {
+    const sel = h('select', {
+      onChange: (e) => { state.scope = e.target.value; onChange(); },
+    },
+      h('option', { value: 'selection', selected: state.scope === 'selection' }, '已选环境'),
+      h('option', { value: 'session', selected: state.scope === 'session' }, '当前同步会话'));
+    return h('div', { class: 'row', style: { marginBottom: '6px' } },
+      h('span', { class: 'muted small' }, '作用范围'), sel,
+      h('span', { class: 'muted small' }, state.scope === 'selection'
+        ? `已选 ${selectionIds().length} 个环境`
+        : '用当前同步会话里的窗口'));
+  }
 
   async function showAll() {
+    const ids = state.scope === 'selection' ? selectionIds() : null;
     try {
-      const r = await api.syncShow();
+      const r = await api.syncShow(ids || undefined);
       const s = r?.summary || {};
       toast(s.message || '已显示', s.failed ? 'bad' : '');
       /* page_only 那批：给一个**显式**的补救按钮。默认绝不做「最小化→恢复」（会闪任务栏），
@@ -157,7 +227,7 @@ export function buildShowPanel({ nameOf }) {
           ? h('div', { class: 'notice bad', style: { marginTop: '6px' } },
             h('strong', null, s.message),
             ...(s.details || []).map((x) => h('div', { class: 'muted small' },
-              `${nameOf(x.profile_id)}（${x.role === 'master' ? '主控' : '受控'}）：${x.reason || '没显示出来'}`)))
+              `${nameOf(x.profile_id)}（${roleLabel(x.role)}）：${x.reason || '没显示出来'}`)))
           : h('div', { class: 'muted small', style: { marginTop: '6px' } }, s.message),
         s.ok && s.page_only
           ? h('div', { class: 'notice warn', style: { marginTop: '6px' } },
@@ -195,7 +265,7 @@ export function buildShowPanel({ nameOf }) {
           ? h('div', { class: 'notice bad', style: { marginTop: '6px' } },
             h('strong', null, s.message),
             ...(s.details || []).map((x) => h('div', { class: 'muted small' },
-              `${nameOf(x.profile_id)}（${x.role === 'master' ? '主控' : '受控'}）：${x.reason || '未能确认'}`)))
+              `${nameOf(x.profile_id)}（${roleLabel(x.role)}）：${x.reason || '未能确认'}`)))
           : h('div', { class: 'muted small', style: { marginTop: '6px' } },
             `${s.message}。窗口已恢复正常显示；这一版确认不了它是否在最前面。`));
     } catch (e) {
@@ -204,10 +274,14 @@ export function buildShowPanel({ nameOf }) {
     }
   }
 
-  mount(el,
-    h('div', { class: 'row' },
-      h('button', { class: 'btn primary sm', onClick: showAll }, '显示窗口'),
-      h('span', { class: 'muted small' }, '恢复最小化的窗口，并把它放到前面')),
-    resBox);
-  return { el };
+  function paint() {
+    mount(el,
+      scopeRow(paint),
+      h('div', { class: 'row' },
+        h('button', { class: 'btn primary sm', onClick: showAll }, '显示窗口'),
+        h('span', { class: 'muted small' }, '恢复最小化的窗口，并把它放到前面')),
+      resBox);
+  }
+  paint();
+  return { el, refresh: paint };
 }
