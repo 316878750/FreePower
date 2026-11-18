@@ -105,7 +105,11 @@ export async function probeStartEgress(profile, { force = false, timeoutMs = PRO
       : cfg;
 
     const once = async () => {
-      if (!bound) return probeDirect({ url: EGRESS_PROBE_URL, timeoutMs });
+      if (!bound) {
+        const r = await probeDirect({ url: EGRESS_PROBE_URL, timeoutMs });
+        // 没绑代理时探测失败只可能是探测源/本机网络问题，不存在「代理不通」
+        return r.ok ? r : { ...r, kind: 'probe_site' };
+      }
       const r = await checkProxy(probeCfg, { url: EGRESS_PROBE_URL, timeoutMs });
       return r;
     };
@@ -138,6 +142,8 @@ export async function probeStartEgress(profile, { force = false, timeoutMs = PRO
       /** 试了几次（1 = 第一发就通） */
       attempts,
       proxy: meta,
+      /** 失败归类：`tcp`/`auth` = 代理不通；`target`/`probe_site` = 探测源不可用（起始页据此换文案） */
+      ...(raw.ok ? {} : { kind: raw.kind || 'probe_site' }),
       ...(raw.ok ? {} : { error: String(raw.error || '出口探测失败').slice(0, 400) }),
     };
     cache.set(id, { at: Date.now(), result });

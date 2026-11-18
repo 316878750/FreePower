@@ -135,6 +135,15 @@ function probeView(probe) {
       detail: `${probe.ip}${where ? ` · ${where}` : ''}`,
     };
   }
+  // 0.4.7.5 19:45：探测源挂了不许写成「代理未连通」——那是把「没验证成功」当「代理坏了」，
+  // 用户会去换一条本来好的代理（10056 就是这么被误判的：代理 748ms 通，ip-api 被限流）。
+  if (probe.kind === 'probe_site' || probe.kind === 'target') {
+    return {
+      cls: 'warn',
+      label: '探测源不可用',
+      detail: `不是代理不通：${String(probe.error || '出口探测源不可达').slice(0, 300)}`,
+    };
+  }
   return { cls: 'bad', label: '代理未连通', detail: String(probe.error || '出口探测失败') };
 }
 
@@ -184,6 +193,7 @@ export function renderStartHtml(profile, { probe = null } = {}) {
   .status .tag { flex: none; font-weight: 600; padding: 2px 10px; border-radius: 999px; font-size: 12px; }
   .status.ok .tag { background: #14361f; color: #6ee7a0; border: 1px solid #1f5c35; }
   .status.bad .tag { background: #3a1717; color: #ff9b9b; border: 1px solid #6b2323; }
+  .status.warn .tag { background: #3a2f14; color: #ffd68a; border: 1px solid #6b5a23; }
   .status.pending .tag { background: #23262f; color: #c3c9d8; border: 1px solid #333846; }
   .status .detail { color: #b9c0d0; font-size: 13px; word-break: break-all; }
   dl { display: grid; grid-template-columns: 104px 1fr; gap: 10px 16px; margin: 0; }
@@ -272,9 +282,11 @@ export function renderStartHtml(profile, { probe = null } = {}) {
       ipEl.textContent = p.ip || '—';
       metaEl.textContent = [p.country, p.city].filter(Boolean).join(' · ');
     } else {
-      statusBox.className = 'status bad';
-      tag.textContent = '代理未连通';
-      detail.textContent = p.error || '出口探测失败';
+      // 探测源不可用 ≠ 代理不通：文案分开，别让用户去换一条本来好的代理
+      var softProbe = p.kind === 'probe_site' || p.kind === 'target';
+      statusBox.className = 'status ' + (softProbe ? 'warn' : 'bad');
+      tag.textContent = softProbe ? '探测源不可用' : '代理未连通';
+      detail.textContent = (softProbe ? '不是代理不通：' : '') + (p.error || '出口探测失败');
       ipEl.textContent = '—';
       metaEl.textContent = '';
     }

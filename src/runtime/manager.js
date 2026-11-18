@@ -19,7 +19,7 @@ import { ensureNoiseSeeds } from '../fingerprint/seeds.js';
 import { checkProfile, markStatus, markLaunched, applyProfileFields, persistEgress, getProfile } from '../store/profiles.js';
 import { extensionsForProfile, rememberUniqueId } from '../store/extensions.js';
 import { loadUnpackedExtensions } from '../kernel/extensions.js';
-import { checkProxy, hasProxy, normalizeProxyConfig } from '../proxy/probe.js';
+import { checkProxy, hasProxy, isHardProxyFailure, normalizeProxyConfig } from '../proxy/probe.js';
 import { resolveChain, startChain } from '../proxy/chain.js';
 import { startRelay } from '../proxy/relay.js';
 // 环境 → 中继端口：起始页的出口探测要跟浏览器走**同一条链路**（0.4.7.5）
@@ -288,19 +288,32 @@ export async function startProfile(profile, { force = false, systemProxy = null 
         // 链式环境下这就是「整条链 + 目标」的端到端探测：探通即每一跳都通
         proxyCheck = await checkProxy(effectiveProxy, { url: EGRESS_PROBE_URL, timeoutMs: PROXY_PROBE_TIMEOUT_MS });
         if (!proxyCheck.ok) {
-          const hop = chainServer && chainServer.lastError ? chainServer.lastError.hop : undefined;
-          if (chainServer) { await chainServer.close().catch(() => {}); chainServer = null; }
-          log(id, '代理预检失败，拒绝启动', proxyCheck.error);
-          const err = new Error(`代理不可用，已阻止启动（fail-closed）：${proxyCheck.error}`);
-          err.code = 800003;
-          // 链式：那一跳是「连不上 / 认证失败」→ proxy_chain_hop_failed（带 hop 下标）；
-          // 单代理：保持原来的 proxy_unreachable
-          err.reason = chain.mode === 'chain' ? 'proxy_chain_hop_failed' : 'proxy_unreachable';
-          err.proxy_check = proxyCheck;
-          if (Number.isInteger(hop)) err.failed_hop = hop;
-          throw err;
+          if (!isHardProxyFailure(proxyCheck.kind)) {
+            /* 0.4.7.5 19:45：**探测源挂了 ≠ 代理不通**。
+             * 现场：10056 的代理单发 748ms 就通，但 ip-api.com 被我们打了几百次触发了限流
+             * （免费额度 45 次/分钟），启动被 fail-closed 拦住，报「代理不可用」。
+             * 现在只有 TCP 不通 / 握手被拒（认证失败）才拦；「所有探测源都不可达」只记一条
+             * `探测源不可用（不是代理不通）`，按「未验证」继续启动，起始页如实写。 */
+            log(id, 'WARN 探测源不可用（不是代理不通），按「未验证」继续启动', proxyCheck.error);
+            warnings.push(soft('proxy_probe_unavailable',
+              `探测源不可用（不是代理不通）：${proxyCheck.error}。已按「未验证」启动，`
+              + '起始页会显示「探测源不可用」；代理是否真能用，以页面实际打开为准'));
+          } else {
+            const hop = chainServer && chainServer.lastError ? chainServer.lastError.hop : undefined;
+            if (chainServer) { await chainServer.close().catch(() => {}); chainServer = null; }
+            log(id, '代理预检失败，拒绝启动', proxyCheck.error);
+            const err = new Error(`代理不可用，已阻止启动（fail-closed）：${proxyCheck.error}`);
+            err.code = 800003;
+            // 链式：那一跳是「连不上 / 认证失败」→ proxy_chain_hop_failed（带 hop 下标）；
+            // 单代理：保持原来的 proxy_unreachable
+            err.reason = chain.mode === 'chain' ? 'proxy_chain_hop_failed' : 'proxy_unreachable';
+            err.proxy_check = proxyCheck;
+            if (Number.isInteger(hop)) err.failed_hop = hop;
+            throw err;
+          }
+        } else {
+          log(id, '代理预检通过', `${proxyCheck.ip} ${proxyCheck.countryCode || ''} ${proxyCheck.latency_ms}ms`);
         }
-        log(id, '代理预检通过', `${proxyCheck.ip} ${proxyCheck.countryCode || ''} ${proxyCheck.latency_ms}ms`);
       }
     } else {
       warnings.push(soft('proxy', '未绑定代理：出口即本机 IP，跑真实账号请务必绑代理'));
@@ -556,8 +569,8 @@ export async function startProfile(profile, { force = false, systemProxy = null 
         const diag = egress.readyState || egress.finalUrl
           ? `（readyState=${egress.readyState || '?'} finalUrl=${egress.finalUrl || '?'} target=${String(egress.targetId || '?').slice(0, 8)}）`
           : '';
-        log(id, 'WARN 出口探测失败', `${egress.error || ''}${diag}`);
-        warnings.push(soft('ip', `浏览器出口探测失败：${egress.error || '未知原因'}${diag}`));
+        log(id, egress.kind === 'probe_site' ? 'WARN 出口探测源不可用（不是代理不通）' : 'WARN 出口探测失败', `${egress.error || ''}${diag}`);
+        warnings.push(soft('ip', `${egress.kind === 'probe_site' ? '出口探测源不可用（不是代理不通）' : '浏览器出口探测失败'}：${egress.error || '未知原因'}${diag}`));
       }
 
       // 6) 自检：在环境自己的页面里读回真实指纹，逐项对照声明值。

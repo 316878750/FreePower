@@ -92,17 +92,26 @@ async function probeOnce(client, { url, timeoutMs, onTarget }) {
       // blank-reload watcher 把在飞的导航顶掉了（`net::ERR_ABORTED`，`readyState=complete` +
       // `finalUrl=about:blank` 正是它的指纹）。HSTS/CONNECT 仍是**另一个独立可能**，但不再是主因；
       // 修法与回归见 src/runtime/manager.js 的 scheduleBlankReload 与 README 已知限制 37。
+      // 0.4.7.5 19:45：**区分「代理不通」与「探测源不可用」**。
+      // 落点是 chrome-error:// 才算这一跳（代理）出了问题；落在探测 URL 上却没内容、
+      // 或者还停在 about:blank，说明是探测目标/它上游不可达 —— 那是探测源的问题，
+      // 起始页与日志都不许写成「代理未连通」。
+      const onErrorPage = /^chrome-error:\/\//i.test(String(href || ''));
       return {
-        ok: false, url, error: '出口探测页没有内容（探测目标不可达或被拦截）',
+        ok: false, url,
+        kind: onErrorPage ? 'proxy' : 'probe_site',
+        error: onErrorPage
+          ? '出口探测页打不开（代理这一跳失败）'
+          : '出口探测页没有内容（探测源不可用，不是代理不通）',
         targetId, readyState: state || '(空)', finalUrl: href || '(空)',
       };
     }
     const info = parseExitInfo(text, url);
-    if (info.error) return { ok: false, url, error: info.error, raw: text.slice(0, 200) };
-    if (!info.ip) return { ok: false, url, error: `出口探测页不是预期格式：${text.slice(0, 120)}` };
+    if (info.error) return { ok: false, url, kind: 'probe_site', error: info.error, raw: text.slice(0, 200) };
+    if (!info.ip) return { ok: false, url, kind: 'probe_site', error: `出口探测页不是预期格式：${text.slice(0, 120)}` };
     return { ok: true, ...info, url };
   } catch (e) {
-    return { ok: false, url, error: e.message };
+    return { ok: false, url, kind: 'proxy', error: e.message };
   } finally {
     if (targetId) client.send('Target.closeTarget', { targetId }).catch(() => {});
   }

@@ -16,6 +16,35 @@ import { EGRESS_PROBE_URL, PROXY_PROBE_TIMEOUT_MS } from '../config.js';
 /** 主探测失败后的备用出口源（https 走 CONNECT + TLS） */
 const FALLBACK_PROBE_URLS = ['https://ipinfo.io/json'];
 
+/**
+ * 失败归类（0.4.7.5 19:45）—— 决定「能不能因为这一条就拒绝启动」。
+ *
+ * 现场：10056 的代理单发 748ms 就通，但启动被 fail-closed 拦住，理由是
+ * `代理不可用：http://ip-api.com/...`。真因是 ip-api.com 被我们打了几百次、
+ * 触发免费额度限流（45 次/分钟）——**探测源挂了，不是代理不通**。
+ *
+ * 所以失败必须分两类：
+ *   - 硬（`tcp` / `auth`）：TCP 连不上上游、SOCKS/HTTP 握手被拒（认证失败）→ 拒绝启动；
+ *   - 软（`target` / `probe_site`）：上游连不上目标、探测站 429/403/5xx、空 body、慢 →
+ *     **只说明「没验证成功」**，不许当成代理不通，更不能拦启动。
+ */
+export const PROBE_FAIL = {
+  TCP: 'tcp',
+  AUTH: 'auth',
+  TARGET: 'target',
+  PROBE_SITE: 'probe_site',
+};
+
+/** 硬失败：只有这两类才允许 fail-closed 拦启动 */
+export function isHardProxyFailure(kind) {
+  return kind === PROBE_FAIL.TCP || kind === PROBE_FAIL.AUTH;
+}
+
+function tagged(e, kind) {
+  if (e && typeof e === 'object') e.kind = kind;
+  return e;
+}
+
 export function normalizeProxyConfig(p = {}) {
   const raw = String(p.proxy_type || p.type || 'http').toLowerCase();
   const type = raw === 'socks' ? 'socks5' : raw === 'socks5h' ? 'socks5' : raw;
@@ -110,12 +139,12 @@ function connectTcp({ host, port, timeoutMs }) {
     const socket = net.connect({ host, port });
     const timer = setTimeout(() => {
       socket.destroy();
-      reject(new Error(`连接 ${host}:${port} 超时（${timeoutMs}ms）`));
+      reject(tagged(new Error(`连接 ${host}:${port} 超时（${timeoutMs}ms）`), PROBE_FAIL.TCP));
     }, timeoutMs);
     socket.once('connect', () => { clearTimeout(timer); socket.setNoDelay(true); resolve(socket); });
     socket.once('error', (e) => {
       clearTimeout(timer);
-      reject(new Error(`连接 ${host}:${port} 失败：${e.code || e.message}`));
+      reject(tagged(new Error(`连接 ${host}:${port} 失败：${e.code || e.message}`), PROBE_FAIL.TCP));
     });
   });
 }
@@ -140,15 +169,15 @@ async function socks5Handshake(reader, socket, proxy, { host, port }, timeoutMs)
   const withAuth = Boolean(proxy.username);
   socket.write(Buffer.from(withAuth ? [0x05, 0x02, 0x00, 0x02] : [0x05, 0x01, 0x00]));
   const [ver, method] = await need(reader, 2, timeoutMs, 'SOCKS5 握手');
-  if (ver !== 0x05) throw new Error(`SOCKS5 版本异常：${ver}`);
-  if (method === 0xff) throw new Error('SOCKS5 代理不接受任何认证方式');
+  if (ver !== 0x05) throw tagged(new Error(`SOCKS5 版本异常：${ver}`), PROBE_FAIL.AUTH);
+  if (method === 0xff) throw tagged(new Error('SOCKS5 代理不接受任何认证方式'), PROBE_FAIL.AUTH);
   if (method === 0x02) {
-    if (!withAuth) throw new Error('SOCKS5 代理要求用户名密码，但配置里没有');
+    if (!withAuth) throw tagged(new Error('SOCKS5 代理要求用户名密码，但配置里没有'), PROBE_FAIL.AUTH);
     const u = Buffer.from(proxy.username, 'utf8');
     const p = Buffer.from(proxy.password || '', 'utf8');
     socket.write(Buffer.concat([Buffer.from([0x01, u.length]), u, Buffer.from([p.length]), p]));
     const [, status] = await need(reader, 2, timeoutMs, 'SOCKS5 认证');
-    if (status !== 0x00) throw new Error('SOCKS5 用户名密码认证失败');
+    if (status !== 0x00) throw tagged(new Error('SOCKS5 用户名密码认证失败'), PROBE_FAIL.AUTH);
   }
 
   const name = Buffer.from(host, 'utf8');
@@ -157,7 +186,8 @@ async function socks5Handshake(reader, socket, proxy, { host, port }, timeoutMs)
   socket.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x03, name.length]), name, portBuf]));
 
   const head = await need(reader, 4, timeoutMs, 'SOCKS5 CONNECT 响应');
-  if (head[1] !== 0x00) throw new Error(`SOCKS5 CONNECT 被拒绝（code ${head[1]}）`);
+  // 上游连不上目标（拒绝/不可达）是**软失败**：探测站打不开，不等于代理挂了
+  if (head[1] !== 0x00) throw tagged(new Error(`SOCKS5 CONNECT 被拒绝（code ${head[1]}）`), PROBE_FAIL.TARGET);
   const atyp = head[3];
   if (atyp === 0x01) await need(reader, 4 + 2, timeoutMs, 'SOCKS5 绑定地址');
   else if (atyp === 0x04) await need(reader, 16 + 2, timeoutMs, 'SOCKS5 绑定地址');
@@ -210,6 +240,15 @@ async function readHttpResponse(reader, timeoutMs) {
   return { status, statusLine, headers, body: body.toString('utf8') };
 }
 
+/** 读响应失败 = 探测站的问题（软失败），不是代理不通 */
+async function readResponse(reader, timeoutMs) {
+  try {
+    return await readHttpResponse(reader, timeoutMs);
+  } catch (e) {
+    throw tagged(e, PROBE_FAIL.PROBE_SITE);
+  }
+}
+
 /**
  * 通过代理发一个 GET（明文 HTTP 走 absolute-form，HTTPS 走 CONNECT + TLS）。
  * @returns {Promise<{status:number, headers:object, body:string}>}
@@ -238,18 +277,19 @@ export async function httpGetViaProxy(proxyRaw, rawUrl, { timeoutMs = PROXY_PROB
     if (secure) {
       const rest = reader.detach();
       if (rest.length) socket.unshift(rest);
-      socket = await tlsUpgrade(socket, host, timeoutMs);
+      socket = await tlsUpgrade(socket, host, timeoutMs).catch((e) => { throw tagged(e, PROBE_FAIL.PROBE_SITE); });
       reader = new Reader(socket);
     }
     socket.write(`GET ${target} HTTP/1.1\r\nHost: ${u.host}\r\n${commonHeaders}Connection: close\r\n\r\n`);
-    return readHttpResponse(reader, timeoutMs);
+    return readResponse(reader, timeoutMs);
   }
 
   // HTTP / HTTPS 代理
   if (proxy.type === 'https') {
     const raw = await connectTcp({ host: proxy.host, port: proxy.port, timeoutMs });
     raw.removeAllListeners('error');
-    socket = await tlsUpgrade(raw, proxy.host, timeoutMs);
+    // TLS 到**代理本身**失败 = 代理这一跳不通（硬失败）
+    socket = await tlsUpgrade(raw, proxy.host, timeoutMs).catch((e) => { throw tagged(e, PROBE_FAIL.TCP); });
   } else {
     socket = await connectTcp({ host: proxy.host, port: proxy.port, timeoutMs });
   }
@@ -258,22 +298,27 @@ export async function httpGetViaProxy(proxyRaw, rawUrl, { timeoutMs = PROXY_PROB
   if (secure) {
     if (proxy.type === 'https') throw new Error('https 代理 + https 目标暂不支持（TLS in TLS）');
     socket.write(`CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\n${authHeader}\r\n`);
-    const headBuf = await reader.readUntil('\r\n\r\n', timeoutMs, 'CONNECT 响应');
+    const headBuf = await reader.readUntil('\r\n\r\n', timeoutMs, 'CONNECT 响应').catch((e) => { throw tagged(e, PROBE_FAIL.TARGET); });
     const { status, statusLine } = parseHeaders(headBuf.toString('latin1'));
-    if (status !== 200) throw new Error(`代理拒绝 CONNECT：${statusLine}`);
+    if (status !== 200) {
+      throw tagged(
+        new Error(`代理拒绝 CONNECT：${statusLine}`),
+        status === 407 ? PROBE_FAIL.AUTH : PROBE_FAIL.TARGET,
+      );
+    }
     const rest = reader.detach();
     if (rest.length) socket.unshift(rest);
-    socket = await tlsUpgrade(socket, host, timeoutMs);
+    socket = await tlsUpgrade(socket, host, timeoutMs).catch((e) => { throw tagged(e, PROBE_FAIL.PROBE_SITE); });
     reader = new Reader(socket);
     socket.write(`GET ${target} HTTP/1.1\r\nHost: ${u.host}\r\n${commonHeaders}Connection: close\r\n\r\n`);
-    return readHttpResponse(reader, timeoutMs);
+    return readResponse(reader, timeoutMs);
   }
 
   // 明文目标：absolute-form，HTTP/HTTPS 代理都吃这套
   socket.write(
     `GET ${u.href} HTTP/1.1\r\nHost: ${u.host}\r\n${authHeader}${commonHeaders}Connection: close\r\n\r\n`,
   );
-  return readHttpResponse(reader, timeoutMs);
+  return readResponse(reader, timeoutMs);
 }
 
 /* --------------------------- 出口信息 --------------------------- */
@@ -303,9 +348,13 @@ export function parseExitInfo(body, sourceUrl = '') {
 }
 
 /**
- * 代理预检。**这是 fail-closed 的判定点**：返回 ok:false 时上层必须拒绝启动。
+ * 代理预检。返回 ok:false 时**先看 `kind`**：
+ *   - `tcp` / `auth`（`isHardProxyFailure(kind) === true`）→ 上层必须拒绝启动（fail-closed）；
+ *   - `target` / `probe_site` → **探测源的问题**，只说明「没验证成功」，不许拦启动，
+ *     起始页要如实写「探测源不可用」，别写成「代理未连通」（0.4.7.5 19:45）。
  * @returns {Promise<{ok:boolean, ip?:string, country?:string, countryCode?:string, city?:string,
  *   timezone?:string, isp?:string, latency_ms:number, probe_url?:string, error?:string,
+ *   kind?:'tcp'|'auth'|'target'|'probe_site', attempts?:Array<{url:string, kind:string, message:string}>,
  *   proxy:{type:string, host:string, port:number}}>}
  */
 export async function checkProxy(proxyRaw, {
@@ -316,28 +365,41 @@ export async function checkProxy(proxyRaw, {
   const proxy = normalizeProxyConfig(proxyRaw);
   const meta = { type: proxy.type, host: proxy.host, port: proxy.port };
   const t0 = Date.now();
-  if (!hasProxy(proxy)) return { ok: false, error: '代理配置不完整（host/port 为空）', latency_ms: 0, proxy: meta };
+  if (!hasProxy(proxy)) return { ok: false, kind: PROBE_FAIL.TCP, error: '代理配置不完整（host/port 为空）', latency_ms: 0, proxy: meta };
   if (!['http', 'https', 'socks5'].includes(proxy.type)) {
-    return { ok: false, error: `不支持的代理类型：${proxy.type}（只支持 http/https/socks5）`, latency_ms: 0, proxy: meta };
+    return { ok: false, kind: PROBE_FAIL.TCP, error: `不支持的代理类型：${proxy.type}（只支持 http/https/socks5）`, latency_ms: 0, proxy: meta };
   }
 
   const attempts = [];
+  const kinds = [];
   for (const u of [url, ...fallbackUrls.filter((x) => x !== url)]) {
     try {
       const res = await httpGetViaProxy(proxy, u, { timeoutMs });
-      if (res.status === 407) { attempts.push(`${u} → 407 认证失败`); continue; }
-      if (res.status !== 200) { attempts.push(`${u} → HTTP ${res.status}`); continue; }
+      if (res.status === 407) { attempts.push(`${u} → 407 认证失败`); kinds.push(PROBE_FAIL.AUTH); continue; }
+      if (res.status !== 200) { attempts.push(`${u} → HTTP ${res.status}`); kinds.push(PROBE_FAIL.PROBE_SITE); continue; }
       const info = parseExitInfo(res.body, u);
-      if (info.error) { attempts.push(`${u} → ${info.error}`); continue; }
-      if (!info.ip) { attempts.push(`${u} → 响应里没有 IP`); continue; }
-      return { ok: true, ...info, latency_ms: Date.now() - t0, proxy: meta };
+      if (info.error) { attempts.push(`${u} → ${info.error}`); kinds.push(PROBE_FAIL.PROBE_SITE); continue; }
+      if (!info.ip) { attempts.push(`${u} → 响应里没有 IP`); kinds.push(PROBE_FAIL.PROBE_SITE); continue; }
+      return { ok: true, ...info, latency_ms: Date.now() - t0, probe_url: u, proxy: meta };
     } catch (e) {
+      const kind = isHardProxyFailure(e?.kind) ? e.kind : (e?.kind || PROBE_FAIL.PROBE_SITE);
       attempts.push(`${u} → ${e.message}`);
+      kinds.push(kind);
     }
   }
+
+  const hard = kinds.find((k) => isHardProxyFailure(k)) || null;
+  // 全是软失败时保留具体归类（target / probe_site）：起始页与日志据此说清是哪一类，
+  // 但两者都不拦启动。两种软失败混在一起才收敛成 probe_site。
+  const softKinds = [...new Set(kinds.filter((k) => !isHardProxyFailure(k)))];
+  const kind = hard || (softKinds.length === 1 ? softKinds[0] : PROBE_FAIL.PROBE_SITE);
   return {
     ok: false,
-    error: `代理不可用：${attempts.join(' | ')}`,
+    kind,
+    error: hard
+      ? `代理不可用：${attempts.join(' | ')}`
+      : `探测源不可用（不是代理不通）：${attempts.join(' | ')}`,
+    attempts: attempts.map((message, i) => ({ url: [url, ...fallbackUrls.filter((x) => x !== url)][i], kind: kinds[i], message })),
     latency_ms: Date.now() - t0,
     proxy: meta,
   };
