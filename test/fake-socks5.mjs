@@ -51,6 +51,9 @@ function readExactly(socket, state, n) {
  * @param {number} opt.handshakeConcurrency 同时处理几个握手；传有限值就**串行排队**（0.4.7.5 用）
  * @param {number} opt.handshakeMs 每个握手占用的时间（模拟远端代理的握手成本）
  * @param {boolean} opt.sink true = 回 OK 后不真拨目标、数据全丢（只数域名，0.4.7.5 用）
+ * @param {(host:string, port:number)=>boolean} opt.sinkWhen 只对命中的目标走 sink（其余真拨）。
+ *        全链路判据用它兜住 Chrome 那几条关不掉的后台请求：它们回 OK 后丢弃，
+ *        中继侧仍算「隧道建成」，`tunnels === connections` 才不会被后台域名打红。
  * @param {number} opt.failFirstN 前 N 个握手回 REP_FAIL（验退避重试真的重试了）
  * @param {number} opt.port 指定监听端口（0 = 系统分配）；「稍后再起来」的重试判据要它
  */
@@ -62,6 +65,7 @@ export function startFakeSocks5({
   handshakeConcurrency = Infinity,
   handshakeMs = 0,
   sink = false,
+  sinkWhen = null,
   capture = false,
   failFirstN = 0,
   port = 0,
@@ -180,7 +184,7 @@ export function startFakeSocks5({
     stats.handshakes += 1;
 
     // sink：只数域名，不真拨目标（0.4.7.5 数「Chrome 想连哪些域名」用）
-    if (sink) {
+    if (sink || (sinkWhen && sinkWhen(host, port))) {
       rec.status = 'sink';
       connects.push({ host, port, status: 'sink' });
       client.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));

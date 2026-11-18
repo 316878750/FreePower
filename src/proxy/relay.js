@@ -109,13 +109,13 @@ const REP_CMD_UNSUPPORTED = 0x07;
 
 /** 读 socket 的小工具：按需拿够 N 字节，多余字节留在缓冲里（之后交给裸 pipe） */
 class Reader {
-  constructor(socket) {
+  constructor(socket, { closeCode = 'ERR_STREAM_CLOSED' } = {}) {
     this.socket = socket;
     this.buf = Buffer.alloc(0);
     this.error = null;
     this.waiters = new Set();
     this.onData = (c) => { this.buf = Buffer.concat([this.buf, c]); this.wake(); };
-    this.onClose = () => { this.error = this.error || new Error('连接被对端关闭'); this.wake(); };
+    this.onClose = () => { this.error = this.error || Object.assign(new Error('连接被对端关闭'), { code: closeCode }); this.wake(); };
     this.onErr = (e) => { this.error = e; this.wake(); };
     socket.on('data', this.onData);
     socket.on('close', this.onClose);
@@ -473,6 +473,8 @@ export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, con
       dial_attempts_max: 0,
       /** 拨号失败原因分类计数（timeout / ECONNRESET / ECONNREFUSED / ...） */
       dial_fail_kinds: {},
+      /** 浏览器自己关掉的预连接（还没拨上游就 RST）——不是链路失败，单独记 */
+      client_closed: 0,
       /** 上游拨号：尝试次数（累计）与其中重试次数 */
       dial_attempts: 0,
       dial_retries: 0,
@@ -517,7 +519,7 @@ export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, con
 }
 
 async function handleClient(client, upstream, state, timeoutMs) {
-  const rd = new Reader(client);
+  const rd = new Reader(client, { closeCode: 'ERR_CLIENT_CLOSED' });
   let upstreamSock = null;
   try {
     // ① 问候：只提供 no-auth（浏览器侧不需要认证 —— 凭据是我们的，不是它的）
@@ -574,7 +576,14 @@ async function handleClient(client, upstream, state, timeoutMs) {
     relay(client, upstreamSock);
   } catch (e) {
     state.lastError = e;
-    state.stats.failed += 1;
+    /* 浏览器自己关掉的**预连接**不是链路失败：Chrome 启动/导航时会开几条 speculative socket
+     * 再丢掉（真内核实测 13 条里 2–3 条如此，`read ECONNRESET`）。把它们算进 `failed`，
+     * 「链路健康」就永远不干净 —— 全链路判据（test/relay-e2e-kernel.test.mjs）会假红。
+     * 判据口径因此是：`tunnels + client_closed === connections` 且 `failed === 0`。 */
+    const clientGone = !upstreamSock
+      && (e?.code === 'ERR_CLIENT_CLOSED' || e?.code === 'ECONNRESET' || e?.code === 'EPIPE' || e?.code === 'ERR_STREAM_DESTROYED');
+    if (clientGone) state.stats.client_closed += 1;
+    else state.stats.failed += 1;
     // 拨号超时单独计数：`queue_timeout` 是排队，不能混进来（0.4.7.5 18:40）
     if (e?.reason === 'timeout' || e?.code === 'ETIMEDOUT') state.stats.dial_timeout += 1;
     try { client.write(reply(repFor(e))); } catch { /* 已经断了 */ }
