@@ -28,6 +28,8 @@
  *   --keep           跑完保留临时数据目录（排障用；默认删除）
  *
  * 重要：
+ *   - **单发判别器**（0.4.7.5 19:45）：每个环境启动前先直连上游探**一次**（不并发、不经中继），
+ *     归类以它为准 —— 单发通而产品里不通，绝不归「代理」（今天三个环境就是这么被误判的）；
  *   - 只读用户库副本，**不碰** `%APPDATA%\FreePower`；所有运行数据落在 `.tmp/sweep-data-*`；
  *   - 凭据只用于建立代理，不打印、不写进 JSON / Markdown（表里只有 host:port）；
  *   - 需要完整权限（沙箱会挡 Chrome 命名管道，内核起不来）。
@@ -131,6 +133,9 @@ const skipped = (v) => args.skip.includes(String(v));
 let entries = healthy
   .map((s) => {
     const r = byNo.get(String(s.no));
+    /** 库里那份代理配置（含凭据，只留在内存里；打印只出 host:port） */
+    let cfg = null;
+    try { cfg = r?.user_proxy_config ? JSON.parse(r.user_proxy_config) : null; } catch { cfg = null; }
     return {
       no: s.no,
       id: r?.id || null,
@@ -139,6 +144,7 @@ let entries = healthy
       port: Number(s.port),
       type: s.type || 'socks5',
       expectIp: s.expectIp || s.egress || null,
+      cfg,
       open_urls: r?.open_urls || null,
       in_db: Boolean(r),
     };
@@ -164,6 +170,8 @@ const { createApiServer } = await import('../src/api/server.js');
 const { CdpClient } = await import('../src/kernel/cdp.js');
 const { setStartPagePort } = await import('../src/start/page.js');
 const manager = await import('../src/runtime/manager.js');
+/** 单发判别器（0.4.7.5 19:45）：产品里不通 ≠ 代理不通，必须先单发探一次再归类 */
+const { checkProxy, isHardProxyFailure } = await import('../src/proxy/probe.js');
 
 const { server, apiKey } = createApiServer();
 const port = await new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
@@ -331,14 +339,21 @@ async function probeSite(c, targetId, sessionId, site, waitMs) {
   return rec;
 }
 
-/* 4. 失败归类（三类 + 我核不了；不猜） */
+/* 4. 失败归类（单发判别器 + 三类 + 我核不了；不猜）
+ *
+ * 0.4.7.5 19:45 的教训：**产品里打不开 ≠ 代理不通**。当时 3 个环境全被我归成「代理」，
+ * 而 CEO 单发探同一台代理 649ms / 748ms 就通 —— 真因是中继把槽位占死了（max_dial_ms=60015）。
+ * 所以归类必须以「单发 TCP/checkProxy 通不通」为判别器：
+ *   - 单发都不通且是 TCP/认证失败 → `代理`
+ *   - 单发都不通但只是探测源不可用（软失败）→ `我核不了`（判不了代理好坏）
+ *   - 单发通、产品里不通 → **不许归代理**：有中继证据归 `中继`，否则归 `产品`
+ */
 function verdictOf(run) {
-  if (run.start_error) {
-    if (run.proxy_check && run.proxy_check.ok === false) return '代理';
-    return '我核不了';
+  const single = run.single;
+  if (single && single.ok === false) {
+    return isHardProxyFailure(single.kind) ? '代理' : '我核不了';
   }
-  if (run.proxy && run.proxy.ok === false) return '代理';
-  if (run.egress && run.egress.ok === false) return '代理';
+  if (run.start_error) return '产品';
   const st = run.relay || {};
   const q = Number(st.queue_timeout) || 0;
   const d = Number(st.dial_timeout) || 0;
@@ -347,27 +362,34 @@ function verdictOf(run) {
   if ((q > 0 || d > 0) && tun < conn / 2) return '中继';
   if (run.sites.length === SITES.length && run.sites.every((s) => s.label === '过')) return '过';
   if (run.sites.some((s) => s.blocked)) return '指纹';
-  return '我核不了';
+  // 页面有内容但标题不符（改版/被换页）：算指纹类，不算「核不了」
+  if (run.sites.some((s) => !s.chrome_error && String(s.body || '').trim())) return '指纹';
+  return '产品';
 }
 
 function noteOf(run, verdict) {
   if (verdict === '过') return '';
-  if (run.start_error) return `启动失败：${String(run.start_error).replace(/\s+/g, ' ').slice(0, 100)}`;
+  const one = run.single
+    ? `单发 ${run.single.ok ? '通' : '不通'} ${run.single.latency_ms || 0}ms${run.single.ok ? ` 出口 ${run.single.ip || '?'}` : `（${run.single.kind || '?'}）`}`
+    : '单发未跑';
+  if (run.start_error) return `启动失败：${String(run.start_error).replace(/\s+/g, ' ').slice(0, 90)}；${one}`;
   if (verdict === '代理') {
-    if (run.proxy && run.proxy.ok === false) return `代理预检失败：${String(run.proxy.error || '').slice(0, 50)}`;
-    if (run.egress && run.egress.ok === false) return `出口探测失败：${String(run.egress.error || '').slice(0, 50)}`;
-    return '代理不可用';
+    return `${one}；${String(run.single?.error || run.proxy?.error || run.egress?.error || '').slice(0, 60)}`;
   }
   if (verdict === '中继') {
     const st = run.relay || {};
-    return `queue_timeout=${st.queue_timeout || 0} dial_timeout=${st.dial_timeout || 0} tunnels=${st.tunnels || 0}/${st.connections || 0}`;
+    return `${one}；queue_timeout=${st.queue_timeout || 0} dial_timeout=${st.dial_timeout || 0} tunnels=${st.tunnels || 0}/${st.connections || 0}`;
   }
   if (verdict === '指纹') {
-    const bad = run.sites.find((s) => s.blocked);
-    return bad ? `${bad.label}（${bad.title || '无标题'}）` : '';
+    const bad = run.sites.find((s) => s.blocked) || run.sites.find((s) => s.label !== '过');
+    return `${one}；${bad ? `${bad.label}（${bad.title || '无标题'}）` : ''}`;
+  }
+  if (verdict === '产品') {
+    const bad = run.sites.filter((s) => s.label !== '过').map((s) => `${s.label}`);
+    return `${one}；页面未通过：${bad.join(' / ') || '无站点读数'}`;
   }
   const bad = run.sites.filter((s) => s.label !== '过').map((s) => `${s.label}`);
-  return bad.length ? `未命中三类：${bad.join(' / ')}` : '未命中三类';
+  return `${one}；未命中三类：${bad.join(' / ') || '无站点读数'}`;
 }
 
 /* 5. 输出目录 */
@@ -404,6 +426,8 @@ for (let i = 0; i < entries.length; i += 1) {
     start_ms: 0,
     start_ok: false,
     start_error: null,
+    /** 单发判别（直连上游、不经中继、不并发）—— 归类的第一依据 */
+    single: null,
     proxy_check: null,
     egress: null,
     relay: null,
@@ -439,6 +463,22 @@ for (let i = 0; i < entries.length; i += 1) {
 
   let cdp = null;
   try {
+    // 单发判别器（0.4.7.5 19:45）：不并发、不经中继，直连上游探**一次**。
+    // 产品里不通时用它回答「是代理坏了，还是我们自己坏了」—— 今天就是没这一步，
+    // 三个环境全被误判成「代理」，差点把方向定反。
+    run.single = null;
+    if (e.cfg) {
+      const t1 = Date.now();
+      try {
+        run.single = await checkProxy(e.cfg, { timeoutMs: 30000 });
+      } catch (err) {
+        run.single = { ok: false, kind: 'tcp', error: err.message, latency_ms: Date.now() - t1 };
+      }
+      console.log(`${tag} 单发判别：${run.single.ok
+        ? `通 ${run.single.latency_ms}ms 出口 ${run.single.ip || '?'}`
+        : `不通 ${run.single.kind || '?'} ${String(run.single.error || '').slice(0, 70)}`}`);
+    }
+
     const t0 = Date.now();
     const started = await api('GET', `/api/v2/browser-profile/start?profile_id=${encodeURIComponent(e.id)}`);
     run.start_ms = Date.now() - t0;
@@ -506,7 +546,7 @@ const residual = await localActive();
 await manager.stopAll().catch(() => {});
 const finishedAt = new Date().toISOString();
 
-const summary = { total: results.length, pass: 0, fail: 0, by_reason: { 代理: 0, 中继: 0, 指纹: 0, 我核不了: 0 } };
+const summary = { total: results.length, pass: 0, fail: 0, by_reason: { 代理: 0, 中继: 0, 指纹: 0, 产品: 0, 我核不了: 0 } };
 for (const r of results) {
   if (r.verdict === '过') summary.pass += 1;
   else { summary.fail += 1; summary.by_reason[r.verdict] = (summary.by_reason[r.verdict] || 0) + 1; }
@@ -529,24 +569,31 @@ md.push(`# FreePower 指纹扫描（本机时间 ${fmtLocal(startedAt)} → ${fm
 md.push('');
 md.push(`- 环境库：\`${dbSrc}\`；健康代理清单：\`${sweepSrc}\``);
 md.push(`- 口径：串行、一次一个；每站最多等 ${(args.wait / 1000).toFixed(0)}s；共 ${results.length} 个`);
-md.push(`- 汇总：**过 ${summary.pass} / 不过 ${summary.fail}**（代理 ${summary.by_reason['代理'] || 0} · 中继 ${summary.by_reason['中继'] || 0} · 指纹 ${summary.by_reason['指纹'] || 0} · 我核不了 ${summary.by_reason['我核不了'] || 0}）`);
+md.push(`- 汇总：**过 ${summary.pass} / 不过 ${summary.fail}**（代理 ${summary.by_reason['代理'] || 0} · 中继 ${summary.by_reason['中继'] || 0} · 指纹 ${summary.by_reason['指纹'] || 0} · 产品 ${summary.by_reason['产品'] || 0} · 我核不了 ${summary.by_reason['我核不了'] || 0}）`);
 md.push(`- 残留运行环境：${residual.length ? residual.map((x) => x.profile_id).join(', ') : '0（全部确认退出）'}`);
 md.push('');
-md.push('| # | 环境 id | 名字 | 代理 | 站1 defi.xstocks.fi/points | 站2 app.startale.com | 耗时 | 失败归类 | 备注 |');
-md.push('|---|---|---|---|---|---|---|---|---|');
+md.push('| # | 环境 id | 名字 | 代理 | 单发判别 | 站1 defi.xstocks.fi/points | 站2 app.startale.com | 耗时 | 失败归类 | 备注 |');
+md.push('|---|---|---|---|---|---|---|---|---|---|');
 for (const r of results) {
   const id = r.profile_id ? `${String(r.profile_id).slice(0, 8)}…` : '-';
   const s1 = r.sites[0] ? siteCell(r.sites[0]) : (r.start_error ? '未测' : '-');
   const s2 = r.sites[1] ? siteCell(r.sites[1]) : (r.start_error ? '未测' : '-');
-  md.push(`| ${r.index} | ${id} | ${r.name} | ${r.proxy} | ${s1} | ${s2} | ${(r.total_ms / 1000).toFixed(1)}s | ${r.verdict} | ${r.note || ''} |`);
+  const one = r.single
+    ? (r.single.ok ? `通 ${r.single.latency_ms}ms` : `不通（${r.single.kind || '?'}）`)
+    : '未跑';
+  md.push(`| ${r.index} | ${id} | ${r.name} | ${r.proxy} | ${one} | ${s1} | ${s2} | ${(r.total_ms / 1000).toFixed(1)}s | ${r.verdict} | ${r.note || ''} |`);
 }
 md.push('');
-md.push('> 归类口径：`代理` = TCP 到上游不通 / 起始页出口 IP 探测失败；`中继` = 上游能连但 `queue_timeout`/`dial_timeout` 且隧道数 < 连接数一半；`指纹` = 页面通了但被拦（验证码/风控页/标题不符）；判不了写 `我核不了`。');
+md.push('> 归类口径：**判别器是「单发 checkProxy 通不通」**（不并发、不经中继、只探一次）。'
+  + '`代理` = 单发就 TCP 不通 / 握手被拒（认证失败）；单发通而产品里不通 → **不许归代理**：'
+  + '`中继` = 中继读数里 `queue_timeout`/`dial_timeout` 且隧道数 < 连接数一半；'
+  + '`产品` = 单发通、页面仍打不开且没有中继证据；`指纹` = 页面通了但被拦（验证码/风控页/标题不符）；'
+  + '单发不通但只是探测源不可用（软失败）→ `我核不了`，不猜。');
 /* 表格带 BOM：Windows 记事本 / Excel / PowerShell 默认编码都能直接读对中文 */
 fs.writeFileSync(path.join(outDir, 'sweep.md'), `\uFEFF${md.join('\n')}\n`, 'utf8');
 
 console.log('=== 汇总 ===');
-console.log(`过 ${summary.pass} / 不过 ${summary.fail}（代理 ${summary.by_reason['代理'] || 0} / 中继 ${summary.by_reason['中继'] || 0} / 指纹 ${summary.by_reason['指纹'] || 0} / 我核不了 ${summary.by_reason['我核不了'] || 0}）`);
+console.log(`过 ${summary.pass} / 不过 ${summary.fail}（代理 ${summary.by_reason['代理'] || 0} / 中继 ${summary.by_reason['中继'] || 0} / 指纹 ${summary.by_reason['指纹'] || 0} / 产品 ${summary.by_reason['产品'] || 0} / 我核不了 ${summary.by_reason['我核不了'] || 0}）`);
 console.log(`残留运行环境：${residual.length}`);
 console.log(`JSON：${path.join(outDir, 'sweep.json')}`);
 console.log(`表格：${path.join(outDir, 'sweep.md')}`);
