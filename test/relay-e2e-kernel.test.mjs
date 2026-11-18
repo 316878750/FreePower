@@ -109,8 +109,8 @@ const relay = await startRelay(
     concurrency: Number(process.env.E2E_RELAY_CONCURRENCY || 8),
     // 压小排队窗口：槽位一旦被别的阶段占住，这里会立刻暴露成 queue_timeout（红判据靠它）
     queueTimeoutMs: 2000,
-    dialAttemptMs: 8000,
-    dialBudgetMs: 20000,
+    dialAttemptMs: 21000,
+    dialBudgetMs: 45000,
     dialAttempts: 2,
   },
 );

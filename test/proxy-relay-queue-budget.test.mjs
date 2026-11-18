@@ -87,8 +87,8 @@ try {
     check('① 默认并发 = 8（旧版 4 会把 29 条连接排到 7 分钟）', st.concurrency === 8, `concurrency=${st.concurrency}`);
     check('① 默认排队上限 = 20000ms（独立于拨号预算；19:45 由 45s 收到 20s）', st.queue_timeout_ms === 20000, `queue_timeout_ms=${st.queue_timeout_ms}`);
     check('① 默认拨号+握手预算 = 60000ms', st.timeout_ms === 60000, `timeout_ms=${st.timeout_ms}`);
-    check('① 默认单次拨号 8s / 单连接总预算 20s / 最多 2 次',
-      st.dial_attempt_ms === 8000 && st.dial_budget_ms === 20000 && st.dial_attempts_max === 2,
+    check('① 默认单次拨号 21s / 单连接总预算 45s / 最多 2 次（TCP 重传 1s/3s/7s/15s 要跑完）',
+      st.dial_attempt_ms === 21000 && st.dial_budget_ms === 45000 && st.dial_attempts_max === 2,
       `dial_attempt_ms=${st.dial_attempt_ms} budget=${st.dial_budget_ms} max=${st.dial_attempts_max}`);
     check('① 两个超时计数初始为 0、max_queue_wait_ms 有初值',
       st.queue_timeout === 0 && st.dial_timeout === 0 && st.max_queue_wait_ms === 0,

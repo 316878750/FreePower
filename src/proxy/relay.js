@@ -50,8 +50,8 @@ const DEFAULT_TIMEOUT_MS = 60000;
  * 说明 8 这个档位在「别把上游打满」与「别把自己排死」之间更合理。
  * 可用 `FREEPOWER_RELAY_CONCURRENCY` 覆盖。
  *
- * 槽位只覆盖「拨号 + 握手」这一段，隧道建好立刻释放 —— 长连接不占槽，
- * 否则一个开着 6 个标签页的环境会把槽全占死。
+ * 槽位只覆盖「**一次拨号**」这一段，拨完立刻释放 —— 长连接不占槽、慢握手不占槽，
+ * 否则一个开着 6 个标签页的环境（或一个慢上游）会把槽全占死。
  */
 const DEFAULT_CONCURRENCY = Number(process.env.FREEPOWER_RELAY_CONCURRENCY || 8) || 8;
 /**
@@ -61,30 +61,30 @@ const DEFAULT_CONCURRENCY = Number(process.env.FREEPOWER_RELAY_CONCURRENCY || 8)
  * 不能拿拨号预算去付 —— 否则排队久的连接还没拨就超时，日志里只剩 `queue_timeout`，
  * 看起来像上游挂了，其实是自己被队列饿死。排队超时单独计数。
  *
- * 20s 的依据：单连接拨号总预算已经是 20s（8s × 最多 2 次），排到 20s 还没轮到，
+ * 20s 的依据：单连接拨号总预算现在是 45s（21s × 最多 2 次），排到 20s 还没轮到，
  * 说明这一波窗口已经过去了 —— 与其挂着，不如快点失败让 Chrome 重连（它自己会重试）。
  * 可用 `FREEPOWER_RELAY_QUEUE_TIMEOUT_MS` 覆盖（判据用它把窗口压小）。
  */
 const DEFAULT_QUEUE_TIMEOUT_MS = Number(process.env.FREEPOWER_RELAY_QUEUE_TIMEOUT_MS || 20000) || 20000;
 /**
- * 单次拨号超时、单连接拨号总预算、最多试几次（0.4.7.5 19:45，CEO 定的口径）。
+ * 单次拨号超时、单连接拨号总预算、最多试几次。
  *
- * 为什么从「21s × 3 次」改成「8s × 2 次、总 20s」：
- *   - 21s 是 Windows 上 SYN 被丢时 `connect` 报 ETIMEDOUT 的时间，但它只在**上游真丢包**
- *     时才该发生；同一台代理单发实测 649ms / 748ms 就通 —— 我们看到的 60s 是**自己**造成的。
- *   - 一条连接最坏 21s × 3 = 63s，而槽位只有 8 个：8 个槽全卡在重试里 60 秒，
- *     Chrome 后面 18 条连接全在排队，页面 45 秒超时。实测 `max_dial_ms=60015`、
- *     `dial_attempts=51` 就是这条链路的指纹。
- *   - 失败要**快**：8s 一次、最多 2 次、总预算 20s；而且**失败立刻还槽位**（见 dialUpstream，
- *     槽位是公共资源，重试期间不许占着）。旧版 10s / 不重试 / 无界反而能开页面 ——
- *     因为它失败得快、槽位流转快，剩下的交给 Chrome 自己重连。
+ * 2026-11-18 21:40 更正（CEO 在干净代理 10057 上直接量了上游端口的建连行为）：
+ *   - **上游在丢 SYN，TCP 自己在重传**（1s / 3s / 7s / 15s）。成功耗时实测：
+ *     120ms / 3.2s / 4.3s / **15.2s**。
+ *   - 8s 超时正好砍掉 15s 那次重传：并发 1 时 8 次里 4 次被误杀；**21s 下并发 1 / 8 都 8/8 通**。
+ *   - 所以 8s 是错的（上一版的口径），21s 才能把 TCP 自己的恢复机制跑完。
+ *     并发不是瓶颈（21s 下并发 8 全通），也不是「我们把代理打坏了」。
  *
- * 可用 `FREEPOWER_RELAY_DIAL_TIMEOUT_MS`（单次，默认 8000）、
- * `FREEPOWER_RELAY_DIAL_BUDGET_MS`（单连接总预算，默认 20000）、
+ * 参数：单次 **21s**、最多 **2 次**、单连接拨号总预算 **45s**（2 × 21 + 余量）；
+ * 而且**失败立刻还槽位**（见 dialUpstream，槽位是公共资源，重试期间不许占着）。
+ *
+ * 可用 `FREEPOWER_RELAY_DIAL_TIMEOUT_MS`（单次，默认 21000）、
+ * `FREEPOWER_RELAY_DIAL_BUDGET_MS`（单连接总预算，默认 45000）、
  * `FREEPOWER_RELAY_DIAL_ATTEMPTS`（默认 2）覆盖；判据用它们把窗口压小。
  */
-const DEFAULT_DIAL_ATTEMPT_MS = Math.max(200, Number(process.env.FREEPOWER_RELAY_DIAL_TIMEOUT_MS || 8000) || 8000);
-const DEFAULT_DIAL_BUDGET_MS = Math.max(500, Number(process.env.FREEPOWER_RELAY_DIAL_BUDGET_MS || 20000) || 20000);
+const DEFAULT_DIAL_ATTEMPT_MS = Math.max(200, Number(process.env.FREEPOWER_RELAY_DIAL_TIMEOUT_MS || 21000) || 21000);
+const DEFAULT_DIAL_BUDGET_MS = Math.max(500, Number(process.env.FREEPOWER_RELAY_DIAL_BUDGET_MS || 45000) || 45000);
 const DEFAULT_DIAL_ATTEMPTS = Math.max(1, Math.min(5, Number(process.env.FREEPOWER_RELAY_DIAL_ATTEMPTS || 2) || 2));
 const MAX_HEAD_BYTES = 64 * 1024;
 
@@ -220,7 +220,7 @@ async function dialUpstream(upstream, { timeoutMs, dialAttemptMs, dialBudgetMs, 
       return await dial(upstream.host, upstream.port, Math.min(dialAttemptMs, left));
     } catch (e) {
       last = e;
-      // 失败原因分类计数（0.4.7.5 20:10）：`timeout` = 8s 内没连上（上游排队/丢 SYN）；
+      // 失败原因分类计数（0.4.7.5 20:10）：`timeout` = 单次拨号窗口内没连上（上游丢 SYN / 排队）；
       // `ECONNRESET`/`ECONNREFUSED` = 上游**立刻拒绝**（多半是并发连接数被限流）。
       // 两者混在一个 failed 计数里，就看不出「上游慢」还是「上游不让我们连」。
       const k = String(e?.reason || e?.code || 'other');
@@ -418,7 +418,7 @@ function createGate(limit, state) {
  *   `concurrency` = 上游拨号并发上限（默认 8）；槽位只覆盖**一次拨号**，拨完即释放。
  *   `timeoutMs` = 单条连接「拨号 + 握手」的预算（默认 60s，**从开始拨号起算**）。
  *   `queueTimeoutMs` = 排队上限（默认 20s，**独立于拨号预算**）。
- *   `dialAttemptMs` / `dialBudgetMs` / `dialAttempts` = 单次拨号 8s / 单连接拨号总预算 20s / 最多 2 次。
+ *   `dialAttemptMs` / `dialBudgetMs` / `dialAttempts` = 单次拨号 21s / 单连接拨号总预算 45s / 最多 2 次。
  * @returns {Promise<{port:number, close:Function, lastError:object|null, sockets:Set, stats:object}>}
  */
 export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, concurrency = DEFAULT_CONCURRENCY, queueTimeoutMs = DEFAULT_QUEUE_TIMEOUT_MS, dialAttempts = DEFAULT_DIAL_ATTEMPTS, dialAttemptMs = DEFAULT_DIAL_ATTEMPT_MS, dialBudgetMs = DEFAULT_DIAL_BUDGET_MS } = {}) {

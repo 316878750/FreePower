@@ -10,7 +10,8 @@
  *   并发 8 × （单次 21s × 最多 3 次）⇒ 8 个槽全卡在重试里 60s，Chrome 后面 18 条全排队。
  *
  * 修法（本判据钉的就是这三条）：
- *   ① 单次拨号 **8s**、最多 **2 次**、单连接拨号总预算 **20s**（`dial_attempt_ms=8000`）；
+ *   ① 单次拨号 **21s**（2026-11-18 21:40 更正：8s 会砍掉 TCP 第 4 次重传）、最多 **2 次**、
+ *      单连接拨号总预算 **45s**（`dial_attempt_ms=21000`）；
  *   ② **槽位只覆盖一次拨号**：失败立刻还槽，绝不带着槽位重试；
  *   ③ 槽位不再覆盖握手（握手慢是上游的事，别让它占公共槽位）。
  *
@@ -83,11 +84,24 @@ function connectViaRelay(relayPort, { targetPort, timeoutMs = 70000 } = {}) {
 const echo = await startEchoServer({ ip: '203.0.113.91' });
 
 try {
+  // ⓪ 产品默认值：单次拨号 21s（TCP SYN 重传 1s/3s/7s/15s 要跑完）、最多 2 次、总预算 45s
+  //    只读 stats、不真的拨号，所以不花 21s。
+  {
+    const relay = await startRelay({ type: 'socks5', ...BLACKHOLE, username: USER, password: PASS });
+    const st = relay.stats;
+    check('⓪ 产品默认：单次拨号 21s、最多 2 次、总预算 45s、并发 8、排队 20s',
+      st.dial_attempt_ms === 21000 && st.dial_attempts_max === 2 && st.dial_budget_ms === 45000
+        && st.concurrency === 8 && st.queue_timeout_ms === 20000,
+      `attempt=${st.dial_attempt_ms} max=${st.dial_attempts_max} budget=${st.dial_budget_ms} concurrency=${st.concurrency} queue=${st.queue_timeout_ms}`);
+    await relay.close();
+  }
+
   // ① 26 条并发打黑洞上游：一条连接不许在拨号上吃掉 60 秒
+  //    判据把拨号窗口压小（1.2s × 2 / 总 3s），否则每条都要等满 21s，26 条要跑两分钟。
   {
     const relay = await startRelay(
       { type: 'socks5', ...BLACKHOLE, username: USER, password: PASS },
-      { concurrency: 8, queueTimeoutMs: 20000 },
+      { concurrency: 8, queueTimeoutMs: 20000, dialAttemptMs: 1200, dialBudgetMs: 3000, dialAttempts: 2 },
     );
     const N = 26;
     const t0 = Date.now();
@@ -112,8 +126,8 @@ try {
       dial_attempts_max: st.dial_attempts_max, active: st.active,
     })}`);
 
-    check('① 单次拨号 8s、最多 2 次、单连接总预算 20s（产品默认）',
-      st.dial_attempt_ms === 8000 && st.dial_attempts_max === 2 && st.dial_budget_ms === 20000,
+    check('① 判据窗口：单次拨号 1.2s、最多 2 次、单连接总预算 3s',
+      st.dial_attempt_ms === 1200 && st.dial_attempts_max === 2 && st.dial_budget_ms === 3000,
       `dial_attempt_ms=${st.dial_attempt_ms} max=${st.dial_attempts_max} budget=${st.dial_budget_ms}`);
     check('① 单条连接的拨号耗时不再到 60s（max_dial_ms < 21000）',
       st.max_dial_ms < 21000,
