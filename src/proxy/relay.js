@@ -39,17 +39,30 @@ const CRLF = '\r\n';
  */
 const DEFAULT_TIMEOUT_MS = 60000;
 /**
- * 上游拨号的**有界并发**上限（0.4.7.5）。
+ * 上游拨号的**有界并发**上限（0.4.7.5；18:40 由 4 调到 **8**）。
  *
  * 为什么必须有：无上限扇出会把上游的 accept 队列打满 —— 我们这边 14 条一起拨，
  * 上游侧就排队到 10 秒以上；而用户那台代理在 40+ 连接时直接被供应商限流。
- * 4 是实测值：4 并发打同一台上游全通、~500ms；再多的收益只是把排队从上游挪到我们这边，
- * 但**我们有队列、有 30s 预算，上游没有**。可用 `FREEPOWER_RELAY_CONCURRENCY` 覆盖。
+ *
+ * 为什么从 4 调到 8：4 并发 + 单次拨号 21s × 3 次重试 ⇒ 一个槽位最坏被占 63s，
+ * 吞吐 ≈ 每 16 秒 1 条；真站验收那趟 29 条连接只建成 3 条隧道，25 条**还没轮到拨号**
+ * 就先超时了（`queue_timeout`）。旧版无界并发（实测 14 条一起拨）反而能渲染页面，
+ * 说明 8 这个档位在「别把上游打满」与「别把自己排死」之间更合理。
+ * 可用 `FREEPOWER_RELAY_CONCURRENCY` 覆盖。
  *
  * 槽位只覆盖「拨号 + 握手」这一段，隧道建好立刻释放 —— 长连接不占槽，
- * 否则一个开着 6 个标签页的环境会把 4 个槽全占死。
+ * 否则一个开着 6 个标签页的环境会把槽全占死。
  */
-const DEFAULT_CONCURRENCY = Number(process.env.FREEPOWER_RELAY_CONCURRENCY || 4) || 4;
+const DEFAULT_CONCURRENCY = Number(process.env.FREEPOWER_RELAY_CONCURRENCY || 8) || 8;
+/**
+ * **排队**的独立上限（0.4.7.5 18:40 追加）。
+ *
+ * 60s 是「拨号 + 握手」的预算，**从真正开始拨号那一刻起算**；排队是另一段时间，
+ * 不能拿拨号预算去付 —— 否则排队久的连接还没拨就超时，日志里只剩 `queue_timeout`，
+ * 看起来像上游挂了，其实是自己被队列饿死。排队单独给 45s，超时单独计数。
+ * 可用 `FREEPOWER_RELAY_QUEUE_TIMEOUT_MS` 覆盖（判据用它把窗口压小）。
+ */
+const DEFAULT_QUEUE_TIMEOUT_MS = Number(process.env.FREEPOWER_RELAY_QUEUE_TIMEOUT_MS || 45000) || 45000;
 /**
  * 上游拨号**重试**（0.4.7.5 追加）。
  *
@@ -291,6 +304,10 @@ function openUpstream(upstream, host, port, timeoutMs, state) {
 /**
  * 上游拨号的槽位门（有界并发 + 排队）。
  * 槽位只覆盖「拨号 + 握手」；隧道建好立刻 release。
+ *
+ * `acquire(queueTimeoutMs)` 的等待上限**与拨号预算无关**（0.4.7.5 18:40）：
+ * 排队超时记 `stats.queue_timeout`，排队时长记 `max_queue_wait_ms` / `queue_wait_ms_total`。
+ * 拿到槽位之后才开始算拨号的 60s —— 排队不吃拨号预算。
  */
 function createGate(limit, state) {
   let active = 0;
@@ -308,9 +325,10 @@ function createGate(limit, state) {
     if (next) { clearTimeout(next.timer); grant(); next.resolve(); }
   };
   return {
-    async acquire(timeoutMs) {
+    async acquire(queueTimeoutMs) {
       if (state.closed) throw Object.assign(new Error('中继已关闭，不再接新连接'), { reason: 'relay_closed' });
       if (active < limit) { grant(); return release; }
+      const enqueuedAt = Date.now();
       state.stats.queued += 1;
       state.stats.queue_depth = queue.length + 1;
       state.stats.peak_queue = Math.max(state.stats.peak_queue || 0, queue.length + 1);
@@ -320,13 +338,21 @@ function createGate(limit, state) {
           const i = queue.indexOf(waiter);
           if (i >= 0) queue.splice(i, 1);
           state.stats.queue_depth = queue.length;
+          state.stats.queue_timeout += 1;
+          // 排队超时也要留下等了多久 —— 否则出问题时看不出是「排死」还是「拨号慢」
+          const timedOutWait = Date.now() - enqueuedAt;
+          state.stats.max_queue_wait_ms = Math.max(state.stats.max_queue_wait_ms || 0, timedOutWait);
+          state.stats.queue_wait_ms_total += timedOutWait;
           reject(Object.assign(
-            new Error(`上游拨号排队超时（${timeoutMs}ms，并发上限 ${limit}）`),
+            new Error(`上游拨号排队超时（${queueTimeoutMs}ms，并发上限 ${limit}）`),
             { reason: 'queue_timeout' },
           ));
-        }, timeoutMs);
+        }, queueTimeoutMs);
         queue.push(waiter);
       });
+      const waited = Date.now() - enqueuedAt;
+      state.stats.max_queue_wait_ms = Math.max(state.stats.max_queue_wait_ms || 0, waited);
+      state.stats.queue_wait_ms_total += waited;
       return release;
     },
     /** close 时把还在排队的全部拒掉，别让它们挂到超时 */
@@ -346,15 +372,18 @@ function createGate(limit, state) {
  * 上游用 `upstream` 的协议与凭据。
  *
  * @param {{type?:string, host:string, port:number, username?:string, password?:string}} upstream
- * @param {{timeoutMs?:number, concurrency?:number}} [opt]
- *   `concurrency` = 上游拨号并发上限（默认 4）；槽位只覆盖握手，隧道建好即释放。
+ * @param {{timeoutMs?:number, concurrency?:number, queueTimeoutMs?:number, dialAttempts?:number}} [opt]
+ *   `concurrency` = 上游拨号并发上限（默认 8）；槽位只覆盖握手，隧道建好即释放。
+ *   `timeoutMs` = 单条连接「拨号 + 握手」的预算（默认 60s，**从开始拨号起算**）。
+ *   `queueTimeoutMs` = 排队上限（默认 45s，**独立于拨号预算**）。
  * @returns {Promise<{port:number, close:Function, lastError:object|null, sockets:Set, stats:object}>}
  */
-export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, concurrency = DEFAULT_CONCURRENCY, dialAttempts = DEFAULT_DIAL_ATTEMPTS } = {}) {
+export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, concurrency = DEFAULT_CONCURRENCY, queueTimeoutMs = DEFAULT_QUEUE_TIMEOUT_MS, dialAttempts = DEFAULT_DIAL_ATTEMPTS } = {}) {
   if (!upstream || !upstream.host || !(Number(upstream.port) > 0)) {
     throw new Error('startRelay 需要上游代理的 host 与 port');
   }
   const limit = Math.max(1, Math.floor(Number(concurrency) || DEFAULT_CONCURRENCY));
+  const queueLimit = Math.max(1, Math.floor(Number(queueTimeoutMs) || DEFAULT_QUEUE_TIMEOUT_MS));
   const up = {
     type: String(upstream.type || 'http').toLowerCase(),
     host: String(upstream.host),
@@ -377,11 +406,20 @@ export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, con
       queued: 0,
       queue_depth: 0,
       peak_queue: 0,
+      /** 排队预算、排队超时次数、排队时长读数（0.4.7.5 18:40） */
+      queue_timeout_ms: queueLimit,
+      queue_timeout: 0,
+      max_queue_wait_ms: 0,
+      queue_wait_ms_total: 0,
       /** 正在握手 / 峰值 / 上限 */
       active: 0,
       peak_active: 0,
       concurrency: limit,
       timeout_ms: timeoutMs,
+      /** 拨号超时次数（与 queue_timeout 分开）、拨号耗时读数 */
+      dial_timeout: 0,
+      max_dial_ms: 0,
+      dial_ms_total: 0,
       /** 上游拨号：尝试次数（累计）与其中重试次数 */
       dial_attempts: 0,
       dial_retries: 0,
@@ -395,7 +433,7 @@ export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, con
     state.sockets.add(socket);
     socket.on('close', () => state.sockets.delete(socket));
     socket.on('error', () => { /* 浏览器主动断，正常 */ });
-    handleClient(socket, up, state, timeoutMs, gate).catch((e) => {
+    handleClient(socket, up, state, timeoutMs, gate, queueLimit).catch((e) => {
       state.lastError = state.lastError || e;
       state.stats.failed += 1;
       try { socket.destroy(); } catch { /* ignore */ }
@@ -421,7 +459,7 @@ export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, con
   return state;
 }
 
-async function handleClient(client, upstream, state, timeoutMs, gate) {
+async function handleClient(client, upstream, state, timeoutMs, gate, queueLimit) {
   const rd = new Reader(client);
   let upstreamSock = null;
   let releaseSlot = null;
@@ -468,8 +506,17 @@ async function handleClient(client, upstream, state, timeoutMs, gate) {
     // ③ 连上游（协议与凭据都在这一段）
     //    有界并发：先排队拿槽位，**拿到才拨** —— 无上限扇出会把上游 accept 队列打满，
     //    上游排队时间最后变成我们这边的「超时」（用户 2026-11-18 那 4 个环境就是这么死的）。
-    releaseSlot = await gate.acquire(timeoutMs);
-    const t = await openUpstream(upstream, host, port, timeoutMs, state);
+    //    排队预算**独立**（queueTimeoutMs）：排在队里不算拨号，别让排队把 60s 拨号预算吃掉。
+    releaseSlot = await gate.acquire(queueLimit);
+    const dialStart = Date.now();
+    let t;
+    try {
+      t = await openUpstream(upstream, host, port, timeoutMs, state);
+    } finally {
+      const dialMs = Date.now() - dialStart;
+      state.stats.max_dial_ms = Math.max(state.stats.max_dial_ms || 0, dialMs);
+      state.stats.dial_ms_total += dialMs;
+    }
     upstreamSock = t.socket;
     state.stats.tunnels += 1;
     // 隧道建好即释放槽位：长连接不占槽，否则一个开 6 个标签的环境会把槽全占死
@@ -484,6 +531,8 @@ async function handleClient(client, upstream, state, timeoutMs, gate) {
   } catch (e) {
     state.lastError = e;
     state.stats.failed += 1;
+    // 拨号超时单独计数：`queue_timeout` 是排队，不能混进来（0.4.7.5 18:40）
+    if (e?.reason === 'timeout' || e?.code === 'ETIMEDOUT') state.stats.dial_timeout += 1;
     try { client.write(reply(repFor(e))); } catch { /* 已经断了 */ }
     try { client.destroy(); } catch { /* ignore */ }
     if (upstreamSock) { try { upstreamSock.destroy(); } catch { /* ignore */ } }

@@ -12,7 +12,7 @@
  *
  * 判据：
  *   ① 14 并发必须**全通**（改之前第 12 条起就 REP_FAIL）；
- *   ② 上游同时看到的握手数 ≤ 4（默认上限），排队的连接数 ≥ 10；
+ *   ② 上游同时看到的握手数 ≤ 8（默认上限），排队的连接数 ≥ 6；
  *   ③ 单连接超时是 30s（不是 10s）；
  *   ④ 每条隧道真的能读回出口内容（不是只握手成功）；
  *   ⑤ 上限可配（concurrency: 2 → 上游最多同时看到 2）；
@@ -100,7 +100,7 @@ const upstream = await startFakeSocks5({
   handshakeConcurrency: 1,   // 串行：复现「上游排队」
   handshakeMs: 900,
 });
-// 注意：这里**不传** timeoutMs / concurrency —— 判据要钉的是**产品默认值**（30s / 4）。
+// 注意：这里**不传** timeoutMs / concurrency —— 判据要钉的是**产品默认值**（60s / 8，0.4.7.5 18:40 起）。
 // 传了就等于自己给自己放宽，红测也就不会红了。
 const relay = await startRelay(
   { type: 'socks5', host: '127.0.0.1', port: upstream.port, username: USER, password: PASS },
@@ -136,9 +136,9 @@ try {
   // ② 有界并发：上游同时看到的握手数
   const st = relay.stats || {};
   check('② 上游同时看到的握手数 ≤ 4（默认上限）',
-    Number.isFinite(st.peak_active) && st.peak_active <= 4,
+    Number.isFinite(st.peak_active) && st.peak_active <= 8,
     `peak_active=${st.peak_active} 上游实测 maxInFlight=${upstream.stats.maxInFlight}`);
-  check('② 排过队（不是一次性全放）', Number.isFinite(st.queued) && st.queued >= N - 4, `queued=${st.queued}`);
+  check('② 排过队（不是一次性全放）', Number.isFinite(st.queued) && st.queued >= N - 8, `queued=${st.queued}`);
   check('② 隧道计数 = 14、失败 = 0', st.tunnels === N && st.failed === 0, JSON.stringify({ tunnels: st.tunnels, failed: st.failed }));
   check('② 全部排完没有残留占用', st.active === 0, `active=${st.active}`);
 
