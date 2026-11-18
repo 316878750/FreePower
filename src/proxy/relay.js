@@ -220,6 +220,11 @@ async function dialUpstream(upstream, { timeoutMs, dialAttemptMs, dialBudgetMs, 
       return await dial(upstream.host, upstream.port, Math.min(dialAttemptMs, left));
     } catch (e) {
       last = e;
+      // 失败原因分类计数（0.4.7.5 20:10）：`timeout` = 8s 内没连上（上游排队/丢 SYN）；
+      // `ECONNRESET`/`ECONNREFUSED` = 上游**立刻拒绝**（多半是并发连接数被限流）。
+      // 两者混在一个 failed 计数里，就看不出「上游慢」还是「上游不让我们连」。
+      const k = String(e?.reason || e?.code || 'other');
+      state.stats.dial_fail_kinds[k] = (state.stats.dial_fail_kinds[k] || 0) + 1;
     } finally {
       recordDial(state, t0);
       release();
@@ -466,6 +471,8 @@ export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, con
       dial_attempt_ms: attemptMs,
       dial_budget_ms: budgetMs,
       dial_attempts_max: 0,
+      /** 拨号失败原因分类计数（timeout / ECONNRESET / ECONNREFUSED / ...） */
+      dial_fail_kinds: {},
       /** 上游拨号：尝试次数（累计）与其中重试次数 */
       dial_attempts: 0,
       dial_retries: 0,
