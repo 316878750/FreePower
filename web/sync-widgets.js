@@ -13,6 +13,70 @@
 import { h, mount, toast } from './ui.js';
 import { api } from './api.js';
 
+import { ARRANGE_KINDS, readArrangePrefs, writeArrangePrefs } from './sync-prefs.js';
+
+/**
+ * **窗口排列请求体**的唯一构造函数（两处界面共用，不许各拼一份）。
+ *
+ * @param {{mode?:'grid'|'over'|'vertical'|'custom', screenId?:any, ids?:string[], custom?:object|null}} o
+ *   mode: grid = 一键排列（宫格平铺）；over = 重叠平铺；vertical = 垂直平铺（单列铺满）；
+ *         custom = 自定义参数
+ * @returns {object} 直接交给 `api.syncArrange`
+ */
+export function buildArrangeBody({ mode = 'grid', screenId = null, ids = [], custom = null } = {}) {
+  let body;
+  if (mode === 'custom') {
+    body = { ...(custom || {}) };
+  } else if (mode === 'over') {
+    /* 重叠平铺：尺寸与步长都由服务端按工作区算（30 硬编码），只把「起始位置」带过去。
+     * 宽/高/间距/每行个数对它无效 —— 这一点界面上要写出来，不能让用户以为填了有用。 */
+    body = { range: 1 };
+    if (custom) {
+      if (custom.left !== undefined) body.left = custom.left;
+      if (custom.top !== undefined) body.top = custom.top;
+    }
+  } else if (mode === 'vertical') {
+    // 垂直平铺 = 单列纵向：一行一个，高度按窗口数等分所选屏的可用区。
+    // 用既有自定义参数表达，不新增后端分支。
+    const area = (custom && custom.area) || { x: 0, y: 0, width: 1280, height: 800 };
+    const n = Math.max(1, (ids || []).length || 1);
+    body = {
+      width: area.width, height: Math.max(200, Math.floor(area.height / n)),
+      row: 1, hs: 0, vs: 0, left: area.x, top: area.y, range: 0,
+    };
+  } else {
+    body = { auto: true };
+  }
+  if (screenId !== null && screenId !== undefined) body.screenId = screenId;
+  const list = (ids || []).filter(Boolean).map(String);
+  if (list.length) body.ids = list;
+  return body;
+}
+
+/**
+ * **排列的唯一执行入口**：构造请求体 + 打 `POST /api/v2/sync/arrange`。
+ *
+ * 为什么连「调用」也放这里：两处界面（窗口同步页 / 操作台小窗）的**视觉骨架**按 31 号文
+ * 故意不同（一个是屏幕卡片 + 单选，一个是下拉 + 数字输入），但**请求只许有一个出处** ——
+ * 否则参数一改就得改两遍，早晚走岔。
+ *
+ * @returns {Promise<object>} 服务端原样返回（`placed` / `skipped` / `warnings` / `auto`）
+ */
+export async function runArrange(opts) {
+  return api.syncArrange(buildArrangeBody(opts));
+}
+
+/**
+ * **「显示窗口」的唯一执行入口**（与 `runArrange` 同一条理由）：
+ * 两处界面的按钮长得不一样，但打的必须是同一条路由、同一套参数形状。
+ *
+ * @param {string[]|null} ids 传 null/空数组 = 用当前同步会话里的窗口
+ */
+export async function runShow(ids) {
+  const list = (ids || []).filter(Boolean).map(String);
+  return list.length ? api.syncShow(list) : api.syncShow();
+}
+
 /**
  * 窗口排列区块。
  *
@@ -34,14 +98,30 @@ import { api } from './api.js';
  * @returns {{el:HTMLElement, refresh:(displays?:object[])=>void}}
  */
 export function buildArrangePanel({ nameOf, getDisplays, getSelectionIds = null, compact = false }) {
+  const saved = readArrangePrefs();
   const state = {
     mode: 'auto', // 'auto'（一键排列）| 'custom'（自定义排列）
+    tileMode: saved.tileMode, // 'grid'（宫格平铺）| 'over'（重叠平铺）
     scope: 'selection', // 'selection'（已选环境）| 'session'（当前同步会话）
-    left: 0, top: 0, width: 1000, height: 700, hs: 0, vs: 0, row: 2,
+    left: saved.custom.left, top: saved.custom.top,
+    width: saved.custom.width, height: saved.custom.height,
+    hs: saved.custom.hs, vs: saved.custom.vs, row: saved.custom.row,
     screenId: null, // null = 主屏；-1 = 全部屏幕
   };
   const el = h('div');
   const resBox = h('div');
+
+  /** 自定义那 4 行（8 个数字框）每次改都落盘，切页/重进都还在 */
+  function remember() {
+    writeArrangePrefs({
+      autoArrange: state.mode === 'auto',
+      tileMode: state.tileMode,
+      custom: {
+        left: state.left, top: state.top, width: state.width, height: state.height,
+        hs: state.hs, vs: state.vs, row: state.row,
+      },
+    });
+  }
 
   function paint() {
     const a = state;
@@ -49,14 +129,27 @@ export function buildArrangePanel({ nameOf, getDisplays, getSelectionIds = null,
       h('span', { class: 'muted small', style: { minWidth: '56px' } }, label), ...inputs);
     const num = (key, { min = 0, max = 20000, w = '68px' } = {}) => h('input', {
       type: 'number', min, max, value: String(a[key]), style: { width: w },
-      onInput: (e) => { a[key] = Number(e.target.value) || 0; },
+      onInput: (e) => { a[key] = Number(e.target.value) || 0; remember(); },
     });
 
     const modeSel = h('select', {
-      onChange: (e) => { a.mode = e.target.value; paint(); },
+      onChange: (e) => { a.mode = e.target.value; remember(); paint(); },
     },
       h('option', { value: 'auto', selected: a.mode === 'auto' }, '一键排列'),
       h('option', { value: 'custom', selected: a.mode === 'custom' }, '自定义排列'));
+
+    /* 排列方式：宫格平铺 / 重叠平铺。两个模式都渲染；只有「重叠平铺」在
+     * 「全部屏幕」时按对手行为不出现（跨屏拉满没有意义）。 */
+    const kindRow = h('div', { class: 'row', style: { marginTop: '6px' } },
+      h('span', { class: 'muted small', style: { minWidth: '56px' } }, '排列方式'),
+      ...ARRANGE_KINDS
+        .filter((k) => !(k.key === 'over' && a.screenId === -1))
+        .map((k) => h('label', { class: 'row', style: { marginRight: '12px', cursor: 'pointer' } },
+          h('input', {
+            type: 'radio', name: 'fp-arrange-kind', checked: a.tileMode === k.key,
+            onChange: () => { a.tileMode = k.key; remember(); paint(); },
+          }),
+          h('span', { class: 'muted small' }, k.label))));
 
     const scopeSel = h('select', {
       onChange: (e) => { a.scope = e.target.value; paint(); },
@@ -70,18 +163,27 @@ export function buildArrangePanel({ nameOf, getDisplays, getSelectionIds = null,
       // 没有桌面壳在管（命令行跑服务）时只有一项，并如实说明按原点算
       screenOpts.push(h('option', { value: 'primary', selected: a.screenId === null }, '内置屏幕'));
     } else {
-      displays.forEach((d, i) => {
+      // 编号只给扩展屏用：主屏叫「内置屏幕」，其余按 1、2… 排（0.4.7.5）。
+      // 老实现用数组下标，于是主屏也被叫成「扩展屏幕 1」，用户根本分不清哪块是主屏。
+      let extIndex = 0;
+      displays.forEach((d) => {
+        const label = d.primary ? '内置屏幕' : `扩展屏幕 ${(extIndex += 1)}`;
         screenOpts.push(h('option', {
           value: String(d.id),
           selected: String(a.screenId) === String(d.id),
-        }, `${d.primary ? '内置屏幕' : `扩展屏幕 ${i}`} ${d.work_area.width}×${d.work_area.height}`));
+        }, `${label} ${d.work_area.width}×${d.work_area.height}`));
       });
       screenOpts.push(h('option', { value: '-1', selected: a.screenId === -1 }, '全部屏幕'));
     }
     const screenSel = h('select', {
       onChange: (e) => {
         const v = e.target.value;
-        a.screenId = v === '-1' ? -1 : (v === 'primary' ? null : Number(v));
+        // 显示器 id 是系统给的不透明值（Windows 上是大整数），能原样保留就原样保留
+        a.screenId = v === '-1' ? -1 : (v === 'primary' ? null : (/^-?\d+$/.test(v) ? Number(v) : v));
+        // 「全部屏幕」下没有重叠平铺：把选择归回宫格，别让界面显示一个不会生效的选项
+        if (a.screenId === -1) a.tileMode = 'grid';
+        remember();
+        paint();
       },
     }, ...screenOpts);
 
@@ -92,9 +194,10 @@ export function buildArrangePanel({ nameOf, getDisplays, getSelectionIds = null,
           ? `已选 ${selectionIds().length} 个环境（同步没开始时也能排列）`
           : '用当前同步会话里的窗口')),
       h('div', { class: 'row', style: { marginTop: '6px' } },
-        h('span', { class: 'muted small' }, '排列方式'), modeSel,
+        h('span', { class: 'muted small' }, '排列模式'), modeSel,
         h('span', { class: 'spacer' }),
         h('button', { class: 'btn primary sm', onClick: () => run() }, '窗口排列')),
+      kindRow,
       a.mode === 'custom'
         ? h('div', null,
           field('起始位置', num('left'), num('top')),
@@ -105,9 +208,11 @@ export function buildArrangePanel({ nameOf, getDisplays, getSelectionIds = null,
         : h('div', null,
           field('显示器', screenSel)),
       h('div', { class: 'muted small', style: { marginTop: '6px' } },
-        a.mode === 'auto'
-          ? '根据显示器的分辨率自动排列所选窗口'
-          : '跨屏同步：建议使用【自定义排列】设置相同的窗口大小'),
+        a.tileMode === 'over'
+          ? '重叠平铺：窗口拉到工作区大小、按 30px 横向层叠（宽/高/间距/每行个数对它无效）'
+          : (a.mode === 'auto'
+            ? '根据显示器的分辨率自动排列所选窗口'
+            : '跨屏同步：建议使用【自定义排列】设置相同的窗口大小')),
       resBox);
   }
 
@@ -122,17 +227,19 @@ export function buildArrangePanel({ nameOf, getDisplays, getSelectionIds = null,
 
   async function run() {
     const a = state;
-    const ids = a.scope === 'selection' ? selectionIds() : null;
-    const body = a.mode === 'auto'
-      ? { auto: true, screenId: a.screenId === null ? undefined : a.screenId }
-      : {
+    const ids = a.scope === 'selection' ? selectionIds() : [];
+    const opts = {
+      // 重叠平铺优先：它不看自定义的宽/高/间距（服务端按工作区算），但起始位置照样带过去
+      mode: a.tileMode === 'over' ? 'over' : (a.mode === 'auto' ? 'grid' : 'custom'),
+      screenId: a.screenId,
+      ids,
+      custom: a.mode === 'auto' ? null : {
         width: a.width, height: a.height, row: a.row, hs: a.hs, vs: a.vs,
         left: a.left, top: a.top, range: 0,
-        screenId: a.screenId === null ? undefined : a.screenId,
-      };
-    if (ids) body.ids = ids;
+      },
+    };
     try {
-      const r = await api.syncArrange(body);
+      const r = await runArrange(opts);
       const bad = (r?.placed || []).filter((x) => !x.ok);
       const warn = (r?.warnings || []).slice();
       const skipped = r?.skipped || [];
@@ -215,7 +322,7 @@ export function buildShowPanel({ nameOf, getSelectionIds = null }) {
   async function showAll() {
     const ids = state.scope === 'selection' ? selectionIds() : null;
     try {
-      const r = await api.syncShow(ids || undefined);
+      const r = await runShow(ids);
       const s = r?.summary || {};
       toast(s.message || '已显示', s.failed ? 'bad' : '');
       /* page_only 那批：给一个**显式**的补救按钮。默认绝不做「最小化→恢复」（会闪任务栏），

@@ -329,3 +329,232 @@ body.console-collapsed .page-head { display: none; }
 .console-title { font-weight: 600; font-size: 12px; white-space: nowrap; }
 .console-master { max-width: 96px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #9fb0c4; font-size: 12px; }
 .console-slaves { color: #9fb0c4; font-size: 12px; white-space: nowrap; }
+
+/* ================= 窗口同步页（0.4.7.5，照逆向 31 号文重排） =================
+   骨架：顶部操作条(40+12) / 左表格卡(flex:1,min-width:540,圆角8) / 右操作台卡(480 定宽)
+   颜色全部取 31 号文 §7 的实测值，不另造变量。 */
+.page.sync-page { padding: 12px; }
+
+.sync-top {
+  display: flex; align-items: center; justify-content: space-between;
+  height: 40px; margin-bottom: 12px; gap: 12px;
+}
+.sync-top-left { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.sync-top-right { display: flex; align-items: center; gap: 12px; }
+
+.sync-groups {
+  height: 32px; min-width: 96px; padding: 0 8px; border: 1px solid #E2E6F0;
+  border-radius: 6px; background: #fff; color: #1B1F24;
+}
+.sync-btn {
+  height: 32px; padding: 0 16px; border-radius: 6px; border: 1px solid transparent;
+  cursor: pointer; font-size: 13px; white-space: nowrap;
+}
+.sync-btn-start { background: #1E4DFF; color: #fff; border-color: #1E4DFF; }
+.sync-btn-start:hover { background: #1B45E0; }
+.sync-btn-stop { background: #E5484D; color: #fff; border-color: #E5484D; }
+.sync-btn-stop:hover { background: #D33B40; }
+.sync-btn-text { background: transparent; color: #1E4DFF; border-color: transparent; }
+.sync-btn-text:hover:not(:disabled) { background: #F4F6FF; }
+.sync-btn:disabled { opacity: .45; cursor: not-allowed; }
+
+.sync-sel {
+  display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 10px;
+  border-radius: 6px; background: #F4F6FF; color: #1E4DFF; font-size: 13px;
+}
+.sync-sel-clear {
+  border: 0; background: transparent; color: inherit; cursor: pointer; font-size: 12px;
+  padding: 0 2px; line-height: 1;
+}
+.sync-gear {
+  width: 32px; height: 32px; border: 1px solid #E2E6F0; border-radius: 6px;
+  background: #fff; cursor: pointer; font-size: 15px; color: #5B6470;
+}
+.sync-gear:hover { border-color: #1E4DFF; color: #1E4DFF; }
+
+.sync-wrap { display: flex; align-items: flex-start; }
+
+/* ---- 左：表格卡 ---- */
+.sync-table-card {
+  flex: 1; min-width: 540px; margin-right: 12px; margin-bottom: 12px;
+  border-radius: 8px; background: #fff; border: 1px solid #E2E6F0; overflow: hidden;
+}
+.sync-table-scroll { overflow: auto; max-height: calc(100vh - 200px); }
+.sync-table { width: 100%; border-collapse: separate; border-spacing: 0; table-layout: fixed; font-size: 13px; }
+.sync-table thead th {
+  height: 38px; padding: 0 8px; text-align: left; font-weight: 500; color: #5B6470;
+  background: #F8FAFF; border-bottom: 2px solid #F8FAFF; white-space: nowrap;
+  position: sticky; top: 0; z-index: 2;
+}
+.sync-table tbody td {
+  height: 56px; padding: 0 8px; border-bottom: 1px solid #F1F3F9; color: #1B1F24;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sync-table tbody tr:nth-child(even) td { background: #F8FAFF; }
+.sync-table tbody tr:hover td { background: #E8EDFF; }
+.sync-table tbody tr.is-main td { background: #D2ECFF; }
+.sync-table tbody tr.is-main:hover td { background: #D2ECFF; }
+
+/* 操作列固定在右侧：对手在 1342 窗口下这列被挤进横向滚动区，得滚才看得见；
+   这一处我们**故意偏离**（CEO 拍板），不抄那个毛病。 */
+.sync-table .sync-col-op {
+  position: sticky; right: 0; z-index: 1; background: inherit;
+  box-shadow: -1px 0 0 #F1F3F9;
+}
+.sync-table thead .sync-col-op { background: #F8FAFF; z-index: 3; }
+.sync-table tbody tr:nth-child(even) .sync-col-op { background: #F8FAFF; }
+.sync-table tbody tr:hover .sync-col-op { background: #E8EDFF; }
+.sync-table tbody tr.is-main .sync-col-op { background: #D2ECFF; }
+
+.sync-col-check { width: 40px; }
+.sync-ops { display: flex; align-items: center; gap: 10px; }
+.sync-icon {
+  width: 24px; height: 24px; border: 0; background: transparent; cursor: pointer;
+  color: #5B6470; font-size: 15px; line-height: 1; border-radius: 4px;
+}
+.sync-icon:hover { color: #1E4DFF; background: #F4F6FF; }
+.sync-icon.is-on { color: #1E4DFF; }
+
+/* 状态列三态（表格里没有「同步异常」） */
+.sync-st-main { color: #1E4DFF; font-weight: 500; display: inline-flex; align-items: center; }
+.sync-st-icon { margin-right: 4px; font-size: 12px; }
+.sync-st-syncing { color: #1B1F24; }
+.sync-st-syncing::after {
+  content: '.'; display: inline-block; width: 10px; text-align: left;
+  animation: sync-doing 1s infinite steps(1, end);
+}
+@keyframes sync-doing { 0% { content: '.'; } 50% { content: '..'; } 100% { content: '...'; } }
+.sync-st-charge { color: #1E4DFF; }
+.sync-st-idle { color: #C9CAD1; }
+
+/* 空态：三行居中在**表格区**，不是整页 */
+.sync-empty { padding: 140px 16px; text-align: center; }
+.sync-empty-title { font-size: 14px; color: #1B1F24; margin-bottom: 8px; }
+.sync-empty-sub { font-size: 12px; color: #8F92A0; margin-bottom: 18px; }
+.sync-empty-link { border: 0; background: transparent; color: #1E4DFF; cursor: pointer; font-size: 13px; }
+
+/* ---- 右：操作台卡 ---- */
+.sync-operate-card {
+  width: 480px; flex-shrink: 0; margin-bottom: 12px; border-radius: 8px;
+  border: 1px solid #D9E0F5; background: #fff; display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.sync-console-head {
+  height: 60px; padding: 16px 16px 12px; display: flex; align-items: flex-start;
+  justify-content: space-between;
+  background: linear-gradient(180deg, #D3DBFF 0%, #F4F6FF 100%);
+}
+.sync-console-title { font-size: 18px; line-height: 28px; font-weight: 500; color: #1B1F24; }
+.sync-widget-btn {
+  border: 0; background: transparent; color: #1E4DFF; cursor: pointer; font-size: 13px;
+}
+.sync-widget-btn:hover { text-decoration: underline; }
+
+.sync-tabs {
+  display: flex; gap: 4px; height: 32px; padding: 4px; margin: 0 16px;
+  border-radius: 8px; background: #F4F6FF;
+}
+.sync-tab {
+  flex: 1; height: 24px; border: 0; border-radius: 4px; background: transparent;
+  cursor: pointer; font-size: 12px; color: #5B6470;
+}
+.sync-tab.is-active { background: #fff; color: #1E4DFF; font-weight: 500; }
+
+.sync-console-body { padding: 16px; margin-top: 24px; }
+.sync-tab-body { display: flex; flex-direction: column; gap: 12px; }
+.sync-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sync-row-end { justify-content: flex-end; }
+.sync-label { color: #5B6470; font-size: 12px; }
+.sync-section-title { font-size: 13px; font-weight: 500; color: #1B1F24; }
+.sync-tip { font-size: 12px; color: #8F92A0; line-height: 18px; }
+.sync-link {
+  border: 0; background: transparent; color: #1E4DFF; cursor: pointer; font-size: 13px;
+  padding: 2px 0;
+}
+.sync-link:hover { text-decoration: underline; }
+.sync-check { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+
+.sync-screens { display: flex; gap: 8px; flex-wrap: wrap; }
+.sync-screen {
+  min-width: 132px; padding: 8px 10px; border-radius: 6px; cursor: pointer;
+  border: 1px solid #E2E6F0; background: #fff; text-align: left;
+}
+.sync-screen.is-active { background: #F4F6FF; border-color: #1E4DFF; }
+.sync-screen-name { font-size: 12px; color: #1B1F24; }
+.sync-screen-size { font-size: 12px; color: #8F92A0; }
+.sync-radio { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; }
+
+.sync-custom { display: flex; flex-direction: column; gap: 8px; padding-top: 4px; }
+.sync-custom[hidden] { display: none; }
+.sync-custom input[type="number"] { width: 84px; }
+
+/* ⚙ 设置弹层 */
+.sync-overlay {
+  position: fixed; inset: 0; background: rgba(17, 24, 39, .35);
+  display: flex; align-items: center; justify-content: center; z-index: 60;
+}
+.sync-dialog {
+  width: 520px; max-height: 80vh; overflow: auto; background: #fff;
+  border-radius: 8px; box-shadow: 0 12px 40px rgba(17, 24, 39, .2);
+}
+.sync-dialog-head {
+  height: 48px; padding: 0 16px; display: flex; align-items: center;
+  justify-content: space-between; border-bottom: 1px solid #F1F3F9; font-weight: 500;
+}
+.sync-dialog-body { padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+
+/* 会话读数条（表格底部，纯读数不是控件） */
+.sync-foot {
+  padding: 8px 12px; font-size: 12px; color: #8F92A0;
+  border-top: 1px solid #F1F3F9; background: #FBFCFE;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* 尺寸不一致提示条（0.4.7.4 要求，改版保留） */
+.sync-warn:empty { display: none; }
+.sync-warn-inner {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 4px;
+  padding: 8px 12px; margin-bottom: 12px; border-radius: 8px;
+  background: #FDF3E2; color: #A86900; font-size: 12px; line-height: 18px;
+}
+
+/* 操作台：显示窗口 / 统一大小 等宽一行（31 号文 §11.1） */
+.sync-grid-row { display: flex; gap: 12px; }
+.sync-grid-btn {
+  flex: 1; height: 40px; border-radius: 6px; border: 1px solid #E2E6F0;
+  background: #fff; color: #1E4DFF; cursor: pointer; font-size: 13px;
+}
+.sync-grid-btn:hover:not(:disabled) { border-color: #1E4DFF; background: #F4F6FF; }
+.sync-grid-btn:disabled { color: #C9CAD1; border-color: #EEF1F4; cursor: not-allowed; }
+
+/* 自动排列开关（rangeTips 那一行） */
+.sync-switch { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.sync-switch input { display: none; }
+.sync-switch-dot {
+  width: 28px; height: 16px; border-radius: 8px; background: #DDDEE1;
+  position: relative; flex-shrink: 0; transition: background .15s;
+}
+.sync-switch-dot::after {
+  content: ''; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px;
+  border-radius: 50%; background: #fff; transition: left .15s;
+}
+.sync-switch input:checked + .sync-switch-dot { background: #1E4DFF; }
+.sync-switch input:checked + .sync-switch-dot::after { left: 14px; }
+
+/* 自定义排列的 4 行字段（顺序固定，只有第 4 行有单位） */
+.sync-custom { display: flex; flex-direction: column; gap: 16px; padding: 8px 0 4px; }
+.sync-custom-row { display: flex; align-items: center; gap: 6px; }
+.sync-custom-label {
+  width: 60px; margin-right: 10px; text-align: right; font-size: 14px; color: #5B6470;
+}
+.sync-custom-pre { font-size: 12px; color: #8F92A0; }
+.sync-custom input[type="number"] { width: 90px; height: 32px; padding: 0 8px; border: 1px solid #E2E6F0; border-radius: 4px; }
+.sync-btn-wide { width: 100%; height: 40px; }
+
+/* 排列方式：宫格平铺 / 重叠平铺（两个模式下都渲染，只有「全部屏幕」时不出现重叠） */
+.sync-kinds { display: flex; align-items: center; gap: 14px; padding: 10px 0 2px; }
+.sync-kind { display: inline-flex; align-items: center; gap: 6px; font-size: 14px; color: #5B6470; cursor: pointer; }
+.sync-kind input[type="radio"] { width: 14px; height: 14px; accent-color: #1E4DFF; cursor: pointer; }
+
+/* 同步中「新开的环境不会自动加入」这句说明（读数条下面，不是控件） */
+.sync-hint { padding: 8px 12px; font-size: 12px; color: #8F92A0; border-top: 1px solid #EEF1F8; }

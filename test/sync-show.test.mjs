@@ -439,10 +439,15 @@ t('面板有「显示窗口」按钮，且调 /api/v2/sync/show', () => {
   assert.match(apiSrc, /syncShow:[\s\S]{0,120}\/api\/v2\/sync\/show/);
 });
 
-t('两个页面用的是同一份「显示窗口」组件（不是各写一套）', () => {
+t('两个页面用的是同一份「显示窗口」实现（不是各写一套）', () => {
+  /* 0.4.7.5 布局改版：窗口同步页的视觉骨架按 31 号文重排（表格行内图标 + 操作台里的「显示窗口」），
+   * 不再复用操作台小窗那个 DOM 组件。但**调用只有一处**：页面必须走 sync-widgets 的 runShow，
+   * 自己不许出现 api.syncShow。 */
   assert.match(widgetSrc, /export function buildShowPanel/);
-  assert.match(syncPageSrc, /buildShowPanel/);
+  assert.match(widgetSrc, /export async function runShow/);
   assert.match(panelSrc, /buildShowPanel/);
+  assert.match(syncPageSrc, /runShow/);
+  assert.doesNotMatch(syncPageSrc, /api\.syncShow\(/);
 });
 
 t('面板把 page_only 的能力边界写出来（不假装都到前面了）', () => {
@@ -450,11 +455,12 @@ t('面板把 page_only 的能力边界写出来（不假装都到前面了）', 
   assert.match(widgetSrc, /盖住/);
 });
 
-t('面板初始渲染就把这块画出来（定义了却没人调用 = 界面上没有）', () => {
-  // 组件被两个页面 import 并且真的 mount 进页面；组件内部建好就画
+t('「显示窗口」在两个页面上都真的能用（不是定义了没人调用）', () => {
+  // 组件内部建好就画；操作台直接 mount 它；窗口同步页走同一个 runShow
   assert.match(widgetSrc, /mount\(el,/, '组件内部必须先画一次');
-  assert.match(syncPageSrc, /showPanel\.el/, '「窗口同步」页要把它 mount 出来');
   assert.match(panelSrc, /showPanel\.el/, '操作台要把它 mount 出来');
+  assert.match(syncPageSrc, /runShow\(/, '「窗口同步」页要真的调它');
+  assert.match(syncPageSrc, /'显示窗口'/, '「窗口同步」页要有这个入口');
 });
 
 /* ---- CEO 点的两条：强制置前的按钮 + 默认行为不许偷偷做 ---- */

@@ -420,11 +420,17 @@ t('界面「重启同步」调的是 /api/v2/sync/restart', () => {
   assert.match(syncSrc, /api\.syncRestart\(/);
   assert.match(apiSrc, /syncRestart:\s*\(body\)\s*=>\s*call\('\/api\/v2\/sync\/restart'/);
 });
-t('「窗口排列」「显示窗口」两个页面 import 同一份组件（不各写一套）', () => {
+t('「窗口排列」「显示窗口」两处界面共用同一份实现（不各写一套）', () => {
+  /* 0.4.7.5 布局改版后，窗口同步页的**视觉骨架**按 31 号文重排（表格行内图标 + 操作台卡片），
+   * 不再复用操作台小窗那两个 DOM 组件；但「不各写一套」的实质要求钉得更死：
+   * 请求体构造与调用只有 sync-widgets.js 一处，页面必须走 runArrange / runShow。 */
   assert.match(syncSrc, /from '\.\.\/sync-widgets\.js'/);
   assert.match(panelSrc, /from '\.\.\/sync-widgets\.js'/);
-  assert.match(syncSrc, /buildArrangePanel/);
-  assert.match(syncSrc, /buildShowPanel/);
+  assert.match(syncSrc, /runArrange/);
+  assert.match(syncSrc, /runShow/);
+  assert.match(panelSrc, /buildArrangePanel/);
+  assert.match(panelSrc, /buildShowPanel/);
+  assert.ok(!syncSrc.includes('api.syncArrange'), '页面自己调了 api.syncArrange');
 });
 t('排列/显示打的就是既有那两条路由', () => {
   assert.match(widgetsSrc, /api\.syncArrange\(/);

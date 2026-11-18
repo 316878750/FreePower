@@ -554,9 +554,17 @@ console.log('\n— 11. 接线（静态扫描）—');
     /import \{[^}]*arrangeWindows[^}]*\} from '\.\.\/sync\/session\.js'/.test(routeSrc)
     && /import \{ readDisplays \} from '\.\.\/sync\/displays\.js'/.test(routeSrc));
   check('界面有「窗口排列」按钮并接上 API', widgetSrc.includes('窗口排列') && widgetSrc.includes('syncArrange'));
-  check('两个页面用的是同一份排列组件（不是各写一套）',
-    /import \{[^}]*buildArrangePanel[^}]*\} from '\.\.\/sync-widgets\.js'/.test(panelSrc)
-    && /import \{[^}]*buildArrangePanel[^}]*\} from '\.\.\/sync-widgets\.js'/.test(syncPageSrc));
+  /*
+   * 0.4.7.5 布局改版后，两处界面的**视觉骨架**按 31 号文故意不同（窗口同步页是屏幕卡片 + 单选，
+   * 操作台小窗是下拉 + 数字输入），所以不再要求两边都 import 同一个 DOM 组件。
+   * 但「不各写一套」的实质要求反而钉得更死了：**请求体构造与调用只有一处** ——
+   * 页面自己不许出现 api.syncArrange，必须走 sync-widgets 的 runArrange。
+   */
+  check('两处界面共用同一份排列实现（请求体与调用都在 sync-widgets.js，页面不自己拼）',
+    /import \{[^}]*runArrange[^}]*\} from '\.\.\/sync-widgets\.js'/.test(syncPageSrc)
+    && /import \{[^}]*buildArrangePanel[^}]*\} from '\.\.\/sync-widgets\.js'/.test(panelSrc)
+    && !syncPageSrc.includes('api.syncArrange')
+    && (code(widgetSrc).match(/api\.syncArrange/g) || []).length === 1);
   check('界面的参数名对齐对手（排列方式/起始位置/窗口大小/窗口间距/窗口数量/个\\/行/显示器）',
     ['排列方式', '起始位置', '窗口大小', '窗口间距', '窗口数量', '个/行', '显示器', '一键排列', '自定义排列']
       .every((k) => widgetSrc.includes(k)));
