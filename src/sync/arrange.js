@@ -75,11 +75,18 @@ export function normalizeArrange(raw = {}) {
   const top = int(raw.top, 0, -20000, 20000);
   const left = int(raw.left, 0, -20000, 20000);
   const range = num(raw.range, 0) === 1 ? 1 : 0;
-  const screenId = raw.screenId === undefined || raw.screenId === null ? null : int(raw.screenId, null, -1, 999);
-  // -1 是「全部屏幕」，不是普通编号：越界的编号不能悄悄变成 -1（那会从「排这块屏」变成「排所有屏」）
-  if (raw.screenId !== undefined && raw.screenId !== null && screenId !== null && Number(raw.screenId) !== screenId) {
-    warnings.push(`显示器编号 ${raw.screenId} 超出范围，按 ${screenId}${screenId === -1 ? '（全部屏幕）' : ''} 处理`);
-  }
+  /* 显示器编号（0.4.7.5）：**只有 -1 是特殊值**（全部屏幕），其它值当不透明 id 原样保留。
+   *
+   * 老实现把它夹到 [-1, 999]，但 Windows 的显示器 id 是大整数
+   * （本机实测：479047157 = 24G4，2139135862 = CU34G3X）。夹成 999 之后
+   * `areaOf(999)` 匹配不到任何屏 → 静默回落到 list[0]（左边那块扩展屏），
+   * 于是「把窗口排到 3440 屏」变成了跨两块屏，而 summary 还报「已排列 4 个窗口」。
+   * 编号不是我们自己编的序号，是系统给的不透明 id —— 夹值等于改语义。
+   * 类型也不硬转数字：UI 传的是字符串，按字符串比对即可（见 planArrange 的 areaOf）。 */
+  const rawScreenId = raw.screenId;
+  const screenId = rawScreenId === undefined || rawScreenId === null || rawScreenId === ''
+    ? null
+    : (String(rawScreenId).trim() === '-1' ? -1 : rawScreenId);
 
   const screenList = Array.isArray(raw.screenList)
     ? raw.screenList
@@ -114,8 +121,42 @@ export function gridPosition({ index, row, width, height, hs = 0, vs = 0, left =
 }
 
 /**
- * 重叠式（`range=1`）：逆序叠在一条水平线上，最后一个落在起点。
- * 对手是 `x = left + vs * |s - (count-1)|`（注意它用的是 **vs**，不是 hs —— 照它的读数来）。
+ * 重叠平铺的横向步长。**30 是硬编码**（31 号文 §12 实测：n=2 落在 x=0/30，n=3 落在 0/30/60），
+ * 界面上没有对应设置项、不可配。
+ */
+export const OVERLAP_STEP = 30;
+
+/**
+ * 重叠平铺（`range=1`）：**横向层叠，窗口被拉到工作区大小**。
+ *
+ *   第 i 个（i 从 0 起）：x = 工作区.x + 30×i，y = 工作区.y
+ *                        宽 = 工作区宽 − 30×(n−1)，高 = 工作区高
+ *
+ * 实测对照（3440×1392 那块屏）：n=2 → 3410×1392 落在 x=0/30；n=3 → 3380×1392 落在 0/30/60。
+ * 同屏同数量下宫格是等分（n=2 各 1720），所以这是**两套完全不同的语义**，不是宫格加个偏移。
+ *
+ * 注意两点（容易搞混）：
+ *   · 它**不跟主控窗口大小**（那是「统一大小」按钮的事），尺寸一律由工作区算；
+ *   · 自定义排列里的 宽/高 对它无效 —— 所以界面上选着重叠平铺时要说明这一点。
+ */
+export function overlapLayout({ index, count, area, left = 0, top = 0 }) {
+  const i = Math.max(0, Math.floor(Number(index) || 0));
+  const n = Math.max(1, Math.floor(Number(count) || 1));
+  const a = area || {};
+  const w = Math.max(1, Math.floor(Number(a.width) || 1));
+  const h = Math.max(1, Math.floor(Number(a.height) || 1));
+  return {
+    x: Math.round(Number(a.x) || 0) + left + OVERLAP_STEP * i,
+    y: Math.round(Number(a.y) || 0) + top,
+    width: Math.max(MIN_WINDOW_WIDTH, w - OVERLAP_STEP * (n - 1)),
+    height: Math.max(MIN_WINDOW_HEIGHT, h),
+  };
+}
+
+/**
+ * @deprecated 0.4.7.5 起 `range=1` 用实测出来的 {@link overlapLayout}（正向层叠 + 拉满工作区）。
+ * 这条老公式（逆序叠、用 vs 当步长）来自 `26-窗口同步实现细节.md` §5 的静态读码，没有实测过；
+ * 2026-11-18 逆向补测推翻了它。保留导出只为兼容旧调用点，**新代码别用**。
  */
 export function overlapPosition({ index, count, left = 0, top = 0, vs = 0 }) {
   const i = Math.max(0, Math.floor(Number(index) || 0));
@@ -164,25 +205,37 @@ export function planArrange({ count, params = {}, screens = [] } = {}) {
   const list = Array.isArray(screens) ? screens : [];
   const out = [];
 
-  const areaOf = (screenId) => {
+  const areaOf = (screenId, { explicit = false } = {}) => {
     if (!list.length) {
       warnings.push('没有显示器信息（没有桌面壳在跑），按原点 (0,0) 排列 —— 多屏环境下可能排到屏幕外');
       return { x: 0, y: 0, width: 0, height: 0 };
     }
-    const hit = list.find((s) => String(s.id) === String(screenId))
-      || list.find((s) => s.primary)
-      || list[0];
-    return hit?.workArea || { x: 0, y: 0, width: 0, height: 0 };
+    // 不透明 id：按字符串比对（UI 传的是 `String(d.id)`，服务端拿到的可能是数字）
+    const hit = screenId === null || screenId === undefined
+      ? null
+      : list.find((s) => String(s.id) === String(screenId));
+    if (hit) return hit.workArea;
+    /* 明确指定了某块屏却找不到：**说出来**，不许静默换成别的屏（0.4.7.5）。
+     * 用户 2026-11-18 就是这么被坑的：编号被夹成 999 → 匹配不到 → 排到 list[0]，
+     * 结果跨了两块屏，而响应里只写「已排列 4 个窗口」。 */
+    if (explicit && screenId !== null && screenId !== undefined) {
+      warnings.push(`找不到显示器 ${screenId}，按主屏处理`);
+    }
+    const fallback = list.find((s) => s.primary) || list[0];
+    return fallback?.workArea || { x: 0, y: 0, width: 0, height: 0 };
   };
 
   /* 全部屏幕：按 screenList 逐屏填满再进下一屏（对手 `screenId === -1` 的分支）。
    * 对手公式直译：`x = left + (d % col) * width`、`y = top + floor(d / col) * height`
    * —— 注意**多屏分支不带间距**（它只用了 n[0]/n[1] 宽高，没有 hs/vs），照它来。 */
   if (p.screenId === -1) {
+    /* 重叠平铺在「全部屏幕」下没有意义（一块屏拉满才对，跨屏拉满会横跨两块屏），
+     * 而且对手那边这个选项在「全部屏幕」时**根本不出现**。这里不静默改语义，说出来。 */
+    if (p.range === 1) warnings.push('重叠平铺不支持「全部屏幕」，按宫格平铺处理');
     const plan = p.screenList.length ? p.screenList : buildScreenList(n, p, list);
     let i = 0;
     for (const s of plan) {
-      const area = areaOf(s.screen_id);
+      const area = areaOf(s.screen_id, { explicit: true });
       const originX = area.x + s.left;
       const originY = area.y + s.top;
       for (let k = 0; k < s.num && i < n; k++, i++) {
@@ -201,7 +254,7 @@ export function planArrange({ count, params = {}, screens = [] } = {}) {
   }
 
   const targetScreen = p.screenId === null ? (list.find((s) => s.primary)?.id ?? list[0]?.id ?? null) : p.screenId;
-  const area = areaOf(targetScreen);
+  const area = areaOf(targetScreen, { explicit: p.screenId !== null });
   const originX = area.x + p.left;
   const originY = area.y + p.top;
 
@@ -218,10 +271,22 @@ export function planArrange({ count, params = {}, screens = [] } = {}) {
     return { windows: out, screen_id: targetScreen, warnings };
   }
 
+  /* 重叠平铺（range=1）：横向层叠、窗口拉到工作区大小（实测语义，见 overlapLayout）。
+   * 它**不看** width/height/row/hs/vs —— 尺寸一律由工作区算，步长硬编码 30。 */
+  if (p.range === 1) {
+    const cascade = OVERLAP_STEP * Math.max(0, n - 1);
+    if (area.width - cascade < MIN_WINDOW_WIDTH) {
+      warnings.push(`重叠平铺：${n} 个窗口按 ${OVERLAP_STEP}px 步长层叠后宽度低于系统下限 ${MIN_WINDOW_WIDTH}，按 ${MIN_WINDOW_WIDTH} 处理，后面的窗口会超出屏幕`);
+    }
+    for (let i = 0; i < n; i++) {
+      const pos = overlapLayout({ index: i, count: n, area, left: p.left, top: p.top });
+      out.push({ index: i, screen_id: targetScreen, x: pos.x, y: pos.y, width: pos.width, height: pos.height });
+    }
+    return { windows: out, screen_id: targetScreen, warnings };
+  }
+
   for (let i = 0; i < n; i++) {
-    const pos = p.range === 1
-      ? overlapPosition({ index: i, count: n, left: originX, top: originY, vs: p.vs })
-      : gridPosition({ index: i, row: row || Math.max(1, n), width: p.width, height: p.height, hs: p.hs, vs: p.vs, left: originX, top: originY });
+    const pos = gridPosition({ index: i, row: row || Math.max(1, n), width: p.width, height: p.height, hs: p.hs, vs: p.vs, left: originX, top: originY });
     out.push({ index: i, screen_id: targetScreen, x: pos.x, y: pos.y, width: p.width, height: p.height });
   }
   return { windows: out, screen_id: targetScreen, warnings };

@@ -207,6 +207,10 @@ export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, use
   const win = view.window || { width: screen.width, height: screen.height };
 
   const disableFeatures = ['Translate', 'OptimizationHints', 'MediaRouter', 'CalculateNativeWinOcclusion'];
+  /* 0.4.7.5：网络时间服务会去 `clients2.google.com/time/1/current`（明文 HTTP，启动瞬间一发）。
+   * 它不是后台网络任务，`--disable-background-networking` 关不掉，只能用 feature 开关。
+   * 判据读数：只加 8 个 flag 时 clients2 还在（4 个后台域名），加上这条才降到 3 个。 */
+  disableFeatures.push('NetworkTimeServiceQuerying');
   if (fp.webgl_config?.webgpu?.webgpu_switch === '0') disableFeatures.push('WebGPU', 'WebGPUService');
 
   /**
@@ -239,6 +243,35 @@ export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, use
     `--disable-features=${[...new Set(disableFeatures)].join(',')}`,
     '--disable-search-engine-choice-screen',
     '--hide-crash-restore-bubble',
+    /* 0.4.7.5：把内核自己的后台网络全关掉。
+     *
+     * 为什么（用户 2026-11-18 14:32 的实测）：Chrome 一个实例启动瞬间会对代理开 14 条连接，
+     * 其中 10 条是 Google 后台 —— clients2.google.com / clientservices.googleapis.com /
+     * update.googleapis.com / redirector.gvt1.com / chromewebstore.googleapis.com /
+     * www.googleapis.com / accounts.google.com / www.gstatic.com。
+     * 这些连接对用户一个用处都没有，却和真正的业务请求**抢同一台代理的上游拨号槽位**：
+     * 14 并发把上游 accept 队列打满 → 排队 10.6s → 中继 10s 超时 → 整页打不开
+     * （netlog 里 81 次 `ERR_SOCKS_CONNECTION_FAILED(-120)`）。
+     * 有界并发（src/proxy/relay.js）是兜底，这一组 flag 是**直接砍掉源头**。
+     *
+     * 逐条对得上哪条连接：
+     *   --disable-background-networking      组件更新/安全浏览/域名可靠性等后台任务的总闸
+     *   --disable-component-update           组件更新（update.googleapis.com）
+     *   --disable-sync                       账号同步（accounts.google.com）
+     *   --disable-domain-reliability         Domain Reliability 上报（clientservices）
+     *   --no-pings                           <a ping> 上报
+     *   --disable-client-side-phishing-detection  客户端钓鱼检测下载（chromewebstore）
+     *   --disable-default-apps               默认应用安装（chromewebstore）
+     *   --metrics-recording-only             只记本地指标、不上报
+     * 判据：test/kernel-quiet.test.mjs（真内核 + 数域名的假代理，断言后台域名 0 个）。 */
+    '--disable-background-networking',
+    '--disable-component-update',
+    '--disable-sync',
+    '--disable-domain-reliability',
+    '--no-pings',
+    '--disable-client-side-phishing-detection',
+    '--disable-default-apps',
+    '--metrics-recording-only',
     // 会话恢复（差距清单第 5 条）：这条 flag 是**真正起作用的那一半**。
     // 实测（2026-11-13，Chrome 157.0.8103.78，裸 Chrome + 同一套 argv，两次独立探针）：
     // 只把 `Default/Preferences` 的 `session.restore_on_startup` 写成 1 → 重启后**不恢复**

@@ -177,9 +177,14 @@ test('P2 automation_controlled：只有 "1" 才放开 navigator.webdriver，注�
   // "1"：不放这个 flag（内核原生 navigator.webdriver=true），其余写法维持基线（false）
   assert.equal(has(built('1')), false, 'automation_controlled=1 时不该再摘 AutomationControlled');
   for (const v of ['0', '', undefined, 'false', '2']) assert.equal(has(built(v)), true, `"${v}" 应维持基线`);
-  // 基线其它参数不受影响：同一个环境只是少了这一条
+  // 基线其它参数不受影响：同一个环境只是少了这一条。
+  // 0.4.7.5 起 `--disable-features` 里还会追加别的开关（NetworkTimeServiceQuerying 等），
+  // 所以这里**不再钉死整串**，但原来那四个必须还在 —— 别把「允许追加」写成「允许删」。
   const off = built('0').args;
-  assert.ok(off.includes('--disable-features=Translate,OptimizationHints,MediaRouter,CalculateNativeWinOcclusion'), off.join(' '));
+  const feat = String(off.find((a) => a.startsWith('--disable-features=')) || '');
+  for (const f of ['Translate', 'OptimizationHints', 'MediaRouter', 'CalculateNativeWinOcclusion']) {
+    assert.ok(feat.includes(f), `基线特性 ${f} 被顺手删掉了：${feat}`);
+  }
 
   // 数字 1 归一成 "1"（对手是 `"1" === value` 的严格比较，数字落库会被当成「关」）
   assert.equal(normalizeValue('automation_controlled', 1), '1');

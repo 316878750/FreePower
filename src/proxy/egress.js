@@ -6,25 +6,45 @@
  *
  * 做法：开一张临时标签加载出口信息接口，读回 JSON，然后立刻关掉。
  * 这张标签和其它标签一样会走注入层，不影响指纹一致性。
+ *
+ * 0.4.7.5：**3 次退避重试（0 / 1.5s / 4s）**。CEO 实测代理冷启动第一发 35.5s 才通、
+ * 第二发 691ms —— 一次失败就写「代理未连通」会把「慢」判成「坏」，起始页上就是一句
+ * 假的「代理未连通」。重试是这一版的口径，不是放宽判据（每次尝试的判定完全不变）。
  */
 import { EGRESS_PROBE_URL, EGRESS_TIMEOUT_MS } from '../config.js';
 import { parseExitInfo } from './probe.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** 三次尝试之间的等待（第 1 次不等）。与起始页那条口径一致（src/start/probe.js）。 */
+export const EGRESS_RETRY_DELAYS_MS = [0, 1500, 4000];
+
 /**
  * @param {import('../kernel/cdp.js').CdpClient} client
- * @param {{ url?: string, timeoutMs?: number, onTarget?: (targetId: string) => void }} [opt]
+ * @param {{ url?: string, timeoutMs?: number, onTarget?: (targetId: string) => void, retries?: number[] }} [opt]
  *   `onTarget` 在目标刚建好、导航之前同步调用：调用方用它给这张探测页登记「别被 blank-reload 碰」。
  *   不传也能工作（只是会在 400ms 那一拍和 watcher 抢一下）。
+ *   `retries` 传 `[0]` 可以关掉重试（判据里模拟「单发」时用）。
  * @returns {Promise<{ok:boolean, ip?:string, country?:string, countryCode?:string, city?:string,
- *   timezone?:string, isp?:string, url:string, error?:string}>}
+ *   timezone?:string, isp?:string, url:string, attempts?:number, error?:string}>}
  */
 export async function probeEgressInBrowser(client, {
   url = EGRESS_PROBE_URL,
   timeoutMs = EGRESS_TIMEOUT_MS,
   onTarget = null,
+  retries = EGRESS_RETRY_DELAYS_MS,
 } = {}) {
+  const delays = Array.isArray(retries) && retries.length ? retries : [0];
+  let last = null;
+  for (let i = 0; i < delays.length; i += 1) {
+    if (delays[i]) await sleep(delays[i]);
+    last = await probeOnce(client, { url, timeoutMs, onTarget });
+    if (last.ok) return { ...last, attempts: i + 1 };
+  }
+  return { ...last, attempts: delays.length };
+}
+
+async function probeOnce(client, { url, timeoutMs, onTarget }) {
   let targetId = null;
   try {
     ({ targetId } = await client.send('Target.createTarget', { url: 'about:blank' }));

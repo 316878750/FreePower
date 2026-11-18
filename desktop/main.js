@@ -515,9 +515,14 @@ function publishDisplays(reason) {
     displayTimer = null;
     try {
       const list = screen.getAllDisplays();
-      const okWrite = displaysMod?.writeDisplays?.(list);
+      // Electron 的 Display 没有 `primary` 字段：主屏必须用 getPrimaryDisplay().id 比（0.4.7.5）。
+      // 老实现把 `d.primary === true` 原样透传 → displays.json 里两块屏全是 false，
+      // UI 永远不显示「内置屏幕」，不传 screenId 的排列也落不到主屏上。
+      let primaryId = null;
+      try { primaryId = screen.getPrimaryDisplay()?.id ?? null; } catch { /* ignore */ }
+      const okWrite = displaysMod?.writeDisplays?.(list, { primaryId });
       log(`displays ${reason} → ${list.length} 块屏 ${okWrite ? 'ok' : 'FAILED'}`
-        + ` ${list.map((d) => `${d.id}:${d.workArea.width}x${d.workArea.height}@${d.workArea.x},${d.workArea.y}${d.primary ? '*' : ''}`).join(' ')}`);
+        + ` ${list.map((d) => `${d.id}:${d.workArea.width}x${d.workArea.height}@${d.workArea.x},${d.workArea.y}${String(d.id) === String(primaryId) ? '*' : ''}`).join(' ')}`);
     } catch (e) {
       log('displays 写入失败', e && e.message ? e.message : String(e));
     }
@@ -842,7 +847,12 @@ async function runSelfTest() {
       c.collapsed_not_resizable = syncPanel.isResizable() === false;
 
       const displays = safeDisplays();
-      const primary = displays.find((d) => d.primary === true) || displays[0] || null;
+      // Electron 的 Display 没有 `primary`：老代码 find(d => d.primary === true) 永远落空，
+      // 于是退回 displays[0]（多屏时常常是左边那块扩展屏）—— 自检读数就跟着算错（0.4.7.5）
+      let primaryDisplayId = null;
+      try { primaryDisplayId = screen.getPrimaryDisplay()?.id ?? null; } catch { /* ignore */ }
+      const primary = displays.find((d) => String(d.id) === String(primaryDisplayId))
+        || displays.find((d) => d.primary === true) || displays[0] || null;
       const wa = (primary && primary.workArea) || { x: 0, y: 0, width: 1920, height: 1080 };
       c.displays_count = displays.length;
       // 位置记忆：屏幕上能看见的点，校验后应当沿用保存值

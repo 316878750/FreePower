@@ -22,6 +22,8 @@ import { loadUnpackedExtensions } from '../kernel/extensions.js';
 import { checkProxy, hasProxy, normalizeProxyConfig } from '../proxy/probe.js';
 import { resolveChain, startChain } from '../proxy/chain.js';
 import { startRelay } from '../proxy/relay.js';
+// 环境 → 中继端口：起始页的出口探测要跟浏览器走**同一条链路**（0.4.7.5）
+import { setRelayPort, clearRelayPort } from '../proxy/relay-registry.js';
 import { pacInUse, pacMessage } from '../proxy/pac.js';
 import { probeEgressInBrowser } from '../proxy/egress.js';
 import { runSelfCheck } from '../selfcheck/index.js';
@@ -327,6 +329,8 @@ export async function startProfile(profile, { force = false, systemProxy = null 
         throw err;
       }
       log(id, '代理中继', `127.0.0.1:${relayServer.port} → 上游 ${upstream.type} ${upstream.host}:${upstream.port}`);
+      // 起始页探测要用这个端口（与浏览器同一条链路）；生命周期与 relayServer 一致
+      setRelayPort(id, relayServer.port);
       warnings.push(soft('proxy_auth_relay',
         `代理带用户名密码：Chrome 内核不支持 SOCKS5 认证（只会发 no-auth），已由本地中继转发 —— `
         + `内核只看到 127.0.0.1:${relayServer.port}，认证在 FreePower 这一侧对上游完成`));
@@ -394,7 +398,7 @@ export async function startProfile(profile, { force = false, systemProxy = null 
     } catch (e) {
       if (chainServer) { await chainServer.close().catch(() => {}); chainServer = null; }
       // 中继同理：拼参数/起进程这一步抛错也要立刻还端口
-      if (relayServer) { await relayServer.close().catch(() => {}); relayServer = null; }
+      if (relayServer) { await relayServer.close().catch(() => {}); relayServer = null; clearRelayPort(id); }
       throw e;
     }
     let client = null;
@@ -488,7 +492,7 @@ export async function startProfile(profile, { force = false, systemProxy = null 
           scheduleCachePurgeOnClose(cur);
         }
         if (chainServer) { chainServer.close().catch(() => {}); chainServer = null; }
-        if (relayServer) { relayServer.close().catch(() => {}); relayServer = null; }
+        if (relayServer) { relayServer.close().catch(() => {}); relayServer = null; clearRelayPort(id); }
         try { if (client) client.close(); } catch { /* ignore */ }
       });
 
@@ -589,7 +593,7 @@ export async function startProfile(profile, { force = false, systemProxy = null 
       // 链监听一定要关：失败路径漏端口，几轮反复起停之后才会炸，最难查
       if (chainServer) { await chainServer.close().catch(() => {}); chainServer = null; }
       // 带凭据代理的本地中继同理（0.4.7.3）：漏一个端口就是下次启动「端口被占」
-      if (relayServer) { await relayServer.close().catch(() => {}); relayServer = null; }
+      if (relayServer) { await relayServer.close().catch(() => {}); relayServer = null; clearRelayPort(id); }
       if (!err.code) err.code = 800003;
       throw err;
     }
@@ -1630,7 +1634,7 @@ export async function stopProfile(profileId) {
   // 链监听跟实例同生命周期：不关它，反复起停会一直漏端口
   if (inst.chain) { await inst.chain.close().catch(() => {}); inst.chain = null; }
   // 带凭据代理的本地中继（0.4.7.3）同理：**先 destroy 所有 socket 再 close 监听**（relay.close 内部就这么做）
-  if (inst.relay) { await inst.relay.close().catch(() => {}); inst.relay = null; }
+  if (inst.relay) { await inst.relay.close().catch(() => {}); inst.relay = null; clearRelayPort(profileId); }
   running.delete(profileId);
   markStatus(profileId, 'idle');
   // 关闭时自动备份（0.4.7 ③，**默认关**）：必须在清缓存之前，否则备份到的是被删空的目录。

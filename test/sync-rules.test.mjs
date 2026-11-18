@@ -36,7 +36,7 @@ const { mapPoint, buildInputPlan, buildKeyPlan, enabledBySwitch, EVENT_SWITCH, M
 const { makeRng, SyncScheduler, pickLine, randomNumber, typingDelays } =
   await import('../src/sync/scheduler.js');
 const { buildCaptureScript, FORBIDDEN_IN_SCRIPT } = await import('../src/sync/agent-script.js');
-const { normalizeSettings, DEFAULT_SETTINGS, syncStatus } = await import('../src/sync/session.js');
+const { normalizeSettings, DEFAULT_SETTINGS, syncStatus, unusableMasterPage } = await import('../src/sync/session.js');
 
 /** 保持事件循环活着：调度器的定时器是 unref 的，只 await promise 进程会提前退出 */
 function keepAlive() {
@@ -350,6 +350,25 @@ check('非法请求被拒且不落盘', badReq.ok === false && !!badReq.error, J
 const st = readHotkeyStatus();
 check('没有桌面壳时 status 形状稳定（managed=false、ok=null，不伪装成功也不伪装失败）',
   st.managed === false && st.ok === null && typeof st.accelerator === 'string', JSON.stringify(st));
+
+/* ================= 主窗口「可不可以同步」的口径（0.4.7.4 / 0.4.7.5） =================
+ * 纯函数直接断言口径，真内核那条在 test/sync-kernel.test.mjs（错误页 → 明确报错）。
+ * 0.4.7.5 新增起始页：用户 4 个环境全停在起始页（代理挂 → 打不开真站），
+ * 会话起来了、事件也转发了，但点哪都没效果 —— 那就是「同步没反应」的真相。
+ */
+console.log('\n— 主窗口可同步性：起始页 / 错误页 / 空白页 —');
+check('起始页 → 不能同步，原因点名「起始页」',
+  /起始页/.test(String(unusableMasterPage('http://start.freepower.test:53380/start?id=p1&sig=abc') || '')),
+  String(unusableMasterPage('http://start.freepower.test:53380/start?id=p1&sig=abc')));
+check('起始页（不带端口）也认得',
+  /起始页/.test(String(unusableMasterPage('http://start.freepower.test/start?id=p1&sig=abc') || '')));
+check('Chrome 错误页 → 不能同步，原因点名「错误页」',
+  /错误页/.test(String(unusableMasterPage('chrome-error://chromewebdata/') || '')));
+check('注入过的 about:blank → 能同步（新建标签的常态）',
+  unusableMasterPage('about:blank', { injected: true }) === null);
+check('没注入的 about:blank → 不能同步',
+  /空白页/.test(String(unusableMasterPage('about:blank', { injected: false }) || '')));
+check('普通网页 → 能同步', unusableMasterPage('https://example.com/a') === null);
 
 /* ============================ 收尾 ============================ */
 try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ }

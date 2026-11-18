@@ -29,7 +29,7 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'fp-arrange-'));
 process.env.FREEPOWER_DATA = TMP;
 
 const {
-  MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT, MAX_PER_ROW, normalizeArrange, gridPosition, overlapPosition,
+  MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT, MAX_PER_ROW, normalizeArrange, gridPosition, overlapLayout,
   autoFit, planArrange, auditPlan, verifyPlacement, summarizeArrange, placeOne,
 } = await import('../src/sync/arrange.js');
 const { writeDisplays, readDisplays, screensForArrange } = await import('../src/sync/displays.js');
@@ -89,10 +89,23 @@ t('range 只认 1，其它一律 0（含字符串 "1"）', () => {
   assert.equal(normalizeArrange({ range: 2 }).range, 0);
   assert.equal(normalizeArrange({ range: 'overlap' }).range, 0);
 });
-t('显示器编号越界要 warn（不能悄悄变成 -1 = 全部屏幕）', () => {
-  const p = normalizeArrange({ screenId: -5 });
-  assert.equal(p.screenId, -1);
-  assert.match(p.warnings.join(''), /显示器编号 -5 超出范围/);
+/* 0.4.7.5 改口径：显示器编号是**系统给的不透明 id**（Windows 上是大整数，本机实测
+ * 479047157 / 2139135862），只有字面量 -1 才是「全部屏幕」。老实现把它夹到 [-1,999]：
+ * 夹值 → 匹配不到 → 静默回落到 list[0]（左边那块扩展屏），用户点「排到 3440 屏」却跨了两块屏，
+ * 而 summary 还报成功。所以这条断言从「越界要变成 -1」改成「原样保留、由 planArrange 明确报错」。 */
+t('显示器编号原样保留（只有字面 -1 是「全部屏幕」）', () => {
+  assert.equal(normalizeArrange({ screenId: -5 }).screenId, -5);
+  assert.equal(normalizeArrange({ screenId: -1 }).screenId, -1);
+  assert.equal(normalizeArrange({ screenId: '2139135862' }).screenId, '2139135862');
+  assert.equal(normalizeArrange({ screenId: 2139135862 }).screenId, 2139135862);
+  assert.equal(normalizeArrange({ screenId: null }).screenId, null);
+  assert.equal(normalizeArrange({}).screenId, null);
+  assert.equal(normalizeArrange({ screenId: 479047157 }).warnings.length, 0);
+});
+t('找不到的编号不许静默换屏：明确 warn「找不到显示器 X，按主屏处理」', () => {
+  const plan = planArrange({ count: 2, screens: SCREENS, params: { width: 800, height: 600, screenId: -5 } });
+  assert.match(plan.warnings.join(''), /找不到显示器 -5，按主屏处理/);
+  assert.doesNotMatch(plan.warnings.join(''), /超出范围/);
 });
 
 /* ============================ 2. Grid 公式（对手 §5 直译） ============================ */
@@ -112,11 +125,53 @@ t('间距真的等于设定值：相邻两窗右边到左边 = hs', () => {
 t('每行 1 个：全部竖着排', () => {
   assert.deepEqual(gridPosition({ index: 2, row: 1, width: 800, height: 600, hs: 10, vs: 20, left: 0, top: 0 }), { x: 0, y: 1240 });
 });
-t('range=1（重叠式）：x = left + vs*|i-(c-1)|，最后一个落在 left', () => {
-  const p = (index) => overlapPosition({ index, count: 3, left: 100, top: 50, vs: 10 });
-  assert.deepEqual(p(0), { x: 120, y: 50 });
-  assert.deepEqual(p(1), { x: 110, y: 50 });
-  assert.deepEqual(p(2), { x: 100, y: 50 });
+/* 0.4.7.5 改口径：`range=1` 的重叠式**实测出来了**（31 号文 §12），老公式
+ * （逆序叠、用 vs 当步长）来自静态读码、没有实测过，已被推翻。现在的语义：
+ *   第 i 个 x = 工作区.x + 30×i，y = 工作区.y，宽 = 工作区宽 − 30×(n−1)，高 = 工作区高。
+ * 步长 30 是硬编码（界面没有对应设置项），窗口被拉到工作区大小、**不跟主控窗口**。 */
+t('重叠平铺：n=2 → 宽 = 工作区宽−30，落在 x=0/30', () => {
+  const area = { x: 0, y: 0, width: 3440, height: 1392 };
+  const a = overlapLayout({ index: 0, count: 2, area });
+  const b = overlapLayout({ index: 1, count: 2, area });
+  assert.deepEqual(a, { x: 0, y: 0, width: 3410, height: 1392 });
+  assert.deepEqual(b, { x: 30, y: 0, width: 3410, height: 1392 });
+});
+t('重叠平铺：n=3 → 宽 = 工作区宽−60，落在 x=0/30/60', () => {
+  const area = { x: 0, y: 0, width: 3440, height: 1392 };
+  const xs = [0, 1, 2].map((i) => overlapLayout({ index: i, count: 3, area }));
+  assert.deepEqual(xs.map((w) => w.x), [0, 30, 60]);
+  assert.deepEqual(xs.map((w) => w.width), [3380, 3380, 3380]);
+  assert.deepEqual(xs.map((w) => w.height), [1392, 1392, 1392]);
+});
+t('重叠平铺：原点跟着工作区走（扩展屏 x=-1080 时也在那块屏上）', () => {
+  const area = { x: -1080, y: 0, width: 1080, height: 1920 };
+  const w = overlapLayout({ index: 1, count: 2, area });
+  assert.equal(w.x, -1050);
+  assert.equal(w.width, 1050);
+});
+t('重叠平铺：数量太多时宽度夹到系统下限并 warn（不静默排到屏外）', () => {
+  const area = { x: 0, y: 0, width: 3440, height: 1392 };
+  const plan = planArrange({
+    count: 120, screens: [{ id: 'a', primary: true, workArea: area }],
+    params: { screenId: 'a', range: 1 },
+  });
+  assert.match(plan.warnings.join(''), /低于系统下限/);
+  assert.ok(plan.windows.every((w) => w.width >= MIN_WINDOW_WIDTH));
+});
+t('重叠平铺 vs 宫格：同屏同数量是**两套语义**（n=2：3410 对 1720）', () => {
+  const area = { x: 0, y: 0, width: 3440, height: 1392 };
+  const screens = [{ id: 'a', primary: true, workArea: area }];
+  const over = planArrange({ count: 2, screens, params: { screenId: 'a', range: 1 } });
+  const grid = planArrange({ count: 2, screens, params: { screenId: 'a', auto: true } });
+  assert.deepEqual(over.windows.map((w) => [w.x, w.width]), [[0, 3410], [30, 3410]]);
+  assert.ok(grid.windows.every((w) => w.width < 3410), JSON.stringify(grid.windows));
+  assert.equal(grid.windows[0].x, 0);
+  assert.notEqual(grid.windows[1].x, 30);
+});
+t('重叠平铺 + 「全部屏幕」：不静默改语义，明确 warn 按宫格处理', () => {
+  const plan = planArrange({ count: 2, screens: SCREENS, params: { screenId: -1, range: 1 } });
+  assert.equal(plan.screen_id, -1);
+  assert.match(plan.warnings.join(''), /重叠平铺不支持「全部屏幕」/);
 });
 
 /* ============================ 3. 出计划 ============================ */
@@ -161,9 +216,15 @@ t('row=0（显式）→ 全部堆到 (0,0)，并且**说出来**（不静默）'
   assert.deepEqual(plan.windows.map((w) => [w.x, w.y]), [[0, 0], [0, 0]]);
   assert.match(plan.warnings.join(''), /会完全重叠/);
 });
-t('range=1 → 叠在一条线上（间距用 vs，照对手）', () => {
+t('range=1 → 横向层叠 30px、尺寸拉满工作区（实测语义，不是老公式的 vs 间距）', () => {
   const plan = planArrange({ count: 3, screens: SCREENS, params: { width: 800, height: 600, range: 1, vs: 12, left: 10, top: 50 } });
-  assert.deepEqual(plan.windows.map((w) => w.x), [10 + 24, 10 + 12, 10]);
+  const area = PRIMARY.workArea;
+  assert.deepEqual(plan.windows.map((w) => w.x), [area.x + 10, area.x + 40, area.x + 70]);
+  assert.deepEqual(plan.windows.map((w) => w.y), [area.y + 50, area.y + 50, area.y + 50]);
+  assert.deepEqual(plan.windows.map((w) => w.width), [area.width - 60, area.width - 60, area.width - 60]);
+  assert.deepEqual(plan.windows.map((w) => w.height), [area.height, area.height, area.height]);
+  // 自定义里的宽/高/间距对它无效 —— 这是「两套语义」的关键，钉住
+  assert.notEqual(plan.windows[0].width, 800);
 });
 t('没有显示器信息 → 按 (0,0) 算并带 warning（不假装知道多屏布局）', () => {
   const plan = planArrange({ count: 1, screens: [], params: { width: 800, height: 600, row: 1 } });
@@ -202,6 +263,91 @@ t('screenList 不够放 → 如实 warn，不静默少排', () => {
   assert.equal(plan.windows.length, 1);
   assert.match(plan.warnings.join(''), /只安排了 1 个窗口，还有 2 个没排进去/);
 });
+
+/* ============ 4.5 真实多屏：大整数显示器 id + 主屏标记（0.4.7.5 用户实测的坑） ============
+ *
+ * 用户机器：左边 24G4（id 479047157，x=-1080，1080×1920）、主屏 CU34G3X（id 2139135862，
+ * x=0，3440×1440，可用区 3440×1392）。他在 UI 里选「3440 那块」点排列，结果窗口跨了两块屏，
+ * 而 summary 还报「已排列 4 个窗口」。
+ *
+ * 根因两条：
+ *   ① `normalizeArrange` 把 screenId 夹到 [-1,999] → 2139135862 变 999 → 匹配不到 → 回落 list[0]；
+ *   ② `displays.json` 里两块屏 primary 都是 false（Electron 的 Display 没有 primary 字段，
+ *      桌面壳却直接透传 `d.primary === true`）→ UI 不显示「内置屏幕」、不传 screenId 也落不到主屏。
+ */
+console.log('\n— 4.5 真实多屏：大整数 id 与主屏标记 —');
+const USER_SCREENS = [
+  { id: 479047157, primary: false, workArea: { x: -1080, y: 0, width: 1080, height: 1920 } },
+  { id: 2139135862, primary: true, workArea: { x: 0, y: 0, width: 3440, height: 1392 } },
+];
+const inArea = (w, a) => w.x >= a.x && w.y >= a.y
+  && w.x + w.width <= a.x + a.width && w.y + w.height <= a.y + a.height;
+
+t('screenId = 2139135862（>999）不再被夹：4 个窗口全在 3440 屏 workArea 内', () => {
+  const area = USER_SCREENS[1].workArea;
+  const fit = autoFit(4, area);
+  const plan = planArrange({
+    count: 4, screens: USER_SCREENS,
+    params: { screenId: 2139135862, width: fit.width, height: fit.height },
+  });
+  assert.equal(plan.screen_id, 2139135862);
+  assert.doesNotMatch(plan.warnings.join(''), /超出范围/);
+  assert.doesNotMatch(plan.warnings.join(''), /找不到显示器/);
+  for (const w of plan.windows) {
+    assert.ok(inArea(w, area), `窗口 ${w.index} 跑到屏外了：${JSON.stringify(w)}（可用区 ${JSON.stringify(area)}）`);
+    assert.ok(w.x >= 0, `窗口 ${w.index} 的 x=${w.x} 落到了左边那块屏`);
+  }
+  // 4 个窗口互不重叠
+  for (let i = 0; i < plan.windows.length; i += 1) {
+    for (let j = i + 1; j < plan.windows.length; j += 1) {
+      const a = plan.windows[i];
+      const b = plan.windows[j];
+      const overlap = a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+      assert.ok(!overlap, `窗口 ${i} 与 ${j} 重叠`);
+    }
+  }
+});
+t('screenId 传字符串（UI 就是这么传的）也认', () => {
+  const area = USER_SCREENS[1].workArea;
+  const plan = planArrange({
+    count: 2, screens: USER_SCREENS,
+    params: { screenId: '2139135862', width: 800, height: 600, row: 2 },
+  });
+  assert.equal(String(plan.screen_id), '2139135862');
+  for (const w of plan.windows) assert.ok(inArea(w, area), JSON.stringify(w));
+});
+t('显示器交接：Electron 形状（没有 primary 字段）+ primaryId → 恰好一块 primary', () => {
+  const electron = [
+    { id: 479047157, label: '24G4', scaleFactor: 1, bounds: { x: -1080, y: 0, width: 1080, height: 1920 }, workArea: { x: -1080, y: 0, width: 1080, height: 1920 } },
+    { id: 2139135862, label: 'CU34G3X', scaleFactor: 1, bounds: { x: 0, y: 0, width: 3440, height: 1440 }, workArea: { x: 0, y: 0, width: 3440, height: 1392 } },
+  ];
+  assert.equal(writeDisplays(electron, { primaryId: 2139135862 }), true);
+  const back = readDisplays();
+  const prim = back.displays.filter((d) => d.primary === true);
+  assert.equal(prim.length, 1, `primary 数量不对：${JSON.stringify(back.displays.map((d) => [d.id, d.primary]))}`);
+  assert.equal(String(prim[0].id), '2139135862');
+  const forArrange = screensForArrange();
+  assert.equal(String(forArrange.find((s) => s.primary)?.id), '2139135862');
+});
+t('不传 screenId → 落在主屏（3440 那块）workArea 内，不是 list[0]', () => {
+  const plan = planArrange({ count: 2, screens: USER_SCREENS, params: { width: 800, height: 600, row: 2 } });
+  assert.equal(String(plan.screen_id), '2139135862');
+  for (const w of plan.windows) assert.ok(inArea(w, USER_SCREENS[1].workArea), JSON.stringify(w));
+});
+t('回归：没有任何屏被标 primary 时，不传 screenId 仍能排（回落 list[0]，不许抛）', () => {
+  const noPrimary = USER_SCREENS.map((s) => ({ ...s, primary: false }));
+  const plan = planArrange({ count: 2, screens: noPrimary, params: { width: 800, height: 600, row: 2 } });
+  assert.equal(plan.windows.length, 2);
+  assert.equal(String(plan.screen_id), '479047157');
+});
+t('回归：screenId:-1（全部屏幕）语义不变', () => {
+  const plan = planArrange({ count: 4, screens: USER_SCREENS, params: { width: 800, height: 600, screenId: -1 } });
+  assert.equal(plan.screen_id, -1);
+  assert.equal(plan.windows.length, 4);
+});
+// 上面写了一份 displays.json：后面第 10 节要测「没有文件时 managed:false」，这里清掉，
+// 免得把顺序依赖带进判据（清不掉也不影响本节断言，只是第 10 节会红）。
+try { fs.rmSync(path.join(TMP, 'displays.json'), { force: true }); } catch { /* ignore */ }
 
 /* ============================ 5. 计划自检 ============================ */
 console.log('\n— 5. 计划自检：重叠 / 越界算得出来 —');

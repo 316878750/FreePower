@@ -107,6 +107,11 @@ function unusableMasterPage(url, { injected = false } = {}) {
   const u = String(url || '');
   if (!u) return '主窗口这张标签没有地址';
   if (/^chrome-error:/i.test(u)) return `主窗口停在 Chrome 错误页（${u.slice(0, 90)}）`;
+  /* 0.4.7.5：起始页也不是业务页面。
+   * 用户 2026-11-18 的场景：4 个环境全停在起始页（代理挂 → 打不开真站），
+   * 同步会话起来了、事件也转发了，但点哪里都没有可见效果 —— 用户看到的就是「同步没反应」。
+   * 起始页是**我们自己的本地页**，同步它没有任何意义，所以在起会话之前就明确拒绝。 */
+  if (isStartPageUrl(u)) return '主窗口停在起始页（还没有打开真正的网站）';
   if (/^devtools:/i.test(u)) return '主窗口是开发者工具页';
   if (/^(chrome|chrome-extension|edge|view-source|chrome-search|chrome-untrusted):/i.test(u)) {
     return `主窗口是浏览器内部页面（${u.slice(0, 60)}）`;
@@ -1282,3 +1287,5 @@ export async function refreshAll() {
 }
 
 export { sleep };
+/** 判据用：主窗口这张页面能不能同步（纯函数，A 层直接断言口径，不启内核） */
+export { unusableMasterPage };

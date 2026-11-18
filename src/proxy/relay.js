@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 带凭据代理的本地中继（0.4.7.3，P0）
  *
  * 为什么要有这个文件：**Chrome 内核不支持 SOCKS5 认证**。
@@ -25,8 +25,45 @@
 import net from 'node:net';
 
 const CRLF = '\r\n';
-const DEFAULT_TIMEOUT_MS = 10000;
+/**
+ * 单连接（上游拨号 + SOCKS5 握手）的超时。
+ *
+ * 0.4.7.5：10s → **60s**。两次实测支撑这个数：
+ *   ① 用户 4 个环境同开时，Chrome 一个实例会对中继开 14 条连接（10 条是 Google 后台），
+ *      远端代理在 14 并发下 TCP connect 排队 3.6s→10.6s，再加 SOCKS5 认证就超过 10s ——
+ *      中继回 REP_FAIL，Chrome 报 `ERR_SOCKS_CONNECTION_FAILED(-120)`，页面全打不开；
+ *   ② CEO 2026-11-18 复测**单连接**（不并发、不经中继、直连上游）：第 1 发 35,572ms 才通
+ *      （其中主探测源 ip-api.com 25 秒超时失败，靠备用源 ipinfo.io 救回来），第 2 发 691ms。
+ *      冷启动第一发 25 秒都不够，所以 30s 仍偏紧 —— 定 60s。
+ * 真正的解法是下面的有界并发（不把上游 accept 队列打满），超时只是兜底预算。
+ */
+const DEFAULT_TIMEOUT_MS = 60000;
+/**
+ * 上游拨号的**有界并发**上限（0.4.7.5）。
+ *
+ * 为什么必须有：无上限扇出会把上游的 accept 队列打满 —— 我们这边 14 条一起拨，
+ * 上游侧就排队到 10 秒以上；而用户那台代理在 40+ 连接时直接被供应商限流。
+ * 4 是实测值：4 并发打同一台上游全通、~500ms；再多的收益只是把排队从上游挪到我们这边，
+ * 但**我们有队列、有 30s 预算，上游没有**。可用 `FREEPOWER_RELAY_CONCURRENCY` 覆盖。
+ *
+ * 槽位只覆盖「拨号 + 握手」这一段，隧道建好立刻释放 —— 长连接不占槽，
+ * 否则一个开着 6 个标签页的环境会把 4 个槽全占死。
+ */
+const DEFAULT_CONCURRENCY = Number(process.env.FREEPOWER_RELAY_CONCURRENCY || 4) || 4;
+/**
+ * 上游拨号**重试**（0.4.7.5 追加）。
+ *
+ * 为什么光有队列不够：供应商限流时不是「慢」，而是**直接丢 SYN** —— 我们实测串行 5/5 通，
+ * 4 并发时 14 条里只成 3 条，失败全是 `connect ETIMEDOUT`（Windows 上 SYN 被丢约 21s 才报）。
+ * 一次丢包就报废一条浏览器连接，页面自然打不开。重拨一次就是重新掷骰子（实测单次成功率 ~1/3）。
+ *
+ * 每次拨号上限 21s（再等也还是 ETIMEDOUT），总预算仍受 `timeoutMs` 约束，不会把 60s 花光。
+ */
+const DIAL_ATTEMPT_MS = 21000;
+const DEFAULT_DIAL_ATTEMPTS = Math.max(1, Math.min(5, Number(process.env.FREEPOWER_RELAY_DIAL_ATTEMPTS || 3) || 3));
 const MAX_HEAD_BYTES = 64 * 1024;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* SOCKS5 常量 */
 const VER = 0x05;
@@ -126,14 +163,43 @@ function dial(host, port, timeoutMs, label = '上游') {
   });
 }
 
+/**
+ * 上游拨号（带重试）。只有「连不上」才重试 —— 握手阶段失败（认证错、上游拒绝）重试没有意义，
+ * 那是配置问题，重试只会把错误拖成超时。
+ */
+async function dialUpstream(upstream, timeoutMs, state) {
+  const deadline = Date.now() + timeoutMs;
+  const attempts = state.dialAttempts;
+  let last = null;
+  for (let i = 1; i <= attempts; i += 1) {
+    const left = deadline - Date.now();
+    if (left <= 250) break;
+    state.stats.dial_attempts += 1;
+    try {
+      return await dial(upstream.host, upstream.port, Math.min(DIAL_ATTEMPT_MS, left));
+    } catch (e) {
+      last = e;
+      if (i < attempts) {
+        state.stats.dial_retries += 1;
+        state.lastError = e;
+        await sleep(Math.min(400, Math.max(deadline - Date.now(), 1)));
+      }
+    }
+  }
+  throw last || Object.assign(
+    new Error(`连不上上游 ${upstream.host}:${upstream.port}（${timeoutMs}ms 内没连上）`),
+    { reason: 'timeout' },
+  );
+}
+
 /* ------------------------------ 上游握手 ------------------------------ */
 
 /**
  * SOCKS5 上游：greeting（同时提供 no-auth 与用户名密码）→ 必要时 RFC1929 子协商 → CONNECT。
  * 目标用**域名**形式交给上游（DNS 在上游解析，语义等同 socks5h）—— 本机不做 DNS 泄漏。
  */
-async function openSocks5Upstream(upstream, host, port, timeoutMs) {
-  const sock = await dial(upstream.host, upstream.port, timeoutMs);
+async function openSocks5Upstream(upstream, host, port, timeoutMs, state) {
+  const sock = await dialUpstream(upstream, timeoutMs, state);
   const rd = new Reader(sock);
   try {
     const methods = (upstream.username || upstream.password) ? [M_NOAUTH, M_USERPASS] : [M_NOAUTH];
@@ -188,8 +254,8 @@ async function openSocks5Upstream(upstream, host, port, timeoutMs) {
 }
 
 /** HTTP/HTTPS 上游：CONNECT + `Proxy-Authorization: Basic`（凭据只在这一段出现） */
-async function openHttpUpstream(upstream, host, port, timeoutMs) {
-  const sock = await dial(upstream.host, upstream.port, timeoutMs);
+async function openHttpUpstream(upstream, host, port, timeoutMs, state) {
+  const sock = await dialUpstream(upstream, timeoutMs, state);
   const rd = new Reader(sock);
   try {
     const authority = `${host}:${port}`;
@@ -214,25 +280,81 @@ async function openHttpUpstream(upstream, host, port, timeoutMs) {
   }
 }
 
-function openUpstream(upstream, host, port, timeoutMs) {
+function openUpstream(upstream, host, port, timeoutMs, state) {
   const type = String(upstream.type || 'http').toLowerCase();
-  if (type === 'socks5' || type === 'socks') return openSocks5Upstream(upstream, host, port, timeoutMs);
-  return openHttpUpstream(upstream, host, port, timeoutMs);
+  if (type === 'socks5' || type === 'socks') return openSocks5Upstream(upstream, host, port, timeoutMs, state);
+  return openHttpUpstream(upstream, host, port, timeoutMs, state);
 }
 
 /* ------------------------------ 本地监听 ------------------------------ */
+
+/**
+ * 上游拨号的槽位门（有界并发 + 排队）。
+ * 槽位只覆盖「拨号 + 握手」；隧道建好立刻 release。
+ */
+function createGate(limit, state) {
+  let active = 0;
+  const queue = [];
+  const grant = () => {
+    active += 1;
+    state.stats.active = active;
+    state.stats.peak_active = Math.max(state.stats.peak_active || 0, active);
+  };
+  const release = () => {
+    active -= 1;
+    state.stats.active = active;
+    const next = queue.shift();
+    state.stats.queue_depth = queue.length;
+    if (next) { clearTimeout(next.timer); grant(); next.resolve(); }
+  };
+  return {
+    async acquire(timeoutMs) {
+      if (state.closed) throw Object.assign(new Error('中继已关闭，不再接新连接'), { reason: 'relay_closed' });
+      if (active < limit) { grant(); return release; }
+      state.stats.queued += 1;
+      state.stats.queue_depth = queue.length + 1;
+      state.stats.peak_queue = Math.max(state.stats.peak_queue || 0, queue.length + 1);
+      await new Promise((resolve, reject) => {
+        const waiter = { resolve, timer: null };
+        waiter.timer = setTimeout(() => {
+          const i = queue.indexOf(waiter);
+          if (i >= 0) queue.splice(i, 1);
+          state.stats.queue_depth = queue.length;
+          reject(Object.assign(
+            new Error(`上游拨号排队超时（${timeoutMs}ms，并发上限 ${limit}）`),
+            { reason: 'queue_timeout' },
+          ));
+        }, timeoutMs);
+        queue.push(waiter);
+      });
+      return release;
+    },
+    /** close 时把还在排队的全部拒掉，别让它们挂到超时 */
+    drain(reason = 'relay_closed') {
+      while (queue.length) {
+        const w = queue.shift();
+        clearTimeout(w.timer);
+        w.reject(Object.assign(new Error('中继已关闭'), { reason }));
+      }
+      state.stats.queue_depth = 0;
+    },
+  };
+}
 
 /**
  * 起一个只 bind `127.0.0.1` 的 SOCKS5 中继（对浏览器不要求认证），
  * 上游用 `upstream` 的协议与凭据。
  *
  * @param {{type?:string, host:string, port:number, username?:string, password?:string}} upstream
+ * @param {{timeoutMs?:number, concurrency?:number}} [opt]
+ *   `concurrency` = 上游拨号并发上限（默认 4）；槽位只覆盖握手，隧道建好即释放。
  * @returns {Promise<{port:number, close:Function, lastError:object|null, sockets:Set, stats:object}>}
  */
-export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, concurrency = DEFAULT_CONCURRENCY, dialAttempts = DEFAULT_DIAL_ATTEMPTS } = {}) {
   if (!upstream || !upstream.host || !(Number(upstream.port) > 0)) {
     throw new Error('startRelay 需要上游代理的 host 与 port');
   }
+  const limit = Math.max(1, Math.floor(Number(concurrency) || DEFAULT_CONCURRENCY));
   const up = {
     type: String(upstream.type || 'http').toLowerCase(),
     host: String(upstream.host),
@@ -245,16 +367,35 @@ export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS } = 
     lastError: null,
     sockets: new Set(),
     closed: false,
+    dialAttempts: Math.max(1, Math.min(5, Math.floor(Number(dialAttempts) || DEFAULT_DIAL_ATTEMPTS))),
     /** 只记读数，不含凭据 */
-    stats: { connections: 0, tunnels: 0, failed: 0, upstream: `${up.type} ${up.host}:${up.port}` },
+    stats: {
+      connections: 0,
+      tunnels: 0,
+      failed: 0,
+      /** 排过队的连接数（累计）与当前队列深度 */
+      queued: 0,
+      queue_depth: 0,
+      peak_queue: 0,
+      /** 正在握手 / 峰值 / 上限 */
+      active: 0,
+      peak_active: 0,
+      concurrency: limit,
+      timeout_ms: timeoutMs,
+      /** 上游拨号：尝试次数（累计）与其中重试次数 */
+      dial_attempts: 0,
+      dial_retries: 0,
+      upstream: `${up.type} ${up.host}:${up.port}`,
+    },
   };
+  const gate = createGate(limit, state);
 
   const server = net.createServer((socket) => {
     state.stats.connections += 1;
     state.sockets.add(socket);
     socket.on('close', () => state.sockets.delete(socket));
     socket.on('error', () => { /* 浏览器主动断，正常 */ });
-    handleClient(socket, up, state, timeoutMs).catch((e) => {
+    handleClient(socket, up, state, timeoutMs, gate).catch((e) => {
       state.lastError = state.lastError || e;
       state.stats.failed += 1;
       try { socket.destroy(); } catch { /* ignore */ }
@@ -272,6 +413,7 @@ export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS } = 
 
   state.close = () => new Promise((resolve) => {
     state.closed = true;
+    gate.drain();
     for (const s of state.sockets) { try { s.destroy(); } catch { /* ignore */ } }
     state.sockets.clear();
     server.close(() => resolve());
@@ -279,9 +421,10 @@ export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS } = 
   return state;
 }
 
-async function handleClient(client, upstream, state, timeoutMs) {
+async function handleClient(client, upstream, state, timeoutMs, gate) {
   const rd = new Reader(client);
   let upstreamSock = null;
+  let releaseSlot = null;
   try {
     // ① 问候：只提供 no-auth（浏览器侧不需要认证 —— 凭据是我们的，不是它的）
     const [ver, n] = await rd.readExactly(2, timeoutMs, 'SOCKS5 问候');
@@ -323,9 +466,15 @@ async function handleClient(client, upstream, state, timeoutMs) {
     if (!host) throw Object.assign(new Error('目标主机为空'), { reason: 'bad_target' });
 
     // ③ 连上游（协议与凭据都在这一段）
-    const t = await openUpstream(upstream, host, port, timeoutMs);
+    //    有界并发：先排队拿槽位，**拿到才拨** —— 无上限扇出会把上游 accept 队列打满，
+    //    上游排队时间最后变成我们这边的「超时」（用户 2026-11-18 那 4 个环境就是这么死的）。
+    releaseSlot = await gate.acquire(timeoutMs);
+    const t = await openUpstream(upstream, host, port, timeoutMs, state);
     upstreamSock = t.socket;
     state.stats.tunnels += 1;
+    // 隧道建好即释放槽位：长连接不占槽，否则一个开 6 个标签的环境会把槽全占死
+    releaseSlot();
+    releaseSlot = null;
 
     client.write(reply(REP_OK));
     if (t.rest.length) { try { upstreamSock.write(t.rest); } catch { /* ignore */ } }
@@ -338,6 +487,8 @@ async function handleClient(client, upstream, state, timeoutMs) {
     try { client.write(reply(repFor(e))); } catch { /* 已经断了 */ }
     try { client.destroy(); } catch { /* ignore */ }
     if (upstreamSock) { try { upstreamSock.destroy(); } catch { /* ignore */ } }
+  } finally {
+    if (releaseSlot) { try { releaseSlot(); } catch { /* ignore */ } }
   }
 }
 
