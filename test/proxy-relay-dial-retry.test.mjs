@@ -8,8 +8,9 @@
  * 一次丢包报废一条浏览器连接 → 页面打不开。重拨一次就是重新掷骰子。
  *
  * 判据：
- *   ① 上游端口没有监听（ECONNREFUSED）→ 必须**试 3 次**（`dial_attempts=3`、`dial_retries=2`），
- *      客户端拿到非 0 REP（不能假成功）；改之前只试 1 次。
+ *   ① 上游端口没有监听（ECONNREFUSED）→ 必须**试 2 次**（`dial_attempts=2`、`dial_retries=1`；
+ *      0.4.7.5 19:45 由「3 次 × 21s」收到「2 次 × 8s」，因为 3×21s 会把 8 个槽位占满 60 秒），
+ *      客户端拿到非 0 REP（不能假成功）。
  *   ② 上游在重试窗口内起来 → **隧道最终成功**（证明重拨真的救了连接，不只是计数）。
  *   ③ `dialAttempts: 1` → 只试 1 次（可配、能关）。
  *   ④ 握手阶段失败（密码错）**不重试** —— 配置问题重试没有意义，只会把错误拖成超时。
@@ -74,14 +75,14 @@ function connectViaRelay(relayPort, { targetPort, timeoutMs = 90000 } = {}) {
 
 /* ------------------------------------------------------------------ */
 
-// ① 上游没有监听：必须试 3 次、客户端拿到失败（不假成功）
+// ① 上游没有监听：必须试 2 次、客户端拿到失败（不假成功）
 {
   const deadPort = await pickFreePort();
   const relay = await startRelay({ type: 'socks5', host: '127.0.0.1', port: deadPort, username: 'u', password: 'p' }, { timeoutMs: 20000 });
   const r = await connectViaRelay(relay.port, { targetPort: 443 });
   check('① 上游连不上时客户端拿到非 0 REP（不假成功）', r.ok === false && r.rep !== 0, `rep=${r.rep} ${r.ms}ms ${r.note || ''}`);
-  check('① 拨号试了 3 次（dial_attempts=3）', relay.stats.dial_attempts === 3, `dial_attempts=${relay.stats.dial_attempts}`);
-  check('① 其中重试 2 次（dial_retries=2）', relay.stats.dial_retries === 2, `dial_retries=${relay.stats.dial_retries}`);
+  check('① 拨号试了 2 次（dial_attempts=2，0.4.7.5 19:45 由 3 次收到 2 次）', relay.stats.dial_attempts === 2, `dial_attempts=${relay.stats.dial_attempts}`);
+  check('① 其中重试 1 次（dial_retries=1）', relay.stats.dial_retries === 1, `dial_retries=${relay.stats.dial_retries}`);
   check('① 失败进 stats.failed 与 lastError', relay.stats.failed >= 1 && Boolean(relay.lastError), `failed=${relay.stats.failed} lastError=${relay.lastError?.message || 'none'}`);
   await relay.close();
 }
@@ -91,11 +92,11 @@ function connectViaRelay(relayPort, { targetPort, timeoutMs = 90000 } = {}) {
   const echo = await startEchoServer();
   const laterPort = await pickFreePort();
   const relay = await startRelay({ type: 'socks5', host: '127.0.0.1', port: laterPort, username: 'retry-user', password: 'retry-pass-77c' }, { timeoutMs: 20000 });
-  // 第 1 次拨号必然 ECONNREFUSED；重试间隔 400ms，第 3 次在 ~800ms 左右 → 700ms 起来
+  // 第 1 次拨号必然 ECONNREFUSED；重试间隔 400ms，第 2 次（也是最后一次）在 ~400ms → 250ms 起来
   let fake = null;
   const timer = setTimeout(async () => {
     fake = await startFakeSocks5({ requireAuth: ['retry-user', 'retry-pass-77c'], port: laterPort });
-  }, 700);
+  }, 250);
   const r = await connectViaRelay(relay.port, { targetPort: echo.port });
   clearTimeout(timer);
   check('② 上游中途起来时重拨救回连接（隧道成功）', r.ok === true, `rep=${r.rep} ${r.ms}ms ${r.note || ''}`);

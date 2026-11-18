@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 带凭据代理的本地中继（0.4.7.3，P0）
  *
  * 为什么要有这个文件：**Chrome 内核不支持 SOCKS5 认证**。
@@ -55,25 +55,37 @@ const DEFAULT_TIMEOUT_MS = 60000;
  */
 const DEFAULT_CONCURRENCY = Number(process.env.FREEPOWER_RELAY_CONCURRENCY || 8) || 8;
 /**
- * **排队**的独立上限（0.4.7.5 18:40 追加）。
+ * **排队**的独立上限（0.4.7.5 18:40 追加；19:45 由 45s 收到 **20s**）。
  *
  * 60s 是「拨号 + 握手」的预算，**从真正开始拨号那一刻起算**；排队是另一段时间，
  * 不能拿拨号预算去付 —— 否则排队久的连接还没拨就超时，日志里只剩 `queue_timeout`，
- * 看起来像上游挂了，其实是自己被队列饿死。排队单独给 45s，超时单独计数。
+ * 看起来像上游挂了，其实是自己被队列饿死。排队超时单独计数。
+ *
+ * 20s 的依据：单连接拨号总预算已经是 20s（8s × 最多 2 次），排到 20s 还没轮到，
+ * 说明这一波窗口已经过去了 —— 与其挂着，不如快点失败让 Chrome 重连（它自己会重试）。
  * 可用 `FREEPOWER_RELAY_QUEUE_TIMEOUT_MS` 覆盖（判据用它把窗口压小）。
  */
-const DEFAULT_QUEUE_TIMEOUT_MS = Number(process.env.FREEPOWER_RELAY_QUEUE_TIMEOUT_MS || 45000) || 45000;
+const DEFAULT_QUEUE_TIMEOUT_MS = Number(process.env.FREEPOWER_RELAY_QUEUE_TIMEOUT_MS || 20000) || 20000;
 /**
- * 上游拨号**重试**（0.4.7.5 追加）。
+ * 单次拨号超时、单连接拨号总预算、最多试几次（0.4.7.5 19:45，CEO 定的口径）。
  *
- * 为什么光有队列不够：供应商限流时不是「慢」，而是**直接丢 SYN** —— 我们实测串行 5/5 通，
- * 4 并发时 14 条里只成 3 条，失败全是 `connect ETIMEDOUT`（Windows 上 SYN 被丢约 21s 才报）。
- * 一次丢包就报废一条浏览器连接，页面自然打不开。重拨一次就是重新掷骰子（实测单次成功率 ~1/3）。
+ * 为什么从「21s × 3 次」改成「8s × 2 次、总 20s」：
+ *   - 21s 是 Windows 上 SYN 被丢时 `connect` 报 ETIMEDOUT 的时间，但它只在**上游真丢包**
+ *     时才该发生；同一台代理单发实测 649ms / 748ms 就通 —— 我们看到的 60s 是**自己**造成的。
+ *   - 一条连接最坏 21s × 3 = 63s，而槽位只有 8 个：8 个槽全卡在重试里 60 秒，
+ *     Chrome 后面 18 条连接全在排队，页面 45 秒超时。实测 `max_dial_ms=60015`、
+ *     `dial_attempts=51` 就是这条链路的指纹。
+ *   - 失败要**快**：8s 一次、最多 2 次、总预算 20s；而且**失败立刻还槽位**（见 dialUpstream，
+ *     槽位是公共资源，重试期间不许占着）。旧版 10s / 不重试 / 无界反而能开页面 ——
+ *     因为它失败得快、槽位流转快，剩下的交给 Chrome 自己重连。
  *
- * 每次拨号上限 21s（再等也还是 ETIMEDOUT），总预算仍受 `timeoutMs` 约束，不会把 60s 花光。
+ * 可用 `FREEPOWER_RELAY_DIAL_TIMEOUT_MS`（单次，默认 8000）、
+ * `FREEPOWER_RELAY_DIAL_BUDGET_MS`（单连接总预算，默认 20000）、
+ * `FREEPOWER_RELAY_DIAL_ATTEMPTS`（默认 2）覆盖；判据用它们把窗口压小。
  */
-const DIAL_ATTEMPT_MS = 21000;
-const DEFAULT_DIAL_ATTEMPTS = Math.max(1, Math.min(5, Number(process.env.FREEPOWER_RELAY_DIAL_ATTEMPTS || 3) || 3));
+const DEFAULT_DIAL_ATTEMPT_MS = Math.max(200, Number(process.env.FREEPOWER_RELAY_DIAL_TIMEOUT_MS || 8000) || 8000);
+const DEFAULT_DIAL_BUDGET_MS = Math.max(500, Number(process.env.FREEPOWER_RELAY_DIAL_BUDGET_MS || 20000) || 20000);
+const DEFAULT_DIAL_ATTEMPTS = Math.max(1, Math.min(5, Number(process.env.FREEPOWER_RELAY_DIAL_ATTEMPTS || 2) || 2));
 const MAX_HEAD_BYTES = 64 * 1024;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -176,31 +188,50 @@ function dial(host, port, timeoutMs, label = '上游') {
   });
 }
 
+/** 记一次拨号耗时（只统计 TCP 连接这一段，不含握手） */
+function recordDial(state, t0) {
+  const ms = Date.now() - t0;
+  state.stats.max_dial_ms = Math.max(state.stats.max_dial_ms || 0, ms);
+  state.stats.dial_ms_total += ms;
+}
+
 /**
- * 上游拨号（带重试）。只有「连不上」才重试 —— 握手阶段失败（认证错、上游拒绝）重试没有意义，
+ * 上游拨号（带重试）。
+ *
+ * **槽位只覆盖「一次拨号」**：每次尝试前 acquire、尝试结束（成功或失败）立刻 release。
+ * 0.4.7.5 19:45 之前是「拿到槽位 → 拨号失败 → 占着槽位重试」：一条连接最坏占槽 63s，
+ * 8 个槽被 8 条坏连接占满，Chrome 剩下的连接全在排队 —— 实测 `max_dial_ms=60015`、
+ * `dial_attempts=51`。现在失败立刻还槽，别的连接马上能进来拨。
+ *
+ * 只有「连不上」才重试 —— 握手阶段失败（认证错、上游拒绝）重试没有意义，
  * 那是配置问题，重试只会把错误拖成超时。
  */
-async function dialUpstream(upstream, timeoutMs, state) {
-  const deadline = Date.now() + timeoutMs;
-  const attempts = state.dialAttempts;
+async function dialUpstream(upstream, { timeoutMs, dialAttemptMs, dialBudgetMs, attempts, state, gate, queueTimeoutMs }) {
+  const deadline = Date.now() + Math.min(dialBudgetMs, timeoutMs);
   let last = null;
   for (let i = 1; i <= attempts; i += 1) {
     const left = deadline - Date.now();
     if (left <= 250) break;
     state.stats.dial_attempts += 1;
+    // 槽位是公共资源：这次拨号一结束（成功或失败）就还回去，绝不带着它重试
+    const release = await gate.acquire(queueTimeoutMs);
+    const t0 = Date.now();
     try {
-      return await dial(upstream.host, upstream.port, Math.min(DIAL_ATTEMPT_MS, left));
+      return await dial(upstream.host, upstream.port, Math.min(dialAttemptMs, left));
     } catch (e) {
       last = e;
-      if (i < attempts) {
-        state.stats.dial_retries += 1;
-        state.lastError = e;
-        await sleep(Math.min(400, Math.max(deadline - Date.now(), 1)));
-      }
+    } finally {
+      recordDial(state, t0);
+      release();
+    }
+    if (i < attempts) {
+      state.stats.dial_retries += 1;
+      state.lastError = last;
+      await sleep(Math.min(400, Math.max(deadline - Date.now(), 1)));
     }
   }
   throw last || Object.assign(
-    new Error(`连不上上游 ${upstream.host}:${upstream.port}（${timeoutMs}ms 内没连上）`),
+    new Error(`连不上上游 ${upstream.host}:${upstream.port}（${Math.min(dialBudgetMs, timeoutMs)}ms 内没连上）`),
     { reason: 'timeout' },
   );
 }
@@ -211,8 +242,9 @@ async function dialUpstream(upstream, timeoutMs, state) {
  * SOCKS5 上游：greeting（同时提供 no-auth 与用户名密码）→ 必要时 RFC1929 子协商 → CONNECT。
  * 目标用**域名**形式交给上游（DNS 在上游解析，语义等同 socks5h）—— 本机不做 DNS 泄漏。
  */
-async function openSocks5Upstream(upstream, host, port, timeoutMs, state) {
-  const sock = await dialUpstream(upstream, timeoutMs, state);
+async function openSocks5Upstream(upstream, host, port, ctx) {
+  const { timeoutMs } = ctx;
+  const sock = await dialUpstream(upstream, ctx);
   const rd = new Reader(sock);
   try {
     const methods = (upstream.username || upstream.password) ? [M_NOAUTH, M_USERPASS] : [M_NOAUTH];
@@ -267,8 +299,9 @@ async function openSocks5Upstream(upstream, host, port, timeoutMs, state) {
 }
 
 /** HTTP/HTTPS 上游：CONNECT + `Proxy-Authorization: Basic`（凭据只在这一段出现） */
-async function openHttpUpstream(upstream, host, port, timeoutMs, state) {
-  const sock = await dialUpstream(upstream, timeoutMs, state);
+async function openHttpUpstream(upstream, host, port, ctx) {
+  const { timeoutMs } = ctx;
+  const sock = await dialUpstream(upstream, ctx);
   const rd = new Reader(sock);
   try {
     const authority = `${host}:${port}`;
@@ -293,10 +326,10 @@ async function openHttpUpstream(upstream, host, port, timeoutMs, state) {
   }
 }
 
-function openUpstream(upstream, host, port, timeoutMs, state) {
+function openUpstream(upstream, host, port, ctx) {
   const type = String(upstream.type || 'http').toLowerCase();
-  if (type === 'socks5' || type === 'socks') return openSocks5Upstream(upstream, host, port, timeoutMs, state);
-  return openHttpUpstream(upstream, host, port, timeoutMs, state);
+  if (type === 'socks5' || type === 'socks') return openSocks5Upstream(upstream, host, port, ctx);
+  return openHttpUpstream(upstream, host, port, ctx);
 }
 
 /* ------------------------------ 本地监听 ------------------------------ */
@@ -343,10 +376,13 @@ function createGate(limit, state) {
           const timedOutWait = Date.now() - enqueuedAt;
           state.stats.max_queue_wait_ms = Math.max(state.stats.max_queue_wait_ms || 0, timedOutWait);
           state.stats.queue_wait_ms_total += timedOutWait;
-          reject(Object.assign(
+          // 单独留一条：`lastError` 只保留最后一个错误，排队与拨号会互相覆盖，看不出是哪一类
+          const err = Object.assign(
             new Error(`上游拨号排队超时（${queueTimeoutMs}ms，并发上限 ${limit}）`),
             { reason: 'queue_timeout' },
-          ));
+          );
+          state.lastQueueError = err;
+          reject(err);
         }, queueTimeoutMs);
         queue.push(waiter);
       });
@@ -372,18 +408,22 @@ function createGate(limit, state) {
  * 上游用 `upstream` 的协议与凭据。
  *
  * @param {{type?:string, host:string, port:number, username?:string, password?:string}} upstream
- * @param {{timeoutMs?:number, concurrency?:number, queueTimeoutMs?:number, dialAttempts?:number}} [opt]
- *   `concurrency` = 上游拨号并发上限（默认 8）；槽位只覆盖握手，隧道建好即释放。
+ * @param {{timeoutMs?:number, concurrency?:number, queueTimeoutMs?:number, dialAttempts?:number,
+ *   dialAttemptMs?:number, dialBudgetMs?:number}} [opt]
+ *   `concurrency` = 上游拨号并发上限（默认 8）；槽位只覆盖**一次拨号**，拨完即释放。
  *   `timeoutMs` = 单条连接「拨号 + 握手」的预算（默认 60s，**从开始拨号起算**）。
- *   `queueTimeoutMs` = 排队上限（默认 45s，**独立于拨号预算**）。
+ *   `queueTimeoutMs` = 排队上限（默认 20s，**独立于拨号预算**）。
+ *   `dialAttemptMs` / `dialBudgetMs` / `dialAttempts` = 单次拨号 8s / 单连接拨号总预算 20s / 最多 2 次。
  * @returns {Promise<{port:number, close:Function, lastError:object|null, sockets:Set, stats:object}>}
  */
-export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, concurrency = DEFAULT_CONCURRENCY, queueTimeoutMs = DEFAULT_QUEUE_TIMEOUT_MS, dialAttempts = DEFAULT_DIAL_ATTEMPTS } = {}) {
+export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, concurrency = DEFAULT_CONCURRENCY, queueTimeoutMs = DEFAULT_QUEUE_TIMEOUT_MS, dialAttempts = DEFAULT_DIAL_ATTEMPTS, dialAttemptMs = DEFAULT_DIAL_ATTEMPT_MS, dialBudgetMs = DEFAULT_DIAL_BUDGET_MS } = {}) {
   if (!upstream || !upstream.host || !(Number(upstream.port) > 0)) {
     throw new Error('startRelay 需要上游代理的 host 与 port');
   }
   const limit = Math.max(1, Math.floor(Number(concurrency) || DEFAULT_CONCURRENCY));
   const queueLimit = Math.max(1, Math.floor(Number(queueTimeoutMs) || DEFAULT_QUEUE_TIMEOUT_MS));
+  const attemptMs = Math.max(200, Math.floor(Number(dialAttemptMs) || DEFAULT_DIAL_ATTEMPT_MS));
+  const budgetMs = Math.max(500, Math.floor(Number(dialBudgetMs) || DEFAULT_DIAL_BUDGET_MS));
   const up = {
     type: String(upstream.type || 'http').toLowerCase(),
     host: String(upstream.host),
@@ -397,6 +437,8 @@ export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, con
     sockets: new Set(),
     closed: false,
     dialAttempts: Math.max(1, Math.min(5, Math.floor(Number(dialAttempts) || DEFAULT_DIAL_ATTEMPTS))),
+    /** 拨号参数（dialUpstream 每次尝试都用它） */
+    dialCtx: { timeoutMs, dialAttemptMs: attemptMs, dialBudgetMs: budgetMs, attempts: 0, state: null, gate: null, queueTimeoutMs: queueLimit },
     /** 只记读数，不含凭据 */
     stats: {
       connections: 0,
@@ -411,15 +453,19 @@ export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, con
       queue_timeout: 0,
       max_queue_wait_ms: 0,
       queue_wait_ms_total: 0,
-      /** 正在握手 / 峰值 / 上限 */
+      /** 正在拨号 / 峰值 / 上限（槽位只覆盖一次拨号） */
       active: 0,
       peak_active: 0,
       concurrency: limit,
       timeout_ms: timeoutMs,
-      /** 拨号超时次数（与 queue_timeout 分开）、拨号耗时读数 */
+      /** 拨号超时次数（与 queue_timeout 分开）、拨号耗时读数（只算 TCP 连接那一段） */
       dial_timeout: 0,
       max_dial_ms: 0,
       dial_ms_total: 0,
+      /** 拨号参数：单次上限 / 单连接总预算 / 最多几次 */
+      dial_attempt_ms: attemptMs,
+      dial_budget_ms: budgetMs,
+      dial_attempts_max: 0,
       /** 上游拨号：尝试次数（累计）与其中重试次数 */
       dial_attempts: 0,
       dial_retries: 0,
@@ -427,13 +473,17 @@ export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, con
     },
   };
   const gate = createGate(limit, state);
+  state.dialCtx.attempts = state.dialAttempts;
+  state.dialCtx.state = state;
+  state.dialCtx.gate = gate;
+  state.stats.dial_attempts_max = state.dialAttempts;
 
   const server = net.createServer((socket) => {
     state.stats.connections += 1;
     state.sockets.add(socket);
     socket.on('close', () => state.sockets.delete(socket));
     socket.on('error', () => { /* 浏览器主动断，正常 */ });
-    handleClient(socket, up, state, timeoutMs, gate, queueLimit).catch((e) => {
+    handleClient(socket, up, state, timeoutMs).catch((e) => {
       state.lastError = state.lastError || e;
       state.stats.failed += 1;
       try { socket.destroy(); } catch { /* ignore */ }
@@ -459,10 +509,9 @@ export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, con
   return state;
 }
 
-async function handleClient(client, upstream, state, timeoutMs, gate, queueLimit) {
+async function handleClient(client, upstream, state, timeoutMs) {
   const rd = new Reader(client);
   let upstreamSock = null;
-  let releaseSlot = null;
   try {
     // ① 问候：只提供 no-auth（浏览器侧不需要认证 —— 凭据是我们的，不是它的）
     const [ver, n] = await rd.readExactly(2, timeoutMs, 'SOCKS5 问候');
@@ -504,24 +553,12 @@ async function handleClient(client, upstream, state, timeoutMs, gate, queueLimit
     if (!host) throw Object.assign(new Error('目标主机为空'), { reason: 'bad_target' });
 
     // ③ 连上游（协议与凭据都在这一段）
-    //    有界并发：先排队拿槽位，**拿到才拨** —— 无上限扇出会把上游 accept 队列打满，
-    //    上游排队时间最后变成我们这边的「超时」（用户 2026-11-18 那 4 个环境就是这么死的）。
-    //    排队预算**独立**（queueTimeoutMs）：排在队里不算拨号，别让排队把 60s 拨号预算吃掉。
-    releaseSlot = await gate.acquire(queueLimit);
-    const dialStart = Date.now();
-    let t;
-    try {
-      t = await openUpstream(upstream, host, port, timeoutMs, state);
-    } finally {
-      const dialMs = Date.now() - dialStart;
-      state.stats.max_dial_ms = Math.max(state.stats.max_dial_ms || 0, dialMs);
-      state.stats.dial_ms_total += dialMs;
-    }
+    //    有界并发 + **每次拨号一个槽位**：槽位在 dialUpstream 里 acquire/release，
+    //    拨完（成功或失败）立刻还 —— 失败绝不带着槽位重试（0.4.7.5 19:45，见 dialUpstream 注释）。
+    //    排队预算**独立**（queueTimeoutMs）：排在队里不算拨号，别让排队把拨号预算吃掉。
+    const t = await openUpstream(upstream, host, port, state.dialCtx);
     upstreamSock = t.socket;
     state.stats.tunnels += 1;
-    // 隧道建好即释放槽位：长连接不占槽，否则一个开 6 个标签的环境会把槽全占死
-    releaseSlot();
-    releaseSlot = null;
 
     client.write(reply(REP_OK));
     if (t.rest.length) { try { upstreamSock.write(t.rest); } catch { /* ignore */ } }
@@ -536,8 +573,6 @@ async function handleClient(client, upstream, state, timeoutMs, gate, queueLimit
     try { client.write(reply(repFor(e))); } catch { /* 已经断了 */ }
     try { client.destroy(); } catch { /* ignore */ }
     if (upstreamSock) { try { upstreamSock.destroy(); } catch { /* ignore */ } }
-  } finally {
-    if (releaseSlot) { try { releaseSlot(); } catch { /* ignore */ } }
   }
 }
 

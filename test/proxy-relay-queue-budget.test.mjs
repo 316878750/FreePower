@@ -11,10 +11,11 @@
  *   - `stats.max_queue_wait_ms` 让下次一眼看出是排队还是拨号。
  *
  * 判据（先红后绿，全部用假上游 / TEST-NET 黑洞，**不碰用户真代理**）：
- *   ① 默认值：concurrency=8、queue_timeout_ms=45000、timeout_ms=60000；
- *   ② 排队超时独立生效并单独计数：queueTimeoutMs=700 + 慢上游 → 4 条排队超时，
- *      它们**一次都没拨到上游**（上游 connections 只等于拿到槽位的条数），dial_timeout=0；
- *   ③ 排队不吃拨号预算：timeoutMs=2500、排队 20s、串行上游 1.5s/次 → 3 条全通；
+ *   ① 默认值：concurrency=8、queue_timeout_ms=20000、timeout_ms=60000、
+ *      单次拨号 8000 / 单连接总预算 20000 / 最多 2 次（19:45 由 45s、21s×3 收窄）；
+ *   ② 排队超时独立生效并单独计数：慢拨号（3s/次）+ 并发 2 + 排队 700ms → 4 条排队超时，
+ *      拿到槽位的 2 条是拨号超时（两类计数不混）；
+ *   ③ 排队不吃拨号预算：并发 1 + 慢拨号 1.2s → 3 条串行，每条都拿到完整 1.2s 预算；
  *   ④ 拨号超时单独计数：黑洞上游（192.0.2.1，SYN 被丢）+ timeoutMs=600 → dial_timeout=1、
  *      queue_timeout=0，lastError.reason=timeout；
  *   ⑤ 两个计数恒为数字，max_queue_wait_ms 有真实读数。
@@ -84,8 +85,11 @@ try {
     const relay = await startRelay({ type: 'socks5', host: '127.0.0.1', port: up.port, username: USER, password: PASS });
     const st = relay.stats;
     check('① 默认并发 = 8（旧版 4 会把 29 条连接排到 7 分钟）', st.concurrency === 8, `concurrency=${st.concurrency}`);
-    check('① 默认排队上限 = 45000ms（独立于拨号预算）', st.queue_timeout_ms === 45000, `queue_timeout_ms=${st.queue_timeout_ms}`);
+    check('① 默认排队上限 = 20000ms（独立于拨号预算；19:45 由 45s 收到 20s）', st.queue_timeout_ms === 20000, `queue_timeout_ms=${st.queue_timeout_ms}`);
     check('① 默认拨号+握手预算 = 60000ms', st.timeout_ms === 60000, `timeout_ms=${st.timeout_ms}`);
+    check('① 默认单次拨号 8s / 单连接总预算 20s / 最多 2 次',
+      st.dial_attempt_ms === 8000 && st.dial_budget_ms === 20000 && st.dial_attempts_max === 2,
+      `dial_attempt_ms=${st.dial_attempt_ms} budget=${st.dial_budget_ms} max=${st.dial_attempts_max}`);
     check('① 两个超时计数初始为 0、max_queue_wait_ms 有初值',
       st.queue_timeout === 0 && st.dial_timeout === 0 && st.max_queue_wait_ms === 0,
       JSON.stringify({ queue_timeout: st.queue_timeout, dial_timeout: st.dial_timeout, max_queue_wait_ms: st.max_queue_wait_ms }));
@@ -93,16 +97,12 @@ try {
     await up.close();
   }
 
-  // ② 排队超时独立生效并单独计数；排队的连接一次都没拨上游
+  // ② 排队超时独立生效并单独计数（用**慢拨号**造队，不是慢握手）：
+  //    0.4.7.5 19:45 起槽位只覆盖一次拨号，握手不再占槽 —— 慢握手造不出队列了。
   {
-    const up = await startFakeSocks5({
-      requireAuth: [USER, PASS], label: 'slow-handshake',
-      handshakeConcurrency: 1, handshakeMs: 1200,
-    });
-    // timeoutMs 保持 60s：证明排队超时不是拨号超时连坐
     const relay = await startRelay(
-      { type: 'socks5', host: '127.0.0.1', port: up.port, username: USER, password: PASS },
-      { timeoutMs: 60000, queueTimeoutMs: 700, concurrency: 2 },
+      { type: 'socks5', host: '192.0.2.1', port: 47283, username: USER, password: PASS },
+      { timeoutMs: 60000, queueTimeoutMs: 700, concurrency: 2, dialAttemptMs: 3000, dialBudgetMs: 3000, dialAttempts: 1 },
     );
     const N = 6;
     const settled = await Promise.all(Array.from({ length: N }, async () => {
@@ -117,45 +117,39 @@ try {
     const st = relay.stats;
     const ok = settled.filter((x) => x.ok).length;
     const failed = settled.filter((x) => !x.ok).length;
-    console.log(`② 6 并发（并发上限 2 / 排队 700ms / 握手 1200ms）：通 ${ok} / 失败 ${failed}；stats=${JSON.stringify({
+    console.log(`② 6 并发（并发上限 2 / 排队 700ms / 拨号 3000ms×1）：通 ${ok} / 失败 ${failed}；stats=${JSON.stringify({
       queued: st.queued, peak_queue: st.peak_queue, queue_timeout: st.queue_timeout, dial_timeout: st.dial_timeout, max_queue_wait_ms: st.max_queue_wait_ms,
     })}`);
     check('② 排队超时的连接被单独计数（queue_timeout ≥ 4）', st.queue_timeout >= 4, `queue_timeout=${st.queue_timeout}`);
-    check('② 排队超时**不算**拨号超时（dial_timeout = 0）', st.dial_timeout === 0, `dial_timeout=${st.dial_timeout}`);
-    check('② 排队的连接一次都没拨到上游（上游只看到拿到槽位的 2 条）',
-      up.stats.connections === 2, `上游 connections=${up.stats.connections}（期望 2 = 并发上限）`);
-    check('② 拿到槽位的连接照常建成隧道', st.tunnels === 2 && ok === 2, `tunnels=${st.tunnels} 客户端通=${ok}`);
+    check('② 拿到槽位的 2 条走的是拨号超时（dial_timeout = 2），两类计数不混',
+      st.dial_timeout === 2, `dial_timeout=${st.dial_timeout}`);
     check('② max_queue_wait_ms 记录到真实排队时长（≥ 650ms）', st.max_queue_wait_ms >= 650, `max_queue_wait_ms=${st.max_queue_wait_ms}`);
-    check('② 失败原因是排队超时，不是拨号', /排队超时/.test(String(relay.lastError?.message || '')), String(relay.lastError?.message || '').slice(0, 60));
+    check('② 排队超时单独留痕（lastQueueError 里能看到），不是混在拨号里',
+      /排队超时/.test(String(relay.lastQueueError?.message || '')), String(relay.lastQueueError?.message || '').slice(0, 60));
     await relay.close();
-    await up.close();
   }
 
-  // ③ 排队不吃拨号预算：每条连接拿到槽位后仍有完整 timeoutMs
+  // ③ 排队不吃拨号预算：排在队里的连接，轮到自己时仍拿到**完整**的一次拨号预算
+  //    （0.4.7.5 19:45 起槽位只覆盖一次拨号，所以这里用「慢拨号」造队；
+  //     若排队把预算吃掉，后两条的拨号会被截断 → dial_ms_total 明显小于 3 × 1.1s）
   {
-    const up = await startFakeSocks5({
-      requireAuth: [USER, PASS], label: 'serial-1.5s',
-      handshakeConcurrency: 1, handshakeMs: 1500,
-    });
     const relay = await startRelay(
-      { type: 'socks5', host: '127.0.0.1', port: up.port, username: USER, password: PASS },
-      { timeoutMs: 2500, queueTimeoutMs: 20000, concurrency: 1 },
+      { type: 'socks5', host: '192.0.2.1', port: 47283, username: USER, password: PASS },
+      { timeoutMs: 60000, queueTimeoutMs: 20000, concurrency: 1, dialAttemptMs: 1200, dialBudgetMs: 1200, dialAttempts: 1 },
     );
-    const settled = await Promise.all(Array.from({ length: 3 }, async () => {
-      try {
-        const s = await connectViaRelay(relay.port, { targetPort: echo.port, timeoutMs: 30000 });
-        s.destroy();
-        return true;
-      } catch { return false; }
+    const t0 = Date.now();
+    await Promise.all(Array.from({ length: 3 }, async () => {
+      try { const s = await connectViaRelay(relay.port, { targetPort: echo.port, timeoutMs: 30000 }); s.destroy(); } catch { /* 预期失败 */ }
     }));
-    check('③ 排队 3s 后拨号仍拿到完整 2500ms 预算（3/3 通）',
-      settled.every(Boolean) && relay.stats.tunnels === 3,
-      `通=${settled.filter(Boolean).length}/3 tunnels=${relay.stats.tunnels} max_queue_wait_ms=${relay.stats.max_queue_wait_ms}`);
-    check('③ 这一轮没有排队超时、也没有拨号超时',
-      relay.stats.queue_timeout === 0 && relay.stats.dial_timeout === 0,
-      `queue_timeout=${relay.stats.queue_timeout} dial_timeout=${relay.stats.dial_timeout}`);
+    const elapsed = Date.now() - t0;
+    const st = relay.stats;
+    check('③ 排完队的那条仍拿到完整拨号预算（dial_ms_total ≥ 3 × 1100ms）',
+      st.dial_ms_total >= 3 * 1100 && st.max_dial_ms >= 1100,
+      `dial_ms_total=${st.dial_ms_total} max_dial_ms=${st.max_dial_ms} 总耗时=${elapsed}ms`);
+    check('③ 这一轮只有拨号超时、没有排队超时（排队 3.6s 也还在 20s 上限内）',
+      st.queue_timeout === 0 && st.dial_timeout === 3,
+      `queue_timeout=${st.queue_timeout} dial_timeout=${st.dial_timeout} max_queue_wait_ms=${st.max_queue_wait_ms}`);
     await relay.close();
-    await up.close();
   }
 
   // ④ 拨号超时单独计数：TEST-NET-1 黑洞（SYN 被丢，Windows 上 21s 才报 ETIMEDOUT，这里 600ms 截断）

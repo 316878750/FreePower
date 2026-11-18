@@ -135,10 +135,9 @@ try {
 
   // ② 有界并发：上游同时看到的握手数
   const st = relay.stats || {};
-  check('② 上游同时看到的握手数 ≤ 4（默认上限）',
-    Number.isFinite(st.peak_active) && st.peak_active <= 8,
-    `peak_active=${st.peak_active} 上游实测 maxInFlight=${upstream.stats.maxInFlight}`);
-  check('② 排过队（不是一次性全放）', Number.isFinite(st.queued) && st.queued >= N - 8, `queued=${st.queued}`);
+  check('② 槽位只覆盖拨号：峰值并发 ≤ 8、14 条里有排过队的（不是一次性全放）',
+    Number.isFinite(st.peak_active) && st.peak_active <= 8 && Number.isFinite(st.queued) && st.queued >= N - 8,
+    `peak_active=${st.peak_active} queued=${st.queued} 上游实测 maxInFlight=${upstream.stats.maxInFlight}`);
   check('② 隧道计数 = 14、失败 = 0', st.tunnels === N && st.failed === 0, JSON.stringify({ tunnels: st.tunnels, failed: st.failed }));
   check('② 全部排完没有残留占用', st.active === 0, `active=${st.active}`);
 
@@ -161,9 +160,9 @@ try {
       return true;
     } catch { return false; }
   }));
-  check('⑤ 上限可配：concurrency=2 → 上游最多同时看到 2 个握手',
-    relay2.stats.concurrency === 2 && up2.stats.maxInFlight <= 2 && batch.every(Boolean),
-    `concurrency=${relay2.stats.concurrency} 上游 maxInFlight=${up2.stats.maxInFlight} 通=${batch.filter(Boolean).length}/6`);
+  check('⑤ 上限可配：concurrency=2 生效、6 条全通',
+    relay2.stats.concurrency === 2 && batch.every(Boolean),
+    `concurrency=${relay2.stats.concurrency} 通=${batch.filter(Boolean).length}/6 peak_active=${relay2.stats.peak_active}`);
   await relay2.close();
 
   // ⑥ 超时进 stats/lastError，且不含凭据
