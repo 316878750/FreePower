@@ -76,8 +76,10 @@ function parseArgs(argv) {
 
 const USAGE = `用法：node --no-warnings tools/fingerprint-sweep.mjs [--limit N] [--skip a,b] [--only a,b] [--db path] [--sweep path] [--out dir] [--wait ms] [--keep]`;
 
-const SITES = [
-  { key: 'xpoints', label: '站1 defi.xstocks.fi/points', url: 'https://defi.xstocks.fi/points', titleIncludes: 'xPoints' },
+export const SITES = [
+  // 站1 标题基准：AdsPower 里实测就是 `xStocks`（2026-11-19 逆向），不是站点路径里的 `xPoints`。
+  // 拿错基准会把「正常渲染」判成「标题不符」—— 基准宁可宽（xStock），也别写一个从来没出现过的串。
+  { key: 'xpoints', label: '站1 defi.xstocks.fi/points', url: 'https://defi.xstocks.fi/points', titleIncludes: 'xStock' },
   { key: 'startale', label: '站2 app.startale.com', url: 'https://app.startale.com/', titleIncludes: 'Startale' },
 ];
 
@@ -88,6 +90,43 @@ const SITES = [
 const BLOCK_RE = /captcha|verify (?:that )?you are (?:a )?human|checking your browser|just a moment|attention required|access denied|cloudflare|人机验证|验证码|安全验证|滑动验证|访问被拒绝|访问被拒/i;
 
 /* ------------------------------ 小工具 ------------------------------ */
+
+/**
+ * 页面正文里**真正有声明的文字**：剥掉 `<style>` / `<script>` / `<noscript>` / `<template>` 的内容。
+ *
+ * 为什么必须剥（2026-11-19 实证）：不剥时站2 的 `body_len=27396`、开头 80 字是
+ * `@layer dynamic-sdk-styles{...}` —— CSS 也占长度，拿长度当判据等于用样式表骗自己。
+ *
+ * 这段逻辑在中继里跑（CDP `Runtime.evaluate`），这里留一份**纯函数等价实现**给判据用：
+ * 两边保持同一套标签集合，改一边就得改另一边（判据 `sweep-page-body.test.mjs` 钉住行为）。
+ */
+export const DROP_TAGS = Object.freeze(['STYLE', 'SCRIPT', 'NOSCRIPT', 'TEMPLATE']);
+
+/** 浏览器的 DOM 走法（注入到页面里的是同一段逻辑，见 `readPage`） */
+export function visibleTextFromHtml(html) {
+  const drop = new Set(DROP_TAGS);
+  let body = String(html || '');
+  // 只取 <body> 里的内容（没有 body 就原样处理）
+  const bm = /<body[^>]*>([\s\S]*)<\/body>/i.exec(body);
+  if (bm) body = bm[1];
+  // 去掉注释与整段 style/script/noscript/template（含内容）
+  body = body.replace(/<!--[\s\S]*?-->/g, ' ');
+  for (const tag of drop) {
+    body = body.replace(new RegExp(`<${tag}\\b[^>]*>[\\s\\S]*?<\\/${tag}>`, 'gi'), ' ');
+    body = body.replace(new RegExp(`<${tag}\\b[^>]*\\/>`, 'gi'), ' ');
+  }
+  // 剩下的标签剥成空白，实体做常见解码
+  const text = body
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/g, "'");
+  return text.replace(/\s+/g, ' ').trim();
+}
+
 function alive(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
@@ -104,7 +143,13 @@ function siteCell(site) {
 }
 
 /* ------------------------------ 主流程 ------------------------------ */
-const args = parseArgs(process.argv.slice(2));
+// 被判据 import 时（`SWEEP_IMPORT_ONLY=1`）只导出解析函数，不跑扫描：
+// 纯函数（正文剥离 / 标题基准 / 归类）要能单测，又不能顺带起内核、连真代理。
+const IMPORT_ONLY = process.env.SWEEP_IMPORT_ONLY === '1';
+const args = IMPORT_ONLY
+  ? { limit: 0, skip: [], only: [], db: null, sweep: null, out: null, wait: 45000, keep: false, help: false }
+  : parseArgs(process.argv.slice(2));
+if (IMPORT_ONLY) { /* 只导出 */ } else {
 if (args.help) { console.log(USAGE); process.exit(0); }
 
 const dbSrc = args.db
@@ -254,13 +299,30 @@ async function pageTargets(c) {
   return (r?.targetInfos || []).filter((t) => t.type === 'page');
 }
 
+/**
+ * 读页面：`body` 是**剥掉 `<style>` / `<script>` / `<noscript>` 内容后的可见文字**。
+ *
+ * 为什么必须剥（2026-11-19 实证）：不剥的时候站2 的 `body_len=27396`，开头 80 字是
+ * `@layer dynamic-sdk-styles{...}` —— CSS 也占长度，拿长度当判据等于用样式表骗自己。
+ */
 async function readPage(c, targetId, sessionId, perCallMs = 5000) {
-  const expr = `JSON.stringify({
-    href: location.href,
-    title: document.title,
-    ready: document.readyState,
-    body: (document.body ? (document.body.textContent || document.body.innerText) : ''),
-  })`;
+  const expr = `(() => {
+    const drop = new Set(['STYLE', 'SCRIPT', 'NOSCRIPT', 'TEMPLATE']);
+    const out = [];
+    const walk = (n) => {
+      for (const ch of n.childNodes) {
+        if (ch.nodeType === 3) out.push(ch.nodeValue);
+        else if (ch.nodeType === 1 && !drop.has(ch.tagName)) walk(ch);
+      }
+    };
+    if (document.body) walk(document.body);
+    return JSON.stringify({
+      href: location.href,
+      title: document.title,
+      ready: document.readyState,
+      body: out.join(' ').replace(/\\s+/g, ' ').trim(),
+    });
+  })()`;
   const attempts = perCallMs >= 4000 ? 3 : 1;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const r = await withTimeout(
@@ -276,15 +338,31 @@ async function readPage(c, targetId, sessionId, perCallMs = 5000) {
   return {};
 }
 
+/**
+ * 一站：导航 → **每 500ms 轮询正文**（不是等 readyState），判据是「正文非空」。
+ *
+ * 为什么改成轮询正文（CEO 2026-11-19 从 trace 读出来）：站1 的 HTML/JS 都下来了、
+ * `points-api.xstocks.fi` 的隧道也建了，说明脚本跑起来了；`readyState=complete` 时 React 还没挂载，
+ * 于是读到空正文 → 判「标题不符」。**拿 readyState 当完成条件对 SPA 天然假红。**
+ *
+ * 判定：
+ *   - 第一次读到非空正文 → 记 `first_body_ms`，**继续轮询**直到正文 2 秒不再变化（稳定）或到 waitMs；
+ *   - 从没读到非空正文 → 停在上限，按「正文为空」记（这时才算没打开）。
+ * 读数里的 `ms` = 正文首次非空的时刻（没有则 = 上限），`settle_ms` = 稳定下来的时刻。
+ */
 async function probeSite(c, targetId, sessionId, site, waitMs) {
   const t0 = Date.now();
+  const pollMs = 500;
+  const stableMs = 2000;
   let cancelled = false;
   let snap = {};
-  let timedOut = true;
+  let firstBodyMs = null;
+  let settleMs = null;
+  let everBody = false;
 
   // 用「一个到点就结束的计时器」和轮询赛跑：轮询里的 sleep 会被事件循环拖慢，
   // 单靠 while (Date.now() < deadline) 实测会等到 46.9s / 52s（自测踩到），
-  // 赛跑才能保证「每站最多等 45s」是硬上限。
+  // 赛跑才能保证「每站最多等 waitMs」是硬上限。
   const deadline = new Promise((resolve) => { setTimeout(() => resolve('deadline'), waitMs); });
   let navMs = 0;
   const work = (async () => {
@@ -293,48 +371,58 @@ async function probeSite(c, targetId, sessionId, site, waitMs) {
     const navStart = Date.now();
     await withTimeout(c.send('Page.navigate', { url: site.url }, sessionId), 5000, 'Page.navigate').catch(() => {});
     navMs = Date.now() - navStart;
+    let lastBody = null;
+    let lastChangeAt = null;
     while (!cancelled) {
-      await sleep(1000);
+      await sleep(pollMs);
       if (cancelled) return 'cancelled';
-      snap = await readPage(c, targetId, sessionId, 5000);
-      // 先看预算再看结果：到点之后才 complete 的，按「超时」记（不把 45s 撑成 50s）
+      const s = await readPage(c, targetId, sessionId, 3000);
+      if (s.href) snap = s;
+      const body = String(s.body || '');
+      if (body.length > 0) {
+        if (firstBodyMs === null) { firstBodyMs = Date.now() - t0; everBody = true; }
+        if (body !== lastBody) { lastBody = body; lastChangeAt = Date.now(); }
+      }
       if (Date.now() - t0 >= waitMs) return 'deadline';
-      if (snap.ready === 'complete' && snap.href && !String(snap.href).startsWith('about:')) return 'done';
+      // 正文稳定 2s 就收（没有正文时不提前收，一直等到上限 —— 给 SPA 留足挂载时间）
+      if (everBody && lastChangeAt && Date.now() - lastChangeAt >= stableMs) {
+        settleMs = Date.now() - t0;
+        return 'done';
+      }
     }
     return 'cancelled';
   })().catch(() => 'error');
 
   const winner = await Promise.race([work, deadline]);
   cancelled = true;
-  // 「耗时」= 到页面 complete（或到 45s 上限）为止；之后读最终正文的 1.2s 不算进去，
-  // 否则 44.9s 完成 + 1.2s settle + 一次读会把 45s 的读数写成 50s（自测踩到过）。
-  const readyMs = Date.now() - t0;
-  if (winner === 'done') {
-    timedOut = false;
-    await sleep(1200); // 给前端渲染留一点时间，再读最终态
-    const again = await readPage(c, targetId, sessionId, 1500);
-    if (again.href) snap = again;
-  }
+  const elapsed = Date.now() - t0;
+  if (settleMs === null) settleMs = elapsed;
   const rec = {
     url: site.url,
-    ms: readyMs,
-    timeout: timedOut,
+    // `ms` = 正文首次非空的时刻（= 用户能看到内容的时间）；没有正文时等于上限
+    ms: firstBodyMs ?? elapsed,
+    body_ms: firstBodyMs,
+    settle_ms: settleMs,
+    timeout: !everBody,
     winner,
     nav_ms: navMs,
+    ready: snap.ready ?? null,
     href: snap.href ?? null,
     title: snap.title ?? null,
     chrome_error: String(snap.href || '').startsWith('chrome-error://'),
+    body300: String(snap.body || '').slice(0, 300),
     body80: body80(snap.body),
-    body_len: String(snap.body || '').replace(/\s+/g, ' ').trim().length,
+    body_len: String(snap.body || '').length,
   };
-  // 归类：chrome-error / 超时不算「被拦」；命中关键词或标题不符才算「指纹」候选
+  // 归类：chrome-error / 超时（45s 内正文一直为空）不算「被拦」；命中关键词或标题不符才算「指纹」候选。
+  // 「正文为空」不再单独成一类 —— 它已经由 `timeout`（从没读到非空正文）覆盖，
+  // 留一个阈值会让「读到 19 个字符的真实页面」被误判。
   const m = rec.chrome_error ? null : BLOCK_RE.exec(String(snap.body || ''));
   if (rec.chrome_error) { rec.label = 'chrome-error'; rec.blocked = null; }
   else if (rec.timeout) { rec.label = '超时'; rec.blocked = null; }
   else if (!rec.href || rec.href.startsWith('about:')) { rec.label = '没打开'; rec.blocked = null; }
   else if (m) { rec.label = `被拦(${m[0].slice(0, 16)})`; rec.blocked = '被拦'; }
   else if (site.titleIncludes && !String(rec.title || '').includes(site.titleIncludes)) { rec.label = '标题不符'; rec.blocked = '标题不符'; }
-  else if (rec.body_len < 20) { rec.label = '正文为空'; rec.blocked = null; }
   else { rec.label = '过'; rec.blocked = null; }
   return rec;
 }
@@ -603,3 +691,4 @@ try { server.close(); } catch { /* ignore */ }
 await sleep(300);
 if (!args.keep) { try { fs.rmSync(DATA, { recursive: true, force: true }); } catch { /* ignore */ } }
 process.exit(interrupted ? 130 : 0);
+}
