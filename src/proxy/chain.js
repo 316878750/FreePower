@@ -103,7 +103,9 @@ export function parseProxyServer(raw = '') {
     const scheme = m ? m[1].toLowerCase() : '';
     const type = scheme.startsWith('https') ? 'https' : scheme.startsWith('socks') ? 'socks5' : 'http';
     const hp = splitHostPort(m ? m[2] : s);
-    if (hp) entries.push({ type, host: hp.host, port: hp.port, raw: s });
+    // `bare` = 这一条没有 `xxx=` 前缀。Windows 惯例裸值是 HTTP，但有些客户端（v2rayN 实测）
+    // 直接把 SOCKS 端口裸写进来 —— 由 `system-proxy.js` 当「SOCKS5 候选」，握不成再退回直连。
+    if (hp) entries.push({ type, host: hp.host, port: hp.port, raw: s, bare: !m });
   }
   const pick = entries.find((e) => e.type === 'http')
     || entries.find((e) => e.type === 'https')

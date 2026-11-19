@@ -30,7 +30,7 @@ const SYS = { ProxyEnable: 1, ProxyServer: '127.0.0.1:7890', ProxyOverride: '<lo
 /* ------------------------------ ProxyServer 解析 ------------------------------ */
 {
   const a = parseProxyServer('127.0.0.1:7890');
-  check('parseProxyServer：裸 host:port → http 跳', eq(a.pick, { type: 'http', host: '127.0.0.1', port: 7890, raw: '127.0.0.1:7890' }), fmt(a.pick));
+  check('parseProxyServer：裸 host:port → http 跳（多级代理链仍按 HTTP 惯例，标 bare=true 供链式上游当 SOCKS5 候选）', eq(a.pick, { type: 'http', host: '127.0.0.1', port: 7890, raw: '127.0.0.1:7890', bare: true }), fmt(a.pick));
 
   const b = parseProxyServer('http=10.1.1.1:8080;https=10.1.1.1:8443');
   check('parseProxyServer：http=…;https=… → 优先挑 http 那条', b.pick?.type === 'http' && b.pick.host === '10.1.1.1' && b.pick.port === 8080, fmt(b.pick));

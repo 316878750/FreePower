@@ -95,6 +95,11 @@ export function startFakeSocks5({
     sockets.add(client);
     client.on('close', () => sockets.delete(client));
     client.on('error', () => { /* 对端断，正常 */ });
+    // socket 上挂过 pipe：一端关了要把另一端也带走，否则残端让 server.close() 永远等不到回调，
+    // 整个判据进程退不出去（判据全绿、npm test 挂住）。只在本文件内生效。
+    client.on('close', () => {
+      for (const s of client.__piped || []) { try { s.destroy(); } catch { /* ignore */ } }
+    });
     const state = { buf: Buffer.alloc(0) };
     const rec = { label, offered: [], method: null, auth: null, cmd: null, host: null, port: null, status: null };
     records.push(rec);
@@ -212,6 +217,9 @@ export function startFakeSocks5({
       rec.status = 'tunnel';
       connects.push({ host, port, status: 'tunnel' });
       client.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+      // 互相记一笔：任一端关掉就把另一端也 destroy（见上面 client 的 close 处理）
+      (client.__piped ||= []).push(up);
+      (up.__piped ||= []).push(client);
       client.pipe(up);
       up.pipe(client);
     });
@@ -232,9 +240,13 @@ export function startFakeSocks5({
         hostnames: () => [...new Set(records.map((r) => r.host).filter(Boolean))],
         url: `socks5://127.0.0.1:${port}`,
         close: () => new Promise((r) => {
+          // 先踢连接再 close：`close()` 只停监听，已建立的连接（含被 pipe 的 `up`）不踢就永远
+          // 等不到回调 —— 那会让调用方的 finally 卡住，node 进程退不出去（判据全绿、npm test 挂住）。
           for (const s of sockets) { try { s.destroy(); } catch { /* ignore */ } }
           sockets.clear();
           server.close(() => r());
+          // node >= 18.2：兜底踢掉 server 自己记的连接（`sockets` 没覆盖到的）
+          try { server.closeAllConnections?.(); } catch { /* ignore */ }
         }),
       });
     });
@@ -324,9 +336,13 @@ export function startFakeConnectProxy({ requireAuth = ['http-user', 'http-pass']
         sockets,
         url: `http://127.0.0.1:${port}`,
         close: () => new Promise((r) => {
+          // 先踢连接再 close：`close()` 只停监听，已建立的连接（含被 pipe 的 `up`）不踢就永远
+          // 等不到回调 —— 那会让调用方的 finally 卡住，node 进程退不出去（判据全绿、npm test 挂住）。
           for (const s of sockets) { try { s.destroy(); } catch { /* ignore */ } }
           sockets.clear();
           server.close(() => r());
+          // node >= 18.2：兜底踢掉 server 自己记的连接（`sockets` 没覆盖到的）
+          try { server.closeAllConnections?.(); } catch { /* ignore */ }
         }),
       });
     });
