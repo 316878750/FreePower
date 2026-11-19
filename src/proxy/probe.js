@@ -13,8 +13,17 @@ import net from 'node:net';
 import tls from 'node:tls';
 import { EGRESS_PROBE_URL, PROXY_PROBE_TIMEOUT_MS } from '../config.js';
 
-/** 主探测失败后的备用出口源（https 走 CONNECT + TLS） */
-const FALLBACK_PROBE_URLS = ['https://ipinfo.io/json'];
+/**
+ * 出口探测端点（按顺序试，**任一成功即止**）。
+ *
+ * 2026-11-19 全量的教训：43 个环境、35 个跑了，起始页的「实测出口 IP」**35/35 全失败**，
+ * `raw={"status":"fail"}` —— 只有 `ip-api.com` 一个源，被 35 环境 × 3 次退避打进了
+ * 免费额度限流（45 次/分钟）。而出口 IP 是用户启动后第一眼要看的东西，不能这样。
+ *
+ * 所以改成三源轮换：`ip-api.com`（明文 HTTP，CONNECT 受限的代理也能过）→ `ipinfo.io` →
+ * `api.ipify.org`（纯文本 IP，最省）。任一成功即止；全失败才写「未验证」。
+ */
+export const FALLBACK_PROBE_URLS = ['https://ipinfo.io/json', 'https://api.ipify.org'];
 
 /**
  * 失败归类（0.4.7.5 19:45）—— 决定「能不能因为这一条就拒绝启动」。
@@ -301,10 +310,14 @@ export async function httpGetViaProxy(proxyRaw, rawUrl, { timeoutMs = PROXY_PROB
     const headBuf = await reader.readUntil('\r\n\r\n', timeoutMs, 'CONNECT 响应').catch((e) => { throw tagged(e, PROBE_FAIL.TARGET); });
     const { status, statusLine } = parseHeaders(headBuf.toString('latin1'));
     if (status !== 200) {
-      throw tagged(
+      const err = tagged(
         new Error(`代理拒绝 CONNECT：${statusLine}`),
         status === 407 ? PROBE_FAIL.AUTH : PROBE_FAIL.TARGET,
       );
+      // 代理回了明确的 HTTP 状态行 → 这一发是「有响应」的失败，重试同一个源/同一个端点
+      // 不会立刻变好（429 限流尤其），上层据此跳过退避重试
+      err.definitive = true;
+      throw err;
     }
     const rest = reader.detach();
     if (rest.length) socket.unshift(rest);
@@ -375,15 +388,19 @@ export async function checkProxy(proxyRaw, {
   for (const u of [url, ...fallbackUrls.filter((x) => x !== url)]) {
     try {
       const res = await httpGetViaProxy(proxy, u, { timeoutMs });
-      if (res.status === 407) { attempts.push(`${u} → 407 认证失败`); kinds.push(PROBE_FAIL.AUTH); continue; }
-      if (res.status !== 200) { attempts.push(`${u} → HTTP ${res.status}`); kinds.push(PROBE_FAIL.PROBE_SITE); continue; }
+      // `definitive`：**拿到了 HTTP 响应**，说明这一跳（代理）是通的，问题在探测源本身。
+      // 上层据此决定还要不要再重试：源被限流，重试同一个源毫无意义，换源才有用。
+      if (res.status === 407) { attempts.push({ url: u, kind: PROBE_FAIL.AUTH, message: `${u} → 407 认证失败`, definitive: true }); kinds.push(PROBE_FAIL.AUTH); continue; }
+      if (res.status !== 200) { attempts.push({ url: u, kind: PROBE_FAIL.PROBE_SITE, message: `${u} → HTTP ${res.status}`, definitive: true }); kinds.push(PROBE_FAIL.PROBE_SITE); continue; }
       const info = parseExitInfo(res.body, u);
-      if (info.error) { attempts.push(`${u} → ${info.error}`); kinds.push(PROBE_FAIL.PROBE_SITE); continue; }
-      if (!info.ip) { attempts.push(`${u} → 响应里没有 IP`); kinds.push(PROBE_FAIL.PROBE_SITE); continue; }
+      if (info.error) { attempts.push({ url: u, kind: PROBE_FAIL.PROBE_SITE, message: `${u} → ${info.error}`, definitive: true }); kinds.push(PROBE_FAIL.PROBE_SITE); continue; }
+      if (!info.ip) { attempts.push({ url: u, kind: PROBE_FAIL.PROBE_SITE, message: `${u} → 响应里没有 IP`, definitive: true }); kinds.push(PROBE_FAIL.PROBE_SITE); continue; }
       return { ok: true, ...info, latency_ms: Date.now() - t0, probe_url: u, proxy: meta };
     } catch (e) {
       const kind = isHardProxyFailure(e?.kind) ? e.kind : (e?.kind || PROBE_FAIL.PROBE_SITE);
-      attempts.push(`${u} → ${e.message}`);
+      // 超时 / 连接被断 = 传输层，不 definitive：换个源、或同一源再试一次都可能成。
+      // 代理回了明确状态行（`e.definitive`）算 definitive。
+      attempts.push({ url: u, kind, message: `${u} → ${e.message}`, definitive: e?.definitive === true });
       kinds.push(kind);
     }
   }
@@ -397,9 +414,11 @@ export async function checkProxy(proxyRaw, {
     ok: false,
     kind,
     error: hard
-      ? `代理不可用：${attempts.join(' | ')}`
-      : `探测源不可用（不是代理不通）：${attempts.join(' | ')}`,
-    attempts: attempts.map((message, i) => ({ url: [url, ...fallbackUrls.filter((x) => x !== url)][i], kind: kinds[i], message })),
+      ? `代理不可用：${attempts.map((a) => a.message).join(' | ')}`
+      : `探测源不可用（不是代理不通）：${attempts.map((a) => a.message).join(' | ')}`,
+    attempts,
+    /** 每个失败都是「拿到了响应」→ 源的问题，重试没意义（上层据此不再退避重试） */
+    all_definitive: attempts.length > 0 && attempts.every((a) => a.definitive === true),
     latency_ms: Date.now() - t0,
     proxy: meta,
   };

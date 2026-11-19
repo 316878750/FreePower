@@ -12,7 +12,7 @@
  * 假的「代理未连通」。重试是这一版的口径，不是放宽判据（每次尝试的判定完全不变）。
  */
 import { EGRESS_PROBE_URL, EGRESS_TIMEOUT_MS } from '../config.js';
-import { parseExitInfo } from './probe.js';
+import { FALLBACK_PROBE_URLS, parseExitInfo } from './probe.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -21,27 +21,41 @@ export const EGRESS_RETRY_DELAYS_MS = [0, 1500, 4000];
 
 /**
  * @param {import('../kernel/cdp.js').CdpClient} client
- * @param {{ url?: string, timeoutMs?: number, onTarget?: (targetId: string) => void, retries?: number[] }} [opt]
+ * @param {{ url?: string, urls?: string[], timeoutMs?: number, onTarget?: (targetId: string) => void, retries?: number[] }} [opt]
  *   `onTarget` 在目标刚建好、导航之前同步调用：调用方用它给这张探测页登记「别被 blank-reload 碰」。
  *   不传也能工作（只是会在 400ms 那一拍和 watcher 抢一下）。
  *   `retries` 传 `[0]` 可以关掉重试（判据里模拟「单发」时用）。
+ *   `urls` 多端点轮换（0.4.7.7）：默认 `[url, ...FALLBACK_PROBE_URLS]`，任一成功即止。
  * @returns {Promise<{ok:boolean, ip?:string, country?:string, countryCode?:string, city?:string,
  *   timezone?:string, isp?:string, url:string, attempts?:number, error?:string}>}
  */
 export async function probeEgressInBrowser(client, {
   url = EGRESS_PROBE_URL,
+  urls = null,
   timeoutMs = EGRESS_TIMEOUT_MS,
   onTarget = null,
   retries = EGRESS_RETRY_DELAYS_MS,
 } = {}) {
   const delays = Array.isArray(retries) && retries.length ? retries : [0];
+  // 端点顺序：显式给的 url 打头，后面接备用源（去重）
+  const endpoints = (Array.isArray(urls) && urls.length ? urls : [url, ...FALLBACK_PROBE_URLS])
+    .filter((u, i, a) => u && a.indexOf(u) === i);
   let last = null;
+  let tries = 0;
+  const dead = new Set(); // 已经明确「这个源被限流/给了 fail」的端点，后面几轮不再试
   for (let i = 0; i < delays.length; i += 1) {
     if (delays[i]) await sleep(delays[i]);
-    last = await probeOnce(client, { url, timeoutMs, onTarget });
-    if (last.ok) return { ...last, attempts: i + 1 };
+    for (const u of endpoints) {
+      if (dead.has(u)) continue;
+      tries += 1;
+      last = await probeOnce(client, { url: u, timeoutMs, onTarget });
+      if (last.ok) return { ...last, attempts: tries };
+      // 拿到了 HTTP 响应但内容是 `status=fail` / 空 body → 源的问题，换源，别再重试同一个源
+      if (last.definitive) dead.add(u);
+    }
+    if (dead.size === endpoints.length) break;
   }
-  return { ...last, attempts: delays.length };
+  return { ...(last || { ok: false, url, error: '没有可用的探测端点' }), attempts: tries };
 }
 
 async function probeOnce(client, { url, timeoutMs, onTarget }) {
@@ -108,8 +122,10 @@ async function probeOnce(client, { url, timeoutMs, onTarget }) {
       };
     }
     const info = parseExitInfo(text, url);
-    if (info.error) return { ok: false, url, kind: 'probe_site', error: info.error, raw: text.slice(0, 200) };
-    if (!info.ip) return { ok: false, url, kind: 'probe_site', error: `出口探测页不是预期格式：${text.slice(0, 120)}` };
+    // `definitive`：页面真的打开了、也读到了响应，只是这个源给了 `status=fail` 或格式不对
+    // → 换源有用，重试同一个源没用（0.4.7.7 多源轮换靠它决定跳过）
+    if (info.error) return { ok: false, url, kind: 'probe_site', error: info.error, raw: text.slice(0, 200), definitive: true };
+    if (!info.ip) return { ok: false, url, kind: 'probe_site', error: `出口探测页不是预期格式：${text.slice(0, 120)}`, definitive: true };
     return { ok: true, ...info, url };
   } catch (e) {
     return { ok: false, url, kind: 'proxy', error: e.message };

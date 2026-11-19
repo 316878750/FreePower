@@ -24,10 +24,18 @@
  * `force:true` 绕过缓存（那是用户明确要的「再测一次」）。
  */
 import { EGRESS_PROBE_URL, PROXY_PROBE_TIMEOUT_MS } from '../config.js';
-import { checkProxy, hasProxy, normalizeProxyConfig, parseExitInfo } from '../proxy/probe.js';
+import { FALLBACK_PROBE_URLS, checkProxy, hasProxy, normalizeProxyConfig, parseExitInfo } from '../proxy/probe.js';
 import { relayPortFor } from '../proxy/relay-registry.js';
 
-const CACHE_TTL_MS = 15000;
+/**
+ * 结果缓存：成功 10 分钟、失败 60 秒。
+ *
+ * 0.4.7.5 是「一律 15 秒」，等于每开一个环境就打一轮出口接口 —— 43 个环境 × 3 次退避
+ * 直接把 `ip-api.com` 打进限流（2026-11-19 全量 35/35 全失败就是它）。出口 IP 变化很慢，
+ * 成功的结果没必要反复探；失败则短一点，用户换个代理后能较快看到新读数。
+ */
+export const CACHE_TTL_OK_MS = 10 * 60 * 1000;
+export const CACHE_TTL_FAIL_MS = 60 * 1000;
 /** 三次尝试之间的等待（第 1 次不等）。CEO 拍板：0 / 1.5s / 4s */
 export const RETRY_DELAYS_MS = [0, 1500, 4000];
 /** profileId -> { at:number, result:object } */
@@ -43,30 +51,47 @@ export function resetStartProbeCache() {
   inflight.clear();
 }
 
-/** 直连探测（没绑代理时）：与 `checkProxy` 的直连版等价，只是不经过任何 hop */
-async function probeDirect({ url = EGRESS_PROBE_URL, timeoutMs = PROXY_PROBE_TIMEOUT_MS } = {}) {
+/** 这个缓存条目还有效吗（成功/失败两档 TTL） */
+function cacheFresh(hit, now) {
+  if (!hit) return false;
+  const ttl = hit.result?.ok ? CACHE_TTL_OK_MS : CACHE_TTL_FAIL_MS;
+  return now - hit.at < ttl;
+}
+
+/**
+ * 直连探测（没绑代理时）：与 `checkProxy` 的直连版等价，只是不经过任何 hop。
+ * 同样多源轮换（0.4.7.7）：任一成功即止。
+ */
+async function probeDirect({ urls = [EGRESS_PROBE_URL, ...FALLBACK_PROBE_URLS], timeoutMs = PROXY_PROBE_TIMEOUT_MS } = {}) {
   const t0 = Date.now();
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), timeoutMs);
-  timer.unref?.();
-  try {
-    const res = await fetch(url, { signal: ac.signal, redirect: 'follow' });
-    const text = await res.text();
-    if (res.status !== 200) return { ok: false, error: `出口接口返回 HTTP ${res.status}`, latency_ms: Date.now() - t0 };
-    const info = parseExitInfo(text, url);
-    if (info.error) return { ok: false, error: info.error, latency_ms: Date.now() - t0 };
-    if (!info.ip) return { ok: false, error: '出口接口的响应里没有 IP', latency_ms: Date.now() - t0 };
-    return { ok: true, ...info, latency_ms: Date.now() - t0 };
-  } catch (e) {
-    const aborted = e?.name === 'AbortError';
-    return {
-      ok: false,
-      error: aborted ? `直连探测超时（${timeoutMs}ms）` : `直连探测失败：${e?.message || e}`,
-      latency_ms: Date.now() - t0,
-    };
-  } finally {
-    clearTimeout(timer);
+  const attempts = [];
+  let last = null;
+  for (const url of urls) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    timer.unref?.();
+    try {
+      const res = await fetch(url, { signal: ac.signal, redirect: 'follow' });
+      const text = await res.text();
+      if (res.status !== 200) { attempts.push({ url, message: `HTTP ${res.status}`, definitive: true }); last = { ok: false, error: `出口接口返回 HTTP ${res.status}` }; continue; }
+      const info = parseExitInfo(text, url);
+      if (info.error) { attempts.push({ url, message: info.error, definitive: true }); last = { ok: false, error: info.error }; continue; }
+      if (!info.ip) { attempts.push({ url, message: '响应里没有 IP', definitive: true }); last = { ok: false, error: '出口接口的响应里没有 IP' }; continue; }
+      return { ok: true, ...info, latency_ms: Date.now() - t0, probe_url: url };
+    } catch (e) {
+      const aborted = e?.name === 'AbortError';
+      attempts.push({ url, message: aborted ? `超时（${timeoutMs}ms）` : `失败：${e?.message || e}`, definitive: false });
+      last = { ok: false, error: aborted ? `直连探测超时（${timeoutMs}ms）` : `直连探测失败：${e?.message || e}` };
+    } finally {
+      clearTimeout(timer);
+    }
   }
+  return {
+    ...(last || { ok: false, error: '没有可用的探测端点' }),
+    latency_ms: Date.now() - t0,
+    attempts,
+    all_definitive: attempts.length > 0 && attempts.every((a) => a.definitive === true),
+  };
 }
 
 /**
@@ -83,7 +108,7 @@ export async function probeStartEgress(profile, { force = false, timeoutMs = PRO
   const now = Date.now();
   if (!force) {
     const hit = cache.get(id);
-    if (hit && now - hit.at < CACHE_TTL_MS) return hit.result;
+    if (cacheFresh(hit, now)) return hit.result;
     const running = inflight.get(id);
     if (running) return running;
   }
@@ -106,7 +131,7 @@ export async function probeStartEgress(profile, { force = false, timeoutMs = PRO
 
     const once = async () => {
       if (!bound) {
-        const r = await probeDirect({ url: EGRESS_PROBE_URL, timeoutMs });
+        const r = await probeDirect({ timeoutMs });
         // 没绑代理时探测失败只可能是探测源/本机网络问题，不存在「代理不通」
         return r.ok ? r : { ...r, kind: 'probe_site' };
       }
@@ -114,7 +139,9 @@ export async function probeStartEgress(profile, { force = false, timeoutMs = PRO
       return r;
     };
 
-    // 3 次退避（0 / 1.5s / 4s）：冷启动第一发可能 35s 才通，单发失败不许直接判死
+    // 退避重试（0 / 1.5s / 4s）：冷启动第一发可能 35s 才通，单发失败不许直接判死。
+    // 0.4.7.7：**所有端点都「拿到了响应」（源被限流/给 fail）就别再重试了** ——
+    // 源限流不会因为我们等 4 秒就好，重试只会把配额烧得更快（35/35 全失败就是这么来的）。
     let raw = null;
     let attempts = 0;
     for (let i = 0; i < RETRY_DELAYS_MS.length; i += 1) {
@@ -122,6 +149,7 @@ export async function probeStartEgress(profile, { force = false, timeoutMs = PRO
       attempts = i + 1;
       raw = await once();
       if (raw && raw.ok) break;
+      if (raw?.all_definitive) break;
     }
 
     const result = {
@@ -141,6 +169,8 @@ export async function probeStartEgress(profile, { force = false, timeoutMs = PRO
       ...(relayPort ? { relay_port: relayPort } : {}),
       /** 试了几次（1 = 第一发就通） */
       attempts,
+      /** 成功时用的是哪个端点（0.4.7.7 多源轮换：ip-api → ipinfo → ipify） */
+      ...(raw.probe_url ? { probe_url: raw.probe_url } : {}),
       proxy: meta,
       /** 失败归类：`tcp`/`auth` = 代理不通；`target`/`probe_site` = 探测源不可用（起始页据此换文案） */
       ...(raw.ok ? {} : { kind: raw.kind || 'probe_site' }),

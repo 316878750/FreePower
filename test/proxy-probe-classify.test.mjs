@@ -74,8 +74,52 @@ try {
     check('① 文案写「探测源不可用（不是代理不通）」，不写「代理不可用」',
       /探测源不可用（不是代理不通）/.test(String(r.error)) && !/^代理不可用/.test(String(r.error)),
       String(r.error).slice(0, 90));
-    check('① 两个源都试过（attempts 有两条）', Array.isArray(r.attempts) && r.attempts.length === 2, `attempts=${r.attempts?.length}`);
+    check('① 两个源都试过（attempts 有两条）', Array.isArray(r.attempts) && r.attempts.length >= 2, `attempts=${r.attempts?.length}`);
+    check('① 每个失败都带 definitive（拿到了响应 → 源的问题，重试没意义）',
+      Array.isArray(r.attempts) && r.attempts.every((a) => a.definitive === true), JSON.stringify(r.attempts?.map((a) => a.definitive)));
+    check('① all_definitive=true（上层据此不再退避重试烧配额）', r.all_definitive === true, `all_definitive=${r.all_definitive}`);
     await fake.close();
+  }
+
+  // ①-b 第一个端点返回 `{"status":"fail"}`（ip-api 限流的真实形状）→ 自动落到第二个并成功
+  //    这是 CEO 2026-11-19 点名要的判据：43 全量里 35/35 全失败就是因为只有一个源。
+  //    假 HTTP 代理做不了 TLS，所以判据里用 http 端点测「轮换逻辑」本身（parseExitInfo 与协议无关）。
+  {
+    const failFirst = await startFakeHttpProxy((req) => {
+      const first = /ip-api\.com/.test(req);
+      if (first) {
+        const body = '{"status":"fail","message":"private range"}';
+        return `HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`;
+      }
+      const body = '{"ip":"203.0.113.7","country":"Nowhere","countryCode":"NW","city":"Testville"}';
+      return `HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`;
+    });
+    const r = await checkProxy(
+      { type: 'http', host: '127.0.0.1', port: failFirst.port },
+      { timeoutMs: 4000, url: 'http://ip-api.com/json/', fallbackUrls: ['http://ipinfo.io/json', 'http://api.ipify.org'] },
+    );
+    check('①-b 第一个源返回 status=fail → 自动落到第二个源并成功', r.ok === true && r.ip === '203.0.113.7',
+      `ok=${r.ok} ip=${r.ip} kind=${r.kind} err=${String(r.error).slice(0, 80)}`);
+    check('①-b 成功记的是第二个源（probe_url=ipinfo）', /ipinfo\.io/.test(String(r.probe_url)), String(r.probe_url));
+    await failFirst.close();
+  }
+
+  // ①-c 纯文本端点（api.ipify.org 的响应形状）也能解析成 IP
+  {
+    const plain = await startFakeHttpProxy((req) => {
+      if (/ip-api\.com/.test(req) || /ipinfo\.io/.test(req)) {
+        const body = '{"status":"fail"}';
+        return `HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`;
+      }
+      const body = '198.51.100.9\n';
+      return `HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`;
+    });
+    const r = await checkProxy(
+      { type: 'http', host: '127.0.0.1', port: plain.port },
+      { timeoutMs: 4000, url: 'http://ip-api.com/json/', fallbackUrls: ['http://ipinfo.io/json', 'http://api.ipify.org'] },
+    );
+    check('①-c 纯文本 IP 端点（ipify）解析成功', r.ok === true && r.ip === '198.51.100.9', `ok=${r.ok} ip=${r.ip}`);
+    await plain.close();
   }
 
   // ② 探测站 200 但空 body（代理通了，探测站没给内容）
@@ -124,7 +168,7 @@ try {
     });
     // 页面里那段内联脚本本来就含 '代理未连通' 这个字符串（客户端重绘用），
     // 所以断言要钉**服务端渲染出来的状态标签**：>探测源不可用< / >代理未连通<
-    check('⑥ 软失败：状态标签写「探测源不可用」', softHtml.includes('>探测源不可用<'), '');
+    check('⑥ 软失败：状态标签写「未验证（探测源不可用）」', softHtml.includes('>未验证（探测源不可用）<'), '');
     check('⑥ 软失败：状态标签**不是**「代理未连通」', !softHtml.includes('>代理未连通<'), '');
     check('⑥ 软失败：状态块用的是 warn 样式（不是 bad）', /class="status warn"/.test(softHtml), '');
     check('⑥ 硬失败：状态标签仍写「代理未连通」', hardHtml.includes('>代理未连通<'), '');

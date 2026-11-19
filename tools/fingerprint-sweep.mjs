@@ -156,6 +156,96 @@ function siteCell(site) {
   return `${site.label} ${secs}s`;
 }
 
+/* --------------------------- 失败归类（纯函数） ---------------------------
+ *
+ * 0.4.7.5 19:45 的教训：**产品里打不开 ≠ 代理不通**。当时 3 个环境全被我归成「代理」，
+ * 而 CEO 单发探同一台代理 649ms / 748ms 就通 —— 真因是中继把槽位占死了（max_dial_ms=60015）。
+ * 所以归类以「单发 TCP/checkProxy 通不通」为判别器：
+ *   - 单发都不通且是 TCP/认证失败 → `代理`
+ *   - 单发都不通但只是探测源不可用（软失败）→ `我核不了`（判不了代理好坏）
+ *   - 单发通、产品里不通 → **不许归代理**：有中继证据归 `中继`，否则归 `产品`
+ *
+ * 2026-11-19 全量的教训（环境 10090）：**页面已经渲染出来了，单发探针不许把这一轮判红**。
+ * 10090 单发 55272ms 超时，紧接着 proxy_check 1692ms 通、两站 body_ms 15436/35117 都出了正文，
+ * 却被归成「代理」。单发探针只是**页面失败时的判别器**，页面成功时它没有发言权。
+ *
+ * 这几个函数放在主流程外面，判据才能 `SWEEP_IMPORT_ONLY=1` 直接 import 单测（不起内核、不连代理）。
+ */
+
+/** 硬失败（与 src/proxy/probe.js 的 isHardProxyFailure 同一口径：只有这两类算代理坏了） */
+const HARD_PROBE_KINDS = new Set(['tcp', 'auth']);
+
+/** 页面是否真的渲染出了正文（有正文、且不是 chrome-error）。 */
+export function pagesRendered(run) {
+  return (run?.sites || []).some((s) => s && !s.chrome_error && Number(s.body_ms) > 0);
+}
+
+/** 本轮里失败的那些站（label 不是「过」）。 */
+function failedSites(run) {
+  return (run?.sites || []).filter((s) => s && s.label !== '过');
+}
+
+export function verdictOf(run) {
+  const rendered = pagesRendered(run);
+  // 页面已经渲染 → 单发探针不再有资格判「代理」/「我核不了」
+  if (!rendered) {
+    const single = run.single;
+    if (single && single.ok === false) {
+      return HARD_PROBE_KINDS.has(single.kind) ? '代理' : '我核不了';
+    }
+  }
+  if (run.start_error) return '产品';
+  const st = run.relay || {};
+  const q = Number(st.queue_timeout) || 0;
+  const d = Number(st.dial_timeout) || 0;
+  const conn = Number(st.connections) || 0;
+  const tun = Number(st.tunnels) || 0;
+  if ((q > 0 || d > 0) && tun < conn / 2) return '中继';
+  if (run.sites.length === SITES.length && run.sites.every((s) => s.label === '过')) return '过';
+  if (run.sites.some((s) => s.blocked)) return '指纹';
+  // 页面有内容但标题不符（改版/被换页）：算指纹类，不算「核不了」
+  if (rendered) return '指纹';
+  return '产品';
+}
+
+/** 单发那一行读数：只在「页面没渲染」时进 note，页面成了就不拿它盖页面结果。 */
+function singleNote(run) {
+  const s = run.single;
+  if (!s) return '单发未跑';
+  if (s.ok) return `单发 通 ${s.latency_ms || 0}ms 出口 ${s.ip || '?'}`;
+  return `单发 不通 ${s.latency_ms || 0}ms（${s.kind || '?'}）`;
+}
+
+export function noteOf(run, verdict) {
+  if (verdict === '过') return '';
+  const rendered = pagesRendered(run);
+  const bad = failedSites(run);
+  const pageLine = bad.length
+    ? `页面未通过：${bad.map((s) => `${s.label}${s.body_ms ? ` ${Math.round(s.body_ms / 1000)}s` : ''}`).join(' / ')}`
+    : '无站点读数';
+  // 页面渲染了：note 只讲页面，单发读数最多作为附注，绝不覆盖结论
+  if (rendered) {
+    return `${pageLine}；单发附注 ${singleNote(run)}`;
+  }
+  const one = singleNote(run);
+  if (run.start_error) return `启动失败：${String(run.start_error).replace(/\s+/g, ' ').slice(0, 90)}；${one}`;
+  if (verdict === '代理') {
+    return `${one}；${String(run.single?.error || run.proxy?.error || run.egress?.error || '').slice(0, 60)}`;
+  }
+  if (verdict === '中继') {
+    const st = run.relay || {};
+    return `${one}；queue_timeout=${st.queue_timeout || 0} dial_timeout=${st.dial_timeout || 0} tunnels=${st.tunnels || 0}/${st.connections || 0}`;
+  }
+  if (verdict === '指纹') {
+    const b = bad[0];
+    return `${one}；${b ? `${b.label}（${b.title || '无标题'}）` : ''}`;
+  }
+  if (verdict === '产品') {
+    return `${one}；${pageLine}`;
+  }
+  return `${one}；未命中三类：${pageLine}`;
+}
+
 /* ------------------------------ 主流程 ------------------------------ */
 // 被判据 import 时（`SWEEP_IMPORT_ONLY=1`）只导出解析函数，不跑扫描：
 // 纯函数（正文剥离 / 标题基准 / 归类）要能单测，又不能顺带起内核、连真代理。
@@ -367,7 +457,13 @@ async function readPage(c, targetId, sessionId, perCallMs = 5000) {
 async function probeSite(c, targetId, sessionId, site, waitMs) {
   const t0 = Date.now();
   const pollMs = 500;
-  const stableMs = 2000;
+  // 正文稳定窗口 4s（原 2s）。2026-11-19 全量的实证：10089 / 10091 的站1 在
+  // settle-body = 2030 / 2034ms 就收了（正好是 2s 窗口的下限），body_len=3339；
+  // 而其余 33 个环境同样两站都过、body_len=6616，settle-body 全部 ≥ 3049ms。
+  // 也就是说「2 秒没变化」在 SPA 上会踩到一次渲染间隙：正文先到 3339 字、停 2 秒、
+  // 再继续长到 6616 字。窗口放宽到 4s 不会改变判据（`body_ms` 仍是首次非空时刻，
+  // 判过与否还是看正文非空 + 标题），只是多等 2 秒把正文收全。
+  const stableMs = 4000;
   let cancelled = false;
   let snap = {};
   let firstBodyMs = null;
@@ -441,58 +537,7 @@ async function probeSite(c, targetId, sessionId, site, waitMs) {
   return rec;
 }
 
-/* 4. 失败归类（单发判别器 + 三类 + 我核不了；不猜）
- *
- * 0.4.7.5 19:45 的教训：**产品里打不开 ≠ 代理不通**。当时 3 个环境全被我归成「代理」，
- * 而 CEO 单发探同一台代理 649ms / 748ms 就通 —— 真因是中继把槽位占死了（max_dial_ms=60015）。
- * 所以归类必须以「单发 TCP/checkProxy 通不通」为判别器：
- *   - 单发都不通且是 TCP/认证失败 → `代理`
- *   - 单发都不通但只是探测源不可用（软失败）→ `我核不了`（判不了代理好坏）
- *   - 单发通、产品里不通 → **不许归代理**：有中继证据归 `中继`，否则归 `产品`
- */
-function verdictOf(run) {
-  const single = run.single;
-  if (single && single.ok === false) {
-    return isHardProxyFailure(single.kind) ? '代理' : '我核不了';
-  }
-  if (run.start_error) return '产品';
-  const st = run.relay || {};
-  const q = Number(st.queue_timeout) || 0;
-  const d = Number(st.dial_timeout) || 0;
-  const conn = Number(st.connections) || 0;
-  const tun = Number(st.tunnels) || 0;
-  if ((q > 0 || d > 0) && tun < conn / 2) return '中继';
-  if (run.sites.length === SITES.length && run.sites.every((s) => s.label === '过')) return '过';
-  if (run.sites.some((s) => s.blocked)) return '指纹';
-  // 页面有内容但标题不符（改版/被换页）：算指纹类，不算「核不了」
-  if (run.sites.some((s) => !s.chrome_error && String(s.body || '').trim())) return '指纹';
-  return '产品';
-}
-
-function noteOf(run, verdict) {
-  if (verdict === '过') return '';
-  const one = run.single
-    ? `单发 ${run.single.ok ? '通' : '不通'} ${run.single.latency_ms || 0}ms${run.single.ok ? ` 出口 ${run.single.ip || '?'}` : `（${run.single.kind || '?'}）`}`
-    : '单发未跑';
-  if (run.start_error) return `启动失败：${String(run.start_error).replace(/\s+/g, ' ').slice(0, 90)}；${one}`;
-  if (verdict === '代理') {
-    return `${one}；${String(run.single?.error || run.proxy?.error || run.egress?.error || '').slice(0, 60)}`;
-  }
-  if (verdict === '中继') {
-    const st = run.relay || {};
-    return `${one}；queue_timeout=${st.queue_timeout || 0} dial_timeout=${st.dial_timeout || 0} tunnels=${st.tunnels || 0}/${st.connections || 0}`;
-  }
-  if (verdict === '指纹') {
-    const bad = run.sites.find((s) => s.blocked) || run.sites.find((s) => s.label !== '过');
-    return `${one}；${bad ? `${bad.label}（${bad.title || '无标题'}）` : ''}`;
-  }
-  if (verdict === '产品') {
-    const bad = run.sites.filter((s) => s.label !== '过').map((s) => `${s.label}`);
-    return `${one}；页面未通过：${bad.join(' / ') || '无站点读数'}`;
-  }
-  const bad = run.sites.filter((s) => s.label !== '过').map((s) => `${s.label}`);
-  return `${one}；未命中三类：${bad.join(' / ') || '无站点读数'}`;
-}
+/* 4. 失败归类 —— 见文件上方（被判据 import 的纯函数区） */
 
 /* 5. 输出目录 */
 const outDir = path.resolve(ROOT, args.out || path.join('.tmp', 'fingerprint-sweep', nowStamp()));

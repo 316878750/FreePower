@@ -137,10 +137,11 @@ function probeView(probe) {
   }
   // 0.4.7.5 19:45：探测源挂了不许写成「代理未连通」——那是把「没验证成功」当「代理坏了」，
   // 用户会去换一条本来好的代理（10056 就是这么被误判的：代理 748ms 通，ip-api 被限流）。
+  // 0.4.7.7：三个端点全失败时（35/35 全失败那次），文案明确写「未验证」，样式是**警告**不是红色错误。
   if (probe.kind === 'probe_site' || probe.kind === 'target') {
     return {
       cls: 'warn',
-      label: '探测源不可用',
+      label: '未验证（探测源不可用）',
       detail: `不是代理不通：${String(probe.error || '出口探测源不可达').slice(0, 300)}`,
     };
   }
@@ -285,7 +286,7 @@ export function renderStartHtml(profile, { probe = null } = {}) {
       // 探测源不可用 ≠ 代理不通：文案分开，别让用户去换一条本来好的代理
       var softProbe = p.kind === 'probe_site' || p.kind === 'target';
       statusBox.className = 'status ' + (softProbe ? 'warn' : 'bad');
-      tag.textContent = softProbe ? '探测源不可用' : '代理未连通';
+      tag.textContent = softProbe ? '未验证（探测源不可用）' : '代理未连通';
       detail.textContent = (softProbe ? '不是代理不通：' : '') + (p.error || '出口探测失败');
       ipEl.textContent = '—';
       metaEl.textContent = '';
