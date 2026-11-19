@@ -40,13 +40,20 @@ test('③ 普通文字 / 实体 / 标签照常读出', () => {
   assert.equal(sweep.visibleTextFromHtml(html), 'Hello World a & b');
 });
 
-test('④ 站1 标题基准是 xStocks（不是 xPoints）：AdsPower 里实测标题就是 xStocks', () => {
+test('④ 站1 标题基准：xPoints 或 xStocks 任一命中都算过（实测 title 两个都在）', () => {
   const s1 = sweep.SITES.find((s) => s.key === 'xpoints');
   assert.ok(s1, '站1 还在');
-  assert.equal(s1.titleIncludes, 'xStock', `站1 标题基准应含 xStocks，实际 ${s1.titleIncludes}`);
-  assert.ok(!sweep.SITES.some((s) => /xPoints/i.test(String(s.titleIncludes || ''))), '不该再用 xPoints 当标题基准');
-  // 实测标题要能过基准
-  assert.ok('xStocks'.includes(s1.titleIncludes));
+  assert.deepEqual(s1.titleIncludesAny, ['xPoints', 'xStocks'], '基准应是两个都接受');
+  // 2026-11-19 五个环境实测标题
+  assert.ok(sweep.titleOk(s1, 'xPoints Rewards Program - xStocks'), '实测标题要过');
+  assert.ok(sweep.titleOk(s1, 'xPoints Rewards Program'), '站点只留 xPoints 也要过');
+  assert.ok(sweep.titleOk(s1, 'xStocks'), '站点只留 xStocks 也要过');
+  assert.ok(!sweep.titleOk(s1, 'Startale App'), '别的站标题要判不符');
+  assert.ok(!sweep.titleOk(s1, ''), '空标题要判不符');
+  // 站2 照旧：单串子串
+  const s2 = sweep.SITES.find((s) => s.key === 'startale');
+  assert.ok(sweep.titleOk(s2, 'Startale App'));
+  assert.ok(!sweep.titleOk(s2, 'Something Else'));
 });
 
 test('⑤ 判据改成「正文非空」：源码里不再拿 readyState 当完成条件', () => {

@@ -77,11 +77,25 @@ function parseArgs(argv) {
 const USAGE = `用法：node --no-warnings tools/fingerprint-sweep.mjs [--limit N] [--skip a,b] [--only a,b] [--db path] [--sweep path] [--out dir] [--wait ms] [--keep]`;
 
 export const SITES = [
-  // 站1 标题基准：AdsPower 里实测就是 `xStocks`（2026-11-19 逆向），不是站点路径里的 `xPoints`。
-  // 拿错基准会把「正常渲染」判成「标题不符」—— 基准宁可宽（xStock），也别写一个从来没出现过的串。
-  { key: 'xpoints', label: '站1 defi.xstocks.fi/points', url: 'https://defi.xstocks.fi/points', titleIncludes: 'xStock' },
+  // 站1 标题基准：2026-11-19 五个环境实测 title 是 `xPoints Rewards Program - xStocks`，
+  // 两个串都在里面。之前「标题不符」不是基准写错，是脚本在 React 挂载前就取了标题；
+  // 取法改了之后基准本来就对。所以基准写成「任一命中」：`xPoints` 或 `xStocks` 都算过，
+  // 站点以后只留其中一个也不会假红。
+  { key: 'xpoints', label: '站1 defi.xstocks.fi/points', url: 'https://defi.xstocks.fi/points', titleIncludes: 'xPoints', titleIncludesAny: ['xPoints', 'xStocks'] },
   { key: 'startale', label: '站2 app.startale.com', url: 'https://app.startale.com/', titleIncludes: 'Startale' },
 ];
+
+/**
+ * 标题基准判定：`titleIncludesAny` 里任一命中就算过（站1 的 `xPoints` / `xStocks`），
+ * 没有 `titleIncludesAny` 时退回单个 `titleIncludes` 子串。
+ */
+export function titleOk(site, title) {
+  const t = String(title || '');
+  const any = Array.isArray(site?.titleIncludesAny) ? site.titleIncludesAny.filter(Boolean) : [];
+  if (any.length) return any.some((s) => t.includes(s));
+  if (site?.titleIncludes) return t.includes(site.titleIncludes);
+  return true;
+}
 
 /**
  * 风控 / 验证码 / 拦截页关键词。只认**页面正文**里的明确字眼；
@@ -422,7 +436,7 @@ async function probeSite(c, targetId, sessionId, site, waitMs) {
   else if (rec.timeout) { rec.label = '超时'; rec.blocked = null; }
   else if (!rec.href || rec.href.startsWith('about:')) { rec.label = '没打开'; rec.blocked = null; }
   else if (m) { rec.label = `被拦(${m[0].slice(0, 16)})`; rec.blocked = '被拦'; }
-  else if (site.titleIncludes && !String(rec.title || '').includes(site.titleIncludes)) { rec.label = '标题不符'; rec.blocked = '标题不符'; }
+  else if (!titleOk(site, rec.title)) { rec.label = '标题不符'; rec.blocked = '标题不符'; }
   else { rec.label = '过'; rec.blocked = null; }
   return rec;
 }
@@ -644,7 +658,7 @@ const out = {
   started_at: startedAt,
   finished_at: finishedAt,
   wait_ms: args.wait,
-  sites: SITES.map((s) => ({ key: s.key, url: s.url, title_includes: s.titleIncludes })),
+  sites: SITES.map((s) => ({ key: s.key, url: s.url, title_includes: s.titleIncludes, title_includes_any: s.titleIncludesAny || null })),
   filters: { only: args.only, skip: args.skip, limit: args.limit },
   summary,
   residual_running: residual.map((x) => ({ profile_id: x.profile_id, pid: x.pid })),
