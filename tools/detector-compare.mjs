@@ -119,7 +119,7 @@ async function runOurs() {
     };
     await sleep(WAIT_MS);
     const metrics = await evalIn(metricsSource(mk));
-    const text = (await evalIn('document.body.innerText')) || '';
+    const text = (await evalIn("(document.body ? (document.body.textContent || document.body.innerText) : '')")) || '';
     return { ok: true, chrome: started.real_version, metrics, picks: pickLines(text), text };
   } catch (e) {
     return { ok: false, error: String(e && e.message) };
@@ -159,7 +159,7 @@ async function runPlain() {
     await sleep(WAIT_MS);
     // 基线不注入，标记名照样按这个环境的种子算 —— 读到的就是「没有注入」那一面
     const metrics = await evalIn(metricsSource(markerNames(fingerprintView(prof).seed)));
-    const text = (await evalIn('document.body.innerText')) || '';
+    const text = (await evalIn("(document.body ? (document.body.textContent || document.body.innerText) : '')")) || '';
     return { ok: true, chrome: chrome.version, metrics, picks: pickLines(text), text };
   } catch (e) {
     return { ok: false, error: String(e && e.message) };

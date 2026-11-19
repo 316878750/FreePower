@@ -136,7 +136,7 @@ async function openAndRead(inst, url, { timeoutMs = 15000 } = {}) {
   let snap = null;
   while (Date.now() < deadline) {
     const r = await inst.client.send('Runtime.evaluate', {
-      expression: 'JSON.stringify({ready:document.readyState,href:location.href,body:(document.body?document.body.innerText:"").slice(0,200)})',
+      expression: 'JSON.stringify({ready:document.readyState,href:location.href,body:(document.body?(document.body.textContent||document.body.innerText):"").slice(0,200)})',
       returnByValue: true,
     }, sessionId).catch(() => null);
     try { snap = JSON.parse(r?.result?.value || 'null'); } catch { /* ignore */ }
@@ -194,7 +194,7 @@ async function rawKernelThroughUpstream(upstreamPort, { timeoutMs = 20000 } = {}
     let snap = null;
     while (Date.now() < deadline) {
       const r = await client.send('Runtime.evaluate', {
-        expression: 'JSON.stringify({ready:document.readyState,href:location.href,body:(document.body?document.body.innerText:"").slice(0,200)})',
+        expression: 'JSON.stringify({ready:document.readyState,href:location.href,body:(document.body?(document.body.textContent||document.body.innerText):"").slice(0,200)})',
         returnByValue: true,
       }, sessionId).catch(() => null);
       try { snap = JSON.parse(r?.result?.value || 'null'); } catch { /* ignore */ }

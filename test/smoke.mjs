@@ -475,7 +475,7 @@ async function main() {
     check('连 127.0.0.1 也走代理（没有 loopback bypass）', loopbackViaProxy.length >= 2, `hits=${loopbackViaProxy.length}`);
     if (pd.ws?.puppeteer) {
       extraPids.push(Number(pd.pid));
-      const body = String(await evalInPage(pd.ws.puppeteer, 'document.body.innerText', { url: echo.url }));
+      const body = String(await evalInPage(pd.ws.puppeteer, "(document.body ? (document.body.textContent || document.body.innerText) : '')", { url: echo.url }));
       let exitIp = '';
       try { exitIp = JSON.parse(body).query; } catch { /* 解析失败下面断言报 */ }
       check('页面内单独验证出口 IP', exitIp === '203.0.113.9', String(exitIp || body.slice(0, 80)));

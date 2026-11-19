@@ -152,11 +152,11 @@ try {
   let summary = '';
   const deadline = Date.now() + 40000;
   while (Date.now() < deadline) {
-    summary = await evalIn(`(document.querySelector('.notice') && document.querySelector('.notice').innerText) || ''`);
+    summary = await evalIn(`(document.querySelector('.notice') && document.querySelector('.notice').textContent) || ''`);
     if (/批量检测完成/.test(String(summary))) break;
     await sleep(500);
   }
-  const bodyText = await evalIn(`document.body.innerText`);
+  const bodyText = await evalIn(`document.body.textContent`);
   console.log('\n=== UI 批量检测结果（页面渲染文字）===');
   console.log(summary);
 
@@ -168,13 +168,13 @@ try {
 
   // 单条：点「好代理」那一行的「检测」
   await evalIn(`(() => {
-    const tr = [...document.querySelectorAll('tbody tr')].find((t) => t.innerText.includes('P8B-好代理'));
+    const tr = [...document.querySelectorAll('tbody tr')].find((t) => t.textContent.includes('P8B-好代理'));
     const b = tr && [...tr.querySelectorAll('button')].find((x) => x.textContent === '检测');
     if (b) { b.click(); return 'clicked'; }
     return 'no-row';
   })()`);
   await sleep(2500);
-  const rowText = await evalIn(`(() => { const tr = [...document.querySelectorAll('tbody tr')].find((t) => t.innerText.includes('P8B-好代理')); return tr ? tr.innerText : 'no-row'; })()`);
+  const rowText = await evalIn(`(() => { const tr = [...document.querySelectorAll('tbody tr')].find((t) => t.textContent.includes('P8B-好代理')); return tr ? tr.textContent : 'no-row'; })()`);
   console.log('\n=== UI 单条检测后「好代理」那行 ===');
   console.log(rowText);
   check('UI：单条检测后行里显示出口 IP 与延迟', /203\.0\.113\.9/.test(String(rowText)) && /ms/.test(String(rowText)), '');

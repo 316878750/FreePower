@@ -259,7 +259,7 @@ async function readPage(c, targetId, sessionId, perCallMs = 5000) {
     href: location.href,
     title: document.title,
     ready: document.readyState,
-    body: (document.body ? document.body.innerText : ''),
+    body: (document.body ? (document.body.textContent || document.body.innerText) : ''),
   })`;
   const attempts = perCallMs >= 4000 ? 3 : 1;
   for (let attempt = 0; attempt < attempts; attempt += 1) {

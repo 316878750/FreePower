@@ -159,7 +159,7 @@ try {
         href: location.href,
         title: document.title,
         ready: document.readyState,
-        body: (document.body ? document.body.innerText : '').slice(0, 200),
+        body: (document.body ? (document.body.textContent || document.body.innerText) : '').slice(0, 200),
         imgs: document.images.length,
         loaded: [...document.images].filter((i) => i.complete && i.naturalWidth > 0).length,
       })`,

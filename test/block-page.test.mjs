@@ -96,7 +96,7 @@ const SNAPSHOT = `(() => JSON.stringify({
   imgComplete: document.images.length ? document.images[0].complete : null,
   imgNatural: document.images.length ? document.images[0].naturalWidth : null,
   navStatus: (performance.getEntriesByType('navigation')[0] || {}).responseStatus ?? null,
-  text: (document.body ? document.body.innerText : '').slice(0, 80),
+  text: (document.body ? (document.body.textContent || document.body.innerText) : '').slice(0, 80),
 }))()`;
 
 /**

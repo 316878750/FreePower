@@ -59,8 +59,9 @@ async function probeOnce(client, { url, timeoutMs, onTarget }) {
     let state = '';
     const read = async () => {
       const r = await client.send('Runtime.evaluate', {
-        // innerText 在某些响应（JSON 走 <pre>、重定向中途）会是空串，退回 textContent 兜一层
-        expression: 'document.readyState + "\\u0000" + ((document.body && document.body.innerText) || (document.documentElement && document.documentElement.textContent) || "")',
+        // 优先 textContent：标签页被遮挡（visibilityState=hidden）时 innerText 会是空串，
+        // 而 textContent 有内容（0.4.7.6 逆向实测：innerText 空、textContent 27,216 字符）
+        expression: 'document.readyState + "\\u0000" + ((document.body && (document.body.textContent || document.body.innerText)) || (document.documentElement && document.documentElement.textContent) || "")',
         returnByValue: true,
       }, sessionId).catch(() => null);
       const value = String(r?.result?.value ?? '');

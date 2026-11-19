@@ -117,7 +117,7 @@ async function readStartPage(inst, targetId, { timeoutMs = 25000 } = {}) {
           ip: (document.getElementById('probe-ip') || {}).textContent || '',
           meta: (document.getElementById('probe-meta') || {}).textContent || '',
           at: (document.getElementById('probe-at') || {}).textContent || '',
-          body: (document.body ? document.body.innerText : '').slice(0, 300),
+          body: (document.body ? (document.body.textContent || document.body.innerText) : '').slice(0, 300),
         })`,
         returnByValue: true,
       }, sessionId).catch(() => null);
