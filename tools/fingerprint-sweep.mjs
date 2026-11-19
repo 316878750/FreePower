@@ -390,8 +390,7 @@ function withTimeout(p, ms, label) {
   ]);
 }
 
-async function connectCdp(wsUrl) {
-  let last = null;
+async function connectCdp(wsUrl) {  let last = null;
   for (let i = 0; i < 20; i += 1) {
     try { return await CdpClient.connect(wsUrl); } catch (e) { last = e; await sleep(500); }
   }
@@ -401,6 +400,38 @@ async function connectCdp(wsUrl) {
 async function pageTargets(c) {
   const r = await withTimeout(c.send('Target.getTargets'), 5000, 'Target.getTargets').catch(() => null);
   return (r?.targetInfos || []).filter((t) => t.type === 'page');
+}
+
+/**
+ * 读起始页那张「实测出口」标签的**实际显示**（0.4.7.7）。
+ *
+ * 为什么要读 DOM 而不是只看 `egress` 字段：用户看到的是标签，不是 JSON。
+ * 2026-11-19 全量里 `egress.ok` 35/35 全 false，而页面到底显示红色「代理未连通」
+ * 还是黄色「未验证（探测源不可用）」，只有读 `#status` 的 class 和文字才知道。
+ */
+async function readStartTab(c, targetId, sessionId) {
+  const expr = `(() => {
+    const box = document.getElementById('status');
+    const tag = document.getElementById('status-tag');
+    const detail = document.getElementById('status-detail');
+    const ip = document.getElementById('probe-ip');
+    const at = document.getElementById('probe-at');
+    const bg = tag ? getComputedStyle(tag).backgroundColor : null;
+    const boxBg = box ? getComputedStyle(box).backgroundColor : null;
+    const fg = tag ? getComputedStyle(tag).color : null;
+    return JSON.stringify({
+      cls: box ? box.className : null,
+      label: tag ? tag.textContent.trim() : null,
+      detail: detail ? detail.textContent.trim().slice(0, 160) : null,
+      ip: ip ? ip.textContent.trim() : null,
+      at: at ? at.textContent.trim() : null,
+      tag_bg: bg, tag_fg: fg, box_bg: boxBg,
+    });
+  })()`;
+  const r = await withTimeout(c.send('Runtime.evaluate', { expression: expr, returnByValue: true }, sessionId), 4000, 'Runtime.evaluate')
+    .catch(() => null);
+  const raw = String(r?.result?.value ?? '');
+  try { return JSON.parse(raw); } catch { return { raw: raw.slice(0, 200) }; }
 }
 
 /**
@@ -654,7 +685,16 @@ for (let i = 0; i < entries.length; i += 1) {
     const attached = await withTimeout(cdp.send('Target.attachToTarget', { targetId: target, flatten: true }), 5000, 'Target.attachToTarget');
     const sessionId = attached.sessionId;
     const first = await readPage(cdp, target, sessionId);
-    run.first_tab = { href: first.href ?? null, title: first.title ?? null };
+    // 起始页那张「实测出口」标签的实际显示（文字 + class + 计算出的配色）：
+    // 用户看的是这个，不是 JSON。等一拍让它把服务端注入的读数画出来。
+    const startTab0 = await readStartTab(cdp, target, sessionId);
+    await sleep(1200);
+    const startTab = await readStartTab(cdp, target, sessionId);
+    run.first_tab = {
+      href: first.href ?? null,
+      title: first.title ?? null,
+      status: startTab && (startTab.label || startTab.raw) ? startTab : startTab0,
+    };
 
     for (const site of SITES) {
       const rec = await probeSite(cdp, target, sessionId, site, args.wait);
@@ -729,6 +769,18 @@ for (const r of results) {
     ? (r.single.ok ? `通 ${r.single.latency_ms}ms` : `不通（${r.single.kind || '?'}）`)
     : '未跑';
   md.push(`| ${r.index} | ${id} | ${r.name} | ${r.proxy} | ${one} | ${s1} | ${s2} | ${(r.total_ms / 1000).toFixed(1)}s | ${r.verdict} | ${r.note || ''} |`);
+}
+md.push('');
+md.push('## 起始页「实测出口」标签的实际显示（用户看到的就是这个）');
+md.push('');
+md.push('| # | 环境 id | 名字 | 标签文字 | class | 标签底/字色 | 显示 IP | egress.ok | kind | 端点 |');
+md.push('|---|---|---|---|---|---|---|---|---|---|');
+for (const r of results) {
+  const st = r.first_tab?.status || {};
+  const eg = r.egress || {};
+  const id = r.profile_id ? `${String(r.profile_id).slice(0, 8)}…` : '-';
+  const ep = eg.probe_url || eg.source || '-';
+  md.push(`| ${r.index} | ${id} | ${r.name} | ${st.label || (r.start_error ? '未启动' : '-')} | ${st.cls || '-'} | ${st.tag_bg || '-'} / ${st.tag_fg || '-'} | ${st.ip || '-'} | ${eg.ok === true ? 'true' : eg.ok === false ? 'false' : '-'} | ${eg.kind || '-'} | ${ep} |`);
 }
 md.push('');
 md.push('> 归类口径：**判别器是「单发 checkProxy 通不通」**（不并发、不经中继、只探一次）。'
