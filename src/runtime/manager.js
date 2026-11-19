@@ -22,6 +22,7 @@ import { loadUnpackedExtensions } from '../kernel/extensions.js';
 import { checkProxy, hasProxy, isHardProxyFailure, normalizeProxyConfig } from '../proxy/probe.js';
 import { resolveChain, startChain } from '../proxy/chain.js';
 import { startRelay } from '../proxy/relay.js';
+import { resolveUpstreamChain } from '../proxy/system-proxy.js';
 // 环境 → 中继端口：起始页的出口探测要跟浏览器走**同一条链路**（0.4.7.5）
 import { setRelayPort, clearRelayPort } from '../proxy/relay-registry.js';
 import { pacInUse, pacMessage } from '../proxy/pac.js';
@@ -332,8 +333,17 @@ export async function startProfile(profile, { force = false, systemProxy = null 
      * 凭据只出现在发往上游的握手报文里：日志只打 `127.0.0.1:<port> → 上游 host:port`。 */
     if (proxyBound && chain.mode !== 'chain' && (effectiveProxy.username || effectiveProxy.password)) {
       const upstream = normalizeProxyConfig(effectiveProxy);
+      /**
+       * 链式上游（0.4.7.7）：对齐 AdsPower 的实际路径 —— 页面流量先到本地 SOCKS5 链（如 v2rayN 10808），
+       * 在隧道里再去连环境代理。本机 → 环境代理 这段会丢 SYN 的路径因此被绕开，
+       * 但**出口仍是环境代理的 IP**（最后一跳 CONNECT 目标的是环境代理）。
+       *
+       * 默认：系统代理是显式 SOCKS5 时走链；`FREEPOWER_RELAY_CHAIN=0` 关掉。
+       * 链本身不可用时中继会自己退回直连（`stats.chain_fail`），这里不 fail-closed。
+       */
+      const chainUpstream = resolveUpstreamChain(process.env);
       try {
-        relayServer = await startRelay(upstream);
+        relayServer = await startRelay(upstream, chainUpstream ? { chain: chainUpstream } : {});
       } catch (e) {
         log(id, '代理中继失败，拒绝启动', e.message);
         const err = new Error(`代理带认证，但本地中继起不来，已阻止启动（fail-closed）：${e.message}`);
@@ -341,7 +351,8 @@ export async function startProfile(profile, { force = false, systemProxy = null 
         err.reason = 'proxy_relay_failed';
         throw err;
       }
-      log(id, '代理中继', `127.0.0.1:${relayServer.port} → 上游 ${upstream.type} ${upstream.host}:${upstream.port}`);
+      log(id, '代理中继', `127.0.0.1:${relayServer.port} → 上游 ${upstream.type} ${upstream.host}:${upstream.port}`
+        + (chainUpstream ? `（经本地链 ${chainUpstream.host}:${chainUpstream.port}）` : '（直连上游）'));
       // 起始页探测要用这个端口（与浏览器同一条链路）；生命周期与 relayServer 一致
       setRelayPort(id, relayServer.port);
       warnings.push(soft('proxy_auth_relay',

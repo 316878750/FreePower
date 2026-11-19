@@ -76,6 +76,10 @@ const DEFAULT_QUEUE_TIMEOUT_MS = Number(process.env.FREEPOWER_RELAY_QUEUE_TIMEOU
  *   - 所以 8s 是错的（上一版的口径），21s 才能把 TCP 自己的恢复机制跑完。
  *     并发不是瓶颈（21s 下并发 8 全通），也不是「我们把代理打坏了」。
  *
+ * 2026-11-19 复核：21s 只解决「串行下等重传」，真实页面 40+ 条扇出时槽位周转极慢
+ * （实测 56 次拨号烧 781s）。CEO 已定「快速失败 4s×4」方向，但**先等链式验证完再改**，
+ * 所以这里暂时保持 21s / 2 次 / 45s，不提前动。
+ *
  * 参数：单次 **21s**、最多 **2 次**、单连接拨号总预算 **45s**（2 × 21 + 余量）；
  * 而且**失败立刻还槽位**（见 dialUpstream，槽位是公共资源，重试期间不许占着）。
  *
@@ -284,6 +288,7 @@ async function dialUpstream(upstream, { timeoutMs, dialAttemptMs, dialBudgetMs, 
     if (i < attempts) {
       state.stats.dial_retries += 1;
       state.lastError = last;
+      // 退避 400ms 再重试（快速失败「立刻重发」的方向 CEO 已定，但要等链式验证完再改，先不动）
       await sleep(Math.min(400, Math.max(deadline - Date.now(), 1)));
     }
   }
@@ -296,19 +301,21 @@ async function dialUpstream(upstream, { timeoutMs, dialAttemptMs, dialBudgetMs, 
 /* ------------------------------ 上游握手 ------------------------------ */
 
 /**
- * SOCKS5 上游：greeting（同时提供 no-auth 与用户名密码）→ 必要时 RFC1929 子协商 → CONNECT。
+ * 在**已有 socket** 上做 SOCKS5 握手 + CONNECT（直连与链式共用）。
  * 目标用**域名**形式交给上游（DNS 在上游解析，语义等同 socks5h）—— 本机不做 DNS 泄漏。
+ *
+ * @param {net.Socket} sock 已经连上的 socket
+ * @param {{username?:string,password?:string}} creds 这一跳的账号密码（链式外层为空）
+ * @param {boolean} recordStages 是否把耗时/失败记进 dial_tcp/dial_reply/dial_fail_stage
+ *   （链式外层不记，避免把「本地链」的耗时混进「到环境代理」的读数）
  */
-async function openSocks5Upstream(upstream, host, port, ctx) {
-  const { timeoutMs } = ctx;
-  const state = ctx.state;
-  const sock = await dialUpstream(upstream, ctx);
+async function socks5Connect(sock, creds, host, port, timeoutMs, state, { recordStages = true } = {}) {
   const rd = new Reader(sock);
   /** 失败落在哪一段：auth = 问候/子协商被拒；reply = CONNECT 回复失败（代理连不上目标） */
   let stage = 'auth';
   let tReply = 0;
   try {
-    const methods = (upstream.username || upstream.password) ? [M_NOAUTH, M_USERPASS] : [M_NOAUTH];
+    const methods = (creds.username || creds.password) ? [M_NOAUTH, M_USERPASS] : [M_NOAUTH];
     sock.write(Buffer.from([VER, methods.length, ...methods]));
     const [v, chosen] = await rd.readExactly(2, timeoutMs, '上游 SOCKS5 方法选择');
     if (v !== VER) throw Object.assign(new Error('上游不是 SOCKS5（版本号不对）'), { reason: 'bad_upstream' });
@@ -316,8 +323,8 @@ async function openSocks5Upstream(upstream, host, port, ctx) {
       throw Object.assign(new Error('上游不接受我们提供的认证方式'), { reason: 'proxy_auth_unsupported' });
     }
     if (chosen === M_USERPASS) {
-      const user = Buffer.from(String(upstream.username || ''), 'utf8');
-      const pass = Buffer.from(String(upstream.password || ''), 'utf8');
+      const user = Buffer.from(String(creds.username || ''), 'utf8');
+      const pass = Buffer.from(String(creds.password || ''), 'utf8');
       if (!user.length) throw Object.assign(new Error('上游要求用户名密码，但环境里没有配用户名'), { reason: 'proxy_auth_missing' });
       sock.write(Buffer.concat([Buffer.from([0x01, user.length]), user, Buffer.from([pass.length]), pass]));
       const [sv, status] = await rd.readExactly(2, timeoutMs, '上游 SOCKS5 认证结果');
@@ -353,13 +360,75 @@ async function openSocks5Upstream(upstream, host, port, ctx) {
       await rd.readExactly(addrLen + 2, timeoutMs, '上游 SOCKS5 绑定地址');
     }
     const rest = rd.detach();
-    recordReplyStage(state, Date.now() - tReply, true);
+    if (recordStages) recordReplyStage(state, Date.now() - tReply, true);
+    return rest;
+  } catch (e) {
+    if (recordStages) {
+      if (stage === 'auth') recordAuthStage(state);
+      else recordReplyStage(state, Date.now() - tReply, false);
+    }
+    rd.detach();
+    throw e;
+  }
+}
+
+/** 直连上游：本机 → 环境代理（这一段就是丢 SYN 的那一跳）→ SOCKS5 CONNECT 目标 */
+async function openSocks5Upstream(upstream, host, port, ctx) {
+  const sock = await dialUpstream(upstream, ctx);
+  try {
+    const rest = await socks5Connect(sock, upstream, host, port, ctx.timeoutMs, ctx.state);
     return { socket: sock, rest };
   } catch (e) {
-    if (stage === 'auth') recordAuthStage(state);
-    else recordReplyStage(state, Date.now() - tReply, false);
-    rd.detach();
     try { sock.destroy(); } catch { /* 已经断了 */ }
+    throw e;
+  }
+}
+
+/** 链式失败（本地链本身连不上/握手失败）——只有这种才允许退回直连 */
+function tagChainFailed(e) {
+  e.chainFailed = true;
+  return e;
+}
+
+/**
+ * 链式上游（对齐 AdsPower 的实际路径）：
+ *   本机 → 本地 SOCKS5 链（如 v2rayN 127.0.0.1:10808）
+ *        → 在隧道里 CONNECT 到**环境代理** host:port
+ *        → 在隧道里对环境代理做 SOCKS5（带它的账号密码）
+ *        → CONNECT 到目标
+ *
+ * 这样「本机 → 环境代理」那段会丢 SYN 的路径被换成「本机 → 本地链 → 泰国节点 → 环境代理」，
+ * 但**页面出口仍然是环境代理的 IP**（最后一跳 CONNECT 目标的是环境代理）。
+ *
+ * 只有「本地链连不上 / 外层握手失败」才标记 `chainFailed`，交给上层退回直连；
+ * 内层（环境代理）失败不退回 —— 那是代理本身的问题，退回直连等于绕过用户配置的代理。
+ */
+async function openViaChain(upstream, host, port, ctx) {
+  const { chain, timeoutMs, state } = ctx;
+  let sock = null;
+  try {
+    const t0 = Date.now();
+    sock = await dial(chain.host, chain.port, Math.min(ctx.dialAttemptMs, timeoutMs), '本地链');
+    state.stats.chain_tcp_ms = Math.max(state.stats.chain_tcp_ms || 0, Date.now() - t0);
+    state.stats.chain_tcp_ms_total = (state.stats.chain_tcp_ms_total || 0) + (Date.now() - t0);
+  } catch (e) {
+    throw tagChainFailed(e);
+  }
+  try {
+    // 外层：在本地链的隧道里连到环境代理（本地链一般不要求认证）
+    const t0 = Date.now();
+    await socks5Connect(sock, { username: '', password: '' }, upstream.host, upstream.port, timeoutMs, state, { recordStages: false });
+    state.stats.chain_reply_ms = Math.max(state.stats.chain_reply_ms || 0, Date.now() - t0);
+  } catch (e) {
+    try { sock.destroy(); } catch { /* ignore */ }
+    throw tagChainFailed(e);
+  }
+  try {
+    // 内层：对环境代理做 SOCKS5（带凭据）→ CONNECT 目标；这一段记进 reply 段
+    const rest = await socks5Connect(sock, upstream, host, port, timeoutMs, state);
+    return { socket: sock, rest };
+  } catch (e) {
+    try { sock.destroy(); } catch { /* ignore */ }
     throw e;
   }
 }
@@ -398,10 +467,23 @@ async function openHttpUpstream(upstream, host, port, ctx) {
   }
 }
 
-function openUpstream(upstream, host, port, ctx) {
+async function openUpstream(upstream, host, port, ctx) {
   const type = String(upstream.type || 'http').toLowerCase();
-  if (type === 'socks5' || type === 'socks') return openSocks5Upstream(upstream, host, port, ctx);
-  return openHttpUpstream(upstream, host, port, ctx);
+  const isSocks = type === 'socks5' || type === 'socks';
+  // 链式只对 SOCKS5 上游有意义（HTTP 上游也能链，但 AdsPower 场景与用户库都是 socks5，先不铺）
+  if (ctx.chain && isSocks) {
+    try {
+      const t = await openViaChain(upstream, host, port, ctx);
+      ctx.state.stats.chain_used += 1;
+      return t;
+    } catch (e) {
+      // 只有「本地链本身不行」才退回直连；环境代理拒绝/认证失败必须照实报，不许绕过代理
+      if (!e.chainFailed) throw e;
+      ctx.state.stats.chain_fail += 1;
+      ctx.state.lastChainError = e;
+    }
+  }
+  return isSocks ? openSocks5Upstream(upstream, host, port, ctx) : openHttpUpstream(upstream, host, port, ctx);
 }
 
 /* ------------------------------ 本地监听 ------------------------------ */
@@ -486,9 +568,11 @@ function createGate(limit, state) {
  *   `timeoutMs` = 单条连接「拨号 + 握手」的预算（默认 60s，**从开始拨号起算**）。
  *   `queueTimeoutMs` = 排队上限（默认 20s，**独立于拨号预算**）。
  *   `dialAttemptMs` / `dialBudgetMs` / `dialAttempts` = 单次拨号 21s / 单连接拨号总预算 45s / 最多 2 次。
+ *   `chain` = `{host, port}` 本地 SOCKS5 链；给了就先走链（本机→链→环境代理），
+ *     链本身失败才退回直连（`stats.chain_fail`），环境代理失败照实报。
  * @returns {Promise<{port:number, close:Function, lastError:object|null, sockets:Set, stats:object}>}
  */
-export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, concurrency = DEFAULT_CONCURRENCY, queueTimeoutMs = DEFAULT_QUEUE_TIMEOUT_MS, dialAttempts = DEFAULT_DIAL_ATTEMPTS, dialAttemptMs = DEFAULT_DIAL_ATTEMPT_MS, dialBudgetMs = DEFAULT_DIAL_BUDGET_MS } = {}) {
+export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, concurrency = DEFAULT_CONCURRENCY, queueTimeoutMs = DEFAULT_QUEUE_TIMEOUT_MS, dialAttempts = DEFAULT_DIAL_ATTEMPTS, dialAttemptMs = DEFAULT_DIAL_ATTEMPT_MS, dialBudgetMs = DEFAULT_DIAL_BUDGET_MS, chain = null } = {}) {
   if (!upstream || !upstream.host || !(Number(upstream.port) > 0)) {
     throw new Error('startRelay 需要上游代理的 host 与 port');
   }
@@ -503,6 +587,10 @@ export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, con
     username: String(upstream.username || ''),
     password: String(upstream.password || ''),
   };
+  // 链式上游：{ host, port } 或 null；本地链一般不要求认证，暂不支持链上的账号密码
+  const ch = chain && chain.host && Number(chain.port) > 0
+    ? { host: String(chain.host), port: Number(chain.port) }
+    : null;
   /* ---------- 可观测（对照 AdsPower 用，默认全关） ----------
    * `FREEPOWER_RELAY_TRACE=1`：逐条记录浏览器连接 → 目标 / 每次拨号的起止与耗时 / 失败原因。
    * `FREEPOWER_RELAY_PROBE_MS=3000`：页面加载期间每隔 N ms 直拨一次上游端口（一次一条，不并发），
@@ -517,7 +605,7 @@ export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, con
     closed: false,
     dialAttempts: Math.max(1, Math.min(5, Math.floor(Number(dialAttempts) || DEFAULT_DIAL_ATTEMPTS))),
     /** 拨号参数（dialUpstream 每次尝试都用它） */
-    dialCtx: { timeoutMs, dialAttemptMs: attemptMs, dialBudgetMs: budgetMs, attempts: 0, state: null, gate: null, queueTimeoutMs: queueLimit },
+    dialCtx: { timeoutMs, dialAttemptMs: attemptMs, dialBudgetMs: budgetMs, attempts: 0, state: null, gate: null, queueTimeoutMs: queueLimit, chain: ch },
     /** 只记读数，不含凭据 */
     stats: {
       connections: 0,
@@ -563,6 +651,14 @@ export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, con
       dial_attempts: 0,
       dial_retries: 0,
       upstream: `${up.type} ${up.host}:${up.port}`,
+      /** 链式上游（本机 → 本地 SOCKS5 链 → 环境代理）：走链次数 / 链失败退回直连次数 */
+      chain: chain ? `${chain.host}:${chain.port}` : null,
+      chain_used: 0,
+      chain_fail: 0,
+      /** 链式两段耗时：连本地链（TCP）/ 在隧道里让链 CONNECT 到环境代理 */
+      chain_tcp_ms: 0,
+      chain_tcp_ms_total: 0,
+      chain_reply_ms: 0,
       /** 逐条连接明细：只在 `FREEPOWER_RELAY_TRACE=1` 时有内容（默认 null，不占内存） */
       trace: traceOn ? [] : null,
       /** 对照组：页面加载期间定时直拨上游端口（不经中继逻辑），看「此刻线路自身通不通」 */
