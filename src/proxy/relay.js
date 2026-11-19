@@ -207,6 +207,39 @@ function recordDial(state, t0) {
 }
 
 /**
+ * 拨号两段拆分（0.4.7.6 之后补，纯埋点）：
+ *
+ * - **tcp**：本机 → 代理本身 的 TCP 建连。这段超时 = **路径丢 SYN**（典型重传 1s/3s/7s/15s），
+ *   跟我们的队列、并发、超时全无关，参数一个都不用动；
+ * - **reply**：TCP 通了之后，代理去连目标、回 SOCKS5 CONNECT 的耗时。这段超时 = **代理到目标**不通，
+ *   方向完全不同（换目标/换出口/代理侧问题）；
+ * - **auth**：SOCKS5 问候/子协商被拒（版本、认证方式、用户名密码）。
+ *
+ * 有了这三段，下次一跑就知道 21s 烧在哪一段，不用再猜。
+ */
+function recordTcpStage(state, ms, ok) {
+  state.stats.dial_tcp_ms = Math.max(state.stats.dial_tcp_ms || 0, ms);
+  state.stats.dial_tcp_ms_total += ms;
+  if (!ok) {
+    state.stats.dial_tcp_fail += 1;
+    state.stats.dial_fail_stage.tcp += 1;
+  }
+}
+
+function recordReplyStage(state, ms, ok) {
+  state.stats.dial_reply_ms = Math.max(state.stats.dial_reply_ms || 0, ms);
+  state.stats.dial_reply_ms_total += ms;
+  if (!ok) {
+    state.stats.dial_reply_fail += 1;
+    state.stats.dial_fail_stage.reply += 1;
+  }
+}
+
+function recordAuthStage(state) {
+  state.stats.dial_fail_stage.auth += 1;
+}
+
+/**
  * 上游拨号（带重试）。
  *
  * **槽位只覆盖「一次拨号」**：每次尝试前 acquire、尝试结束（成功或失败）立刻 release。
@@ -232,6 +265,7 @@ async function dialUpstream(upstream, { timeoutMs, dialAttemptMs, dialBudgetMs, 
     try {
       const sock = await dial(upstream.host, upstream.port, Math.min(dialAttemptMs, left));
       if (at) { at.ms = Date.now() - t0; at.ok = true; rec.attempts.push(at); }
+      recordTcpStage(state, Date.now() - t0, true);
       return sock;
     } catch (e) {
       last = e;
@@ -240,6 +274,8 @@ async function dialUpstream(upstream, { timeoutMs, dialAttemptMs, dialBudgetMs, 
       // 两者混在一个 failed 计数里，就看不出「上游慢」还是「上游不让我们连」。
       const k = String(e?.reason || e?.code || 'other');
       state.stats.dial_fail_kinds[k] = (state.stats.dial_fail_kinds[k] || 0) + 1;
+      // TCP 这一段就失败了（没连上代理本身）：记 tcp 段，不污染 reply/auth
+      recordTcpStage(state, Date.now() - t0, false);
       if (at) { at.ms = Date.now() - t0; at.err = k; rec.attempts.push(at); }
     } finally {
       recordDial(state, t0);
@@ -265,8 +301,12 @@ async function dialUpstream(upstream, { timeoutMs, dialAttemptMs, dialBudgetMs, 
  */
 async function openSocks5Upstream(upstream, host, port, ctx) {
   const { timeoutMs } = ctx;
+  const state = ctx.state;
   const sock = await dialUpstream(upstream, ctx);
   const rd = new Reader(sock);
+  /** 失败落在哪一段：auth = 问候/子协商被拒；reply = CONNECT 回复失败（代理连不上目标） */
+  let stage = 'auth';
+  let tReply = 0;
   try {
     const methods = (upstream.username || upstream.password) ? [M_NOAUTH, M_USERPASS] : [M_NOAUTH];
     sock.write(Buffer.from([VER, methods.length, ...methods]));
@@ -294,6 +334,8 @@ async function openSocks5Upstream(upstream, host, port, ctx) {
       throw Object.assign(new Error(`目标主机名不合法：${host}`), { reason: 'bad_target' });
     }
     sock.write(req);
+    stage = 'reply';
+    tReply = Date.now();
     const head = await rd.readExactly(4, timeoutMs, '上游 SOCKS5 CONNECT 回复');
     if (head[0] !== VER) throw Object.assign(new Error('上游 SOCKS5 回复版本不对'), { reason: 'bad_upstream' });
     if (head[1] !== REP_OK) {
@@ -311,8 +353,11 @@ async function openSocks5Upstream(upstream, host, port, ctx) {
       await rd.readExactly(addrLen + 2, timeoutMs, '上游 SOCKS5 绑定地址');
     }
     const rest = rd.detach();
+    recordReplyStage(state, Date.now() - tReply, true);
     return { socket: sock, rest };
   } catch (e) {
+    if (stage === 'auth') recordAuthStage(state);
+    else recordReplyStage(state, Date.now() - tReply, false);
     rd.detach();
     try { sock.destroy(); } catch { /* 已经断了 */ }
     throw e;
@@ -322,14 +367,17 @@ async function openSocks5Upstream(upstream, host, port, ctx) {
 /** HTTP/HTTPS 上游：CONNECT + `Proxy-Authorization: Basic`（凭据只在这一段出现） */
 async function openHttpUpstream(upstream, host, port, ctx) {
   const { timeoutMs } = ctx;
+  const state = ctx.state;
   const sock = await dialUpstream(upstream, ctx);
   const rd = new Reader(sock);
+  let tReply = Date.now();
   try {
     const authority = `${host}:${port}`;
     const auth = (upstream.username || upstream.password)
       ? `Proxy-Authorization: Basic ${Buffer.from(`${upstream.username || ''}:${upstream.password || ''}`).toString('base64')}${CRLF}`
       : '';
     sock.write(`CONNECT ${authority} HTTP/1.1${CRLF}Host: ${authority}${CRLF}${auth}${CRLF}`);
+    tReply = Date.now();
     const head = await rd.readHead(timeoutMs);
     const status = Number(String(head.split(CRLF)[0] || '').split(' ')[1]);
     if (status === 407) {
@@ -339,8 +387,11 @@ async function openHttpUpstream(upstream, host, port, ctx) {
       throw Object.assign(new Error(`上游代理拒绝 CONNECT ${authority}（HTTP ${status}）`), { reason: 'proxy_refused', status });
     }
     const rest = rd.detach();
+    recordReplyStage(state, Date.now() - tReply, true);
     return { socket: sock, rest };
   } catch (e) {
+    if (e?.reason === 'proxy_auth_failed') recordAuthStage(state);
+    else recordReplyStage(state, Date.now() - tReply, false);
     rd.detach();
     try { sock.destroy(); } catch { /* 已经断了 */ }
     throw e;
@@ -496,6 +547,16 @@ export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, con
       dial_attempts_max: 0,
       /** 拨号失败原因分类计数（timeout / ECONNRESET / ECONNREFUSED / ...） */
       dial_fail_kinds: {},
+      /** 拨号两段拆分：到代理本身的 TCP 建连（最大/累计/失败数） */
+      dial_tcp_ms: 0,
+      dial_tcp_ms_total: 0,
+      dial_tcp_fail: 0,
+      /** 拨号两段拆分：代理回 SOCKS5 CONNECT 的耗时（最大/累计/失败数） */
+      dial_reply_ms: 0,
+      dial_reply_ms_total: 0,
+      dial_reply_fail: 0,
+      /** 失败落在哪一段：tcp（到代理丢 SYN）/ auth（认证被拒）/ reply（代理连目标失败） */
+      dial_fail_stage: { tcp: 0, auth: 0, reply: 0 },
       /** 浏览器自己关掉的预连接（还没拨上游就 RST）——不是链路失败，单独记 */
       client_closed: 0,
       /** 上游拨号：尝试次数（累计）与其中重试次数 */
