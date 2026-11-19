@@ -90,6 +90,17 @@ const MAX_HEAD_BYTES = 64 * 1024;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** 逐条明细的上限（`FREEPOWER_RELAY_TRACE=1`）：够覆盖一个页面的全部连接，不无限涨内存 */
+const TRACE_MAX = 400;
+
+/** 把一条连接的明细收进 `stats.trace`（环形，超了丢最老的） */
+function pushTrace(state, rec) {
+  if (!rec || !state.trace) return;
+  rec.total_ms = Date.now() - rec.t0;
+  state.trace.push(rec);
+  if (state.trace.length > TRACE_MAX) state.trace.shift();
+}
+
 /* SOCKS5 常量 */
 const VER = 0x05;
 const M_NOAUTH = 0x00;
@@ -206,7 +217,7 @@ function recordDial(state, t0) {
  * 只有「连不上」才重试 —— 握手阶段失败（认证错、上游拒绝）重试没有意义，
  * 那是配置问题，重试只会把错误拖成超时。
  */
-async function dialUpstream(upstream, { timeoutMs, dialAttemptMs, dialBudgetMs, attempts, state, gate, queueTimeoutMs }) {
+async function dialUpstream(upstream, { timeoutMs, dialAttemptMs, dialBudgetMs, attempts, state, gate, queueTimeoutMs, rec }) {
   const deadline = Date.now() + Math.min(dialBudgetMs, timeoutMs);
   let last = null;
   for (let i = 1; i <= attempts; i += 1) {
@@ -216,8 +227,12 @@ async function dialUpstream(upstream, { timeoutMs, dialAttemptMs, dialBudgetMs, 
     // 槽位是公共资源：这次拨号一结束（成功或失败）就还回去，绝不带着它重试
     const release = await gate.acquire(queueTimeoutMs);
     const t0 = Date.now();
+    /** 明细用：这次尝试的起点；结束时补耗时与原因（`FREEPOWER_RELAY_TRACE=1` 才有 rec） */
+    const at = rec ? { start: t0, at: new Date(t0).toISOString(), ms: 0, ok: false, err: null } : null;
     try {
-      return await dial(upstream.host, upstream.port, Math.min(dialAttemptMs, left));
+      const sock = await dial(upstream.host, upstream.port, Math.min(dialAttemptMs, left));
+      if (at) { at.ms = Date.now() - t0; at.ok = true; rec.attempts.push(at); }
+      return sock;
     } catch (e) {
       last = e;
       // 失败原因分类计数（0.4.7.5 20:10）：`timeout` = 单次拨号窗口内没连上（上游丢 SYN / 排队）；
@@ -225,6 +240,7 @@ async function dialUpstream(upstream, { timeoutMs, dialAttemptMs, dialBudgetMs, 
       // 两者混在一个 failed 计数里，就看不出「上游慢」还是「上游不让我们连」。
       const k = String(e?.reason || e?.code || 'other');
       state.stats.dial_fail_kinds[k] = (state.stats.dial_fail_kinds[k] || 0) + 1;
+      if (at) { at.ms = Date.now() - t0; at.err = k; rec.attempts.push(at); }
     } finally {
       recordDial(state, t0);
       release();
@@ -436,6 +452,13 @@ export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, con
     username: String(upstream.username || ''),
     password: String(upstream.password || ''),
   };
+  /* ---------- 可观测（对照 AdsPower 用，默认全关） ----------
+   * `FREEPOWER_RELAY_TRACE=1`：逐条记录浏览器连接 → 目标 / 每次拨号的起止与耗时 / 失败原因。
+   * `FREEPOWER_RELAY_PROBE_MS=3000`：页面加载期间每隔 N ms 直拨一次上游端口（一次一条，不并发），
+   *   用来回答「页面打不开的这 45 秒里，线路自己是不是通的」—— 这是区分「线路坏」与「我们的连接行为」
+   *   最直接的一组对照。两条都只写 stats，不落盘、不发给浏览器、不含凭据。 */
+  const traceOn = process.env.FREEPOWER_RELAY_TRACE === '1';
+  const probeMs = Math.max(0, Math.floor(Number(process.env.FREEPOWER_RELAY_PROBE_MS || 0) || 0));
   const state = {
     port: 0,
     lastError: null,
@@ -479,8 +502,16 @@ export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, con
       dial_attempts: 0,
       dial_retries: 0,
       upstream: `${up.type} ${up.host}:${up.port}`,
+      /** 逐条连接明细：只在 `FREEPOWER_RELAY_TRACE=1` 时有内容（默认 null，不占内存） */
+      trace: traceOn ? [] : null,
+      /** 对照组：页面加载期间定时直拨上游端口（不经中继逻辑），看「此刻线路自身通不通」 */
+      probes: probeMs > 0 ? [] : null,
+      probe_ms: probeMs,
     },
   };
+  // 写入端用的是 state.trace / state.probes（不是 stats 上另建的新数组），这里指向同一份
+  state.trace = state.stats.trace;
+  state.probes = state.stats.probes;
   const gate = createGate(limit, state);
   state.dialCtx.attempts = state.dialAttempts;
   state.dialCtx.state = state;
@@ -492,7 +523,10 @@ export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, con
     state.sockets.add(socket);
     socket.on('close', () => state.sockets.delete(socket));
     socket.on('error', () => { /* 浏览器主动断，正常 */ });
-    handleClient(socket, up, state, timeoutMs).catch((e) => {
+    const rec = traceOn
+      ? { id: (state.traceSeq = (state.traceSeq || 0) + 1), t0: Date.now(), target: null, attempts: [], result: null, dial_ms: 0, total_ms: 0 }
+      : null;
+    handleClient(socket, up, state, timeoutMs, rec).catch((e) => {
       state.lastError = state.lastError || e;
       state.stats.failed += 1;
       try { socket.destroy(); } catch { /* ignore */ }
@@ -508,8 +542,33 @@ export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, con
   });
   state.port = server.address().port;
 
+  /* 对照组：每 N ms 直拨一次上游端口（一次一条、不并发），记录耗时。
+   * 页面 45s 全灭的那段时间里如果这些探针一直是 1s 通，就说明「线路通、我们的连接行为不通」，
+   * 反过来若探针也 20s 超时，就是线路/供应商此刻真的不行 —— 这一组数据决定下一步怎么改。 */
+  if (probeMs > 0) {
+    const probe = async () => {
+      const t0 = Date.now();
+      let ok = false;
+      let why = null;
+      try {
+        const s = await dial(up.host, up.port, Math.max(21000, probeMs), '上游探针');
+        ok = true;
+        try { s.destroy(); } catch { /* ignore */ }
+      } catch (e) {
+        why = String(e?.reason || e?.code || 'error');
+      }
+      const rec = { t0, at: new Date(t0).toISOString(), ms: Date.now() - t0, ok, why, in_flight: state.stats.active, tunnels_now: state.stats.tunnels };
+      state.probes.push(rec);
+      if (state.probes.length > TRACE_MAX) state.probes.shift();
+    };
+    state.probeTimer = setInterval(() => { probe().catch(() => {}); }, probeMs);
+    if (state.probeTimer.unref) state.probeTimer.unref();
+    probe().catch(() => {});
+  }
+
   state.close = () => new Promise((resolve) => {
     state.closed = true;
+    if (state.probeTimer) clearInterval(state.probeTimer);
     gate.drain();
     for (const s of state.sockets) { try { s.destroy(); } catch { /* ignore */ } }
     state.sockets.clear();
@@ -518,7 +577,7 @@ export async function startRelay(upstream, { timeoutMs = DEFAULT_TIMEOUT_MS, con
   return state;
 }
 
-async function handleClient(client, upstream, state, timeoutMs) {
+async function handleClient(client, upstream, state, timeoutMs, rec = null) {
   const rd = new Reader(client, { closeCode: 'ERR_CLIENT_CLOSED' });
   let upstreamSock = null;
   try {
@@ -560,19 +619,22 @@ async function handleClient(client, upstream, state, timeoutMs) {
       throw Object.assign(new Error(`不支持的 SOCKS5 命令 ${cmd}`), { reason: 'cmd_unsupported' });
     }
     if (!host) throw Object.assign(new Error('目标主机为空'), { reason: 'bad_target' });
+    if (rec) rec.target = `${host}:${port}`;
 
     // ③ 连上游（协议与凭据都在这一段）
     //    有界并发 + **每次拨号一个槽位**：槽位在 dialUpstream 里 acquire/release，
     //    拨完（成功或失败）立刻还 —— 失败绝不带着槽位重试（0.4.7.5 19:45，见 dialUpstream 注释）。
     //    排队预算**独立**（queueTimeoutMs）：排在队里不算拨号，别让排队把拨号预算吃掉。
-    const t = await openUpstream(upstream, host, port, state.dialCtx);
+    const t = await openUpstream(upstream, host, port, rec ? { ...state.dialCtx, rec } : state.dialCtx);
     upstreamSock = t.socket;
     state.stats.tunnels += 1;
+    if (rec) { rec.result = 'tunnel'; rec.dial_ms = rec.attempts.reduce((a, b) => a + b.ms, 0); }
 
     client.write(reply(REP_OK));
     if (t.rest.length) { try { upstreamSock.write(t.rest); } catch { /* ignore */ } }
     const rest = rd.detach();
     if (rest.length) { try { upstreamSock.write(rest); } catch { /* ignore */ } }
+    pushTrace(state, rec);
     relay(client, upstreamSock);
   } catch (e) {
     state.lastError = e;
@@ -586,6 +648,11 @@ async function handleClient(client, upstream, state, timeoutMs) {
     else state.stats.failed += 1;
     // 拨号超时单独计数：`queue_timeout` 是排队，不能混进来（0.4.7.5 18:40）
     if (e?.reason === 'timeout' || e?.code === 'ETIMEDOUT') state.stats.dial_timeout += 1;
+    if (rec) {
+      rec.result = clientGone ? 'client_closed' : String(e?.reason || e?.code || 'error');
+      rec.dial_ms = rec.attempts.reduce((a, b) => a + b.ms, 0);
+      pushTrace(state, rec);
+    }
     try { client.write(reply(repFor(e))); } catch { /* 已经断了 */ }
     try { client.destroy(); } catch { /* ignore */ }
     if (upstreamSock) { try { upstreamSock.destroy(); } catch { /* ignore */ } }
