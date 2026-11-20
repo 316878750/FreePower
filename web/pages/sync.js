@@ -85,6 +85,22 @@ export default async function renderSync({ head, page }) {
   mount(head, h('h1', null, '窗口同步'));
   mount(page, topBar, warnBar, wrap);
 
+  /* ---------------------- 派生数据（必须在第一个 await 之前） ----------------------
+   * 0.4.7.7 的线上事故：这几行原来在 `reload(true)` 后面，而 `renderSync` 是 async 函数，
+   * `await reload(true)` 一挂起，续体里的 `paintAll()` 就会先读 `isRunning` ——
+   * 那时 `const` 还没执行到，直接 `Cannot access 'isRunning' before initialization`（TDZ），
+   * 整页只剩「出错了」。所以：凡是 paintAll / paintTop / tick 用到的派生函数，
+   * 一律在第一个 await 之前定义，也不要写成「先 await 再 paint」。
+   * 判据见 test/sync-page-import.test.mjs（用真 ESM 把整页跑一遍）。 */
+  const running = () => state.running.filter((r) => !state.groupId || String(state.profiles.get(r.id)?.group_id ?? '0') === state.groupId);
+  const nameOf = (id) => state.profiles.get(id)?.name || id;
+  const groupNameOf = (id) => {
+    const gid = String(state.profiles.get(id)?.group_id ?? '0');
+    return state.groups.find((g) => g.id === gid)?.name || '未分组';
+  };
+  const selectedIds = () => [...state.selected];
+  const isRunning = () => state.status?.running === true;
+
   await reload(true);
   paintAll();
 
@@ -141,15 +157,6 @@ export default async function renderSync({ head, page }) {
     paintTable();
     paintOperate();
   }
-
-  const running = () => state.running.filter((r) => !state.groupId || String(state.profiles.get(r.id)?.group_id ?? '0') === state.groupId);
-  const nameOf = (id) => state.profiles.get(id)?.name || id;
-  const groupNameOf = (id) => {
-    const gid = String(state.profiles.get(id)?.group_id ?? '0');
-    return state.groups.find((g) => g.id === gid)?.name || '未分组';
-  };
-  const selectedIds = () => [...state.selected];
-  const isRunning = () => state.status?.running === true;
 
   /* ------------------------------ 顶部操作条 ------------------------------ */
 

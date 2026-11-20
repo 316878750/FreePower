@@ -50,7 +50,9 @@ async function call(path, { method = 'GET', body, query, timeoutMs = 90000 } = {
      * 原始错误只进 console（排障用），界面上只给中文和下一步动作。
      */
     const timedOut = e && (e.name === 'AbortError' || /abort/i.test(String(e.message || '')));
-    console.warn('[fp] 请求失败', path, e);
+    // 只打白名单字段，不把整个 Error 丢进去：devtools 会把 Error 展开成满屏英文堆栈，
+    // 排障时反而找不到那一句。name/message 足够定位，且不依赖调用栈里的任何东西。
+    console.warn('[fp] 请求失败', path, { name: e?.name, message: String(e?.message || e) });
     throw new FpError({
       code: -1,
       msg: timedOut
