@@ -288,6 +288,26 @@ export async function startProfile(profile, { force = false, systemProxy = null 
       } else {
         // 链式环境下这就是「整条链 + 目标」的端到端探测：探通即每一跳都通
         proxyCheck = await checkProxy(effectiveProxy, { url: EGRESS_PROBE_URL, timeoutMs: PROXY_PROBE_TIMEOUT_MS });
+        /**
+         * 0.4.7.9：链上任何一跳**认证失败（407）一律是硬失败**。
+         *
+         * 现场（0.4.7.8 的 smoke C2）：hop0 = 系统代理要求认证、注册表里没有凭据 → hop0 回 407。
+         * 而 `checkProxy` 看到的是「链末端回了 502」（我们的中继把上游失败统一翻成 502），
+         * 于是把这一跳归成 `probe_site`（软失败）→ 按「未验证」放行启动。
+         * 用户以为在走链，实际链根本没通，出口可能是本机 IP —— 这绝对不能放行。
+         * 这与我们早就定过的「内层（环境代理）认证失败不退回」是同一条口径：链上任何一跳认证失败都不退回。
+         * 判据来源是中继自己记的 `lastError.reason === 'proxy_auth_failed'`（见 src/proxy/chain.js）。
+         */
+        const chainAuthFailed = chain.mode === 'chain' && chainServer && chainServer.lastError
+          && chainServer.lastError.reason === 'proxy_auth_failed';
+        if (!proxyCheck.ok && chainAuthFailed) {
+          proxyCheck = {
+            ...proxyCheck,
+            kind: 'auth',
+            chain_hop: chainServer.lastError.hop,
+            error: `代理链第 ${Number(chainServer.lastError.hop) + 1} 跳认证失败：${chainServer.lastError.message}`,
+          };
+        }
         if (!proxyCheck.ok) {
           if (!isHardProxyFailure(proxyCheck.kind)) {
             /* 0.4.7.5 19:45：**探测源挂了 ≠ 代理不通**。

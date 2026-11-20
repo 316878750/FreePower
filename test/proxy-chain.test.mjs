@@ -192,14 +192,29 @@ const profiles = await import('../src/store/profiles.js');
 
 /* ------------------------------ 工具 ------------------------------ */
 
-/** 本环境的 chrome 进程命令行（按 user-data-dir 里的 profile id 前 8 位归类，不看总数） */
-function chromeProcsFor(frag) {
+/**
+ * 本用例起的 chrome 进程（按 `--user-data-dir` **精确归类**，不看总数）。
+ *
+ * 0.4.7.9 修：原来拿 `profile id 前 8 位`（UUID 的一截，如 `bf094b5c`）做**子串匹配**，
+ * 用户本机上正开着 FreePower（`%APPDATA%\Roaming\FreePower` 下 10053/10055 等环境的 chrome），
+ * 只要那串碰巧出现在别人命令行里就会被捞进来 —— 「零内核进程」于是报 11 个，是环境干扰，不是产品 bug。
+ * 现在只认「`--user-data-dir` 落在**本用例自己的**临时数据目录里」的进程：
+ * 那是 `.tmp/chain-<pid>-<时间戳>/profiles/...`，用户机器上不可能有。
+ * @param {string} tmpDir 本用例的数据目录（DATA）
+ */
+function chromeProcsUnder(tmpDir) {
   if (process.platform !== 'win32') return [];
   try {
     const out = execFileSync('powershell.exe', ['-NoProfile', '-Command',
       "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | Select-Object -ExpandProperty CommandLine",
     ], { encoding: 'utf8', timeout: 20000 });
-    return String(out).split(/\r?\n/).filter((l) => l.includes(frag));
+    const want = path.resolve(tmpDir).replace(/\\/g, '/').toLowerCase();
+    return String(out).split(/\r?\n/).filter((l) => {
+      const m = l.match(/--user-data-dir=(?:"([^"]+)"|(\S+))/);
+      if (!m) return false;
+      const ud = path.resolve(m[1] || m[2]).replace(/\\/g, '/').toLowerCase();
+      return ud === want || ud.startsWith(want + '/');
+    });
   } catch {
     return null;   // 量不到就如实报「量不到」，不当成 0
   }
@@ -265,7 +280,8 @@ async function main() {
     const id = asCase('a', {
       envProxy: { proxy_type: 'http', host: '127.0.0.1', port: hop1.port, username: envAuth[0], password: envAuth[1] },
     });
-    const frag = id.split('-')[0];
+    const frag = id.split('-')[0];   // 仍保留：用于日志/调试，不再参与进程归类
+    void frag;
     try {
       const started = await manager.startProfile(profiles.getProfile(id), {
         systemProxy: { ProxyEnable: 1, ProxyServer: `127.0.0.1:${hop0.port}`, ProxyOverride: '<local>' },
@@ -301,7 +317,7 @@ async function main() {
         hop1.records.some((r) => r.auth === wantEnv), fmt(hop1.records.map((r) => r.auth).filter(Boolean).slice(0, 2)));
 
       /* argv 判据（我们自己的口径）：只许出现本地中继，上游 host/port/凭据都不许进命令行 */
-      const lines = chromeProcsFor(frag);
+      const lines = chromeProcsUnder(DATA);
       check('A. 能量到本环境的 chrome 进程（正例：不是「读了个空串所以全过」）',
         Array.isArray(lines) && lines.length > 0, Array.isArray(lines) ? `${lines.length} 个进程` : '量不到（powershell 失败）');
       const argv = (lines || []).join('\n');
@@ -358,30 +374,47 @@ async function main() {
   }
 
   /* ==========================================================================
-   * C) 断链 fail-closed：hop1 关掉 → 800003 + proxy_chain_hop_failed + 零内核
+   * C) hop0 回 502（它接受了 CONNECT、却没能到目标）→ 按 0.4.7.5 软硬分流**放行**
+   *
+   * 0.4.7.9 口径（CEO 裁决）：502 意味着**代理本身是通的**（接受了我们的 CONNECT 并回了话），
+   * 只是它那一跳没能到目标 —— 与「探测源挂了」同类，不是「代理不可达」。所以：
+   *   ① 允许启动（不抛错）；② 记一条 proxy_probe_unavailable 级别的 soft 警告；
+   *   ③ **不降级直连**（目标 server 命中仍为 0）。
+   * 原来的写法要求「抛 800003 + failed_hop=1」，那是在 0.4.7.5 分流之前的口径，写得太严了。
+   * 注意：**不要**为了这条把 502 改成硬失败 —— 那会重新引发 0.4.7.5 修掉的「探测源一挂就打不开」。
    * ======================================================================== */
-  console.log('\n=== C) 两跳但 hop1 不可达 → fail-closed 拒绝启动 ===');
+  console.log('\n=== C) hop0 回 502 → 按软硬分流放行（不拦启动、不降级直连） ===');
   {
     const hop0 = await startRecorder({ label: 'C-hop0' });
     const hop1 = await startRecorder({ label: 'C-hop1' });
-    await hop1.close();   // 环境代理这一跳直接不可达
+    await hop1.close();   // 环境代理这一跳直接不可达 → hop0 转发时回 502
     const id = asCase('c', { envProxy: { proxy_type: 'http', host: '127.0.0.1', port: hop1.port } });
     try {
+      let started = null;
       let err = null;
       try {
-        await manager.startProfile(profiles.getProfile(id), { systemProxy: { ProxyEnable: 1, ProxyServer: `127.0.0.1:${hop0.port}` } });
+        started = await manager.startProfile(profiles.getProfile(id), { systemProxy: { ProxyEnable: 1, ProxyServer: `127.0.0.1:${hop0.port}` } });
       } catch (e) { err = e; }
-      check('C. 启动被拒（抛错而不是静默直连）', Boolean(err), err ? err.message : '没有抛错');
-      check('C. code=800003 + reason=proxy_chain_hop_failed', err?.code === 800003 && err?.reason === 'proxy_chain_hop_failed',
-        fmt({ code: err?.code, reason: err?.reason }));
-      check('C. failed_hop = 1（是第二跳没能穿过去）', err?.failed_hop === 1, fmt(err?.failed_hop));
+      check('C. 允许启动（502 是「这一跳没到目标」，不是「代理不可达」）', !err && Boolean(started?.real_version),
+        err ? `抛了：${err.message}` : fmt(started?.real_version));
+      const warns = (started?.warnings || []).filter((w) => w && w.field === 'proxy_probe_unavailable');
+      check('C. 记了一条 proxy_probe_unavailable 级别的 soft 警告', warns.length >= 1,
+        warns.length ? fmt(warns[0].message).slice(0, 120) : fmt((started?.warnings || []).map((w) => w?.field)));
       check('C. hop0 确实被连过并回报了上游失败（正例：不是没试就下结论）',
         hop0.records.length >= 1 && hop0.records.every((r) => r.status === 502),
         fmt(hop0.records.map((r) => `${r.target} status=${r.status}`).slice(0, 3)));
-      const procs = chromeProcsFor(id.split('-')[0]);
-      check('C. 零内核进程（按 --user-data-dir 归类；量不到也算红）',
-        Array.isArray(procs) && procs.length === 0, Array.isArray(procs) ? `${procs.length} 个` : '量不到（powershell 失败）');
-      check('C. 目标 server 命中 = 0（直连反例）', targetHit('/case-c.html') === 0, `命中 ${targetHit('/case-c.html')}`);
+      const procs = chromeProcsUnder(DATA);
+      check('C. 不降级直连：目标 server 命中 = 0', targetHit('/case-c.html') === 0, `命中 ${targetHit('/case-c.html')}`);
+      /* 进程回收是异步的：stopProfile 之后内核要几百毫秒才真退干净。
+       * 用例在这里要断的是「这个环境**已经**被关掉」，不是「这一刻恰好为 0」—— 所以轮询等待，别立刻数。 */
+      let procsNow = procs;
+      for (let i = 0; i < 40 && Array.isArray(procsNow) && procsNow.length > 0; i++) {
+        await sleep(250);
+        await manager.stopProfile(id).catch(() => {});
+        procsNow = chromeProcsUnder(DATA);
+      }
+      check('C. 收尾后本用例数据目录下的 chrome 进程数 = 0（按 --user-data-dir 精确归类；量不到也算红）',
+        Array.isArray(procsNow) && procsNow.length === 0, Array.isArray(procsNow) ? `${procsNow.length} 个` : '量不到（powershell 失败）');
     } finally {
       await manager.stopProfile(id).catch(() => {});
       await hop0.close().catch(() => {});
@@ -389,9 +422,13 @@ async function main() {
   }
 
   /* ==========================================================================
-   * C2) 系统代理要求认证（注册表里没有凭据）→ 同样 fail-closed，failed_hop=0
+   * C2) 系统代理（hop0）要求认证、注册表里没有凭据 → **链上第一跳 407 = 硬失败**
+   *
+   * 0.4.7.9 修的真洞：`isHardProxyFailure` 原来只认 `kind === tcp|auth`，而链上某一跳回 407
+   * 时这个失败落到非 hard 类（target/probe_site），于是按「未验证」放行 —— 用户以为在走链，
+   * 实际链没通，出口可能根本不是他要的那个。口径：**链上任何一跳认证失败都不许放行**。
    * ======================================================================== */
-  console.log('\n=== C2) 系统代理要求认证 → fail-closed（failed_hop=0） ===');
+  console.log('\n=== C2) 链上第一跳（系统代理）407 → fail-closed（failed_hop=0） ===');
   {
     const hop0 = await startRecorder({ label: 'C2-hop0', auth: ['sys-user', 'sys-pass'] });
     const hop1 = await startRecorder({ label: 'C2-hop1' });
@@ -407,8 +444,10 @@ async function main() {
       check('C2. failed_hop = 0（407 是**这一跳**不认凭据，不是下一跳）', err?.failed_hop === 0, fmt(err?.failed_hop));
       check('C2. hop0 确实收到了我们的 CONNECT 并回了 407（正例：不是没试就下结论）',
         hop0.records.some((r) => r.status === 407), fmt(hop0.records.map((r) => r.status).slice(0, 3)));
-      const procs = chromeProcsFor(id.split('-')[0]);
-      check('C2. 零内核进程', Array.isArray(procs) && procs.length === 0, Array.isArray(procs) ? `${procs.length} 个` : '量不到（powershell 失败）');
+      const procs = chromeProcsUnder(DATA);
+      check('C2. 本用例数据目录下的 chrome 进程数 = 0（按 --user-data-dir 精确归类）',
+        Array.isArray(procs) && procs.length === 0, Array.isArray(procs) ? `${procs.length} 个` : '量不到（powershell 失败）');
+      check('C2. 目标 server 命中 = 0（没有绕过去直连）', targetHit('/case-c2.html') === 0, `命中 ${targetHit('/case-c2.html')}`);
     } finally {
       await manager.stopProfile(id).catch(() => {});
       await hop0.close().catch(() => {});
@@ -417,8 +456,35 @@ async function main() {
   }
 
   /* ==========================================================================
-   * D) 运行中断链：关掉 hop0 → 再请求失败，且目标命中不增加（防回落直连）
+   * C3) 链上**第二跳**（环境代理）407 → 同样 fail-closed，failed_hop=1
+   *
+   * CEO 0.4.7.9 口径：链上**任何一跳**认证失败都不许放行（和「内层认证失败不退回」同一条）。
+   * C2 钉的是第一跳（系统代理），这条钉第二跳（环境代理）：环境代理收我们的 CONNECT 回 407。
    * ======================================================================== */
+  console.log('\n=== C3) 链上第二跳（环境代理）407 → fail-closed（failed_hop=1） ===');
+  {
+    const hop0 = await startRecorder({ label: 'C3-hop0' });
+    const hop1 = await startRecorder({ label: 'C3-hop1', auth: ['env-user', 'env-pass'] });
+    // 环境代理要认证，但环境配置里**不给**账密 → hop1 回 407
+    const id = asCase('c3', { envProxy: { proxy_type: 'http', host: '127.0.0.1', port: hop1.port } });
+    try {
+      let err = null;
+      try {
+        await manager.startProfile(profiles.getProfile(id), { systemProxy: { ProxyEnable: 1, ProxyServer: `127.0.0.1:${hop0.port}` } });
+      } catch (e) { err = e; }
+      check('C3. 启动被拒（第二跳认证失败也不假装配好了）',
+        Boolean(err) && err.code === 800003 && err.reason === 'proxy_chain_hop_failed',
+        fmt({ code: err?.code, reason: err?.reason }));
+      check('C3. failed_hop = 1（是第二跳不认凭据）', err?.failed_hop === 1, fmt(err?.failed_hop));
+      check('C3. hop1 确实收到了我们经 hop0 转来的 CONNECT 并回了 407（正例）',
+        hop1.records.some((r) => r.status === 407), fmt(hop1.records.map((r) => r.status).slice(0, 3)));
+      check('C3. 目标 server 命中 = 0（没有绕过去直连）', targetHit('/case-c3.html') === 0, `命中 ${targetHit('/case-c3.html')}`);
+    } finally {
+      await manager.stopProfile(id).catch(() => {});
+      await hop0.close().catch(() => {});
+      await hop1.close().catch(() => {});
+    }
+  }
   console.log('\n=== D) 起来之后关掉 hop0 → 请求失败、目标命中不增加 ===');
   {
     const hop0 = await startRecorder({ label: 'D-hop0' });

@@ -398,7 +398,13 @@ async function handleClient(client, hops, state, timeoutMs) {
       upstream.write(rewriteToOriginForm(head, u, method));
     }
   } catch (e) {
-    state.lastError = e;
+    /* 0.4.7.9：`lastError` 要**准**——上层（manager）靠 `hop` + `reason` 判断是认证失败（硬失败、
+     * 必须 fail-closed）还是上游没到目标（软失败、放行）。原来多个并发连接用 `state.lastError = e`
+     * 直接覆盖，晚到的 502 会盖掉先到的 407，上层就分不清了。
+     *   ① `hop`/`reason`/`status` 由 openThroughChain 给出，这里原样保留；
+     *   ② 先到的「认证失败」不被后来的覆盖（认证失败信息量最大，且它决定了要不要拦启动）。 */
+    const isAuth = e && e.reason === 'proxy_auth_failed';
+    if (!state.lastError || isAuth) state.lastError = e;
     try {
       client.write(`HTTP/1.1 502 Bad Gateway${CRLF}Proxy-Agent: FreePower${CRLF}Content-Length: 0${CRLF}${CRLF}`);
     } catch { /* 浏览器已经断了 */ }
