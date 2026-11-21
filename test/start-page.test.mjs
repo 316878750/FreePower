@@ -332,10 +332,39 @@ try {
       && !host.isStartPageUrl('https://example.com/start'), '');
 
     // 同步「挑一张真页面」的两个入口都要跳过起始页，否则点了没反应（smoke 实测 7 条红）
-    const syncSrc = fs.readFileSync(path.join(ROOT, 'src/sync/session.js'), 'utf8');
+    /* 0.4.7.10：这条原来是**对源码做正则**（找 `isStartPageUrl(t.url)` 这个字面量）。
+     * 实现一改写（改用页面自己报的 href 判）就假红 —— 正则只能证明「这行存在」，
+     * 证明不了「起始页真的不会被选走」。改成**真求值**：给 pickPageTarget 一个假 CDP 客户端。 */
+    const { pickPageTarget } = await import('../src/sync/session.js');
+    const fakePages = (pages) => {
+      const attached = new Map();
+      return {
+        async send(method, params = {}, sid = null) {
+          if (method === 'Target.getTargets') {
+            return { targetInfos: pages.map((p) => ({ type: 'page', targetId: p.targetId, url: p.url })) };
+          }
+          if (method === 'Target.attachToTarget') {
+            const s = `s-${params.targetId}`;
+            attached.set(s, params.targetId);
+            return { sessionId: s };
+          }
+          if (method === 'Runtime.evaluate') {
+            const p = pages.find((x) => x.targetId === attached.get(sid));
+            return { result: { value: JSON.stringify({ v: p.visibility || 'hidden', h: p.url }) } };
+          }
+          if (method === 'Target.detachFromTarget') return {};
+          return {};
+        },
+      };
+    };
+    const picked = await pickPageTarget(fakePages([
+      // 起始页是**可见**的那张，真站在后台 —— 也不许选起始页
+      { targetId: 'start-page', url: `http://${host.START_HOST}:53380/start?id=a&sig=1`, visibility: 'visible' },
+      { targetId: 'real-page', url: 'https://example.com/x', visibility: 'hidden' },
+    ]));
+    check('7. 同步选页跳过起始页（真求值：起始页可见也不选它）',
+      picked.targetId === 'real-page', fmt(picked.targetId));
     const showSrc = fs.readFileSync(path.join(ROOT, 'src/sync/batch-show.js'), 'utf8');
-    check('7. 同步选页跳过起始页（session.js）',
-      /isStartPageUrl\(t\.url\)/.test(syncSrc) && /import \{ isStartPageUrl \}/.test(syncSrc), '');
     check('7. 批量显示选页跳过起始页（batch-show.js）',
       /isStartPageUrl\(t\.url\)/.test(showSrc) && /import \{ isStartPageUrl \}/.test(showSrc), '');
 

@@ -29,7 +29,8 @@ import { planForce, planShow, summarizeForce, summarizeShow, verifyForced, verif
 import { DEFAULT_SETTINGS, normalizeSettings } from './settings.js';
 import {
   closeTabAt, isBlankUrl, listTabs, navigateAt, openTabFor,
-  parseOpenUrls, planCloseBlank, planCloseOthers, planUnify, settle, targetIndex, visibleTabIndex,
+  parseOpenUrls, planCloseBlank, planCloseOthers, planUnify, readVisibility, settle, targetIndex,
+  visibleTabIndex,
 } from './tabs.js';
 
 /** 一次只允许一个同步会话：两套同时往同一批窗口发输入必然是灾难 */
@@ -69,21 +70,70 @@ async function connectInstance(profileId) {
 }
 
 /**
- * 选一张页面 target：优先真实 URL（跳过 about:blank / chrome://newtab），没有就取第一张 page。
+ * 选一张页面 target 去同步。
  *
- * 0.4.7.3：**还要跳过我们自己的起始页**（`http://start.freepower.test:.../start?...`）。
- * 它现在是每个环境的第一张标签，不跳过的话「同步起来点哪都没反应」——受控窗口的同步目标
- * 被选成了起始页，用户的点击全落在起始页上（smoke 里 7 条红就是这个）。
+ * 0.4.7.10：**优先选前台可见的那张**。
+ *
+ * 现场（用户 2026-11-21 实测）：主控和 3 个受控窗口各开了 3–4 个标签，每个窗口**可见**的都是
+ * `defi.xstocks.fi/points`，但后台还挂着 `app.startale.com/sign-up`。旧实现取「第一张 URL 像真站的 page」，
+ * `/json/list` 里 startale 排在前面 → 同步目标连到了**看不见的** startale。
+ * 用户看着 xstocks 操作，输入全打到后台那张页上，于是「怎么点都没反应」。
+ * 采集端、派发端、调度器全都正常（events=105 forwarded=105 errors=0），断的就是「连错标签」这一步。
+ * 主控连错同样致命：捕获脚本装在隐藏页上，一条事件都抓不到。
+ *
+ * 优先级（0.4.7.10）：
+ *   ① **可见 + 真站** → `source:'visible'`，`confident:true`
+ *   ② 读不到可见（窗口最小化 / 全读失败）或可见的是起始页 → 退回**第一张真站**（跳过起始页/空白/内部页），
+ *      `source:'real-fallback'`，`confident:false` —— 「跳过起始页」这条**保留**，只是降级为兜底
+ *   ③ 连真站都没有 → `pages[0]`，`source:'first-page'`，`confident:false`
+ *
+ * 返回形状：`{ targetId, url, visible, confident, source }`（`visible` 是实测值，读不到就是 `null`）。
+ * 老的调用方只用 `.targetId`，形状兼容。
  */
-async function pickPageTarget(client) {
+export async function pickPageTarget(client) {
   const { targetInfos } = await client.send('Target.getTargets');
   const pages = (targetInfos || []).filter((t) => t.type === 'page');
   if (!pages.length) return null;
-  const real = pages.find((t) => t.url
-    && !t.url.startsWith('about:blank')
-    && !t.url.startsWith('chrome://newtab')
-    && !isStartPageUrl(t.url));
-  return real || pages[0];
+
+  /* 可见性读不到就整张表都是 null —— 这时**不许**当成「都隐藏」，要走兜底。
+   * 同时把每张页的**真实** href 取回来（targetInfo 的 url 在错误页上是「想去的地址」，不可信）。 */
+  let vis = new Map();
+  try { vis = await readVisibility(client, pages.map((t) => t.targetId)); } catch { /* 全当未知 */ }
+  const infoOf = (t) => vis.get(t.targetId) || { state: null, href: null };
+  const urlOf = (t) => infoOf(t).href || t.url || '';
+
+  /** 真站：不是空白、不是 Chrome 内部新标签、不是我们自己的起始页、不是错误页 */
+  const isReal = (t) => {
+    const u = urlOf(t);
+    if (!u) return false;
+    if (u.startsWith('about:blank') || u.startsWith('chrome://newtab')) return false;
+    if (/^chrome-error:/i.test(u)) return false;
+    return !isStartPageUrl(u);
+  };
+  const visibleOf = (t) => (infoOf(t).state === 'visible' ? true : infoOf(t).state === 'hidden' ? false : null);
+  /** 可见的那张页是谁（无论能不能同步）—— 主窗口用它守住「停在起始页就拒绝」 */
+  const visiblePage = pages.find((t) => infoOf(t).state === 'visible') || null;
+  const visibleUrl = visiblePage ? urlOf(visiblePage) : null;
+
+  const visibleReal = pages.find((t) => infoOf(t).state === 'visible' && isReal(t));
+  if (visibleReal) {
+    return {
+      targetId: visibleReal.targetId, url: urlOf(visibleReal), visible: true, confident: true,
+      source: 'visible', visible_url: visibleUrl,
+    };
+  }
+  const fallbackReal = pages.find(isReal);
+  if (fallbackReal) {
+    return {
+      targetId: fallbackReal.targetId, url: urlOf(fallbackReal), visible: visibleOf(fallbackReal), confident: false,
+      source: 'real-fallback', visible_url: visibleUrl,
+    };
+  }
+  const first = pages[0];
+  return {
+    targetId: first.targetId, url: urlOf(first), visible: visibleOf(first), confident: false,
+    source: 'first-page', visible_url: visibleUrl,
+  };
 }
 
 /**
@@ -121,6 +171,26 @@ function unusableMasterPage(url, { injected = false } = {}) {
     return '主窗口还停在空白页，而且注入脚本没装上（不是我们接管的那张）';
   }
   return null;
+}
+
+/**
+ * 主窗口「能不能开始同步」的判定（0.4.7.10 从 startSync 里抽出来，好让判据真求值测）。
+ *
+ * 两个来源，缺一不可：
+ *   - `href`：选中那张页**自己报的** `location.href`（错误页只有它能看出停在 chrome-error）；
+ *   - `visibleUrl`：前台那张页的真实 href。**前台是起始页、真站在后台标签里**时，不许悄悄同步后台那张
+ *     —— 用户看的是起始页，同步后台页等于「点了没反应」，正是这次要修的 bug。
+ *     同时 0.4.7.5 的「主窗口停在起始页就拒绝」必须保住。
+ *
+ * @returns {string|null} `null` = 能同步；字符串 = 不能同步的原因（人话）
+ */
+export function masterBlockReason({ href, injected = false, visibleUrl = null } = {}) {
+  const h = String(href || '');
+  const vis = String(visibleUrl || '');
+  if (vis && isStartPageUrl(vis) && !isStartPageUrl(h)) {
+    return '主窗口停在起始页（前台是起始页，真站在后台标签里，同步它等于点了没反应）';
+  }
+  return unusableMasterPage(h, { injected });
 }
 
 async function attach(client, targetId) {
@@ -353,7 +423,12 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
     const mTarget = await pickPageTarget(m.client);
     if (!mTarget) throw new Error('主窗口没有页面 target（可能没有开任何标签）');
     const mSession = await attach(m.client, mTarget.targetId);
-    targets.set(master, { client: m.client, sessionId: mSession, targetId: mTarget.targetId, viewport: null, window: await windowSizeOf(m.client, mTarget.targetId) });
+    targets.set(master, {
+      client: m.client, sessionId: mSession, targetId: mTarget.targetId, viewport: null,
+      window: await windowSizeOf(m.client, mTarget.targetId),
+      // 0.4.7.10 可观测性：连的是哪张页、它可见不可见、是不是猜的 —— 见 statusOf()
+      targetUrl: mTarget.url, visible: mTarget.visible, confident: mTarget.confident, source: mTarget.source,
+    });
 
     /* 前置检查：主窗口现在有没有「可同步的页面」（见 unusableMasterPage 的注释）。
      * 必须在装 binding / 捕获脚本**之前**判 —— 先装再报错，等于在死页面上留了一层痕迹。
@@ -370,7 +445,9 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
       try { return JSON.parse(r?.result?.value || 'null'); } catch { return null; }
     }).catch(() => null);
     const masterHref = String(masterProbe?.href || mTarget.url || '');
-    const notSyncable = unusableMasterPage(masterHref, { injected: masterProbe?.injected === true });
+    const notSyncable = masterBlockReason({
+      href: masterHref, injected: masterProbe?.injected === true, visibleUrl: mTarget.visible_url,
+    });
     if (notSyncable) {
       logProfile(master, 'WARN 同步未开始', `主窗口不可同步：${notSyncable}（href=${masterHref.slice(0, 120)}）`);
       const err = new Error(`主窗口现在没有可同步的页面（${notSyncable}），先把页面打开再开始同步`);
@@ -411,7 +488,10 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
       const sid = await attach(s.client, t.targetId);
       const viewport = await viewportOf(s.client, sid);
       const win = await windowSizeOf(s.client, t.targetId);
-      targets.set(id, { client: s.client, sessionId: sid, targetId: t.targetId, viewport, window: win });
+      targets.set(id, {
+        client: s.client, sessionId: sid, targetId: t.targetId, viewport, window: win,
+        targetUrl: t.url, visible: t.visible, confident: t.confident, source: t.source,
+      });
       // 环境被外部关掉：连接断了就标降级，不静默继续
       s.client.on('*', () => {});
       s.client.socket?.on?.('close', () => { degraded.set(id, 'CDP 连接已断开'); });
@@ -555,13 +635,22 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
   return statusOf(session);
 }
 
-function statusOf(session) {
+/** 会话 → 对外的 status 形状（导出是为了让判据能真求值测形状，不用扫源码） */
+export function statusOf(session) {
   const windows = [];
   for (const [id, t] of session.targets) {
     windows.push({
       profile_id: id,
       role: id === session.master ? 'master' : 'slave',
       target_id: t.targetId,
+      /* 0.4.7.10：把「连的是哪张页、它可见不可见」直接放进 status。
+       * 起因：用户报「操作主控受控窗口不动」，而 status 里只有 target_id 一串哈希，
+       * 日志和界面都看不出「连错了后台标签」—— 这类 bug 必须自己暴露出来，不能靠人去映射。 */
+      target_url: t.targetUrl || null,
+      visible: t.visible === true ? true : t.visible === false ? false : null,
+      /** 这个 target 是「实测可见」选出来的（true），还是兜底猜的（false） */
+      confident: t.confident === true,
+      target_source: t.source || null,
       viewport: t.viewport,
       window: t.window,
       degraded: session.degraded.get(id) || null,

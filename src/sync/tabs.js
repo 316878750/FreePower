@@ -194,20 +194,52 @@ export async function listTabs(client) {
 }
 
 /**
- * 当前**可见**（前台）标签的序号。
+ * 批量读「每个标签是不是前台可见」，顺带把它**真实**的 `location.href` 取回来。
+ *
  * CDP 没有「现在哪个标签是激活的」这个字段，只能 attach 上去读 `document.visibilityState`。
+ * 返回 `Map<targetId, { state: 'visible'|'hidden'|null, href: string|null }>`，
+ * `state === null` = 读不到（已关闭 / 最小化挡住 / 不是可求值的页面）—— **读不到不等于隐藏**。
+ *
+ * 为什么要顺带取 href：`Target.getTargets` 报的 url 在**错误页**上是「当初想去的地址」
+ * （`http://127.0.0.1:1/nope`），页面实际停在 `chrome-error://chromewebdata/`。
+ * 光看 targetInfo 会把一张死掉的错误页当成「真站」选去同步（0.4.7.4 就是这么假绿的）。
+ *
+ * 0.4.7.10 抽出来：以前只有 `visibleTabIndex` 用它（切标签用），而「同步到底连哪张页」
+ * 那条路完全不看可见性，于是连到了后台标签（用户操作主控、受控窗口不动）。
+ * 现在两处共用这一个实现，口径不会各写一套。
+ */
+export async function readVisibility(client, targetIds) {
+  const map = new Map();
+  for (const targetId of targetIds) {
+    let info = { state: null, href: null };
+    try {
+      const { sessionId } = await client.send('Target.attachToTarget', { targetId, flatten: true });
+      const r = await client.send('Runtime.evaluate', {
+        expression: 'JSON.stringify({v: document.visibilityState, h: location.href})',
+        returnByValue: true,
+      }, sessionId);
+      await client.send('Target.detachFromTarget', { sessionId }).catch(() => {});
+      let parsed = null;
+      try { parsed = JSON.parse(r?.result?.value || 'null'); } catch { parsed = null; }
+      const v = parsed?.v;
+      info = {
+        state: v === 'visible' ? 'visible' : v === 'hidden' ? 'hidden' : null,
+        href: typeof parsed?.h === 'string' && parsed.h ? parsed.h : null,
+      };
+    } catch { /* 这个 target 挂了就记 null，试下一个 */ }
+    map.set(targetId, info);
+  }
+  return map;
+}
+
+/**
+ * 当前**可见**（前台）标签的序号。
  * 读不到就退回 0 —— 但把 `confident:false` 带回去，调用方可以如实记「这条是猜的」。
  */
 export async function visibleTabIndex(client, tabs) {
   const list = Array.isArray(tabs) ? tabs : await listTabs(client);
-  for (const t of list) {
-    try {
-      const { sessionId } = await client.send('Target.attachToTarget', { targetId: t.targetId, flatten: true });
-      const r = await client.send('Runtime.evaluate', { expression: 'document.visibilityState', returnByValue: true }, sessionId);
-      await client.send('Target.detachFromTarget', { sessionId }).catch(() => {});
-      if (r?.result?.value === 'visible') return { index: t.index, confident: true };
-    } catch { /* 这个 target 挂了就试下一个 */ }
-  }
+  const vis = await readVisibility(client, list.map((t) => t.targetId));
+  for (const t of list) if (vis.get(t.targetId)?.state === 'visible') return { index: t.index, confident: true };
   return { index: 0, confident: false };
 }
 
