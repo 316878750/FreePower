@@ -49,7 +49,7 @@ import { readReportFile, summarize } from '../selfcheck/store.js';
 import { renderHtml } from '../selfcheck/html.js';
 import { issueTicket } from './tickets.js';
 import { apiInfoPayload, setApiVerify, resetStats } from './info.js';
-import { startSync, stopSync, restartSync, syncStatus, updateSettings, refreshAll, unifySize, arrangeWindows, showWindows, forceShowWindows, openTabInAll, tabState, closeTabs, copyTabToSlaves, unifyTabs, DEFAULT_SETTINGS } from '../sync/session.js';
+import { startSync, stopSync, restartSync, syncStatus, updateSettings, refreshAll, unifySize, arrangeWindows, showWindows, forceShowWindows, openTabInAll, tabState, closeTabs, copyTabToSlaves, unifyTabs, getSession, selftestOf, DEFAULT_SETTINGS } from '../sync/session.js';
 import { readSyncDefaults, writeSyncDefaults, resetSyncDefaults, syncDefaultsDiff, mergeSyncSettings,
   readSnapshotOnClose, writeSnapshotOnClose, readSnapshotOnCloseState,
   readUaAutoAlign, writeUaAutoAlign,
@@ -2340,6 +2340,20 @@ export function buildRoutes() {
 
   /** 重读各窗口视口/外框尺寸：用户拖动窗口大小之后，坐标映射得跟着更新 */
   add(['POST'], ['/api/v2/sync/refresh'], async () => ok(await refreshAll()));
+
+  /**
+   * 同步自检（R5）：逐窗口逐 page target 读一次 `visibilityState` / 探针 / 是不是当前投递目标。
+   *
+   * 为什么要有这个接口：用户报「没反应」时，`running=true`、`events>0`、`errors=0` 都可能成立
+   * （0.4.7.9 的 `sent=311 / errors=0` 就是全绿但用户看不到）。这个接口**只回答事实**：
+   * 捕获脚本到底在不在这些页上、现在会投给哪张页。只读，不改状态。
+   */
+  add(['POST'], ['/api/v2/sync/selftest'], async () => {
+    const s = getSession();
+    if (!s) return ok(await selftestOf(null));
+    if (typeof s.selftest === 'function') return ok(await s.selftest());
+    return ok(await selftestOf(s));
+  });
 
   /**
    * 一键统一尺寸：受控窗口拉到主窗口的宽高。

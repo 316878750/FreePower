@@ -296,7 +296,32 @@ export default async function renderSyncPanel({ head, page }) {
             h('button', { class: 'btn sm primary', onClick: unify }, '一键统一尺寸')))
         : h('div', { class: 'muted small', style: { marginTop: '6px' } }, `尺寸一致：${sizes || '—'}`),
       h('div', { class: 'muted small', style: { marginTop: '6px' } },
-        `已发出 ${st.scheduler?.sent ?? 0} / 待发 ${st.scheduler?.pending ?? 0}，被开关拦下 ${st.dropped ?? 0}`));
+        `已发出 ${st.scheduler?.sent ?? 0} / 待发 ${st.scheduler?.pending ?? 0}，被开关拦下 ${st.dropped ?? 0}`),
+      /* 0.4.7.11：主窗口抓不到输入时给一句人话（标签被切走/关掉、停在起始页、很久没事件） */
+      st.hint ? h('div', { class: 'notice warn', style: { marginTop: '8px' } }, st.hint) : null,
+      /* 受控窗口掉线/标签全关：逐条列出来，别静默跳过 */
+      (st.windows || []).filter((w) => w.degraded).length
+        ? h('div', { class: 'notice bad', style: { marginTop: '8px' } },
+          ...(st.windows || []).filter((w) => w.degraded)
+            .map((w) => h('div', null, `${w.role === 'master' ? '主窗口' : '受控窗口'}：${w.degraded}`)))
+        : null,
+      /* 0.4.7.11 第二轮：逐窗口列出「这个窗口里有哪几张标签、现在投的是哪张」。
+       * 只给一个张数（`pages=2`）时，用户报「投错标签」我们只能人去 /json/list 里
+       * 映射 target_id —— 那正是这次要消灭的东西。 */
+      h('div', { class: 'muted small', style: { marginTop: '6px' } },
+        ...(st.windows || []).map((w) => pagesLine(w)).filter(Boolean).map((line) => h('div', null, line))));
+  }
+
+  /** 一个窗口的标签清单（给 paintStatus 用）：`主：xstocks[★当前]  start[后台]` */
+  function pagesLine(w) {
+    const list = Array.isArray(w?.pages) ? w.pages : [];
+    if (!list.length) return null;
+    const parts = list.map((p) => {
+      const u = String(p.url || '').replace(/^https?:\/\//, '').slice(0, 34) || '（无地址）';
+      const mark = p.is_current ? (p.active === false ? '★当前·未激活' : '★当前') : (p.visible ? '可见' : '后台');
+      return `${u}[${mark}]`;
+    });
+    return `${w.role === 'master' ? '主' : '受控'}：${parts.join('  ')}`;
   }
 
   async function start() {

@@ -45,59 +45,87 @@ function keepAlive() {
 }
 
 /* ============================ 1. 坐标映射 ============================ */
-console.log('\n— 1. 坐标映射（视口比例）—');
+console.log('\n— 1. 坐标映射（客户区原值 1:1，越界丢弃）—');
 
-const c720 = mapPoint({ x: 0.5, y: 0.5 }, { vw: 1280, vh: 720 });
-check('1280×720 的中心归一化点 → (640,360)', c720 && c720.x === 640 && c720.y === 360, JSON.stringify(c720));
+/* 依据 `adspower-reverse/8.9.23/34-窗口同步真实行为.md` §5.1/§5.2 实测：
+ * 主控 clientX = 246/446/646 时受控收到的**完全相同**；主控 900/900 时受控 **0 条**。
+ * 所以规则是「原值直传 + 越界丢弃」，不是「按视口比例缩放」。 */
+const c720 = mapPoint({ x: 246, y: 180 }, { vw: 1280, vh: 720 });
+check('原值直传：246,180 在 1280×720 里仍是 246,180',
+  c720 && c720.x === 246 && c720.y === 180, JSON.stringify(c720));
 
-const c1080 = mapPoint({ x: 0.5, y: 0.5 }, { vw: 1920, vh: 1080 });
-check('同一归一化点在 1920×1080 → (960,540)',
-  c1080 && c1080.x === 960 && c1080.y === 540, JSON.stringify(c1080));
+const c1080 = mapPoint({ x: 246, y: 180 }, { vw: 1920, vh: 1080 });
+check('同一坐标在 1920×1080 里也不变（1:1，不按视口缩放）',
+  c1080 && c1080.x === 246 && c1080.y === 180, JSON.stringify(c1080));
 
-// 反向：如果实现是「把归一化值当像素直传」，两种视口会给出同样的结果 —— 这条会红
-check('不同视口给出不同坐标（防「直传绝对像素」的实现）',
-  c720.x !== c1080.x && c720.y !== c1080.y, `${c720.x} vs ${c1080.x}`);
+// 反向：如果实现又退回「按比例缩放」，两个视口会给出不同结果 —— 这条会红
+check('不同视口给出**相同**坐标（防「按视口比例缩放」的实现）',
+  c720.x === c1080.x && c720.y === c1080.y, `${c720.x},${c720.y} vs ${c1080.x},${c1080.y}`);
 
-const corner = mapPoint({ x: 1, y: 1 }, { vw: 1920, vh: 1080 });
-check('归一化 (1,1) 夹在视口内（不会落到 1920/1080 之外）',
-  corner.x === 1919 && corner.y === 1079, JSON.stringify(corner));
+check('(0,0) 合法（左上角真的能点）',
+  JSON.stringify(mapPoint({ x: 0, y: 0 }, { vw: 800, vh: 600 })) === '{"x":0,"y":0}',
+  JSON.stringify(mapPoint({ x: 0, y: 0 }, { vw: 800, vh: 600 })));
 
-const clamped = mapPoint({ x: -0.5, y: 3 }, { vw: 100, vh: 100 });
-check('超界的归一化值被夹到 [0,1]', clamped.x === 0 && clamped.y === 99, JSON.stringify(clamped));
+/* 越界：实测是**丢弃**，不是夹到边上（夹边会点在完全不同的元素上） */
+check('主控 900/900 超出受控 800×600 → null（越界丢弃，不夹边）',
+  mapPoint({ x: 900, y: 900 }, { vw: 800, vh: 600 }) === null);
+check('x 刚好等于视口宽 → null（客户区是 [0,vw) 半开区间）',
+  mapPoint({ x: 800, y: 100 }, { vw: 800, vh: 600 }) === null);
+check('x = vw-1 仍在视口内（边界不能多丢一个像素）',
+  JSON.stringify(mapPoint({ x: 799, y: 599 }, { vw: 800, vh: 600 })) === '{"x":799,"y":599}',
+  JSON.stringify(mapPoint({ x: 799, y: 599 }, { vw: 800, vh: 600 })));
+check('负坐标 → null（不夹到 0）', mapPoint({ x: -5, y: 10 }, { vw: 800, vh: 600 }) === null);
 
 for (const bad of [{ vw: 0, vh: 0 }, { vw: NaN, vh: 720 }, { vw: 1280, vh: -1 }, {}, { vw: 'x', vh: 'y' }]) {
   check(`退化视口 ${JSON.stringify(bad)} → null（宁可不发，也不在 (0,0) 乱点）`,
-    mapPoint({ x: 0.5, y: 0.5 }, bad) === null, String(mapPoint({ x: 0.5, y: 0.5 }, bad)));
+    mapPoint({ x: 10, y: 10 }, bad) === null, String(mapPoint({ x: 10, y: 10 }, bad)));
 }
 
-const nonNum = mapPoint({ x: 'a', y: 0.5 }, { vw: 100, vh: 100 });
+const nonNum = mapPoint({ x: 'a', y: 5 }, { vw: 100, vh: 100 });
 check('坐标不是数字 → null', nonNum === null, JSON.stringify(nonNum));
+
+/* 分开「为什么没投」：out_of_view 是正常现象（要计数），no_viewport 是异常（要降级） */
+const { mapPointStatus } = await import('../src/sync/replay.js');
+check('mapPointStatus 区分 no_viewport（视口读不到）',
+  mapPointStatus({ x: 1, y: 1 }, null).reason === 'no_viewport', JSON.stringify(mapPointStatus({ x: 1, y: 1 }, null)));
+check('mapPointStatus 区分 out_of_view（越界）',
+  mapPointStatus({ x: 900, y: 900 }, { vw: 800, vh: 600 }).reason === 'out_of_view',
+  JSON.stringify(mapPointStatus({ x: 900, y: 900 }, { vw: 800, vh: 600 })));
+check('mapPointStatus 区分 bad_input（没有坐标）',
+  mapPointStatus({ t: 'move' }, { vw: 800, vh: 600 }).reason === 'bad_input',
+  JSON.stringify(mapPointStatus({ t: 'move' }, { vw: 800, vh: 600 })));
+check('mapPointStatus 正常时给 ok + 整数坐标',
+  JSON.stringify(mapPointStatus({ x: 12.4, y: 7.6 }, { vw: 800, vh: 600 })) === '{"ok":true,"x":12,"y":8}',
+  JSON.stringify(mapPointStatus({ x: 12.4, y: 7.6 }, { vw: 800, vh: 600 })));
 
 /* ============================ 2. 事件 → CDP 计划 ============================ */
 console.log('\n— 2. 事件 → CDP 输入计划 —');
 const VP = { vw: 1000, vh: 500 };
 
-const movePlan = buildInputPlan({ t: 'move', x: 0.1, y: 0.2 }, VP);
+const movePlan = buildInputPlan({ t: 'move', x: 100, y: 100 }, VP);
 check('move → 一条 mouseMoved，button 为 none',
   movePlan.length === 1 && movePlan[0].method === 'Input.dispatchMouseEvent'
   && movePlan[0].params.type === 'mouseMoved' && movePlan[0].params.button === 'none',
   JSON.stringify(movePlan[0]?.params));
+check('move 的坐标是原值（100,100 不缩放）',
+  movePlan[0].params.x === 100 && movePlan[0].params.y === 100,
+  JSON.stringify({ x: movePlan[0].params.x, y: movePlan[0].params.y }));
 
-const downPlan = buildInputPlan({ t: 'down', x: 0.5, y: 0.5, b: 0, btns: 1, m: 0 }, VP);
+const downPlan = buildInputPlan({ t: 'down', x: 500, y: 250, b: 0, btns: 1, m: 0 }, VP);
 check('down → 先 mouseMoved 再 mousePressed（顺序不能反）',
   downPlan.length === 2
   && downPlan[0].params.type === 'mouseMoved'
   && downPlan[1].params.type === 'mousePressed',
   downPlan.map((c) => c.params.type).join(' → '));
-check('down 的 mousePressed 坐标 = 映射后坐标，clickCount=1',
+check('down 的 mousePressed 坐标 = 原值，clickCount=1',
   downPlan[1].params.x === 500 && downPlan[1].params.y === 250 && downPlan[1].params.clickCount === 1,
   JSON.stringify({ x: downPlan[1].params.x, y: downPlan[1].params.y }));
 
-const upPlan = buildInputPlan({ t: 'up', x: 0.5, y: 0.5, b: 0, btns: 0, m: 0 }, VP);
+const upPlan = buildInputPlan({ t: 'up', x: 500, y: 250, b: 0, btns: 0, m: 0 }, VP);
 check('up → 只发 mouseReleased（不重复发移动）',
   upPlan.length === 1 && upPlan[0].params.type === 'mouseReleased', String(upPlan.length));
 
-const wheelPlan = buildInputPlan({ t: 'wheel', x: 0.5, y: 0.5, dx: 0, dy: 120, m: 0 }, VP);
+const wheelPlan = buildInputPlan({ t: 'wheel', x: 500, y: 250, dx: 0, dy: 120, m: 0 }, VP);
 check('wheel → mouseWheel，deltaY 原样不缩放（缩放会让不同窗口滚动距离不同）',
   wheelPlan[0].params.type === 'mouseWheel' && wheelPlan[0].params.deltaY === 120,
   String(wheelPlan[0].params.deltaY));
@@ -124,9 +152,11 @@ check('compositionend → 一条 insertText', textPlan.length === 1
 check('空文本不产生 insertText', buildInputPlan({ t: 'text', s: '' }, VP).length === 0);
 
 check('未知事件类型 → 空计划（不发明调用）',
-  buildInputPlan({ t: 'touch', x: 0.5, y: 0.5 }, VP).length === 0);
+  buildInputPlan({ t: 'touch', x: 500, y: 250 }, VP).length === 0);
 check('视口无效时点类事件 → 空计划',
-  buildInputPlan({ t: 'down', x: 0.5, y: 0.5 }, { vw: 0, vh: 0 }).length === 0);
+  buildInputPlan({ t: 'down', x: 500, y: 250 }, { vw: 0, vh: 0 }).length === 0);
+check('坐标越界时点类事件 → 空计划（越界丢弃）',
+  buildInputPlan({ t: 'down', x: 2000, y: 250 }, VP).length === 0);
 
 /* ============================ 3. 四个开关 ============================ */
 console.log('\n— 3. 四个开关（两个方向）—');
@@ -249,8 +279,11 @@ const src = buildCaptureScript({ bindingName: NAME });
 check('脚本里出现本次会话的随机 binding 名', src.includes(NAME), NAME);
 check('抓引用后 delete 掉名字（实测 delete 后 own names 里没有它）',
   src.includes('delete window[NAME]'), '有 delete window[NAME]');
-check('**不**用 defineProperty 覆盖（实测删不干净名字，仍是检测面）',
-  !src.includes('defineProperty'), '无 defineProperty');
+/* 0.4.7.11：探针用 defineProperty 装（Symbol 键 + 不可枚举），但**不许**拿它去覆盖 binding 名 ——
+ * 那会把名字永久留在 own names 里（实测检测面）。所以这条只钉「不对 NAME 用 defineProperty」。 */
+check('**不**用 defineProperty 覆盖 binding 名（名字必须 delete 掉）',
+  !/defineProperty\s*\(\s*window\s*,\s*NAME/.test(src),
+  (src.match(/defineProperty\([^)]{0,40}/g) || []).join(' | ') || 'none');
 
 const forbiddenHits = FORBIDDEN_IN_SCRIPT.filter((f) => src.includes(f));
 check('脚本不含任一检测面/逃逸面字面量（含 __fp / fpS）', forbiddenHits.length === 0, forbiddenHits.join(',') || 'none');
@@ -262,15 +295,35 @@ const genSrc = buildCaptureScript({ bindingName: genName });
 const genHits = FORBIDDEN_IN_SCRIPT.filter((f) => genSrc.includes(f));
 check('用实现生成的 binding 名构造脚本：脚本里也没有 __fp / fpS 字面量',
   genHits.length === 0, `${genName} → ${genHits.join(',') || 'none'}`);
-check('脚本不往 window 上挂自己的属性（只有读 window[NAME] 与 delete）',
-  !/\bwindow\[[^\]]+\]\s*=(?!=)/.test(src) && !/window\.[A-Za-z_$][\w$]*\s*=(?!=)/.test(src),
-  (src.match(/window[.\[]\w*[^\n]{0,12}=/g) || []).join(' | ') || 'none');
+
+/* 0.4.7.11：脚本会装一个**存活探针**（R5 的 `alive` 要读它）。
+ * 第一版用的是每会话随机的 `_s<8hex>` **字符串名**，被 P0 判据当场抓出来：
+ * own names 里多一条且整个会话期间都在 —— 比 binding 名（抓完就 delete）还糟。
+ * 现在改成 **Symbol 键 + 不可枚举**，所以这里钉的是「没有任何字符串键属性」+「探针是 symbol」。 */
+const bareWindowAssign = src.match(/window\.[A-Za-z_$][\w$]*\s*=(?!=)/g) || [];
+check('脚本不往 window 上挂固定名属性',
+  bareWindowAssign.length === 0, bareWindowAssign.join(',') || 'none');
+check('脚本不用字符串键往 window 上赋值（探针不是字符串名）',
+  !/window\[[^\]]+\]\s*=(?!=)/.test(src),
+  (src.match(/window\[[^\]]+\]\s*=(?!=)/g) || []).join(' | ') || 'none');
+
+const srcWithProbe = buildCaptureScript({ bindingName: NAME, probe: true });
+check('装了探针：走 Symbol 键 + 不可枚举（不进 own names / for...in）',
+  srcWithProbe.includes('Object.defineProperty(window, Symbol(),')
+  && srcWithProbe.includes('enumerable: false'), 'symbol probe');
+check('探针带 off()（会话结束能摘干净）', srcWithProbe.includes('off: function'));
+check('探针名不会写死在源码里（源码里没有 __fpSyncProbe）',
+  !fs.readFileSync(new URL('../src/sync/agent-script.js', import.meta.url), 'utf8').includes('__fpSyncProbe'));
+check('没要探针 → PROBE=false（运行时走 if (PROBE) 分支，不挂任何东西）',
+  buildCaptureScript({ bindingName: NAME }).includes('var PROBE = false;'));
 
 const listeners = ['mousemove', 'mousedown', 'mouseup', 'wheel', 'keydown', 'keyup', 'compositionend']
   .filter((e) => src.includes(`'${e}'`));
 check('七类事件全部监听', listeners.length === 7, listeners.join(','));
-check('坐标按 innerWidth/innerHeight 归一（不是屏幕坐标）',
-  src.includes('window.innerWidth') && src.includes('window.innerHeight'));
+/* 0.4.7.11 R3：坐标用**原值**，页面这边不归一化（归一化是上一版的做法，实测行为是 1:1） */
+check('坐标取 clientX/clientY 原值（不按 innerWidth/innerHeight 归一）',
+  src.includes('e.clientX') && src.includes('e.clientY')
+  && !src.includes('window.innerWidth || 1') && !src.includes('/ w;'));
 check('脚本里没有 eval / new Function', !src.includes('eval(') && !src.includes('new Function'));
 
 let threw = false;
@@ -311,6 +364,7 @@ for (const [p, method] of [
   ['/api/v2/sync/refresh', 'POST'],
   ['/api/v2/sync/unify-size', 'POST'],
   ['/api/v2/sync/tab', 'POST'],
+  ['/api/v2/sync/selftest', 'POST'],
 ]) {
   check(`路由存在：${method} ${p}`, !!findRoute(p, method), findRoute(p, method) ? 'ok' : 'missing');
 }

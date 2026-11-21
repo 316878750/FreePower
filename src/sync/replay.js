@@ -1,11 +1,14 @@
 /**
  * 回放层：把主窗口的事件按受控窗口的视口还原成 CDP `Input` 调用。
  *
- * 坐标规则（方案 Q2）：**按视口比例映射**，不按绝对像素。
- *   nx = clientX / innerWidth  →  x = round(nx * 受控视口宽)
- * 这条只在「页面布局不随宽度变」时能命中同一个元素；响应式页面在尺寸不同时布局本来就变了，
- * 比例映射会点偏 —— 这是**已知边界**，产品上用「窗口尺寸不一致」提示 + 一键统一尺寸来兜
- * （见 `sync/session.js` 的 `windows` 读数），不假装能自动对齐。
+ * 坐标规则（0.4.7.11 改，依据 `adspower-reverse/8.9.23/34-窗口同步真实行为.md` §5.1/§5.2 实测）：
+ *   **客户区坐标原值 1:1，不归一化、不缩放。**
+ *   AdsPower 实测：主控 clientX = 246 / 446 / 646 时，受控页收到的完全相同；
+ *   主控 900/900（超出受控视口）时受控 0 条 —— 也就是**越界直接丢弃**，不夹到边上。
+ *
+ * 上一版用「视口比例映射」，在两个窗口尺寸不同时会把点击挪到别的元素上，
+ * 而且和实测行为不一致（实测就是 1:1）。比例映射的残留只作为「尺寸不一致」提示，
+ * 见 `sync/session.js` 的 `windows` 读数，不再参与坐标换算。
  */
 
 import { baseTextAllowed, textCalls } from './text-input.js';
@@ -14,30 +17,38 @@ import { baseTextAllowed, textCalls } from './text-input.js';
 export const MOD = { alt: 1, ctrl: 2, meta: 4, shift: 8 };
 
 /**
- * 归一化坐标 → 目标视口坐标。
- * `vw` / `vh` 为 0（最小化、或 layoutMetrics 还没读到）时返回 `null`，调用方丢弃这条事件：
- * 宁可漏一次移动，也不要在 (0,0) 乱点。`viewport` 传 `null` 同样返回 `null`
- * （会话还没读到视口就是这样传的 —— 不要让它抛异常，一条事件不该弄崩整个会话）。
+ * 坐标 + 结论（供会话区分「为什么没投」并计数）。
+ *
+ * 返回 `{ok:true, x, y}` 或 `{ok:false, reason}`，`reason` 三选一：
+ *   - `no_viewport`：受控视口还没读到（刚 attach / 最小化 / 页面正在导航）
+ *   - `out_of_view`：坐标落在受控视口外 —— **按实测丢弃**，不夹边（R3）
+ *   - `bad_input`：事件里根本没有有效坐标
+ *
+ * 分开的理由：`out_of_view` 是**正常现象**（用户在主控窗口右侧/下侧操作，受控窗口小一点），
+ * 要计数但不能当错误；`no_viewport` 是异常，要进 degraded。
  */
-export function mapPoint({ x, y }, viewport) {
+export function mapPointStatus({ x, y }, viewport) {
   const { vw, vh } = viewport || {};
   const w = Number(vw);
   const h = Number(vh);
-  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return null;
-  const nx = clamp01(Number(x));
-  const ny = clamp01(Number(y));
-  if (!Number.isFinite(nx) || !Number.isFinite(ny)) return null;
-  return {
-    x: Math.min(Math.round(nx * w), Math.max(0, Math.round(w) - 1)),
-    y: Math.min(Math.round(ny * h), Math.max(0, Math.round(h) - 1)),
-  };
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return { ok: false, reason: 'no_viewport' };
+  const px = Number(x);
+  const py = Number(y);
+  if (!Number.isFinite(px) || !Number.isFinite(py)) return { ok: false, reason: 'bad_input' };
+  // 客户区坐标：合法范围 [0, innerWidth) × [0, innerHeight)
+  if (px < 0 || py < 0 || px >= w || py >= h) return { ok: false, reason: 'out_of_view' };
+  return { ok: true, x: Math.round(px), y: Math.round(py) };
 }
 
-function clamp01(v) {
-  if (!Number.isFinite(v)) return NaN;
-  if (v < 0) return 0;
-  if (v > 1) return 1;
-  return v;
+/**
+ * 原值坐标 → 目标视口坐标（1:1）。
+ * 读不到视口或越界时返回 `null`，调用方丢弃这条事件：宁可漏一次，也不要在错位置点。
+ * `viewport` 传 `null` 同样返回 `null`（会话还没读到视口就是这样传的 —— 不要让它抛异常，
+ * 一条事件不该弄崩整个会话）。
+ */
+export function mapPoint(ev, viewport) {
+  const r = mapPointStatus(ev, viewport);
+  return r.ok ? { x: r.x, y: r.y } : null;
 }
 
 /**

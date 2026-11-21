@@ -9,11 +9,28 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
+import net from 'node:net';
 import { spawn } from 'node:child_process';
 import os from 'node:os';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
-const PORT = 53531;
+/**
+ * 端口**不能写死**（0.4.7.11）。
+ *
+ * 实测（2026-11-21）：用户机器上 AdsPower 的内核 `SunBrowser.exe` 正占着 53531，
+ * 我们起的服务绑不上，判据却照样从 53531 拿到了 200 —— 打的是**别人的服务**，
+ * 于是「首页注入了 api_key」「/ui/app.js」这类断言全红，看起来像产品坏了。
+ * 先占一个空闲端口再放掉，再让服务去绑它：撞车只可能撞到极小的时间窗，
+ * 而且真绑不上时 `waitReady()` 会返回 false（判据会明确红在「服务起来了」这一步）。
+ */
+const PORT = await new Promise((resolve, reject) => {
+  const s = net.createServer();
+  s.once('error', reject);
+  s.listen(0, '127.0.0.1', () => {
+    const p = s.address().port;
+    s.close(() => resolve(p));
+  });
+});
 const DATA = path.join(os.tmpdir(), `fp-ui-${process.pid}`);
 process.env.FREEPOWER_DATA = DATA;
 process.env.FREEPOWER_PORT = String(PORT);

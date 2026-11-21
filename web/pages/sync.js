@@ -300,6 +300,12 @@ export default async function renderSync({ head, page }) {
         `　已发出 ${state.status?.scheduler?.sent ?? 0} / 待发 ${state.status?.scheduler?.pending ?? 0}`,
         state.status?.binding_name ? `　binding ${state.status.binding_name}` : '')
         : null,
+      /* 0.4.7.11：抓不到输入时**必须说出来**。
+       * 用户报「同步没反应」时，界面一片「同步中」是最坑的 —— 他没有任何线索知道
+       * 是主窗口的标签被切走/关掉了，还是引擎坏了。服务端算好的人话提示直接摆在这里。 */
+      isRunning() && state.status?.hint
+        ? h('div', { class: 'notice warn', style: { margin: '8px 12px' } }, state.status.hint)
+        : null,
       /* 31 号文 §12 更正 3 第二条：同步启动后才打开的环境**不会**自动加入。
        * 我们本来就是启动时固定窗口集，但必须**在界面上说出来** —— 否则用户会以为新开的环境加进去了。 */
       isRunning() ? h('div', { class: 'sync-hint' },
