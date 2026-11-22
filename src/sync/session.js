@@ -19,7 +19,7 @@ import { makeTextResolver, textOf } from './text-input.js';
 import { SyncScheduler, makeRng } from './scheduler.js';
 import { isStartPageUrl } from '../start/host.js';
 import {
-  FOLLOW_INTERVAL_MS, PageFollower, choosePage, pageKind, pageUsableReason, staleHint,
+  FOLLOW_INTERVAL_MS, PageFollower, choosePage, isSessionDeadError, pageKind, pageUsableReason, staleHint,
 } from './follow.js';
 import {
   normalizeState, needsRestoreBeforeResize, summarizeResize, verifyBounds,
@@ -416,6 +416,19 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
   const DELIVERY_MAX_AGE_MS = 500;
   /** R6：多久没有捕获到**新**事件就重装一次捕获（规格 60s） */
   const CAPTURE_REINSTALL_MS = 60000;
+  /**
+   * 投递链防陈旧（本轮）：探活节流窗口 + 单条命令超时。
+   *
+   * 为什么需要探活：真内核三轮复现（2026-11-22）——受控窗口被主控完全遮挡、部分越出屏幕时，
+   * Chrome 会冻结/丢弃后台渲染器；对这样的页 `Input.dispatchMouseEvent` **被接受且不抛错**
+   * （scheduler errors 恒为 0），页面就是不执行。唯一可靠的判定是「主动问页面一句」：
+   * evaluate 一条常量，答得上来 = 渲染器活着，答不上来/超时 = 陈旧，走唤醒与重连。
+   *
+   * 为什么节流 1500ms：真实 mousemove 一秒几百条，不能每条都多一个 RTT；
+   * 1.5s 内复用上一次「活着」的结论，超窗后下一条事件再验一次。
+   */
+  const DELIVERY_VERIFY_THROTTLE_MS = 1500;
+  const DELIVERY_VERIFY_TIMEOUT_MS = 1200;
 
   /* 0.4.7.11 第二轮：受控窗口「当前激活标签」改成**事件驱动**上报。
    *
@@ -526,6 +539,97 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
       await client.send('Emulation.setFocusEmulationEnabled', { enabled: false }, sessionId);
       return true;
     } catch { return false; }
+  }
+
+  /* --------------------- 投递链防陈旧：探活 → 唤醒 → 重连（本轮） --------------------- */
+
+  /**
+   * 带 timeout 的 CDP 命令：`CdpClient.send` 本身没有超时，页面真挂起时会永远不回，
+   * 把这个窗口的投递队列整个拖死。超时放弃后 send 自己的结局不再关心（吞掉防 unhandled）。
+   */
+  function cdpWithTimeout(client, method, params, sessionId, timeoutMs) {
+    let timer = null;
+    const tracked = client.send(method, params, sessionId);
+    tracked.catch(() => {});
+    return Promise.race([
+      tracked,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${method} 超时（${timeoutMs}ms，页面疑似挂起）`)), timeoutMs);
+      }),
+    ]).finally(() => { if (timer) clearTimeout(timer); });
+  }
+
+  /**
+   * 受控页探活（节流）：向当前投递会话 evaluate 一条常量。
+   *
+   * 「Chrome 不抛错但页面不处理」没有别的判定途径 —— Input 派发被接受只说明 CDP 通道通，
+   * 不说明渲染器会消费。答得上来 = 活着；报会话死错 / 超时 = 陈旧。
+   * 成功结论缓存 1500ms（失败不缓存：下一批事件立刻再验）。
+   */
+  async function verifySlaveAlive(t) {
+    if (!t?.client || !t.sessionId) return false;
+    const now = Date.now();
+    if (t.verified === true && now - (t.last_verify_ms || 0) < DELIVERY_VERIFY_THROTTLE_MS) return true;
+    t.last_verify_ms = now;
+    try {
+      await cdpWithTimeout(t.client, 'Runtime.evaluate', { expression: '1', returnByValue: true },
+        t.sessionId, DELIVERY_VERIFY_TIMEOUT_MS);
+      t.verified = true;
+      return true;
+    } catch {
+      t.verified = false;
+      return false;
+    }
+  }
+
+  /**
+   * 唤醒冻结/被丢弃的页（规格原文的 `Page.setWebLifecycleState active` 或等效手段），
+   * 然后立刻再探活一次。唤醒不算修复 —— 它只是给页面一次「活过来」的机会，
+   * 活没活过来以探活为准，两次都计进 `delivery_wake` 的口径见 statusOf 注释。
+   */
+  async function wakeSlave(t) {
+    if (!t?.client || !t.sessionId) return false;
+    try {
+      await t.client.send('Page.enable', {}, t.sessionId).catch(() => {});
+      await cdpWithTimeout(t.client, 'Page.setWebLifecycleState', { state: 'active' },
+        t.sessionId, DELIVERY_VERIFY_TIMEOUT_MS);
+    } catch {
+      return false;
+    }
+    t.delivery_wake = (t.delivery_wake || 0) + 1;
+    t.last_verify_ms = 0;
+    return verifySlaveAlive(t);
+  }
+
+  /**
+   * 作废死会话并重连：让跟随器丢掉旧 sessionId，强制重新解析投递目标（重新 attach）。
+   * 目标解析不到（标签全关）返回 null，调用方计 `delivery_fail`。
+   */
+  async function rebuildSlaveDelivery(t, id) {
+    const f = t.follower;
+    if (!f) return null;
+    f.invalidateSession(t.targetId);
+    t.delivery_retry = (t.delivery_retry || 0) + 1;
+    let dt = null;
+    try { dt = await f.deliveryTarget({ maxAgeMs: 0 }); } catch { dt = null; }
+    if (!dt || !dt.sessionId) return null;
+    const before = t.targetUrl;
+    const prevSid = t.sessionId;
+    t.targetId = dt.targetId;
+    t.sessionId = dt.sessionId;
+    t.targetUrl = dt.url;
+    t.visible = dt.visible;
+    t.confident = dt.confident;
+    t.source = dt.source;
+    t.signal = dt.signal || null;
+    t.viewport = dt.vw && dt.vh ? { vw: dt.vw, vh: dt.vh } : await viewportOf(t.client, dt.sessionId);
+    await focusEmulate(t);
+    if (prevSid && prevSid !== dt.sessionId) await unfocusEmulate(t.client, prevSid);
+    logProfile(id, '同步目标跟随',
+      `会话=${session.id.slice(0, 8)} 投递会话已作废并重连 ${String(before || '?').slice(0, 90)} → `
+      + `${String(dt.url || '?').slice(0, 90)} target=${dt.targetId} `
+      + `视口=${t.viewport ? `${t.viewport.vw}x${t.viewport.vh}` : '读不到'}`);
+    return t;
   }
 
   /**
@@ -771,10 +875,20 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
       events: session.events, forwarded: session.forwarded,
     };
 
+    /* 投递链防陈旧的聚合读数（结束日志）：用户报「同步时好时坏」时，
+     * wake/retry/fail 三个数能直接看出投递链路在会话期间对抗过多少次陈旧目标。 */
+    let wakeSum = 0; let retrySum = 0; let failSum = 0;
+    for (const [, t] of targets) {
+      wakeSum += Number(t.delivery_wake) || 0;
+      retrySum += Number(t.delivery_retry) || 0;
+      failSum += Number(t.delivery_fail) || 0;
+    }
+
     logProfile(master, abnormal ? '同步异常结束' : '同步结束',
       `会话=${session.id.slice(0, 8)} 事件=${session.events} 转发=${session.forwarded} `
       + `开关拦下=${session.dropped} 闸门拦下=${session.gated || 0} `
       + `文本发出=${session.text_sent} 文本被吞=${session.text_swallowed} `
+      + `唤醒=${wakeSum} 重连=${retrySum} 投递失败=${failSum} `
       + `原因=${reason}${message ? `（${message}）` : ''} `
       + `teardown=${teardown.removed ? 'binding 已摘' : `binding 未摘（${teardown.error || '未知原因'}）`}`);
 
@@ -897,6 +1011,11 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
         signal: t.signal || null, follower: f,
         /* R2/R3 的逐窗口读数（status.windows[] 直接暴露，用户/排障一眼看出卡在哪） */
         delivery_ok: null, delivery_target_url: null, skipped_no_target: 0, dropped_out_of_view: 0,
+        /* 投递链防陈旧计数（本轮）：wake=唤醒过几次冻结/挂起页，retry=死会话重连过几次，
+         * fail=最终放弃的批次数。errors=0 而页面没动的盲区由这三个数堵上。 */
+        delivery_wake: 0, delivery_retry: 0, delivery_fail: 0,
+        /** 探活缓存：verified=true 且距上次验证 <1500ms 时直接复用结论 */
+        verified: null, last_verify_ms: 0,
       };
       targets.set(id, entry);
       /* 回调先挂好再装上报：上报脚本一跑就会立刻推一条 `visible`，
@@ -1017,17 +1136,53 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
           if (plan.some((c) => c.method === 'Input.insertText'
             || (c.params && typeof c.params.text === 'string' && c.params.text))) textEmitted = true;
           scheduler.push(id, async () => {
+            /* 投递前探活（节流 1500ms）：Input 派发对冻结/被丢弃的页「被接受且不抛错」，
+             * errors 恒为 0 —— 唯一可靠的判定是主动问页面一句。陈旧 → 唤醒 → 仍陈旧 →
+             * 作废会话重连重试一次 → 再失败记 delivery_fail 并降级提示，绝不静默。 */
+            let liveOk = await verifySlaveAlive(t);
+            if (!liveOk) {
+              liveOk = await wakeSlave(t);
+              if (!liveOk) {
+                const rebuilt = await rebuildSlaveDelivery(t, id);
+                if (rebuilt) liveOk = await verifySlaveAlive(t);
+              }
+              if (!liveOk) {
+                t.delivery_fail = (t.delivery_fail || 0) + 1;
+                degraded.set(id, '受控页唤醒失败（页面可能已冻结、被丢弃或正在关闭），这一批输入已跳过');
+                logProfile(id, 'WARN 同步投递失败',
+                  `会话=${session.id.slice(0, 8)} 受控页探活失败：唤醒后仍无响应、会话重连后仍无响应，`
+                  + `丢弃 plan=${plan.length} 条 累计 fail=${t.delivery_fail} wake=${t.delivery_wake} retry=${t.delivery_retry}`);
+                return;
+              }
+            }
             for (const call of plan) {
               // waitMs 是「发这一条之前等多久」：逐字投递的字符间隔在这里落地
               if (call.waitMs) await sleep(call.waitMs);
               // 读 t.sessionId（不是快照）：排队期间用户可能又切了标签，要投到新页上
-              await t.client.send(call.method, call.params, t.sessionId);
+              try {
+                await t.client.send(call.method, call.params, t.sessionId);
+              } catch (e) {
+                if (!isSessionDeadError(e)) throw e;
+                /* 派发中途会话死了（渲染器被换掉/页面正在关闭）：作废重连，这一条重试一次 */
+                const rebuilt = await rebuildSlaveDelivery(t, id);
+                if (!rebuilt) {
+                  t.delivery_fail = (t.delivery_fail || 0) + 1;
+                  degraded.set(id, '投递会话被销毁且没能重连（页面可能正在关闭），这一批输入已跳过');
+                  logProfile(id, 'WARN 同步投递失败',
+                    `会话=${session.id.slice(0, 8)} 投递会话被销毁且重连失败，`
+                    + `丢弃 plan=${plan.length} 条 累计 fail=${t.delivery_fail}`);
+                  return;
+                }
+                await t.client.send(call.method, call.params, t.sessionId);
+              }
             }
           });
           t.delivery_ok = true;
           t.delivery_target_url = dt.url || t.targetUrl || null;
           bumpTarget(t.targetId);
           delivered = true;
+          /* 探活/唤醒成功后清掉「唤醒失败」那句降级：恢复要可见，不能停在旧读数上 */
+          if (typeof degraded.get(id) === 'string' && degraded.get(id).includes('唤醒失败')) degraded.delete(id);
         }
         if (delivered) session.forwarded += 1;
         /* 读数：带文字的事件里，**真的发出去了**多少条、被**内容策略**吞掉多少条。
@@ -1222,6 +1377,12 @@ export function statusOf(session) {
       delivery_ok: t.delivery_ok === true ? true : t.delivery_ok === false ? false : null,
       skipped_no_target: Number(t.skipped_no_target) || 0,
       dropped_out_of_view: Number(t.dropped_out_of_view) || 0,
+      /* 投递链防陈旧（本轮）：wake=对冻结/挂起页唤醒的次数，retry=死会话作废重连的次数，
+       * fail=最终放弃的批次。三者全 0 且 delivery_ok=true 才是干净的投递；
+       * fail>0 时 status.hint/degraded 会有人话，不许再出现「errors=0 而页面没动」的盲区。 */
+      delivery_wake: Number(t.delivery_wake) || 0,
+      delivery_retry: Number(t.delivery_retry) || 0,
+      delivery_fail: Number(t.delivery_fail) || 0,
       no_viewport: Number(t.no_viewport) || 0,
       viewport: t.viewport,
       window: t.window,
@@ -1310,6 +1471,9 @@ export function syncStatus() {
       events_from_current_target: 0,
       skipped_no_target: 0,
       dropped_out_of_view: 0,
+      delivery_wake: 0,
+      delivery_retry: 0,
+      delivery_fail: 0,
       capture_reinstalled: 0,
       last_event_at: null,
       last_teardown: lastTeardown,

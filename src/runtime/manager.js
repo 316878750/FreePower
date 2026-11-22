@@ -584,7 +584,12 @@ export async function startProfile(profile, { force = false, systemProxy = null 
         timeoutMs: EGRESS_TIMEOUT_MS,
         // 探测页是它自己建、自己关的：显式告诉 injectAndOpen 的 blank-reload watcher 别碰它。
         // 不加这一句就是「探测页刚 navigate，watcher 400ms 后 reload 把它顶成 ERR_ABORTED」。
-        onTarget: (targetId) => instance.exemptBlankReload(targetId),
+        // 同时登记为**内部目标**：auto-attach 对它跳过整套指纹装配（探测页毫秒级生灭，
+        // 装配命令经常落在死会话上刷「Session with given id not found」——2026-11-22 三轮复现）。
+        onTarget: (targetId) => {
+          instance.exemptBlankReload(targetId);
+          instance.markInternalTarget(targetId);
+        },
       });
       instance.egress = egress;
       if (egress.ok) {
@@ -690,6 +695,13 @@ async function injectAndOpen(instance, profile, view) {
   const navBusy = new Set();
   /** 豁免 blank-reload 的 targetId（我们自己建的目标：出口探测页等） */
   const blankReloadExempt = new Set();
+  /**
+   * 内部目标（我们自己建、自己会关、毫秒级生灭）：出口探测页等。
+   * auto-attach 对它们**不跑指纹装配**（见 attachedToTarget 的 internalTargets 分支）：
+   * 整套装配十几条命令，探测页经常在装配中途就被自己关掉，命令全落在死会话上，
+   * 日志里就是一串「hc 覆写失败 Session with given id not found」（2026-11-22 三轮复现）。
+   */
+  const internalTargets = new Set();
   /** 因为「有人在导航」而暂时跳过补注入的 session：等导航落地后再确认一次 */
   const pendingInjectCheck = new Set();
 
@@ -761,6 +773,15 @@ async function injectAndOpen(instance, profile, view) {
    */
   instance.exemptBlankReload = (targetId) => {
     if (targetId) blankReloadExempt.add(targetId);
+  };
+
+  /**
+   * 把某个 target 登记为「内部目标」：auto-attach 对它跳过整套指纹装配。
+   * 与 exemptBlankReload 分开登记 —— 同步里用 openTabFor 开的新标签也豁免 blank-reload，
+   * 但那些是**用户的真页面**，指纹装配必须照跑，绝不能混为一谈。
+   */
+  instance.markInternalTarget = (targetId) => {
+    if (targetId) internalTargets.add(targetId);
   };
 
   /**
@@ -1003,6 +1024,27 @@ async function injectAndOpen(instance, profile, view) {
       handleNonPageTarget({ sessionId, targetInfo, waitingForDebugger });
       return;
     }
+    if (internalTargets.has(targetInfo.targetId)) {
+      /* 内部目标（出口探测页等）：**整套指纹装配不做**。探测页毫秒级生灭、重试时旧的直接关掉，
+       * 装配命令经常落在死会话上，日志里就是「hc 覆写失败 Session with given id not found」——
+       * 这正是 2026-11-22 三轮复现里「同步启动时挂在死会话上的第二遍注入」的主要来源之一。
+       * 只保留探测页真正需要的两件事：
+       *   ① 代理认证闸门（认证代理的 407 要有人应答，否则探测页打不开、误报「代理不通」）；
+       *   ② runIfWaitingForDebugger 放行（auto-attach 是暂停态接住的，不放行永远加载不了）。
+       * 指纹一律不装配：探测页是我们自己看结果的页，装配与否不影响被测的出口链路。 */
+      (async () => {
+        try {
+          if (!['chain', 'relay'].includes(instance.chain_mode)) {
+            const proxy = normalizeProxyConfig(profile.user_proxy_config || profile.proxy_config || {});
+            await installRequestGating(client, sessionId, profile, proxy, { proxyAuth: true });
+          }
+        } catch { /* 闸门挂不上时探测自己会报错，这里不重复刷日志 */ }
+        if (waitingForDebugger) {
+          await client.send('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => {});
+        }
+      })();
+      return;
+    }
     // 新建标签（我们建的 / 用户 Ctrl+T / window.open）的**首个文档**在 attach 之前就存在，
     // 注册脚本只对下一个文档生效 —— 空白页必须重载一次，否则这张页面上是首帧原始指纹。
     const blank = !targetInfo.url || targetInfo.url === 'about:blank' || targetInfo.url.startsWith('chrome://newtab');
@@ -1010,7 +1052,14 @@ async function injectAndOpen(instance, profile, view) {
       try {
         await applyToSession(client, sessionId, profile, view, { proxyAuth: !['chain', 'relay'].includes(instance.chain_mode) });
       } catch (e) {
-        log(profileId, 'session 装配失败', targetInfo.targetId, e.message);
+        if (e?.sessionDead || isSessionDeadError(e)) {
+          /* 会话在装配中途死了：多半是目标本身被销毁（会话恢复换 target、探测页秒关、标签秒关）。
+           * 这不是装配代码的错，原始报错不回显——「Session with given id not found」刷在日志里
+           * 看着像事故，其实是竞态噪音；新 target 出现时 auto-attach 会重新装配，指纹覆盖不受影响。 */
+          log(profileId, '装配中止：目标在装配期间被销毁（新 target 出现时会重新装配）', targetInfo.targetId);
+        } else {
+          log(profileId, 'session 装配失败', targetInfo.targetId, e.message);
+        }
       } finally {
         if (waitingForDebugger) {
           await client.send('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => {});
@@ -1026,7 +1075,11 @@ async function injectAndOpen(instance, profile, view) {
   });
 
   await client.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
-  client.on('Target.detachedFromTarget', (params) => { pageReady.delete(params.targetId); repairedTargets.delete(params.targetId); });
+  client.on('Target.detachedFromTarget', (params) => {
+    pageReady.delete(params.targetId);
+    repairedTargets.delete(params.targetId);
+    internalTargets.delete(params.targetId);
+  });
 
   /**
    * 启动时 Chrome 自带的那张空白页在 setAutoAttach 之前就存在，脚本已经跑过一轮。
@@ -1269,6 +1322,19 @@ function withTimeout(promise, ms, label) {
   });
 }
 
+/**
+ * 「会话/目标已销毁」类 CDP 错误的识别（装配跑到一半 target 没了）。
+ *
+ * 用途：装配中途会话死掉时，**不回显原始报错**（「Session with given id not found」刷在日志里
+ * 像事故，其实是目标秒关/会话恢复换 target 的竞态噪音），改成一条 INFO 中止说明。
+ * sync 层（src/sync/follow.js）另有一份同口径实现：两层不许互相 import（会成环），
+ * 文案集合保持一致，改一处要记得另一处。
+ */
+function isSessionDeadError(e) {
+  return /session with given id|no target with given id|target closed|session closed|cannot find context|execution context was destroyed/i
+    .test(String(e?.message || e || ''));
+}
+
 async function sessionForTarget(client, targetId) {
   try {
     const { sessionId } = await client.send('Target.attachToTarget', { targetId, flatten: true });
@@ -1285,11 +1351,24 @@ async function sessionForTarget(client, targetId) {
  */
 async function applyToSession(client, sessionId, profile, view, { proxyAuth = true } = {}) {
   const s = sessionId;
+  /**
+   * 装配步骤的失败分流：**会话已死就中止剩余装配**（抛出标记错误，外层统一记一条 INFO），
+   * 其他失败维持原样 WARN —— 那些才是真的要人看的。
+   * 为什么会话死了要中止：目标已经没了，后面的每条命令都注定失败，
+   * 逐条刷「Session with given id not found」只会把日志刷成事故现场（2026-11-22 三轮复现）。
+   */
+  const stepDead = (e) => {
+    if (isSessionDeadError(e)) {
+      const err = new Error('目标在装配期间被销毁');
+      err.sessionDead = true;
+      throw err;
+    }
+  };
   await client.send('Page.enable', {}, s);
   // 页面会话层再挂一次 auto-attach：**专用 worker 只在页面层被接住**（浏览器层接不住，实测）。
   // waitForDebuggerOnStart 让 worker 停在首行之前，注入完再放行 —— 宁可多几毫秒，不留裸窗口。
   await client.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, s)
-    .catch((e) => log(instance_profile(profile), 'worker auto-attach 失败', e.message));
+    .catch((e) => { stepDead(e); log(instance_profile(profile), 'worker auto-attach 失败', e.message); });
   await client.send('Page.addScriptToEvaluateOnNewDocument', { source: buildInjectionSource(view, { debug: FP_DEBUG, markers: markerNames(view?.seed) }) }, s);
 
   if (view.ua) {
@@ -1298,7 +1377,7 @@ async function applyToSession(client, sessionId, profile, view, { proxyAuth = tr
       acceptLanguage: (view.language || []).join(','),
       platform: view.platform || 'Win32',
       userAgentMetadata: view.ua_metadata || undefined,
-    }, s).catch((e) => log(instance_profile(profile), 'UA 覆写失败', e.message));
+    }, s).catch((e) => { stepDead(e); log(instance_profile(profile), 'UA 覆写失败', e.message); });
   }
   if (view.timezone) await client.send('Emulation.setTimezoneOverride', { timezoneId: view.timezone }, s).catch(() => {});
   if (view.locale) await client.send('Emulation.setLocaleOverride', { locale: view.locale }, s).catch(() => {});
@@ -1314,7 +1393,7 @@ async function applyToSession(client, sessionId, profile, view, { proxyAuth = tr
   const hc = Number(view.hardware_concurrency);
   if (Number.isInteger(hc) && hc > 0) {
     await client.send('Emulation.setHardwareConcurrencyOverride', { hardwareConcurrency: hc }, s)
-      .catch((e) => log(instance_profile(profile), 'WARN hc 覆写失败', e.message));
+      .catch((e) => { stepDead(e); log(instance_profile(profile), 'WARN hc 覆写失败', e.message); });
   }
 
   if (view.screen) {
@@ -1339,7 +1418,7 @@ async function applyToSession(client, sessionId, profile, view, { proxyAuth = tr
       latitude: geo.latitude,
       longitude: geo.longitude,
       ...(geo.accuracy !== undefined ? { accuracy: geo.accuracy } : {}),
-    }, s).catch((e) => log(instance_profile(profile), 'WARN 定位覆盖失败', e.message));
+    }, s).catch((e) => { stepDead(e); log(instance_profile(profile), 'WARN 定位覆盖失败', e.message); });
   }
 
   // P2 · DNT 请求头：只有 `do_not_track === "true"` 才加，会话级一次调用。
@@ -1351,15 +1430,15 @@ async function applyToSession(client, sessionId, profile, view, { proxyAuth = tr
     // 表现为「DNT 头配了却没生效」——正是踩过的那种静默空转。行为不变（仍继续设头），
     // 但失败要留一句日志，不然下次还得靠人肉抓包才发现。
     await client.send('Network.enable', {}, s)
-      .catch((e) => log(instance_profile(profile), 'WARN Network.enable 失败，DNT 头可能不生效', e.message));
+      .catch((e) => { stepDead(e); log(instance_profile(profile), 'WARN Network.enable 失败，DNT 头可能不生效', e.message); });
     await client.send('Network.setExtraHTTPHeaders', { headers: { DNT: '1' } }, s)
-      .catch((e) => log(instance_profile(profile), 'WARN DNT 头设置失败', e.message));
+      .catch((e) => { stepDead(e); log(instance_profile(profile), 'WARN DNT 头设置失败', e.message); });
   }
 
   // 与预检 / --proxy-server 同源：AdsPower 形状（proxy_user / proxy_password）也要认，
   // 否则账号密码挂不上，内核收到 407 后页面直接空白。
   const proxy = normalizeProxyConfig(profile.user_proxy_config || profile.proxy_config || {});
-  await installRequestGating(client, s, profile, proxy, { proxyAuth }).catch((e) => log(profile.id, '请求闸门挂载失败', e.message));
+  await installRequestGating(client, s, profile, proxy, { proxyAuth }).catch((e) => { stepDead(e); log(profile.id, '请求闸门挂载失败', e.message); });
 }
 
 function instance_profile(p) {

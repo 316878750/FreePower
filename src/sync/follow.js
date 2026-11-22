@@ -32,6 +32,21 @@ export const FOLLOW_INTERVAL_MS = 450;
 export const STALE_MS = 5000;
 
 /**
+ * 「会话/目标已销毁」类 CDP 错误的统一识别。
+ *
+ * 什么时候会出现：target 还在表里（`targetDestroyed` 还没到 / 根本不会来），但渲染器已经被
+ * 换掉或丢弃，缓存里的 sessionId 成了死会话 —— 之后每条命令都报
+ * 「Session with given id not found」。识别出这一类，调用方才能走「作废重连」而不是报错。
+ *
+ * 内核侧（runtime/manager.js）另有一份同口径实现：两层不许互相 import（sync 层 import
+ * runtime 层可以，反过来会成环），所以各留一份、文案集合保持一致，改一处要记得另一处。
+ */
+export function isSessionDeadError(e) {
+  return /session with given id|no target with given id|target closed|session closed|cannot find context|execution context was destroyed/i
+    .test(String(e?.message || e || ''));
+}
+
+/**
  * URL 分类。
  *
  * 为什么分这么细：`choosePage`（选谁去同步）对「什么算真站」是**宽松**口径（除了空白/新标签/
@@ -463,6 +478,27 @@ export class PageFollower {
     const { sessionId } = await this.client.send('Target.attachToTarget', { targetId, flatten: true });
     p.sessionId = sessionId;
     return sessionId;
+  }
+
+  /**
+   * 作废某个 target 的会话（投递/验证发现「会话已死」时调）。
+   *
+   * 为什么要显式作废：target 还在（targetDestroyed 不会来）但渲染器已经被换掉/挂起时，
+   * 缓存里的 sessionId 已经是死的 —— 继续用它，每条命令都报
+   * 「Session with given id not found」，而且永远不会自愈（没人再 attach 一次）。
+   * 置空之后，下一次 `sessionFor()` 会重新 attach，拿到新会话。
+   * `state` 也一起清：新渲染器要重新读可见性，别拿旧读数选目标。
+   */
+  invalidateSession(targetId) {
+    const p = this.pages.get(targetId);
+    if (!p) return false;
+    const had = !!p.sessionId;
+    p.sessionId = null;
+    p.state = null;
+    p.vw = null;
+    p.vh = null;
+    if (had) this.invalidateDelivery();
+    return had;
   }
 
   /**
