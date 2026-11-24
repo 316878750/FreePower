@@ -363,7 +363,8 @@ t('summarizeForce：全屏跳过不算失败，单独说「没动」', () => {
 /* ============================ 5. 静态扫描 ============================ */
 console.log('\n— 5. 静态扫描：路由 / 分档落点 / page_only 不参与 ok / 面板 / 不引依赖 —');
 
-const sessionSrc = readSrc('src/sync/session.js');
+// 0.4.7.13：session.js 拆成门面 + session-*.js，静态扫描读全部
+const sessionSrc = ['session.js','session-state.js','session-cdp.js','session-live.js','session-windows.js','session-tabs.js'].map((f) => readSrc(`src/sync/${f}`)).join('\n');
 const routesSrc = readSrc('src/api/routes.js');
 const apiSrc = readSrc('web/api.js');
 const panelSrc = readSrc('web/pages/sync-panel.js');

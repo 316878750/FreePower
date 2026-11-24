@@ -55,7 +55,8 @@ const BEHAVIOR_LAYERS = [
   'src/runtime/manager.js', 'src/runtime/batch.js', 'src/runtime/prefs.js',
   'src/fingerprint/view.js',
   'src/proxy/chain.js', 'src/proxy/pac.js', 'src/proxy/egress.js', 'src/proxy/health.js', 'src/proxy/probe.js',
-  'src/sync/session.js', 'src/sync/window.js', 'src/sync/arrange.js', 'src/sync/show.js',
+  'src/sync/session.js', 'src/sync/session-cdp.js', 'src/sync/session-live.js',
+  'src/sync/session-windows.js', 'src/sync/session-tabs.js', 'src/sync/window.js', 'src/sync/arrange.js', 'src/sync/show.js',
   'src/agent/task.js', 'src/agent/workflow.js',
 ];
 

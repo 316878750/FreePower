@@ -111,7 +111,8 @@ console.log('\n— 4. 路由与界面（静态扫描）—');
   const path = await import('node:path');
   const routeSrc = fs.readFileSync(path.resolve(import.meta.dirname, '../src/api/routes.js'), 'utf8');
   const uiSrc = fs.readFileSync(path.resolve(import.meta.dirname, '../web/pages/sync.js'), 'utf8');
-  const sessionSrc = fs.readFileSync(path.resolve(import.meta.dirname, '../src/sync/session.js'), 'utf8');
+  // 0.4.7.13：session.js 拆成门面 + session-*.js，静态扫描读全部
+const sessionSrc = ['session.js','session-state.js','session-cdp.js','session-live.js','session-windows.js','session-tabs.js'].map((f) => fs.readFileSync(path.resolve(import.meta.dirname, '../src/sync', f), 'utf8')).join('\n');
   const sessionCode = sessionSrc.split('\n').filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l)).join('\n');
 
   check('路由存在：/api/v2/sync/unify-size', routeSrc.includes("'/api/v2/sync/unify-size'"));

@@ -388,7 +388,8 @@ const apiSrc = fs.readFileSync(path.join(ROOT, 'web', 'api.js'), 'utf8');
 const syncSrc = fs.readFileSync(path.join(ROOT, 'web', 'pages', 'sync.js'), 'utf8');
 const panelSrc = fs.readFileSync(path.join(ROOT, 'web', 'pages', 'sync-panel.js'), 'utf8');
 const widgetsSrc = fs.readFileSync(path.join(ROOT, 'web', 'sync-widgets.js'), 'utf8');
-const sessionSrc = fs.readFileSync(path.join(ROOT, 'src', 'sync', 'session.js'), 'utf8');
+// 0.4.7.13：session.js 拆成门面 + session-*.js，静态扫描读全部
+const sessionSrc = ['session.js','session-state.js','session-cdp.js','session-live.js','session-windows.js','session-tabs.js'].map((f) => fs.readFileSync(path.join(ROOT, 'src', 'sync', f), 'utf8')).join('\n');
 
 t('三条新路由都在（restart / console GET / console POST）', () => {
   assert.ok(routesSrc.includes("'/api/v2/sync/restart'"));

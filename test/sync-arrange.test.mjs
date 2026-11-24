@@ -534,7 +534,8 @@ console.log('\n— 11. 接线（静态扫描）—');
 {
   const read = (p) => fs.readFileSync(path.resolve(import.meta.dirname, '..', p), 'utf8');
   const routeSrc = read('src/api/routes.js');
-  const sessionSrc = read('src/sync/session.js');
+  // 0.4.7.13：session.js 拆成门面 + session-*.js，静态扫描读全部
+  const sessionSrc = ['session.js','session-state.js','session-cdp.js','session-live.js','session-windows.js','session-tabs.js'].map((f) => read(`src/sync/${f}`)).join('\n');
   const panelSrc = read('web/pages/sync-panel.js');
   /**
    * 排列区块 0.4.5 起搬进了共用组件 `web/sync-widgets.js`（操作台与「窗口同步」页各摆一份，

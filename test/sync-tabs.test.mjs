@@ -208,7 +208,8 @@ console.log('\n— 8. 开标签必须走「先空白再导航」（静态扫描�
   check('本模块里每一条 createTarget 都只建 about:blank（没有带真网址的）',
     createCalls.length > 0 && createCalls.every((s) => s.includes("'about:blank'")), createCalls.join(' | '));
   /* session.js 里也不许自己再拼一份开标签的姿势：绕开 openTabFor 就会漏掉豁免登记 */
-  const sessionSrc = fs.readFileSync(path.resolve(import.meta.dirname, '../src/sync/session.js'), 'utf8');
+  // 0.4.7.13：session.js 拆成门面 + session-*.js，静态扫描读全部
+  const sessionSrc = ['session.js','session-state.js','session-cdp.js','session-live.js','session-windows.js','session-tabs.js'].map((f) => fs.readFileSync(path.resolve(import.meta.dirname, '../src/sync', f), 'utf8')).join('\n');
   const sessionCode = sessionSrc.split('\n').filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l)).join('\n');
   check('session.js 不再直接调 Target.createTarget（统一走 tabs.js 的 openTabFor）',
     !/Target\.createTarget/.test(sessionCode),

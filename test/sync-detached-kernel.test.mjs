@@ -205,7 +205,8 @@ try {
 
   /* ------------------ 静态：解绑路径里没有起内核 / 没有无条件的 throw ------------------ */
   console.log('\n— 静态：解绑路径不许出现 startProfile / 起内核；四个函数里没有无条件的 if (!current) throw —');
-  const src = fs.readFileSync(new URL('../src/sync/session.js', import.meta.url), 'utf8');
+  // 0.4.7.13：session.js 拆成门面 + session-*.js，静态扫描读全部
+  const src = ['session.js','session-state.js','session-cdp.js','session-live.js','session-windows.js','session-tabs.js'].map((f) => fs.readFileSync(new URL(`../src/sync/${f}`, import.meta.url), 'utf8')).join('\n');
   const bodyOf = (name) => {
     const i = src.indexOf(`export async function ${name}`);
     if (i < 0) return '';
@@ -222,7 +223,7 @@ try {
   }
   const resolveBody = (() => {
     const i = src.indexOf('async function resolveWindows');
-    const j = src.indexOf('\nasync function pageSessionOf', i);
+    const j = src.indexOf('\nexport async function pageSessionOf', i);
     return src.slice(i, j);
   })();
   check('静态 resolveWindows：用 getInstance 复用已连客户端，不新开连接',
