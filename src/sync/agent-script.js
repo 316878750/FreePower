@@ -107,14 +107,35 @@ export function buildCaptureScript({ bindingName, probe = false, moveIntervalMs 
   /* 坐标：**原值 1:1**，不归一化、不缩放（R3，依据 34 号文 §5.1/§5.2）。
      越界由主进程按受控页 innerWidth/innerHeight 丢弃 —— 页面这边不做 clamp，
      否则「主控视口内、受控视口外」的点会被压到边上点歪。 */
-  function px(e) { return e.clientX; }
-  function py(e) { return e.clientY; }
+  /* iframe：clientX/Y 是相对**本帧**视口的。同进程（同源）的帧链在这里累加到本 target 的根帧；
+     跨进程 iframe（OOPIF）是独立 target，剩余偏移由主进程按 DOM.getFrameOwner 补（见 session.js）。
+     缓存 100ms：mousemove 每条都 getBoundingClientRect 会触发布局。 */
+  var offAt = 0, offX = 0, offY = 0;
+  function frameOffset() {
+    var now = Date.now();
+    if (now - offAt < 100) return;
+    offAt = now; offX = 0; offY = 0;
+    try {
+      var w = window;
+      while (w !== w.parent) {
+        var fe = null;
+        try { fe = w.frameElement; } catch (e) { fe = null; }
+        if (!fe) break;                       // 上一层跨源：到本 target 根帧了
+        var r = fe.getBoundingClientRect();
+        offX += r.left + (fe.clientLeft || 0);
+        offY += r.top + (fe.clientTop || 0);
+        w = w.parent;
+      }
+    } catch (e) { offX = 0; offY = 0; }
+  }
+  function px(e) { frameOffset(); return e.clientX + offX; }
+  function py(e) { frameOffset(); return e.clientY + offY; }
 
   function onMove(e) {
     var now = Date.now();
     if (now - lastMove < MOVE_MS) return;
     lastMove = now;
-    push({ t: 'move', x: px(e), y: py(e) });
+    push({ t: 'move', x: px(e), y: py(e), btns: e.buttons, m: mods(e) });
   }
   function onDown(e) {
     push({ t: 'down', x: px(e), y: py(e), b: e.button, btns: e.buttons, m: mods(e) });

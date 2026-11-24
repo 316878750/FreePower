@@ -35,6 +35,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
   current_tab_url: false, // 首个网址在当前标签页打开（syncOperateCurrentTabURL）
   delay_ms: 0,
   jitter_ms: 0,
+  /* 投递路径：'win32' = PostMessage 给窗口（Windows 默认，起不来自动退回）；'cdp' = 老路径 */
+  deliver: 'win32',
 });
 
 /** 设置页**不暴露**的字段（内部语义，给了只会造出两种行为）：面板上也不许出现这些开关 */
@@ -75,6 +77,7 @@ export function normalizeSettings(raw = {}) {
     current_tab_url: bool(raw.current_tab_url, false),
     delay_ms: num(raw.delay_ms, 0),
     jitter_ms: num(raw.jitter_ms, 0),
+    deliver: raw.deliver === 'cdp' ? 'cdp' : 'win32',
   };
 }
 

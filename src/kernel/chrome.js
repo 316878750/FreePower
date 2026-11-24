@@ -207,6 +207,10 @@ export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, use
   const win = view.window || { width: screen.width, height: screen.height };
 
   const disableFeatures = ['Translate', 'OptimizationHints', 'MediaRouter', 'CalculateNativeWinOcclusion'];
+  /* 窗口同步：受控窗口常被主控遮挡/在后台。Chrome 默认会降级被遮挡窗口的渲染器、
+   * 节流后台定时器、冻结后台页 —— 这时 CDP `Input.*` 照样返回成功，但页面不执行/不重绘
+   * （0.4.7.9「sent=311 errors=0 但不动」的根因）。IntensiveWakeUpThrottling 是 1 分钟级的强节流。 */
+  disableFeatures.push('IntensiveWakeUpThrottling');
   /* 0.4.7.5：网络时间服务会去 `clients2.google.com/time/1/current`（明文 HTTP，启动瞬间一发）。
    * 它不是后台网络任务，`--disable-background-networking` 关不掉，只能用 feature 开关。
    * 判据读数：只加 8 个 flag 时 clients2 还在（4 个后台域名），加上这条才降到 3 个。 */
@@ -264,6 +268,10 @@ export function buildArgs(profile, { userDataDir, proxy, proxyBound = false, use
      *   --disable-default-apps               默认应用安装（chromewebstore）
      *   --metrics-recording-only             只记本地指标、不上报
      * 判据：test/kernel-quiet.test.mjs（真内核 + 数域名的假代理，断言后台域名 0 个）。 */
+    /* 窗口同步：后台/被遮挡窗口不降级、不节流（见上面 IntensiveWakeUpThrottling 的说明） */
+    '--disable-renderer-backgrounding',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-background-timer-throttling',
     '--disable-background-networking',
     '--disable-component-update',
     '--disable-sync',

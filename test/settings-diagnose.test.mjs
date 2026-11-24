@@ -303,8 +303,9 @@ try {
   check('session.js 仍导出同一份 DEFAULT_SETTINGS / normalizeSettings（对外契约没变）',
     sessionMod.DEFAULT_SETTINGS === settingsMod.DEFAULT_SETTINGS
     && sessionMod.normalizeSettings === settingsMod.normalizeSettings);
-  check('normalizeSettings 对空入参给全套 16 键',
-    Object.keys(settingsMod.normalizeSettings({})).length === 16);
+  /* 17 = 原 16 键 + deliver（投递路径 win32/cdp，见 src/sync/settings.js） */
+  check('normalizeSettings 对空入参给全套 17 键',
+    Object.keys(settingsMod.normalizeSettings({})).length === 17);
   eq('diffSettings 只报不同的键', settingsMod.diffSettings(
     { ...settingsMod.DEFAULT_SETTINGS, input: false }, settingsMod.DEFAULT_SETTINGS,
   ), ['input']);
