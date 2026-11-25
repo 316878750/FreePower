@@ -112,4 +112,5 @@ B 层只认**受控页自己的 DOM 读数**，不认 `scheduler.sent / errors`�
 ## 6. 回退
 
 - 运行时：同步设置 `deliver: 'cdp'` 即回到 0.4.7.12 的投递路径（第 1、2 步的修复仍生效）。
+- **0.4.7.14 起 `cdp` 已是默认**，上一行只对 0.4.7.13 有意义。
 - 代码：本次改动集中在 `src/kernel/chrome.js`、`src/sync/{agent-script,session,settings,win-input}.*`、`test/sync-deliver*.mjs`、`test/settings-diagnose.test.mjs`、`package.json`。

@@ -35,8 +35,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
   current_tab_url: false, // 首个网址在当前标签页打开（syncOperateCurrentTabURL）
   delay_ms: 0,
   jitter_ms: 0,
-  /* 投递路径：'win32' = PostMessage 给窗口（Windows 默认，起不来自动退回）；'cdp' = 老路径 */
-  deliver: 'win32',
+  /* 投递路径：'cdp'（默认）/ 'win32'（实验）。
+   * 0.4.7.14 改回 CDP 默认：环境指纹用 setDeviceMetricsOverride 固定了页面尺寸（如 3170×1800），
+   * 而排列后的真实窗口只有 1146×464，Win32 按「页面坐标 × DPI」换算的点全落在窗口外被丢弃（用户 9 窗口实测 63/64 越界）。 */
+  deliver: 'cdp',
 });
 
 /** 设置页**不暴露**的字段（内部语义，给了只会造出两种行为）：面板上也不许出现这些开关 */
@@ -77,7 +79,7 @@ export function normalizeSettings(raw = {}) {
     current_tab_url: bool(raw.current_tab_url, false),
     delay_ms: num(raw.delay_ms, 0),
     jitter_ms: num(raw.jitter_ms, 0),
-    deliver: raw.deliver === 'cdp' ? 'cdp' : 'win32',
+    deliver: raw.deliver === 'win32' ? 'win32' : 'cdp',
   };
 }
 

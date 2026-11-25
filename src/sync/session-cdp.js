@@ -243,7 +243,7 @@ export async function resolveWindows(rawIds, { what = '排列' } = {}) {
       err.reason = 'no_windows';
       throw err;
     }
-    for (const id of [state.current.master, ...current.slaves]) {
+    for (const id of [state.current.master, ...state.current.slaves]) {
       const t = state.current.targets.get(id);
       if (!t) continue;
       handles.push({

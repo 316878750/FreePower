@@ -15,6 +15,7 @@ import { FOLLOW_INTERVAL_MS, PageFollower, isSessionDeadError, pageKind, staleHi
 import { DEFAULT_SETTINGS, normalizeSettings } from './settings.js';
 import { PROBE_BOOL_EXPR, PROBE_OFF_EXPR, PROBE_READ_EXPR, connectInstance, masterBlockReason, sleep, viewportOf, windowSizeOf } from './session-cdp.js';
 import { state } from './session-state.js';
+import { TabMirror } from './tab-mirror.js';
 
 /* ------------------------------ 启动 / 停止 ------------------------------ */
 
@@ -433,8 +434,16 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
     scheduler.push(id, async () => {
       const r = await session.win.call(cmd);
       if (r?.ok) { t.win_ok = (t.win_ok || 0) + 1; return; }
-      if (r?.reason === 'out_of_view') { t.dropped_out_of_view = (t.dropped_out_of_view || 0) + 1; session.dropped_out_of_view += 1; return; }
-      t.win_fail = (t.win_fail || 0) + 1;
+      /* 0.4.7.14：Win32 判越界/失败**不再吞掉**，计数后把这条改走 CDP（同一队列，顺序不乱）。
+       * 9 窗口实测：指纹页面 3170×1800、真实窗口 1146×464，Win32 63/64 越界，用户看到的就是「全不动」。 */
+      if (r?.reason === 'out_of_view') t.win_oob = (t.win_oob || 0) + 1;
+      else { t.win_fail = (t.win_fail || 0) + 1; t.win_last_reason = r?.reason || '?'; }
+      try {
+        const plan = buildSyncPlan(ev, t.viewport, session.settings, null, textRng);
+        for (const call of plan) await t.client.send(call.method, call.params, t.sessionId);
+        t.delivery_via = 'cdp';
+      } catch { /* CDP 也失败：下一条事件会走正常路径的探活/重连 */ }
+      if (r?.reason === 'out_of_view') return;
       t.win_last_reason = r?.reason || '?';
       if (r?.reason === 'window_gone') t.win = null;
       if (r?.reason === 'window_minimized') degraded.set(id, '受控窗口已最小化（Win32 投递跳过）');
@@ -527,6 +536,8 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
     mt.confident = next.confident;
     mt.source = next.source;
     await refreshViewport(master).catch(() => {});
+    /* 0.4.7.14：主控切了标签，受控也切到对应那张（只对镜像过的标签有效，见 tab-mirror.js） */
+    try { session.mirror?.onMasterActivated(next.targetId); } catch { /* ignore */ }
     if (prev || before) {
       logProfile(master, '同步目标跟随',
         `会话=${session.id.slice(0, 8)} 主窗口可见标签 ${String(before || '?').slice(0, 90)} → `
@@ -571,6 +582,18 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
    * 为什么要收口：0.4.7.10 之前「目标没了」这条路上没有任何一行日志、`running` 还是 true，
    * 用户和我们都看不出「会话其实已经废了」。现在无论怎么结束，都写清楚 `reason` + 人话 `message`。
    */
+  /** 结束日志用：每个受控窗口最后走的路径 + win32 成败 + 越界，例：cdp×8 / win32×0(ok=0,fail=0,越界=0) */
+  function deliverySummary() {
+    let cdp = 0; let win = 0; let wok = 0; let wfail = 0; let oob = 0;
+    for (const id of session.slaves) {
+      const t = targets.get(id);
+      if (!t) continue;
+      if (t.delivery_via === 'win32') win += 1; else cdp += 1;
+      wok += Number(t.win_ok) || 0; wfail += Number(t.win_fail) || 0; oob += Number(t.dropped_out_of_view) || 0;
+    }
+    return `cdp×${cdp}/win32×${win}(ok=${wok},fail=${wfail},越界=${oob})`;
+  }
+
   async function finishSession({ reason, message, abnormal = false, removeBinding = true } = {}) {
     if (session.stopped) return { running: false, teardown: state.lastTeardown };
     session.stopped = true;
@@ -578,6 +601,7 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
     session.end_message = message;
     scheduler.stop();
     try { session.win?.stop(); } catch { /* ignore */ }
+    try { session.mirror?.stop(); } catch { /* ignore */ }
     if (session.watchdog) { clearInterval(session.watchdog); session.watchdog = null; }
 
     /* 顺序不能反：**先摘 binding，再停跟随器**。
@@ -640,6 +664,8 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
       + `开关拦下=${session.dropped} 闸门拦下=${session.gated || 0} `
       + `文本发出=${session.text_sent} 文本被吞=${session.text_swallowed} `
       + `唤醒=${wakeSum} 重连=${retrySum} 投递失败=${failSum} `
+      + `越界丢弃=${session.dropped_out_of_view || 0} 投递路径=${deliverySummary()} `
+      + `标签同步=${session.mirror ? JSON.stringify(session.mirror.status()) : '未启用'} `
       + `原因=${reason}${message ? `（${message}）` : ''} `
       + `teardown=${teardown.removed ? 'binding 已摘' : `binding 未摘（${teardown.error || '未知原因'}）`}`);
 
@@ -1040,6 +1066,39 @@ export async function startSync({ masterId, slaveIds = [], settings = {}, rngSee
   session.watchdog = setInterval(() => { watchdogTick().catch(() => {}); }, 2000);
   session.watchdog.unref?.();
 
+  /* 0.4.7.14 标签镜像：主控新开标签 / 打开链接 / 切标签 / 关标签 → 受控跟着做（见 tab-mirror.js）。
+   * 只看 CDP target 事件，不依赖页面捕获 —— 地址栏、「+」、Ctrl+T、标签栏的操作页面 JS 根本看不到。 */
+  try {
+    const mirror = new TabMirror({
+      masterClient,
+      masterId: master,
+      slaves: () => session.slaves.filter((id) => targets.has(id)),
+      slaveClient: (id) => targets.get(id)?.client || null,
+      settings: () => session.settings,
+    });
+    const seedSlaves = new Map();
+    for (const id of session.slaves) { const t = targets.get(id); if (t) seedSlaves.set(id, t.targetId); }
+    const mt0 = targets.get(master);
+    if (mt0?.targetId) mirror.seed(mt0.targetId, seedSlaves);
+    masterClient.on('Target.targetCreated', (p) => {
+      const t = p?.targetInfo;
+      if (t?.type === 'page' && !t.url?.startsWith('devtools://')) mirror.onMasterTabAdded(t.targetId);
+    });
+    masterClient.on('Target.targetDestroyed', (p) => { if (p?.targetId) mirror.onMasterTabRemoved(p.targetId); });
+    /* 主帧导航：targetInfoChanged 在 URL 变了时触发，不需要 attach（新开但还没装捕获的标签也能看到） */
+    const lastUrl = new Map();
+    masterClient.on('Target.targetInfoChanged', (p) => {
+      const t = p?.targetInfo;
+      if (!t || t.type !== 'page') return;
+      if (lastUrl.get(t.targetId) === t.url) return;
+      lastUrl.set(t.targetId, t.url);
+      mirror.onMasterNavigated(t.targetId, t.url);
+    });
+    session.mirror = mirror;
+  } catch (e) {
+    logProfile(master, 'WARN 标签同步', `没能启用：${e?.message || e}`);
+  }
+
   session.status = () => statusOf(session);
   state.current = session;
   return statusOf(session);
@@ -1243,6 +1302,8 @@ export function statusOf(session) {
     master_visible_url: masterFollower?.visibleHref || null,
     follow_interval_ms: FOLLOW_INTERVAL_MS,
     delivery_cache_ms: 500,
+    /** 0.4.7.14 标签镜像读数：新开/认领/跳转/切换/关闭 计数与最后一次错误 */
+    tab_sync: session.mirror ? session.mirror.status() : null,
     abnormal: session.abnormal || null,
     end_reason: session.end_reason || null,
     end_message: session.end_message || null,
@@ -1310,9 +1371,9 @@ export async function stopSync() {
 export async function restartSync({ settings = null } = {}) {
   if (!state.current) throw new Error('没有正在运行的同步会话，先开始同步');
   const masterId = state.current.master;
-  const slaveIds = [...current.slaves];
+  const slaveIds = [...state.current.slaves];
   const keep = settings && typeof settings === 'object'
-    ? normalizeSettings({ ...current.settings, ...settings })
+    ? normalizeSettings({ ...state.current.settings, ...settings })
     : state.current.settings;
 
   await stopSync();
@@ -1338,7 +1399,7 @@ export async function detachProfile(profileId) {
 /** 改设置：四个开关与延迟可以运行中改，不用重开会话 */
 export function updateSettings(raw) {
   if (!state.current) throw new Error('没有正在运行的同步会话');
-  const st = normalizeSettings({ ...current.settings, ...raw });
+  const st = normalizeSettings({ ...state.current.settings, ...raw });
   state.current.settings = st;
   state.current.scheduler.delayMs = st.delay_ms;
   state.current.scheduler.jitterMs = st.jitter_ms;

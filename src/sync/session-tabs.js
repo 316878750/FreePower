@@ -29,7 +29,7 @@ export async function openTabInAll(rawUrl) {
   const opened = [];
   const masterTabs = await listTabs(state.current.targets.get(state.current.master).client);
   const masterVis = await visibleTabIndex(state.current.targets.get(state.current.master).client, masterTabs);
-  for (const id of [state.current.master, ...current.slaves]) {
+  for (const id of [state.current.master, ...state.current.slaves]) {
     const t = state.current.targets.get(id);
     if (!t) continue;
     const isMaster = id === state.current.master;
@@ -67,7 +67,7 @@ export async function openTabInAll(rawUrl) {
 export async function tabState() {
   if (!state.current) return { running: false, windows: [] };
   const windows = [];
-  for (const id of [state.current.master, ...current.slaves]) {
+  for (const id of [state.current.master, ...state.current.slaves]) {
     const t = state.current.targets.get(id);
     if (!t) continue;
     const tabs = await listTabs(t.client).catch(() => []);
@@ -117,7 +117,7 @@ export async function closeTabs(which = 'current') {
       masterAnchor = (await visibleTabIndex(masterT.client, mTabs).catch(() => ({ index: 0, confident: false }))).index;
     }
   }
-  for (const id of [state.current.master, ...current.slaves]) {
+  for (const id of [state.current.master, ...state.current.slaves]) {
     const t = state.current.targets.get(id);
     if (!t) continue;
     const tabs = await listTabs(t.client).catch(() => []);
@@ -222,7 +222,7 @@ export async function unifyTabs() {
 /** 重读所有窗口的视口（用户改了窗口尺寸之后调；8b 判据也用它） */
 export async function refreshAll() {
   if (!state.current) return null;
-  for (const id of [state.current.master, ...current.slaves]) {
+  for (const id of [state.current.master, ...state.current.slaves]) {
     await state.current.refreshViewport(id).catch(() => {});
     const t = state.current.targets.get(id);
     if (t) t.window = await windowSizeOf(t.client, t.targetId).catch(() => t.window);

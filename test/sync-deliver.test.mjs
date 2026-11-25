@@ -111,10 +111,10 @@ t('方向键 / Delete / 右 Ctrl 是扩展键，字母不是', () => {
 
 /* ============================ 4. 设置 ============================ */
 console.log('\n— 4. settings.deliver —');
-t('默认 win32', () => { assert.equal(DEFAULT_SETTINGS.deliver, 'win32'); assert.equal(normalizeSettings({}).deliver, 'win32'); });
-t('只有 "cdp" 能切回老路径，其它值一律 win32（不许出现第三种行为）', () => {
-  assert.equal(normalizeSettings({ deliver: 'cdp' }).deliver, 'cdp');
-  for (const v of ['CDP', 'x', 1, null, true]) assert.equal(normalizeSettings({ deliver: v }).deliver, 'win32', String(v));
+t('默认 cdp（0.4.7.14：指纹固定页面尺寸 ≠ 真实窗口时 Win32 坐标全越界）', () => { assert.equal(DEFAULT_SETTINGS.deliver, 'cdp'); assert.equal(normalizeSettings({}).deliver, 'cdp'); });
+t('只有 "win32" 能开 Win32 投递，其它值一律 cdp（不许出现第三种行为）', () => {
+  assert.equal(normalizeSettings({ deliver: 'win32' }).deliver, 'win32');
+  for (const v of ['WIN32', 'x', 1, null, true, 'cdp']) assert.equal(normalizeSettings({ deliver: v }).deliver, 'cdp', String(v));
 });
 
 const fail = results.filter((r) => !r.ok).length;
